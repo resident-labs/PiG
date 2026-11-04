@@ -158,3 +158,20 @@ Locked by: `TestTheFirstHeadNamesTheDeferredTools`, `TestALoadChangesNoSection`,
 (mcpext), `TestToolSearchDescriptionNamesTheDeferredToolsSection` (toolsearch).
 
 Upstream: not offered (owner's decision pending).
+
+## P8 Active effort at the top level
+
+What: `ai.StreamOptions.ActiveEffortAtTopLevel` makes an Anthropic request that carries mid-conversation effort markers
+send the active effort as its top-level `output_config.effort`, where Pi sends `"high"`. A request without markers
+already sends the active effort there, so the option changes nothing for it. `SessionOptions.ActiveEffortAtTopLevel`
+(and `CreateAgentSessionFromServicesOptions.ActiveEffortAtTopLevel`) sets it on every request of a Session through
+`buildRequestOptions`, compaction and branch summaries included. Without it nothing changes.
+
+Why: Dyna's Pi fork has sent the active effort at the top level since its "v2 effort fix" (`third_party/pi/DYNA.md`,
+pack level 11), so a session keeps the effort its profile chose on turns that carry markers, not "high". Upstream keeps `"high"` (Pi e3bc05e87).
+
+Locked by: `TestActiveEffortAtTopLevelReplacesTheHighDefault` (ai), `TestActiveEffortAtTopLevelReachesEveryRequest`,
+`TestCreateAgentSessionFromServicesPassesActiveEffortAtTopLevel`
+(coding).
+
+Upstream: not offered (owner's decision pending).

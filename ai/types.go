@@ -844,6 +844,9 @@ type StreamOptions struct {
 	ThinkingEnabled      *bool                  `json:"thinkingEnabled,omitempty"`
 	ThinkingBudgetTokens *int                   `json:"thinkingBudgetTokens,omitempty"`
 	Effort               AnthropicEffort        `json:"effort,omitempty"`
+	// ActiveEffortAtTopLevel sends the active effort as the top-level output_config effort of an Anthropic request that also carries
+	// mid-conversation effort markers, where Pi sends "high" (dyna patch P8). Without markers the top level is the active effort anyway.
+	ActiveEffortAtTopLevel bool `json:"-"`
 	// ThinkingDisplay controls how Anthropic returns thinking content. Empty means "summarized" when thinking is enabled (anthropic-messages.ts:271, :1238, :1246).
 	ThinkingDisplay     AnthropicThinkingDisplay `json:"thinkingDisplay,omitempty"`
 	InterleavedThinking *bool                    `json:"interleavedThinking,omitempty"`

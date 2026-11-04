@@ -14,6 +14,7 @@ import (
 // tokenize, createToolSearchDocument and Bm25Ranker.rank against Pi's tool-search/tool.js over random text (camelCase runs, digits, plural endings, stop words,
 // JS-only case mappings such as U+0130, non-ASCII letters, whitespace kinds), tools with nested schemas and namespaces, and random queries and limits. Names, their order
 // and the scores must match exactly: the idf goes through jsmath.Log, V8's fdlibm Math.log.
+// dyna patch P6 (PATCHES.md): the pinned Pi puts the name into the text and scores it as text, so the document text and the ranking differ from it by design. The oracle compares the tokenizer and the document name; toolsearch_upstream_test.go and toolsearch_reference_test.go lock the ranking.
 func TestToolSearchMatchesPi(t *testing.T) {
 	rng := rand.New(rand.NewSource(8))
 	words := []string{"issue", "issues", "search", "searches", "boxes", "class", "classes", "status", "the", "and", "of", "GitHub", "getHTTPResponse", "XMLParser", "list_issues", "mcp__server__tool", "A1b2", "ABc", "aBC", "ies", "ries", "dies", "ches", "wishes", "as", "us", "\u0130stanbul", "\u0130x", "caf\u00e9", "\u212a", "日本語", "tab\tsep", "line\nbreak", "\u00a0nbsp", "\ufeffbom", "x-y.z", "UPPER", "lower", "Mixed3Case", "FILEName", "id", "URLs", "Pass", "boss", "gas"}
@@ -110,7 +111,6 @@ emit(input.map((p) => {
 	bad := 0
 	for i, p := range probes {
 		w := want[i]
-		var docs []Document
 		for j, tl := range p.Tools {
 			raw, _ := json.Marshal(tl.Parameters)
 			info := extension.ToolInfo{Name: tl.Name, Description: tl.Description, Parameters: raw}
@@ -121,26 +121,9 @@ emit(input.map((p) => {
 				info.Namespace = ns
 			}
 			doc := CreateDocument(info, info.Namespace)
-			docs = append(docs, doc)
-			// Property order differs by design (BM25 counts terms); compare the token multiset.
-			if !sameTerms(Tokenize(doc.Text), Tokenize(w.Docs[j]["text"])) || doc.Name != w.Docs[j]["name"] {
+			if doc.Name != w.Docs[j]["name"] {
 				if bad++; bad <= 8 {
-					t.Errorf("probe %d doc %d: got %q, want %q", i, j, doc.Text, w.Docs[j]["text"])
-				}
-			}
-		}
-		ranked := NewBm25Ranker().Rank(p.Query, docs, p.Limit)
-		if len(ranked) != len(w.Ranked) {
-			if bad++; bad <= 8 {
-				t.Errorf("probe %d rank %q limit %d: got %v, want %v", i, p.Query, p.Limit, ranked, w.Ranked)
-			}
-		} else {
-			for k := range ranked {
-				if ranked[k].Name != w.Ranked[k].Name || ranked[k].Score != w.Ranked[k].Score {
-					if bad++; bad <= 8 {
-						t.Errorf("probe %d rank %q limit %d: got %v, want %v", i, p.Query, p.Limit, ranked, w.Ranked)
-					}
-					break
+					t.Errorf("probe %d doc %d: name %q, want %q", i, j, doc.Name, w.Docs[j]["name"])
 				}
 			}
 		}

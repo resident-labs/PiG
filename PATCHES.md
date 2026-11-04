@@ -154,7 +154,7 @@ prefix holds. Names sort byte-wise here, not with JavaScript's `localeCompare`.
 
 Locked by: `TestTheFirstHeadNamesTheDeferredTools`, `TestALoadChangesNoSection`,
 `TestACompactionHeadHoldsTheCurrentSections`, `TestTheDeferredToolsSectionCountsWhatItLeavesOut`,
-`TestTheDeferredToolsSectionIsReserved` (coding), `TestAgentSessionMCPWithDeferredToolsSectionWaitsForEveryServerAndListsNone`
+`TestTheDeferredToolsSectionIsReserved`, `TestTheDeferredToolsSectionSortsByName` (coding), `TestAgentSessionMCPWithDeferredToolsSectionWaitsForEveryServerAndListsNone`
 (mcpext), `TestToolSearchDescriptionNamesTheDeferredToolsSection` (toolsearch).
 
 Upstream: not offered (owner's decision pending).

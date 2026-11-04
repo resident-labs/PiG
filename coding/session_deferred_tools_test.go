@@ -140,3 +140,12 @@ func TestTheDeferredToolsSectionIsReserved(t *testing.T) {
 		t.Fatal("accepted")
 	}
 }
+
+// Tools are listed by name within their prefix, whatever order they were registered in.
+func TestTheDeferredToolsSectionSortsByName(t *testing.T) {
+	tools := []deferredTool{{name: "mcp__srv__zeta", namespace: "mcp__srv"}, {name: "mcp__srv__alpha", namespace: "mcp__srv"}, {name: "mcp__srv__mid", namespace: "mcp__srv", actions: []string{"b", "a"}}, {name: "mcp__srv__beta", namespace: "mcp__srv", actions: []string{"x"}}}
+	text, _ := renderDeferredTools(tools, true, false)
+	if want := "mcp__srv__: alpha, zeta\n- beta: x\n- mid: b, a"; !strings.HasSuffix(text, want) {
+		t.Fatalf("%s", text)
+	}
+}

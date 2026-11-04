@@ -81,8 +81,19 @@ func (s *Session) promptSectionUpdate(messages []agent.AgentMessage) (*agent.Age
 	if err != nil {
 		return nil, err
 	}
+	if s.contextUpdates && current == nil {
+		// dyna patch P7 (PATCHES.md): the first head names the deferred tools.
+		if desired, err = s.withDeferredTools(desired); err != nil {
+			return nil, err
+		}
+	}
 	if s.contextUpdates && current != nil {
-		return contextUpdate(heldSections(messages, *current), desired), nil
+		held := heldSections(messages, *current)
+		// Only a new head changes the deferred tools, so a tool_search load changes no section (dyna patch P7).
+		if text, ok := held[deferredToolsSection]; ok {
+			desired = append(slices.Clone(desired), ai.PromptSection{Name: deferredToolsSection, Value: &text})
+		}
+		return contextUpdate(held, desired), nil
 	}
 	patch := prompts.DiffSystemPromptSections(previous, desired)
 	if len(patch) == 0 {

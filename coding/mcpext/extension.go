@@ -126,6 +126,12 @@ type Options struct {
 	// become available when they connect. Nil waits 10000 ms; 0 does not wait for a server that is not yet ready
 	// (index.ts:90, 294 `options.startupWaitMs ?? DEFAULT_STARTUP_WAIT_MS`).
 	StartupWaitMs *int
+	// DeferredToolsSection is set when the session names the tools of servers in its head's deferred_tools section
+	// (coding.SessionOptions.ContextUpdates). The extension then adds no mcp_servers section, and the first prompt waits
+	// for every enabled server, not only those with direct tools, so the head names their tools.
+	//
+	// dyna patch P7 (PATCHES.md).
+	DeferredToolsSection bool
 	// AgentDir and ConfigDirName locate the configuration and the credentials.
 	AgentDir      string
 	ConfigDirName string
@@ -1590,7 +1596,8 @@ func recoveredMessage(recovered any) string {
 	return fmt.Sprint(recovered)
 }
 
-// waitForDirectServers makes the first prompt wait for servers whose tools are declared to the model, so they are
+// waitForDirectServers makes the first prompt wait for servers whose tools are declared to the model (with
+// DeferredToolsSection, for every enabled server, which the head names), so they are
 // declared in its first request, but not indefinitely: a slow or hanging server must not hold up the prompt. Other
 // servers are waited for when a script or search needs them ([Extension.ToolCall]).
 func (e *Extension) waitForDirectServers(ctx EventContext) {
@@ -1606,7 +1613,7 @@ func (e *Extension) waitForDirectServers(ctx EventContext) {
 	}
 	var ready []chan struct{}
 	for _, s := range e.servers {
-		if s.enabled() && hasDirectTools(s.entry) && s.ready != nil {
+		if s.enabled() && (hasDirectTools(s.entry) || e.options.DeferredToolsSection) && s.ready != nil {
 			ready = append(ready, s.ready)
 		}
 	}
@@ -1636,7 +1643,7 @@ func (e *Extension) waitForDirectServers(ctx EventContext) {
 // starts; the session appends the section to the conversation when it changed, for example after a server connected.
 func (e *Extension) BeforeAgentStart(ctx EventContext, options *extension.BuildSystemPromptOptions) {
 	e.waitForDirectServers(ctx)
-	if options == nil {
+	if options == nil || e.options.DeferredToolsSection {
 		return
 	}
 	e.mu.Lock()

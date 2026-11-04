@@ -3,6 +3,7 @@ package coding
 // dyna patch P5 (PATCHES.md): context updates.
 
 import (
+	"fmt"
 	"maps"
 	"slices"
 	"strings"
@@ -10,7 +11,9 @@ import (
 
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
+	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/prompts"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
 )
@@ -20,8 +23,12 @@ const contextUpdateType = "context_update"
 
 // SetHostPromptSections replaces the sections the host adds to the prompt, after the sections the Session builds. Each
 // is wrapped in a tag of its name, as a before_agent_start section is, and one of a built section's name takes its
-// place. The next request delivers the change. A section whose name is not a section name is refused.
+// place. The next request delivers the change. A section whose name is not a section name, or is deferred_tools, is
+// refused.
 func (s *Session) SetHostPromptSections(sections ai.OrderedSections) error {
+	if slices.ContainsFunc(sections, func(section ai.PromptSection) bool { return section.Name == deferredToolsSection }) {
+		return fmt.Errorf("Reserved prompt section: %s", deferredToolsSection)
+	}
 	// Applying the sections to an empty prompt checks their names as a request would.
 	if _, err := prompts.ApplyCustomSystemPromptSections(nil, sections); err != nil {
 		return err
@@ -146,4 +153,144 @@ func (s *Session) promptToolOrder(names []string) []string {
 		return slices.Sorted(slices.Values(names))
 	}
 	return names
+}
+
+// deferredToolsSection names the tools tool_search or a codemode script can reach that are not declared, in a head
+// (dyna patch P7, PATCHES.md).
+const deferredToolsSection = "deferred_tools"
+
+// maxDeferredNames is how many tools a namespace lists, and actions a tool; the rest are counted.
+const maxDeferredNames = 80
+
+// deferredTool is a tool the deferred_tools section names: its name, its namespace's, and the action enum of its schema.
+type deferredTool struct {
+	name, namespace string
+	actions         []string
+}
+
+// renderDeferredTools is the deferred_tools section: the tools by name only, grouped by the prefix their namespace gives
+// them. A namespace's line names its tools that take no action, and each tool with actions gets its own line below it.
+// It is absent when nothing is listed or neither tool_search nor codemode is active.
+func renderDeferredTools(tools []deferredTool, toolSearch, codemode bool) (string, bool) {
+	if len(tools) == 0 || (!toolSearch && !codemode) {
+		return "", false
+	}
+	const script = "a codemode script calls one as tools.<prefix><name>."
+	how := "tool_search loads one."
+	switch {
+	case codemode && toolSearch:
+		how = "tool_search loads one, and " + script
+	case codemode:
+		how = "A" + script[1:]
+	}
+	capped := func(names []string) []string {
+		if len(names) <= maxDeferredNames {
+			return names
+		}
+		return append(slices.Clone(names[:maxDeferredNames]), fmt.Sprintf("+%d more; tool_search finds them", len(names)-maxDeferredNames))
+	}
+	groups := map[string][]deferredTool{}
+	for _, tool := range tools {
+		prefix := ""
+		if tool.namespace != "" && strings.HasPrefix(tool.name, tool.namespace+"__") {
+			prefix = tool.namespace + "__"
+		}
+		groups[prefix] = append(groups[prefix], deferredTool{name: strings.TrimPrefix(tool.name, prefix), actions: tool.actions})
+	}
+	lines := []string{"Tools not declared to you yet, by name prefix, with a tool's actions after it. " + how}
+	for _, prefix := range slices.Sorted(maps.Keys(groups)) {
+		sorted := groups[prefix]
+		slices.SortFunc(sorted, func(a, b deferredTool) int { return strings.Compare(a.name, b.name) })
+		kept := sorted[:min(len(sorted), maxDeferredNames)]
+		var plain []string
+		for _, tool := range kept {
+			if len(tool.actions) == 0 {
+				plain = append(plain, tool.name)
+			}
+		}
+		if len(sorted) > maxDeferredNames {
+			plain = append(plain, fmt.Sprintf("+%d more; tool_search finds them", len(sorted)-maxDeferredNames))
+		}
+		switch {
+		case prefix != "" && len(plain) > 0:
+			lines = append(lines, prefix+": "+strings.Join(plain, ", "))
+		case prefix != "":
+			lines = append(lines, prefix+":")
+		case len(plain) > 0:
+			lines = append(lines, strings.Join(plain, ", "))
+		}
+		for _, tool := range kept {
+			if len(tool.actions) > 0 {
+				lines = append(lines, "- "+tool.name+": "+strings.Join(capped(tool.actions), ", "))
+			}
+		}
+	}
+	return strings.Join(lines, "\n"), true
+}
+
+// withDeferredTools is sections with the deferred_tools section of the tools as they are now, the sections of a new
+// head: only a head names them, so a tool_search load adds only its toolsAdded system message. The caller holds
+// toolRegistryMu.
+func (s *Session) withDeferredTools(sections ai.OrderedSections) (ai.OrderedSections, error) {
+	active := map[string]bool{}
+	for _, name := range s.ActiveToolNames() {
+		active[name] = true
+	}
+	var tools []deferredTool
+	for _, entry := range s.toolRegistry.entries {
+		definition := entry.registration.Definition
+		exposure := toolExposureOf(definition)
+		if (exposure != extension.ToolExposureDeferred && exposure != extension.ToolExposureCodemode) || active[definition.Name] {
+			continue
+		}
+		tool := deferredTool{name: definition.Name}
+		if definition.Namespace != nil {
+			tool.namespace = definition.Namespace.Name
+		}
+		// Schemas come from extensions and MCP servers; only a string enum counts as actions.
+		var schema struct {
+			Properties struct {
+				Action struct {
+					Enum []any `json:"enum"`
+				} `json:"action"`
+			} `json:"properties"`
+		}
+		if json.Unmarshal(definition.Parameters, &schema) == nil {
+			for _, action := range schema.Properties.Action.Enum {
+				if name, ok := action.(string); ok {
+					tool.actions = append(tool.actions, name)
+				}
+			}
+		}
+		tools = append(tools, tool)
+	}
+	text, ok := renderDeferredTools(tools, active["tool_search"], active["codemode"])
+	if !ok {
+		return sections, nil
+	}
+	return prompts.ApplyCustomSystemPromptSections(sections, ai.OrderedSections{{Name: deferredToolsSection, Value: &text}})
+}
+
+// compactionHead is the sections a compaction's head holds: the current ones and the deferred tools as they are now.
+// Nil without ContextUpdates keeps the conversation's current system message.
+func (s *Session) compactionHead() (ai.OrderedSections, error) {
+	if !s.contextUpdates {
+		return nil, nil
+	}
+	s.toolRegistryMu.RLock()
+	defer s.toolRegistryMu.RUnlock()
+	sections, err := s.effectiveSystemSections()
+	if err != nil {
+		return nil, err
+	}
+	return s.withDeferredTools(sections)
+}
+
+// appendCompaction records a compaction in manager with the head compactionHead gives.
+func (s *Session) appendCompaction(manager *icodingagent.Session, summary, firstKeptEntryID string, tokensBefore int, details any, fromHook bool, usage *ai.Usage) (string, error) {
+	head, err := s.compactionHead()
+	if err != nil {
+		return "", err
+	}
+	return manager.AppendCompactionWithSections(summary, firstKeptEntryID, tokensBefore, details, fromHook, usage, head)
 }

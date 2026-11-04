@@ -207,7 +207,11 @@ func (s *Session) reportInvalidBoundaryContinuation(event string) {
 }
 
 func (s *Session) commitBoundaryDrafts(drafts []extension.SessionBoundaryDraft) error {
-	appended, err := applyBoundaryDrafts(s.inner, drafts)
+	head, err := s.compactionHead()
+	if err != nil {
+		return err
+	}
+	appended, err := applyBoundaryDrafts(s.inner, drafts, head)
 	if err != nil {
 		return err
 	}
@@ -225,7 +229,11 @@ func (s *Session) createBoundaryPreviewManager(drafts []extension.SessionBoundar
 		branch = s.inner.GetBranch(*leaf)
 	}
 	preview := icodingagent.NewBranchSession(s.inner.GetHeader(), branch)
-	if _, err := applyBoundaryDrafts(preview, drafts); err != nil {
+	head, err := s.compactionHead()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := applyBoundaryDrafts(preview, drafts, head); err != nil {
 		return nil, err
 	}
 	return preview, nil
@@ -243,7 +251,9 @@ func (s *Session) boundaryProjection(drafts []extension.SessionBoundaryDraft) (i
 	return preview.BuildSessionProjection(), nil
 }
 
-func applyBoundaryDrafts(manager *icodingagent.Session, drafts []extension.SessionBoundaryDraft) ([]icodingagent.SessionEntry, error) {
+// applyBoundaryDrafts appends the drafts to manager. A compaction draft's head holds head, nil keeping the current system
+// message's sections (Session.compactionHead, dyna patch P7).
+func applyBoundaryDrafts(manager *icodingagent.Session, drafts []extension.SessionBoundaryDraft, head ai.OrderedSections) ([]icodingagent.SessionEntry, error) {
 	appended := make([]icodingagent.SessionEntry, 0, len(drafts))
 	for _, draft := range drafts {
 		var id string
@@ -268,7 +278,7 @@ func applyBoundaryDrafts(manager *icodingagent.Session, drafts []extension.Sessi
 				firstKept = *draft.FirstKeptEntryID
 			}
 			tokensBefore := compaction.EstimateProjectedContextTokens(manager.BuildSessionProjection(), manager.GetContextBranch()).Tokens
-			id, err = manager.AppendCompaction(draft.Summary, firstKept, tokensBefore, draft.Details, true, draft.Usage)
+			id, err = manager.AppendCompactionWithSections(draft.Summary, firstKept, tokensBefore, draft.Details, true, draft.Usage, head)
 		default:
 			return nil, fmt.Errorf("unsupported session boundary draft type %q", draft.Type)
 		}

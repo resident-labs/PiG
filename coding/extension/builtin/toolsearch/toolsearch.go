@@ -328,6 +328,10 @@ func (r *Bm25Ranker) Rank(query string, documents []Document, limit int) []Match
 	return out
 }
 
+// DeferredToolsDescription is the `tool_search` description for a session whose head names the tools it reaches.
+// dyna patch P7 (PATCHES.md).
+const DeferredToolsDescription = "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nThe `deferred_tools` section of the system prompt names the tools that are not declared yet, such as tools of MCP servers. Search by a tool's name or by what you need; the matches load for your next call."
+
 // ToolSearchDescription is the `tool_search` description. It does not list the searchable tools or their namespaces, so
 // it stays the same while tools are registered, for example when MCP servers connect.
 //

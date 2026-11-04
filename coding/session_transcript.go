@@ -44,18 +44,22 @@ func (s *Session) preparePrompt(_ context.Context, messages []agent.AgentMessage
 		return nil, err
 	}
 	messages = append(messages, s.takeAgentStartMessages()...)
+	if err := s.refreshPromptResources(); err != nil {
+		return nil, err
+	}
 	update, err := s.promptSectionUpdate(append(s.agent.Messages(), messages...))
 	if err != nil {
 		return nil, err
 	}
 	if update != nil {
-		return append([]agent.AgentMessage{{System: update}}, messages...), nil
+		return append([]agent.AgentMessage{*update}, messages...), nil
 	}
 	return messages, nil
 }
 
-// promptSectionUpdate records changed instructions before the next request without persisting a forced prompt projection.
-func (s *Session) promptSectionUpdate(messages []agent.AgentMessage) (*ai.SystemMessage, error) {
+// promptSectionUpdate records changed instructions before the next request without persisting a forced prompt projection:
+// a system message, or with ContextUpdates a context update once the conversation has its first system message.
+func (s *Session) promptSectionUpdate(messages []agent.AgentMessage) (*agent.AgentMessage, error) {
 	s.toolRegistryMu.RLock()
 	defer s.toolRegistryMu.RUnlock()
 	var systems []ai.Message
@@ -66,7 +70,7 @@ func (s *Session) promptSectionUpdate(messages []agent.AgentMessage) (*ai.System
 	}
 	current := ai.GetCurrentSystemMessage(systems)
 	run := s.runPrompt.Load()
-	if current != nil && len(current.Sections) == 0 && !s.structuredSystemPrompt && (run == nil || len(run.Sections) == 0) {
+	if current != nil && len(current.Sections) == 0 && !s.structuredSystemPrompt && (run == nil || len(run.Sections) == 0) && s.hostSections.Load() == nil {
 		return nil, nil
 	}
 	var previous ai.OrderedSections
@@ -77,11 +81,14 @@ func (s *Session) promptSectionUpdate(messages []agent.AgentMessage) (*ai.System
 	if err != nil {
 		return nil, err
 	}
+	if s.contextUpdates && current != nil {
+		return contextUpdate(heldSections(messages, *current), desired), nil
+	}
 	patch := prompts.DiffSystemPromptSections(previous, desired)
 	if len(patch) == 0 {
 		return nil, nil
 	}
-	return &ai.SystemMessage{Content: ai.SystemText(""), Sections: patch, Timestamp: time.Now().UnixMilli()}, nil
+	return &agent.AgentMessage{System: &ai.SystemMessage{Content: ai.SystemText(""), Sections: patch, Timestamp: time.Now().UnixMilli()}}, nil
 }
 
 // systemMessageWithoutTools is message without its tool changes. The replay that promptSectionUpdate runs reads only the sections and whether a system message exists, both of which the tool changes leave as they are, and replaying them copies every tool schema each turn.
@@ -92,6 +99,16 @@ func systemMessageWithoutTools(message ai.SystemMessage) ai.SystemMessage {
 
 // effectiveSystemSections reads the run's live loadout without changing the base prompt. A structured prompt is built from the run's before_agent_start options, as agent-session.ts:1669-1683 builds it for every mode, also when the caller's structured prompt is the rendering of the base options; any other caller-owned structured prompt takes only the tools and rules sections from them. The caller holds toolRegistryMu.
 func (s *Session) effectiveSystemSections() (ai.OrderedSections, error) {
+	sections, err := s.runSystemSections()
+	if host := s.hostSections.Load(); err == nil && host != nil {
+		// dyna patch P5 (PATCHES.md): the host's sections follow the built ones.
+		return prompts.ApplyCustomSystemPromptSections(sections, *host)
+	}
+	return sections, err
+}
+
+// runSystemSections are the sections before the host's: the base prompt with the run's before_agent_start sections. The caller holds toolRegistryMu.
+func (s *Session) runSystemSections() (ai.OrderedSections, error) {
 	desired := s.baseSystemSections
 	run := s.runPrompt.Load()
 	if run == nil {
@@ -100,7 +117,7 @@ func (s *Session) effectiveSystemSections() (ai.OrderedSections, error) {
 	if !s.structuredSystemPrompt {
 		return prompts.ApplyCustomSystemPromptSections(desired, run.Sections)
 	}
-	active, hidden := s.ActiveToolNames(), s.hiddenDeclarations()
+	active, hidden := s.promptToolOrder(s.ActiveToolNames()), s.hiddenDeclarations()
 	built := run.BaseSections(active, hidden)
 	if s.defaultSystemPrompt || s.baseSectionsRenderBaseOptions(active, hidden) {
 		return prompts.ApplyCustomSystemPromptSections(built, run.Sections)
@@ -350,14 +367,17 @@ func (s *Session) prepareNextTurn(ctx context.Context, turn agent.PrepareNextTur
 		s.runPrompt.CompareAndSwap(run, &next)
 	}
 	// _preparePromptAndToolLoadout applies the whole loadout before each later turn, so prepareLoadout hooks and the hidden declarations they set follow the state they read (agent-session.ts:1743-1755); the turn's tools are the ones it declares.
+	if err := s.refreshPromptResources(); err != nil {
+		return nil, err
+	}
 	s.applyPromptToolLoadout(s.ActiveToolNames())
 	update.Context = s.executableContext(projected)
-	system, err := s.promptSectionUpdate(projected)
+	sections, err := s.promptSectionUpdate(projected)
 	if err != nil {
 		return nil, err
 	}
-	if system != nil {
-		update.Messages = append(update.Messages, agent.AgentMessage{System: system})
+	if sections != nil {
+		update.Messages = append(update.Messages, *sections)
 	}
 	return update, nil
 }

@@ -132,12 +132,17 @@ func diffLinesResultToPatch(d *jsdiff.LineDiff, context int) []patchHunk {
 // ─── formatPatch (patch/create.js formatPatch, FILE_HEADERS_ONLY) ──────────────
 
 func formatPatch(path string, hunks []patchHunk) string {
+	return "--- " + path + "\n+++ " + path + "\n" + formatHunks(hunks)
+}
+
+// UnifiedHunks is the hunks of the unified diff from oldStr to newStr with context lines around each change, without the
+// file headers. dyna patch P5 (PATCHES.md): a context update shows a changed prompt section this way.
+func UnifiedHunks(oldStr, newStr string, context int) string {
+	return formatHunks(diffLinesResultToPatch(jsdiff.DiffLineRuns(oldStr, newStr), context))
+}
+
+func formatHunks(hunks []patchHunk) string {
 	var b strings.Builder
-	b.WriteString("--- ")
-	b.WriteString(path)
-	b.WriteString("\n+++ ")
-	b.WriteString(path)
-	b.WriteByte('\n')
 	for _, h := range hunks {
 		oldStart, newStart := h.oldStart, h.newStart
 		// Unified-diff quirk: a zero-length side starts one lower.

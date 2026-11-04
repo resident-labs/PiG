@@ -91,6 +91,7 @@ func (s *Session) clearPendingTools() {
 
 // rebuildSystemPrompt refreshes the tool-owned sections while retaining caller resource sections and custom preambles.
 func (s *Session) rebuildSystemPrompt(toolNames []string) {
+	toolNames = s.promptToolOrder(toolNames)
 	defer func() { s.baseSystemPromptOptions.Store(s.buildSystemPromptOptions(toolNames)) }()
 	if !s.structuredSystemPrompt {
 		return

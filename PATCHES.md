@@ -108,4 +108,25 @@ Locked by: `TestHostSectionsChangeThroughContextUpdates`, `TestAContextUpdateArr
 `TestAToolActiveAgainChangesNoSection`, `TestHostSectionsReachASessionWithAPlainPrompt`, `TestASkillEditReachesTheNextRequest`
 (coding).
 
+## P6 Tool search ranking
+
+What: `toolsearch.Bm25Ranker` ranks with the name and the namespace as fields of their own. `Document` has `Name`,
+`Text` (description, schema descriptions, property names) and `NamespaceText`. A query term in the name counts 3
+times its IDF, one in the namespace 0.5 times, and BM25 length normalization applies to the description only. A
+tool whose whole local name (the last `__` segment) is in the query gets a bonus of the sum of the query terms'
+IDF. A query that is exactly a tool's name (normalized, or a suffix after `__`) ranks that tool first. Among the
+rest, a tool that matches more query terms ranks above one that matches fewer, then the score decides.
+
+Why: the upstream fixes (earendil-works/pi #11625 name ranking and #11632 query coverage ranking) came after PiG's
+pin, and Dyna's Node fork carries them. Without them a model that searches for a tool by its name gets tools that
+only mention the words. This patch changes the order and the scores `tool_search` and `searchTools()` return, so
+`toolsearch_oracle_test.go` compares only the tokenizer and the document name with the pinned Pi.
+
+Locked by: `TestBm25RankerRanksAToolFirstWhenTheQueryIsItsName`,
+`TestBm25RankerRanksANameMatchAboveMentionsInDescriptions`,
+`TestBm25RankerRanksAToolFirstWhenTheQueryContainsItsWholeName`,
+`TestBm25RankerRanksAToolMatchingMoreQueryTermsFirstWhateverTheScores`,
+`TestBm25RankerRanksTheExactNameAboveAToolThatCoversTheSameTermsWithAHigherScore`, `TestBm25ScoresMatchUpstream`
+(toolsearch).
+
 Upstream: not offered (owner's decision pending).

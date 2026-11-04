@@ -12,6 +12,8 @@ import (
 
 // Scores and ties measured on upstream 0.99.1's own Bm25Ranker (dist/extensions/tool-search/tool.js) for the same
 // documents; the upstream tests assert order only, so these pin the numbers, the schema walk and the tie order.
+// dyna patch P6 (PATCHES.md): the scores are now those of the ranker with the name as its own field (weight 3), measured on
+// an independent JavaScript port of earendil-works/pi#11625 and #11632, since the 0.99.1 ranker scores the name as text.
 
 func referenceDocuments() []toolsearch.Document {
 	return []toolsearch.Document{
@@ -27,13 +29,13 @@ func TestBm25ScoresMatchUpstream(t *testing.T) {
 		query string
 		want  []toolsearch.Match
 	}{
-		{"pull requests", []toolsearch.Match{{Name: "alpha_tool", Score: 0.2734552455342617}, {Name: "beta_tool", Score: 0.2734552455342617}, {Name: "gamma_tool", Score: 0.2551344226324625}}},
-		{"issues", []toolsearch.Match{{Name: "alpha_tool", Score: 1.0043065489614753}}},
-		{"repository", []toolsearch.Match{{Name: "alpha_tool", Score: 1.0043065489614753}}},
-		{"alternative", []toolsearch.Match{{Name: "beta_tool", Score: 1.0043065489614753}}},
-		{"zebra", []toolsearch.Match{{Name: "gamma_tool", Score: 0.9370205022568603}}},
-		{"yak", []toolsearch.Match{{Name: "gamma_tool", Score: 0.9370205022568603}}},
-		{"fetch", []toolsearch.Match{{Name: "alpha_tool", Score: 0.13672762276713085}, {Name: "beta_tool", Score: 0.13672762276713085}, {Name: "gamma_tool", Score: 0.12756721131623125}}},
+		{"pull requests", []toolsearch.Match{{Name: "alpha_tool", Score: 0.2769134617541329}, {Name: "beta_tool", Score: 0.2769134617541329}, {Name: "gamma_tool", Score: 0.24932429766792777}}},
+		{"issues", []toolsearch.Match{{Name: "alpha_tool", Score: 1.0170073811965852}}},
+		{"repository", []toolsearch.Match{{Name: "alpha_tool", Score: 1.0170073811965852}}},
+		{"alternative", []toolsearch.Match{{Name: "beta_tool", Score: 1.0170073811965852}}},
+		{"zebra", []toolsearch.Match{{Name: "gamma_tool", Score: 0.915681922553383}}},
+		{"yak", []toolsearch.Match{{Name: "gamma_tool", Score: 0.915681922553383}}},
+		{"fetch", []toolsearch.Match{{Name: "alpha_tool", Score: 0.13845673087706645}, {Name: "beta_tool", Score: 0.13845673087706645}, {Name: "gamma_tool", Score: 0.12466214883396388}}},
 	} {
 		got := toolsearch.NewBm25Ranker().Rank(c.query, documents, 8)
 		if len(got) != len(c.want) {

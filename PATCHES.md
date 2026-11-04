@@ -175,3 +175,23 @@ Locked by: `TestActiveEffortAtTopLevelReplacesTheHighDefault` (ai), `TestActiveE
 (coding).
 
 Upstream: not offered (owner's decision pending).
+
+## P9 A Package install ends with its context
+
+What: `packagemanager.WithContext(ctx)` is an `InstallOption` that runs the processes of a new install under `ctx`: the npm install of an npm Package, and the `git clone`, the `git checkout` of its ref and the dependency install of a git Package. When `ctx` ends they are killed and the install fails with `ctx`'s error. Only that install path takes a context: updating an existing git checkout (`EnsureGitRef`'s fetch, reset and clean), the metadata queries (`RunCmd`, `RunPackageCapture`, git.go's `GetLocalGitUpdateTarget`), `temporary.go`, and the update and removal operations (`package_manager.go`, `package_update_operations.go`) run as before. `RunPackageProcessContext` is `RunPackageProcess` with a context (which keeps its signature and runs under `context.Background()`), `InstallPackageArtifacts` takes install options, and `PackageManager.ResolveContext(ctx, onMissing)` passes its context to the installs of `installMissing` (`Resolve` is `ResolveContext` with `context.Background()`). `DefaultResourceLoader.discover` calls `ResolveContext`, so the context of `ReloadWith` ends the installs of a reload.
+
+Why: a host that reloads a loader under a deadline, as Dyna's box does to check a Package before it keeps it, cannot otherwise stop the install: the reload's goroutine kept running npm or git, and wrote into a folder the host had already removed.
+
+Locked by: `TestDefaultLoaderEndsAnInstallWithItsContext` (coding): a fake npm that hangs on `install` makes `ReloadWith` return the deadline's error within seconds, and the process is gone. `TestDefaultLoaderEndsAGitInstallWithItsContext` (coding) does the same for a git Package whose clone, checkout or dependency install hangs.
+
+Upstream: not offered (owner's decision pending).
+
+## P10 Inline extensions first
+
+What: `DefaultResourceLoaderOptions.InlineExtensionsFirst` loads `ExtensionFactories` ahead of the Package and settings extensions instead of after them. Registrations are first-wins by tool name, so an inline extension's tool then wins a clash with a Package's.
+
+Why: Pi loads `--extension` paths before Packages, so a host's own extension, which Dyna's `dyna.js` was in Pi, wins. Without the option a host had to reorder `ExtensionsOverride`'s result by the `<inline:` path convention.
+
+Locked by: `TestDefaultResourceLoaderInlineExtensionsFirst` (coding): the order of the extension paths with and without the option.
+
+Upstream: not offered (owner's decision pending).

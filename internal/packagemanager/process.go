@@ -16,14 +16,24 @@ import (
 )
 
 // Ports packages/coding-agent/src/core/package-manager.ts (spawnCommand, runCommand).
-// RunPackageProcess inherits child output without retaining it. When the host owns stdout, both streams go to stderr and stdin is ignored. The caller waits for completion before reporting an error or persisting settings.
+// RunPackageProcess is [RunPackageProcessContext] with no context to end the process.
 func RunPackageProcess(dir, name string, args ...string) error {
-	cmd := packageCommand(context.Background(), dir, name, args...)
+	return RunPackageProcessContext(context.Background(), dir, name, args...)
+}
+
+// RunPackageProcessContext inherits child output without retaining it. When the host owns stdout, both streams go to stderr and stdin is ignored. The caller waits for completion before reporting an error or persisting settings.
+//
+// dyna patch P9: ctx kills the process, and the error is then ctx's.
+func RunPackageProcessContext(ctx context.Context, dir, name string, args ...string) error {
+	cmd := packageCommand(ctx, dir, name, args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if codingagent.IsStdoutTakenOver() {
 		cmd.Stdin, cmd.Stdout = nil, os.Stderr
 	}
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if exit, ok := errors.AsType[*exec.ExitError](err); ok {
 			code := fmt.Sprint(exit.ExitCode())
 			if exit.ExitCode() < 0 {

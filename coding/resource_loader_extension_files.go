@@ -181,7 +181,11 @@ func (l *DefaultResourceLoader) loadExtensionFiles(ctx context.Context, request 
 		}
 	}
 	var replacementWarnings []icodingagent.ExtensionWarning
-	result.Extensions = extensionset.OmitReplaced(append(ordered, inline...), &replacementWarnings)
+	loaded := slices.Concat(ordered, inline)
+	if l.options.InlineExtensionsFirst {
+		loaded = slices.Concat(inline, ordered)
+	}
+	result.Extensions = extensionset.OmitReplaced(loaded, &replacementWarnings)
 	result.Runtime = l.factoryRuntime
 	var existing []icodingagent.ExtensionWarning
 	for _, warning := range result.Warnings {

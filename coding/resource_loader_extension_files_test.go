@@ -433,3 +433,33 @@ func TestDefaultResourceLoaderExtensionsOutliveTheContextOfTheReload(t *testing.
 		t.Fatal("the extensions' host has no bridge for a session to bind its state to")
 	}
 }
+
+// dyna patch P10: with InlineExtensionsFirst the inline factories load ahead of the extensions of the settings, so the tool they register wins a clash by name; without it they load last.
+func TestDefaultResourceLoaderInlineExtensionsFirst(t *testing.T) {
+	for _, first := range []bool{false, true} {
+		root := t.TempDir()
+		cwd, agentDir := filepath.Join(root, "project"), filepath.Join(root, "agent")
+		ext := filepath.Join(root, "ok.ts")
+		writeExtensionFiles(t, map[string]string{
+			ext:                                      "export default function (pi) { pi.registerCommand(\"file\", { description: \"d\", handler: async () => {} }); }\n",
+			filepath.Join(agentDir, "settings.json"): `{"extensions": [` + strconv.Quote(ext) + `]}`,
+			filepath.Join(cwd, "keep"):               "",
+		})
+		loader := NewDefaultResourceLoader(DefaultResourceLoaderOptions{CWD: cwd, AgentDir: agentDir, InlineExtensionsFirst: first, ExtensionFactories: []extension.InlineExtension{commandFactory("inline", nil)}})
+		t.Cleanup(loader.Close)
+		if err := loader.Reload(); err != nil {
+			t.Fatal(err)
+		}
+		var paths []string
+		for _, e := range loader.GetExtensions().Extensions {
+			paths = append(paths, e.Path)
+		}
+		want := []string{ext, "<inline:1>"}
+		if first {
+			want = []string{"<inline:1>", ext}
+		}
+		if !slices.Equal(paths, want) {
+			t.Errorf("InlineExtensionsFirst = %v: extension paths = %q, want %q", first, paths, want)
+		}
+	}
+}

@@ -84,7 +84,7 @@ func InstallGitDependencies(packageRoot string, sm *codingagent.SettingsManager,
 		return err
 	}
 	args = append(args, installArgs...)
-	return RunPackageProcess(packageRoot, command[0], args...)
+	return RunPackageProcessContext(resolveInstallOptions(opts).ctx, packageRoot, command[0], args...)
 }
 
 func RepairMissingGitDependencies(packageRoot string, sm *codingagent.SettingsManager, opts ...InstallOption) error {

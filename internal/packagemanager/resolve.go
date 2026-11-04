@@ -1,6 +1,7 @@
 package packagemanager
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -36,11 +37,19 @@ type MissingSourceCallback func(source string) (MissingSourceAction, error)
 
 // Resolve is upstream's resolve: it resolves the Packages, settings entries and auto-discovered locations into the resources they enable, per resource type (package-manager.ts:920-985). Each Package that is not installed, or whose installation does not satisfy its configured version, is installed unless onMissing decides otherwise; a nil onMissing installs it, as DefaultPackageManager does. A local Package that does not exist, and every missing Package in offline mode, contributes nothing. The result lists each type's Package resources, settings entries and auto-discovered resources as a first-wins accumulator keyed by path, ordered by resourcePrecedenceRank. A skill is keyed by its SKILL.md file when it has one.
 func (m *PackageManager) Resolve(onMissing MissingSourceCallback) (ResolvedPaths, error) {
+	return m.ResolveContext(context.Background(), onMissing)
+}
+
+// ResolveContext is [PackageManager.Resolve] whose installs end with ctx: their npm and git processes are killed and the error is ctx's.
+// Resolve calls it with context.Background().
+//
+// dyna patch P9
+func (m *PackageManager) ResolveContext(ctx context.Context, onMissing MissingSourceCallback) (ResolvedPaths, error) {
 	cwd, agentDir, settings := m.CWD, m.agentDir(), m.SettingsManager
 	if err := ValidateConfiguredPackageSources(cwd, agentDir, settings); err != nil {
 		return ResolvedPaths{}, fmt.Errorf("resolve Packages: %w", err)
 	}
-	if err := m.installMissing(onMissing); err != nil {
+	if err := m.installMissing(ctx, onMissing); err != nil {
 		return ResolvedPaths{}, err
 	}
 	if err := ValidateConfiguredPackagePatterns(cwd, agentDir, settings); err != nil {
@@ -77,7 +86,7 @@ func (m *PackageManager) Resolve(onMissing MissingSourceCallback) (ResolvedPaths
 }
 
 // installMissing installs each configured npm or git Package that needs it, asking onMissing first when it is set (package-manager.ts:1282-1340 resolvePackageSources, installMissing).
-func (m *PackageManager) installMissing(onMissing MissingSourceCallback) error {
+func (m *PackageManager) installMissing(ctx context.Context, onMissing MissingSourceCallback) error {
 	if IsOfflineModeEnabled() {
 		return nil
 	}
@@ -97,7 +106,7 @@ func (m *PackageManager) installMissing(onMissing MissingSourceCallback) error {
 				return errors.New("Missing source: " + pkg.Source.Source)
 			}
 		}
-		if err := InstallPackageArtifacts(m.CWD, m.agentDir(), m.SettingsManager, pkg.Source, pkg.Scope == "project", nil); err != nil {
+		if err := InstallPackageArtifacts(m.CWD, m.agentDir(), m.SettingsManager, pkg.Source, pkg.Scope == "project", nil, WithContext(ctx)); err != nil {
 			return fmt.Errorf("install %s Package %q: %w", pkg.Scope, pkg.Source.Source, err)
 		}
 	}

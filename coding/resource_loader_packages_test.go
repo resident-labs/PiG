@@ -876,3 +876,64 @@ func TestDefaultLoaderEndsAnInstallWithItsContext(t *testing.T) {
 		t.Fatalf("npm (pid %d) is still running", pid)
 	}
 }
+
+// dyna patch P9: the git half. Whichever process of a git Package's install hangs (the clone, the checkout of its ref, or
+// the install of its dependencies) ends with the reload's context, and the reload fails with the context's error.
+func TestDefaultLoaderEndsAGitInstallWithItsContext(t *testing.T) {
+	for _, hung := range []string{"clone", "checkout", "dependencies"} {
+		t.Run(hung, func(t *testing.T) {
+			f := newResourceLoaderFixture(t)
+			t.Setenv("PI_OFFLINE", "")
+			t.Setenv("PIG_OFFLINE", "")
+			bin := t.TempDir()
+			pidFile := filepath.Join(bin, "pid")
+			// Each fake exits at once, but the one that hangs records its pid and sleeps.
+			clone, checkout, install := "", "exit 0", "exit 0"
+			hang := "echo $$ > " + pidFile + "; exec sleep 30"
+			switch hung {
+			case "clone":
+				clone = "; " + hang
+			case "checkout":
+				checkout = hang
+			case "dependencies":
+				install = hang
+			}
+			git := "#!/bin/sh\ncase \"$1\" in\n  clone) mkdir -p \"$3\" && echo '{\"name\":\"hung-repo\",\"dependencies\":{\"left-pad\":\"1.0.0\"}}' > \"$3/package.json\"" + clone + " ;;\n  checkout) " + checkout + " ;;\nesac\nexit 0\n"
+			npm := "#!/bin/sh\n" + install + "\n"
+			for name, script := range map[string]string{"git": git, "npm": npm} {
+				writeResource(t, filepath.Join(bin, name), script)
+				if err := os.Chmod(filepath.Join(bin, name), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			settings, err := json.Marshal(map[string]any{"npmCommand": []string{filepath.Join(bin, "npm")}, "packages": []string{"git:example.test/owner/hung-repo@v1"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeResource(t, filepath.Join(f.agentDir, "settings.json"), string(settings))
+			loader := NewDefaultResourceLoader(DefaultResourceLoaderOptions{CWD: f.cwd, AgentDir: f.agentDir})
+			t.Cleanup(loader.Close)
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			start := time.Now()
+			if err := loader.ReloadWith(ctx); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("the reload returned %v, want the context's deadline", err)
+			}
+			if took := time.Since(start); took > 10*time.Second {
+				t.Fatalf("the reload took %s after its context ended", took)
+			}
+			data, err := os.ReadFile(pidFile)
+			if err != nil {
+				t.Fatalf("the %s never started: %v", hung, err)
+			}
+			pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := syscall.Kill(pid, 0); err == nil {
+				t.Fatalf("the %s (pid %d) is still running", hung, pid)
+			}
+		})
+	}
+}

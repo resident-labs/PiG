@@ -24,3 +24,19 @@ Locked by: `TestUserMessageMembersAreRecordedAndNotSent`, `TestUserMessageMember
 `TestAPromptWithAMemberOfTheMessageIsRefused` (coding).
 
 Upstream: not offered (owner's decision pending).
+
+## P2 Continue a recovered session
+
+What: `Session.ContinueRecovered(ctx, ContinueOptions{Interrupted, Started})` resumes a session whose process ended
+during a run. A final attempt that failed is left out of the model's context, as a retry leaves it out. Each tool call of
+the last assistant message that has no result gets an error result with the `Interrupted` text, written to the session
+file, and is not run again. The run then continues from the last message; a session that ends with an answer returns
+`ErrNothingToContinue`.
+
+Why: Pi resumes a session only with a new prompt. A host that restarts mid-run must not send its inputs twice, so it
+finishes the run they started. Dyna's Pi fork had the same as RPC `continue`.
+
+Locked by: `TestContinueRecordsInterruptedToolCalls`, `TestContinueReadsAPendingInput`,
+`TestContinueLeavesOutAFailedAttempt`, `TestContinueAfterAnAnswerIsRefused` (coding).
+
+Upstream: not offered (owner's decision pending).

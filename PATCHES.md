@@ -56,3 +56,28 @@ Locked by: `TestTriggerTokensStartCompactionSooner` (internal/codingagent/compac
 `TestSessionCompactionTriggerTokens` (coding).
 
 Upstream: not offered (owner's decision pending).
+
+## P4 Model transfer
+
+What: `Session.TransferModel(ctx, target, ModelTransferOptions{ThinkingLevel, CompactionTriggerTokens})` moves the
+conversation to a model between runs. A conversation that fits the target and is small switches at once (`unchanged`
+or `switched`). Otherwise it is compacted first, on the model the branch records, because that model can read all of
+it and still has its prompt cache; that includes a conversation over 100,000 tokens that fits but moves to another
+model. If compaction fails, times out after ten minutes or leaves too much, the session switches anyway: a conversation
+that fits stays whole, and one that does not gets a compaction entry written without a model, whose summary names the
+session file and tells the new model to read it (`boundary`), with the previous summary when it fits, and the tail the
+cut point keeps within the limit. A cancelled context stops the compaction and leaves the model as it was (`aborted`).
+The session file keeps every entry on all paths. `runAutoCompaction` gains an internal variant that runs on a given
+model and settings and reports how it ended; its behaviour is unchanged.
+
+Why: Pi checks the context against a new model only at its next request, when it may already be too large, and then
+compacts on the new model with a cold cache. Dyna's Pi fork had the same as `AgentSession.transferModel` and RPC
+`transfer_model`; upstream issue #6426 asked for the check.
+
+Locked by: `TestTransferOfASmallConversation`, `TestTransferCompactsOnTheOldModelFirst`,
+`TestTransferLeavesABoundaryWhenNoSummaryFits`, `TestAStoppedTransferKeepsTheModel`,
+`TestTransferOfALargeConversationToAnotherModelCompacts`, `TestATransferOverTheTriggerOnlyKeepsTheConversation`,
+`TestABoundaryKeepsATailOnlyWithinTheTrigger`, `TestABoundaryKeepsNoTailOverTheLimit`,
+`TestATransferSummarizesOnTheModelTheBranchRecords`, `TestATransferWhoseSummaryTimesOutMovesAnyway` (coding).
+
+Upstream: not offered (owner's decision pending).

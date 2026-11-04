@@ -76,7 +76,7 @@ func TestBoundaryContextEditPreservesLoneSurrogates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	appended, err := applyBoundaryDrafts(sess.inner, []extension.SessionBoundaryDraft{{Type: "context_edit", TargetID: target, Replacement: json.RawMessage(`{"content":"r\ud800"}`)}}, nil)
+	appended, err := applyBoundaryDrafts(sess.inner, []extension.SessionBoundaryDraft{{Type: "context_edit", TargetID: target, Replacement: json.RawMessage(`{"content":"r\ud800"}`)}}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

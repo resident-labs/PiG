@@ -16,7 +16,9 @@ import (
 )
 
 // inputSchema is upstream's toolSearchSchema in TypeBox's key order (type, required, properties; type before description): the order reaches the model's tool declaration and the validation messages.
-var inputSchema = json.RawMessage(`{"type":"object","required":["query"],"properties":{"query":{"type":"string","description":"Search query for deferred tools."},"limit":{"type":"number","description":"Maximum number of tools to return. Defaults to 8."}}}`)
+func inputSchema(defaultLimit int) json.RawMessage {
+	return json.RawMessage(fmt.Sprintf(`{"type":"object","required":["query"],"properties":{"query":{"type":"string","description":"Search query for deferred tools."},"limit":{"type":"number","description":"Maximum number of tools to return. Defaults to %d."}}}`, defaultLimit))
+}
 
 // Details are the details of a tool_search result.
 type Details struct {
@@ -70,12 +72,17 @@ func searchAndLoad(tc *extension.Context, query string, limit int) []resultTool 
 //
 // Ports packages/coding-agent/src/extensions/tool-search/tool.ts (createToolSearchToolDefinition).
 func Definition() extension.ToolDefinition {
+	return definition(DefaultLimit)
+}
+
+// definition is Definition with defaultLimit as the number of matches a call without a limit loads, and as the default its schema states (dyna patch P11, PATCHES.md).
+func definition(defaultLimit int) extension.ToolDefinition {
 	return extension.ToolDefinition{
 		Name:          ToolName,
 		Label:         ToolName,
 		Description:   ToolSearchDescription,
 		PromptSnippet: "Search for tools that are not loaded yet and load the matches",
-		Parameters:    inputSchema,
+		Parameters:    inputSchema(defaultLimit),
 		// Searching is not something scripts need; it changes what the model sees.
 		Exposure: extension.ToolExposureModelOnly,
 		// A query can match any tool that is not declared yet.
@@ -92,7 +99,7 @@ func Definition() extension.ToolDefinition {
 			if jsstring.Trim(input.Query) == "" {
 				return extension.AgentToolResult{}, errors.New("query must not be empty")
 			}
-			limit := float64(DefaultLimit)
+			limit := float64(defaultLimit)
 			if input.Limit != nil {
 				limit = *input.Limit
 			}
@@ -138,18 +145,25 @@ type Options struct {
 	// DeferredToolsSection is set when the session's head names the tools search reaches (coding.SessionOptions.ContextUpdates),
 	// so the description points at that section (dyna patch P7, PATCHES.md).
 	DeferredToolsSection bool
+	// DefaultLimit is the number of tools a call without a limit loads, and the default the schema tells the model. Zero keeps DefaultLimit.
+	// `searchTools()` in codemode scripts keeps DefaultLimit: it only ranks, it loads nothing (dyna patch P11, PATCHES.md).
+	DefaultLimit int
 }
 
 // CreateToolSearchExtensionWith is CreateToolSearchExtension with options.
 func CreateToolSearchExtensionWith(options Options) extension.ExtensionFactory {
 	return func(pi extension.API) error {
-		definition := Definition()
+		defaultLimit := DefaultLimit
+		if options.DefaultLimit != 0 {
+			defaultLimit = options.DefaultLimit
+		}
+		tool := definition(defaultLimit)
 		if options.DeferredToolsSection {
-			definition.Description = DeferredToolsDescription
+			tool.Description = DeferredToolsDescription
 		}
 		inactive := false
-		definition.DefaultActive = &inactive
-		pi.RegisterTool(definition)
+		tool.DefaultActive = &inactive
+		pi.RegisterTool(tool)
 		return nil
 	}
 }

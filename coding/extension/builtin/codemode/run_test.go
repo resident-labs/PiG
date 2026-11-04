@@ -32,6 +32,26 @@ func TestSearchToolsAcceptsALimitBeyondTheIntRange(t *testing.T) {
 	}
 }
 
+// dyna patch P11 (PATCHES.md): searchTools() ranks with toolsearch.DefaultLimit whatever the tool_search extension's Options.DefaultLimit is, and loads nothing.
+func TestSearchToolsKeepsTheDefaultLimitOfEight(t *testing.T) {
+	var tools []extension.AgentTool
+	for i := range 12 {
+		tools = append(tools, extension.AgentTool{Name: fmt.Sprintf("read_%02d", i), Description: "Read a file."})
+	}
+	globals := discoveryGlobals(tools, map[string]string{}, nil)
+	got, err := callGlobal(t, globals, "searchTools", `["read"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []map[string]string
+	if err := json.Unmarshal(got, &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 8 {
+		t.Fatalf("searchTools returned %d tools, want 8", len(entries))
+	}
+}
+
 // upstream execute.ts: when ctx.executeTool rejects, the row keeps status "running" with no duration or error, and
 // becomes "cancelled" when the script ends; only an error outcome marks it "error".
 func TestARejectedNestedCallLeavesItsRowRunningUntilTheScriptEnds(t *testing.T) {

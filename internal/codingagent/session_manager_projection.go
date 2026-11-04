@@ -538,7 +538,7 @@ func CurrentSystemMessage(messages []agent.AgentMessage) *ai.SystemMessage {
 // compactionSystemMessage returns the JSON of the current projected system
 // state stamped with the compaction time, or nil when there is none. Sections,
 // when not nil, take the place of the current ones (dyna patch P7).
-func compactionSystemMessage(messages []agent.AgentMessage, timestampMs int64, sections ai.OrderedSections) (json.RawMessage, error) {
+func compactionSystemMessage(messages []agent.AgentMessage, timestampMs int64, sections ai.OrderedSections, tools []ai.ToolSchema) (json.RawMessage, error) {
 	current := CurrentSystemMessage(messages)
 	if current == nil {
 		if sections == nil {
@@ -548,6 +548,9 @@ func compactionSystemMessage(messages []agent.AgentMessage, timestampMs int64, s
 	}
 	if sections != nil {
 		current.Sections = sections
+	}
+	if tools != nil {
+		current.ToolsAdded = tools
 	}
 	text, _ := current.Content.(ai.SystemText)
 	// Key order follows Pi's getCurrentSystemMessage object literal.

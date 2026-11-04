@@ -207,11 +207,11 @@ func (s *Session) reportInvalidBoundaryContinuation(event string) {
 }
 
 func (s *Session) commitBoundaryDrafts(drafts []extension.SessionBoundaryDraft) error {
-	head, err := s.compactionHead()
+	head, tools, err := s.compactionHead()
 	if err != nil {
 		return err
 	}
-	appended, err := applyBoundaryDrafts(s.inner, drafts, head)
+	appended, err := applyBoundaryDrafts(s.inner, drafts, head, tools)
 	if err != nil {
 		return err
 	}
@@ -229,11 +229,11 @@ func (s *Session) createBoundaryPreviewManager(drafts []extension.SessionBoundar
 		branch = s.inner.GetBranch(*leaf)
 	}
 	preview := icodingagent.NewBranchSession(s.inner.GetHeader(), branch)
-	head, err := s.compactionHead()
+	head, tools, err := s.compactionHead()
 	if err != nil {
 		return nil, err
 	}
-	if _, err := applyBoundaryDrafts(preview, drafts, head); err != nil {
+	if _, err := applyBoundaryDrafts(preview, drafts, head, tools); err != nil {
 		return nil, err
 	}
 	return preview, nil
@@ -252,8 +252,8 @@ func (s *Session) boundaryProjection(drafts []extension.SessionBoundaryDraft) (i
 }
 
 // applyBoundaryDrafts appends the drafts to manager. A compaction draft's head holds head, nil keeping the current system
-// message's sections (Session.compactionHead, dyna patch P7).
-func applyBoundaryDrafts(manager *icodingagent.Session, drafts []extension.SessionBoundaryDraft, head ai.OrderedSections) ([]icodingagent.SessionEntry, error) {
+// message's sections and tools (Session.compactionHead, dyna patch P7, P11).
+func applyBoundaryDrafts(manager *icodingagent.Session, drafts []extension.SessionBoundaryDraft, head ai.OrderedSections, tools []ai.ToolSchema) ([]icodingagent.SessionEntry, error) {
 	appended := make([]icodingagent.SessionEntry, 0, len(drafts))
 	for _, draft := range drafts {
 		var id string
@@ -278,7 +278,7 @@ func applyBoundaryDrafts(manager *icodingagent.Session, drafts []extension.Sessi
 				firstKept = *draft.FirstKeptEntryID
 			}
 			tokensBefore := compaction.EstimateProjectedContextTokens(manager.BuildSessionProjection(), manager.GetContextBranch()).Tokens
-			id, err = manager.AppendCompactionWithSections(draft.Summary, firstKept, tokensBefore, draft.Details, true, draft.Usage, head)
+			id, err = manager.AppendCompactionWithSections(draft.Summary, firstKept, tokensBefore, draft.Details, true, draft.Usage, head, tools)
 		default:
 			return nil, fmt.Errorf("unsupported session boundary draft type %q", draft.Type)
 		}

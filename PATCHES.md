@@ -13,7 +13,8 @@ What: `agent.NewUserMessage(content, timestamp, members)` builds a user message 
 content and timestamp. `PromptOptions.Members` and `QueueInputOptions.Members` put them on a prompt's, steer's or
 follow-up's message. They are written with the message to the session file, as members of a decoded message PiG does not
 model already are, and no provider request carries them, since a request is built from the message's fields. A member
-named role, content or timestamp, or one that is not JSON, is refused before anything is queued or started.
+named role, content or timestamp, or one that is not JSON, is refused (`agent.ValidateUserMembers`) before input handlers
+see the input, so nothing is queued or started.
 
 Why: a host that runs PiG in process needs to know which of its inputs a session file already holds, for example after
 its own process restarted mid-turn. Dyna labels each input with `deliveryId`, as its Pi fork did, so the session file
@@ -21,6 +22,22 @@ format is unchanged across the move to PiG.
 
 Locked by: `TestUserMessageMembersAreRecordedAndNotSent`, `TestUserMessageMembersCannotReplaceTheMessage`,
 `TestAUserMessageWithoutMembersIsPlain` (agent), `TestPromptAndSteerMembersAreRecorded`,
-`TestAPromptWithAMemberOfTheMessageIsRefused` (coding).
+`TestAnInputWithAMemberOfTheMessageIsRefused` (coding).
+
+Upstream: not offered (owner's decision pending).
+
+## P2 Continue a recovered session
+
+What: `Session.ContinueRecovered(ctx, ContinueOptions{Interrupted, Started})` resumes a session whose process ended
+during a run. A final attempt that failed is left out of the model's context, as a retry leaves it out. Each tool call of
+the last assistant message that has no result gets an error result with the `Interrupted` text, written to the session
+file, and is not run again. The run then continues from the last message; a session that ends with an answer returns
+`ErrNothingToContinue`.
+
+Why: Pi resumes a session only with a new prompt. A host that restarts mid-run must not send its inputs twice, so it
+finishes the run they started. Dyna's Pi fork had the same as RPC `continue`.
+
+Locked by: `TestContinueRecordsInterruptedToolCalls`, `TestContinueReadsAPendingInput`,
+`TestContinueLeavesOutAFailedAttempt`, `TestContinueAfterAnAnswerIsRefused` (coding).
 
 Upstream: not offered (owner's decision pending).

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
@@ -85,6 +86,9 @@ func (s *Session) queueUserInput(ctx context.Context, text string, images []ai.I
 		if options.Source != "" {
 			source = options.Source
 		}
+	}
+	if err := agent.ValidateUserMembers(members); err != nil {
+		return "", err
 	}
 	text, images, handled, err := s.RunInputHandlers(ctx, text, images, source, string(behavior))
 	if err != nil {
@@ -186,6 +190,9 @@ func (s *Session) Prompt(ctx context.Context, text string, options ...*PromptOpt
 }
 
 func (s *Session) preparePromptInvocation(ctx context.Context, text string, options PromptOptions) (*PreparedPromptRun, error) {
+	if err := agent.ValidateUserMembers(options.Members); err != nil {
+		return nil, err
+	}
 	// A rejected prompt reports nothing: upstream calls `preflightResult` only when the prompt is accepted (agent-session.ts:1894-1962).
 	accepted := false
 	notify := func(disposition PromptDisposition) {

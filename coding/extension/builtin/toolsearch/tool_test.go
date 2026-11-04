@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/MichaelKinsy/PiG/coding/extension/factoryload"
@@ -141,5 +142,26 @@ func TestToolSearchExtensionRegistersTheToolInactive(t *testing.T) {
 	}
 	if registered.Definition.Exposure != extension.ToolExposureModelOnly {
 		t.Fatalf("exposure = %q, want model-only", registered.Definition.Exposure)
+	}
+}
+
+// recordingAPI is an extension API that records the tool registered.
+type recordingAPI struct {
+	extension.API
+	registered extension.ToolDefinition
+}
+
+func (a *recordingAPI) RegisterTool(tool extension.ToolDefinition) { a.registered = tool }
+
+// dyna patch P7 (PATCHES.md): a session whose head names the deferred tools describes tool_search by that section.
+func TestToolSearchDescriptionNamesTheDeferredToolsSection(t *testing.T) {
+	for _, deferred := range []bool{false, true} {
+		var api recordingAPI
+		if err := toolsearch.CreateToolSearchExtensionWith(toolsearch.Options{DeferredToolsSection: deferred})(&api); err != nil {
+			t.Fatal(err)
+		}
+		if names := strings.Contains(api.registered.Description, "`deferred_tools` section"); names != deferred {
+			t.Fatalf("deferred %v: %s", deferred, api.registered.Description)
+		}
 	}
 }

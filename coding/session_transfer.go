@@ -200,7 +200,7 @@ func (s *Session) appendTransferBoundary(reason string, settings compaction.Comp
 	details := compaction.CompactionDetails{ReadFiles: readFiles, ModifiedFiles: modifiedFiles}
 
 	s.emitCompactionEvent(agent.CompactionStartEvent{Reason: "threshold"})
-	entryID, err := s.inner.AppendCompaction(summary, firstKept, before, details, false, nil)
+	entryID, err := s.appendCompaction(s.inner, summary, firstKept, before, details, false, nil)
 	if err != nil {
 		s.emitOrderedEventSync(agent.CompactionEndEvent{Reason: "threshold", ErrorMessage: err.Error()})
 		return err

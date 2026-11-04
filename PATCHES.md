@@ -130,3 +130,31 @@ Locked by: `TestBm25RankerRanksAToolFirstWhenTheQueryIsItsName`,
 (toolsearch).
 
 Upstream: not offered (owner's decision pending).
+
+## P7 Deferred tools in the head
+
+What: with `SessionOptions.ContextUpdates` (P5), a head (the first system message, and each compaction's) holds a
+`deferred_tools` section that names, by name only, every registered tool with `deferred` or `codemode` exposure that
+is not active, grouped by the prefix its namespace gives it: a namespace's line names its tools that take no action,
+and a tool whose schema has an `action` string enum gets its own `- name: actions` line. A namespace lists at most 80
+tools and a tool 80 actions; the rest are counted as `+N more; tool_search finds them`. The first line says how they
+are reached: `tool_search`, a codemode script, or both, as active; with neither, or nothing to list, there is no
+section. Between heads every request carries the section the head delivered, so a `tool_search` load changes no
+section and adds only its `toolsAdded` system message: the system prompt and the request's tools stay byte-identical.
+A compaction's head also holds the sections as they are then, not the conversation's first ones
+(`Session.compactionHead`, `AppendCompactionWithSections`), so the conversation after it needs no update.
+`deferred_tools` is a reserved host section name. `mcpext.Options.DeferredToolsSection` drops the MCP extension's
+`mcp_servers` section and makes the first prompt wait for every enabled server, so the head names their tools;
+`toolsearch.Options.DeferredToolsSection` gives `tool_search` a description that points at the section. Without them
+nothing changes.
+
+Why: a model that does not know what a search can reach searches blind, and listing servers alone names no tools.
+Dyna's Pi fork had this as P15 (`renderDeferredToolsSection`, `_headSections`), built only with a head so the cached
+prefix holds. Names sort byte-wise here, not with JavaScript's `localeCompare`.
+
+Locked by: `TestTheFirstHeadNamesTheDeferredTools`, `TestALoadChangesNoSection`,
+`TestACompactionHeadHoldsTheCurrentSections`, `TestTheDeferredToolsSectionCountsWhatItLeavesOut`,
+`TestTheDeferredToolsSectionIsReserved`, `TestTheDeferredToolsSectionSortsByName` (coding), `TestAgentSessionMCPWithDeferredToolsSectionWaitsForEveryServerAndListsNone`
+(mcpext), `TestToolSearchDescriptionNamesTheDeferredToolsSection` (toolsearch).
+
+Upstream: not offered (owner's decision pending).

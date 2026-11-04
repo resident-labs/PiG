@@ -2903,7 +2903,7 @@ func (s *Session) compact(ctx context.Context, customInstructions string) (*Comp
 	}
 
 	s.mu.Lock()
-	entryID, err := s.inner.AppendCompaction(result.Summary, result.FirstKeptEntryID, result.TokensBefore, result.Details, fromExtension, result.Usage)
+	entryID, err := s.appendCompaction(s.inner, result.Summary, result.FirstKeptEntryID, result.TokensBefore, result.Details, fromExtension, result.Usage)
 	if err != nil {
 		s.mu.Unlock()
 		return fail(fmt.Errorf("coding: Compact: persist: %w", err), false)
@@ -3501,7 +3501,7 @@ func (s *Session) runAutoCompactionFor(ctx context.Context, reason string, willR
 	}
 	var entryID string
 	if err == nil {
-		entryID, err = s.inner.AppendCompaction(result.Summary, result.FirstKeptEntryID, result.TokensBefore, result.Details, fromExtension, result.Usage)
+		entryID, err = s.appendCompaction(s.inner, result.Summary, result.FirstKeptEntryID, result.TokensBefore, result.Details, fromExtension, result.Usage)
 	}
 	if err != nil {
 		aborted := compactCtx.Err() != nil || cancelledByExtension

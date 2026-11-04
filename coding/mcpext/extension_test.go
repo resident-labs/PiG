@@ -652,6 +652,8 @@ type slowConfig struct {
 	name         string
 	instructions string
 	startupWait  *int
+	// deferredToolsSection is Options.DeferredToolsSection (dyna patch P7).
+	deferredToolsSection bool
 }
 
 func setupSlow(t *testing.T, config slowConfig, initializeDelay time.Duration) *slowHarness {
@@ -675,9 +677,10 @@ func setupSlow(t *testing.T, config slowConfig, initializeDelay time.Duration) *
 			_ = server.Start()
 			return client, nil
 		},
-		StartupWaitMs: config.startupWait,
-		Credentials:   mcpext.NewMcpOAuthCredentialStoreWithBackend(&mcpext.InMemoryAuthStorageBackend{}, ""),
-		LogPath:       t.TempDir() + "/mcp.log",
+		StartupWaitMs:        config.startupWait,
+		DeferredToolsSection: config.deferredToolsSection,
+		Credentials:          mcpext.NewMcpOAuthCredentialStoreWithBackend(&mcpext.InMemoryAuthStorageBackend{}, ""),
+		LogPath:              t.TempDir() + "/mcp.log",
 	})
 	h.ctx = eventContext(t.TempDir(), h.notes)
 	t.Cleanup(h.ext.SessionShutdown)
@@ -1227,5 +1230,20 @@ func TestAgentSessionMCPNamesCollidingToolsAcrossTheWholeCatalog(t *testing.T) {
 	// The second listing of a raw name finds the plain name taken by the first, so it takes the hash suffix.
 	if names["first"] != "mcp__docs__plain" || !regexp.MustCompile(`^mcp__docs__plain_[0-9a-f]{8}$`).MatchString(names["second"]) || names["solo"] != "mcp__docs__solo" {
 		t.Errorf("names = %q, %q, %q, want the plain name, a suffixed name, and the plain name", names["first"], names["second"], names["solo"])
+	}
+}
+
+// dyna patch P7 (PATCHES.md): with the session naming deferred tools, the first prompt waits for a server with no
+// direct tools, so its tools are registered before the head is built, and the extension adds no servers section.
+func TestAgentSessionMCPWithDeferredToolsSectionWaitsForEveryServerAndListsNone(t *testing.T) {
+	h := setupSlow(t, slowConfig{instructions: "Slow docs.", deferredToolsSection: true}, 30*time.Millisecond)
+
+	h.prompt()
+
+	if !toolRegistered(h.host, "mcp__slow__search") {
+		t.Fatal("the first prompt did not wait for the server")
+	}
+	if section, ok := h.serversSection(); ok {
+		t.Fatalf("section = %q, want none", section)
 	}
 }

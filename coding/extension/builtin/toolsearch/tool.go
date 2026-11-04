@@ -130,8 +130,23 @@ func Definition() extension.ToolDefinition {
 //
 // Ports packages/coding-agent/src/extensions/tool-search/index.ts (createToolSearchExtension).
 func CreateToolSearchExtension() extension.ExtensionFactory {
+	return CreateToolSearchExtensionWith(Options{})
+}
+
+// Options are the settings of the tool_search extension.
+type Options struct {
+	// DeferredToolsSection is set when the session's head names the tools search reaches (coding.SessionOptions.ContextUpdates),
+	// so the description points at that section (dyna patch P7, PATCHES.md).
+	DeferredToolsSection bool
+}
+
+// CreateToolSearchExtensionWith is CreateToolSearchExtension with options.
+func CreateToolSearchExtensionWith(options Options) extension.ExtensionFactory {
 	return func(pi extension.API) error {
 		definition := Definition()
+		if options.DeferredToolsSection {
+			definition.Description = DeferredToolsDescription
+		}
 		inactive := false
 		definition.DefaultActive = &inactive
 		pi.RegisterTool(definition)

@@ -22,18 +22,15 @@ func NewUserMessage(content ai.UserContent, timestamp int64, members map[string]
 	if len(members) == 0 {
 		return message, nil
 	}
+	if err := ValidateUserMembers(members); err != nil {
+		return AgentMessage{}, err
+	}
 	encoded, err := message.MarshalJSON()
 	if err != nil {
 		return AgentMessage{}, err
 	}
 	text := bytes.NewBuffer(encoded[:len(encoded)-1])
 	for _, name := range slices.Sorted(maps.Keys(members)) {
-		if name == "role" || name == "content" || name == "timestamp" {
-			return AgentMessage{}, fmt.Errorf("user message member %q is the message's own", name)
-		}
-		if !json.Valid(members[name]) {
-			return AgentMessage{}, errors.New("user message member " + name + " is not JSON")
-		}
 		key, err := json.Marshal(name)
 		if err != nil {
 			return AgentMessage{}, err
@@ -49,4 +46,18 @@ func NewUserMessage(content ai.UserContent, timestamp int64, members map[string]
 		return AgentMessage{}, err
 	}
 	return labelled, nil
+}
+
+// ValidateUserMembers refuses a member that names the message's own role, content or timestamp, or that is not JSON. A
+// session checks its input's members with it before input handlers see the input.
+func ValidateUserMembers(members map[string]json.RawMessage) error {
+	for _, name := range slices.Sorted(maps.Keys(members)) {
+		if name == "role" || name == "content" || name == "timestamp" {
+			return fmt.Errorf("user message member %q is the message's own", name)
+		}
+		if !json.Valid(members[name]) {
+			return errors.New("user message member " + name + " is not JSON")
+		}
+	}
+	return nil
 }

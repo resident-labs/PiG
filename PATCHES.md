@@ -13,7 +13,8 @@ What: `agent.NewUserMessage(content, timestamp, members)` builds a user message 
 content and timestamp. `PromptOptions.Members` and `QueueInputOptions.Members` put them on a prompt's, steer's or
 follow-up's message. They are written with the message to the session file, as members of a decoded message PiG does not
 model already are, and no provider request carries them, since a request is built from the message's fields. A member
-named role, content or timestamp, or one that is not JSON, is refused before anything is queued or started.
+named role, content or timestamp, or one that is not JSON, is refused (`agent.ValidateUserMembers`) before input handlers
+see the input, so nothing is queued or started.
 
 Why: a host that runs PiG in process needs to know which of its inputs a session file already holds, for example after
 its own process restarted mid-turn. Dyna labels each input with `deliveryId`, as its Pi fork did, so the session file
@@ -21,6 +22,6 @@ format is unchanged across the move to PiG.
 
 Locked by: `TestUserMessageMembersAreRecordedAndNotSent`, `TestUserMessageMembersCannotReplaceTheMessage`,
 `TestAUserMessageWithoutMembersIsPlain` (agent), `TestPromptAndSteerMembersAreRecorded`,
-`TestAPromptWithAMemberOfTheMessageIsRefused` (coding).
+`TestAnInputWithAMemberOfTheMessageIsRefused` (coding).
 
 Upstream: not offered (owner's decision pending).

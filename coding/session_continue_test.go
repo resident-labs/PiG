@@ -94,3 +94,26 @@ func TestContinueAfterAnAnswerIsRefused(t *testing.T) {
 		t.Fatalf("err %v", err)
 	}
 }
+
+// Of one message's tool calls, only those without a result get the interrupted one; a recorded result stays the only one.
+func TestContinueAnswersOnlyTheCallsWithoutResults(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{}, fauxReply("done", ai.StopReasonStop, 0))
+	recovered(t, h, recoveredUser("go"),
+		recoveredAssistant(ai.StopReasonToolUse,
+			ai.ToolCall{ID: "call-1", Name: "bash", Arguments: ai.JsonObject{"command": "true"}},
+			ai.ToolCall{ID: "call-2", Name: "bash", Arguments: ai.JsonObject{"command": "sleep 100"}}),
+		agent.AgentMessage{ToolResult: &agent.ToolResultMessage{Role: agent.RoleToolResult, ToolCallID: "call-1", ToolName: "bash", Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "ok"}}, Timestamp: time.Now().UnixMilli()}})
+	if err := h.session.ContinueRecovered(t.Context(), ContinueOptions{Interrupted: "interrupted: unknown"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(h.session.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(data), `"toolCallId":"call-1"`); got != 1 {
+		t.Fatalf("call-1 has %d results in the session file", got)
+	}
+	if !strings.Contains(string(data), `"toolCallId":"call-2","toolName":"bash","content":[{"type":"text","text":"interrupted: unknown"}]`) {
+		t.Fatal("call-2 has no interrupted result")
+	}
+}

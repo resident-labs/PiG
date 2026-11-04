@@ -38,7 +38,7 @@ Why: Pi resumes a session only with a new prompt. A host that restarts mid-run m
 finishes the run they started. Dyna's Pi fork had the same as RPC `continue`.
 
 Locked by: `TestContinueRecordsInterruptedToolCalls`, `TestContinueReadsAPendingInput`,
-`TestContinueLeavesOutAFailedAttempt`, `TestContinueAfterAnAnswerIsRefused` (coding).
+`TestContinueLeavesOutAFailedAttempt`, `TestContinueAfterAnAnswerIsRefused`, `TestContinueAnswersOnlyTheCallsWithoutResults` (coding).
 
 Upstream: not offered (owner's decision pending).
 

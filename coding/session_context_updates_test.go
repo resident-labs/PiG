@@ -9,6 +9,7 @@ import (
 
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
+	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
 )
 
 // dyna patch P5 (PATCHES.md).
@@ -202,5 +203,50 @@ func TestAToolActiveAgainChangesNoSection(t *testing.T) {
 	}
 	if got := contextUpdates(t, h, 1); len(got) > 0 {
 		t.Fatalf("the model read %q", got)
+	}
+}
+
+// A session whose prompt is plain text with no sections, as a transcript of a forced prompt records it, delivers the
+// host's sections too. Such a message holds no sections, so the update names the preamble as new as well, as
+// the Pi fork does.
+func TestHostSectionsReachASessionWithAPlainPrompt(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{contextUpdates: true, systemPrompt: "Be brief."}, fauxReply("done", ai.StopReasonStop, 0))
+	recovered(t, h, agent.AgentMessage{System: &ai.SystemMessage{Content: ai.SystemText("Be brief."), Timestamp: 1}})
+	hostSections(t, h, "goal", "g1")
+	if err := h.session.Prompt(t.Context(), "one"); err != nil {
+		t.Fatal(err)
+	}
+	if got := contextUpdates(t, h, 0); len(got) != 1 || !strings.HasSuffix(got[0], "New section goal:\n<goal>\ng1\n</goal>\n[/Context update]") {
+		t.Fatalf("the model read %q", got)
+	}
+}
+
+// A skill edited between two requests of a run reaches the second.
+func TestASkillEditReachesTheNextRequest(t *testing.T) {
+	var h *recoveryHarness
+	write := func(description string) {
+		path := filepath.Join(h.session.CWD(), icodingagent.CONFIG_DIR_NAME, "skills", "review", "SKILL.md")
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("---\nname: review\ndescription: "+description+"\n---\nReview the change.\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tool := runPromptTool(t, "work", func() { write("Review code in depth") })
+	h = newRecoveryHarness(t, harnessOptions{contextUpdates: true, defaultTools: true, tools: []agent.AgentTool{tool}}, fauxToolCall("work"), fauxReply("done", ai.StopReasonStop, 0))
+	write("Review code")
+	// The refresh rereads the skills of the folders the last reload found, as a box has its skills folder from the start.
+	if err := h.session.ResourceLoader().Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.session.Prompt(t.Context(), "go"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(head(t, h, 0)["skills"], "Review code") {
+		t.Fatalf("the head lacks the skill: %v", head(t, h, 0)["skills"])
+	}
+	if got := contextUpdates(t, h, 1); len(got) != 1 || !strings.Contains(got[0], "Changed section skills:") || !strings.Contains(got[0], "Review code in depth") {
+		t.Fatalf("the run's second request read %q", got)
 	}
 }

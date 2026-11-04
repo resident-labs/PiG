@@ -133,6 +133,8 @@ type harnessOptions struct {
 	compatStream bool
 	// contextUpdates is SessionOptions.ContextUpdates (dyna patch P5).
 	contextUpdates bool
+	// systemPrompt is SessionOptions.SystemPrompt.
+	systemPrompt string
 }
 
 type recoveryHarness struct {
@@ -182,7 +184,7 @@ func newRecoveryHarness(t *testing.T, opts harnessOptions, responses ...scripted
 		}
 		runner = inproc.NewRunner(loaded, t.TempDir(), opts.runtime)
 	}
-	options := SessionOptions{Model: model, SkipBuiltinTools: !opts.defaultTools, Tools: opts.tools, Runner: runner, SystemPromptResources: opts.resources, AllowedTools: opts.allowedTools, ExcludedTools: opts.excludedTools, ContextUpdates: opts.contextUpdates}
+	options := SessionOptions{Model: model, SkipBuiltinTools: !opts.defaultTools, Tools: opts.tools, Runner: runner, SystemPromptResources: opts.resources, AllowedTools: opts.allowedTools, ExcludedTools: opts.excludedTools, ContextUpdates: opts.contextUpdates, SystemPrompt: opts.systemPrompt}
 	if opts.emptySessionManager {
 		options.existing = opts.sessionManager
 		if options.existing == nil {

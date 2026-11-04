@@ -213,11 +213,16 @@ func GetLastAssistantUsage(entries []codingagent.SessionEntry) *ai.Usage {
 
 // ShouldCompact reports whether compaction should trigger.
 // Mirrors upstream shouldCompact (compaction.ts).
+// A trigger below the reserve's threshold starts it sooner (dyna patch P3, PATCHES.md).
 func ShouldCompact(contextTokens, contextWindow int, s CompactionSettings) bool {
 	if !s.Enabled {
 		return false
 	}
-	return contextTokens > contextWindow-s.ReserveTokens
+	threshold := contextWindow - s.ReserveTokens
+	if s.TriggerTokens > 0 {
+		threshold = min(threshold, s.TriggerTokens)
+	}
+	return contextTokens > threshold
 }
 
 // ─── Cut Point Detection ──────────────────────────────────────────────────────

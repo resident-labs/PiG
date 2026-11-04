@@ -18,6 +18,9 @@ type CompactionSettings struct {
 	Enabled          bool `json:"enabled"`
 	ReserveTokens    int  `json:"reserveTokens"`    // tokens reserved for response; default 16384
 	KeepRecentTokens int  `json:"keepRecentTokens"` // tokens to keep from recent history; default 20000
+	// TriggerTokens, when above zero, starts automatic compaction at that context size if it comes before the reserve's
+	// threshold (dyna patch P3, PATCHES.md).
+	TriggerTokens int `json:"triggerTokens,omitempty"`
 }
 
 // FileOperations tracks files read/written/edited during a session segment.

@@ -38,6 +38,21 @@ Why: Pi resumes a session only with a new prompt. A host that restarts mid-run m
 finishes the run they started. Dyna's Pi fork had the same as RPC `continue`.
 
 Locked by: `TestContinueRecordsInterruptedToolCalls`, `TestContinueReadsAPendingInput`,
-`TestContinueLeavesOutAFailedAttempt`, `TestContinueAfterAnAnswerIsRefused` (coding).
+`TestContinueLeavesOutAFailedAttempt`, `TestContinueAfterAnAnswerIsRefused`, `TestContinueAnswersOnlyTheCallsWithoutResults` (coding).
+
+Upstream: not offered (owner's decision pending).
+
+## P3 Compaction trigger tokens
+
+What: `CompactionSettings.TriggerTokens` starts automatic compaction once the context passes that many tokens, when that
+comes before the reserve's threshold (`contextWindow - reserveTokens`); zero keeps the reserve's rule. It is serialized
+only when set. `Session.SetCompactionTriggerTokens(n)` sets it for one session, unsaved, as a per-process flag would.
+
+Why: Pi compacts only near the end of the window. A host that runs several profiles on one model compacts each
+conversation at its own size without writing shared settings. Dyna's Pi fork had the same as
+`--compaction-trigger-tokens`.
+
+Locked by: `TestTriggerTokensStartCompactionSooner` (internal/codingagent/compaction),
+`TestSessionCompactionTriggerTokens` (coding).
 
 Upstream: not offered (owner's decision pending).

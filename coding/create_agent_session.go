@@ -35,6 +35,8 @@ type CreateAgentSessionFromServicesOptions struct {
 	CustomTools []extension.ToolDefinition
 	// SessionStartEvent is the session_start metadata the extension runtime starts with.
 	SessionStartEvent *extension.SessionStartEvent
+	// ContextUpdates is SessionOptions.ContextUpdates (dyna patch P5).
+	ContextUpdates bool
 }
 
 // CreateAgentSessionResult mirrors sdk.ts CreateAgentSessionResult.
@@ -134,6 +136,7 @@ func createAgentSessionOver(options CreateAgentSessionFromServicesOptions, resou
 		DefaultToolModifiers:   selection.modifiers,
 		ExcludedTools:          selection.excluded,
 		ResourceLoader:         resourceLoader,
+		ContextUpdates:         options.ContextUpdates,
 	})
 	if err != nil {
 		return CreateAgentSessionResult{}, err

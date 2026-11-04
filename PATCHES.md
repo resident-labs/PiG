@@ -81,3 +81,31 @@ Locked by: `TestTransferOfASmallConversation`, `TestTransferCompactsOnTheOldMode
 `TestATransferSummarizesOnTheModelTheBranchRecords`, `TestATransferWhoseSummaryTimesOutMovesAnyway` (coding).
 
 Upstream: not offered (owner's decision pending).
+
+## P5 Context updates
+
+What: `SessionOptions.ContextUpdates` (and `CreateAgentSessionFromServicesOptions.ContextUpdates`) delivers a change to
+the prompt's sections after the first system message as one user message instead of a mid-conversation system message:
+a custom `context_update` message whose content is `[Context update]`, then each changed section as line diffs
+(`tools.UnifiedHunks`, jsdiff's hunks with three lines of context, without the `\ No newline at end of file` line the Pi
+fork's diff has, which only says a section has no final newline), each new section whole and each removed one by name,
+then `[/Context update]`. Its details record the sections it delivers, so a resumed session, and the next request,
+compare against the latest update, or against the system messages when one with sections follows it. The head is never
+rewritten, so the cached prefix holds on every provider. `Session.SetHostPromptSections` sets sections the host adds
+after the built ones, each wrapped in a tag of its name. With ContextUpdates the Session also rereads its own loader's
+context files and skills before each request (`DefaultResourceLoader.RefreshPromptResources`; skills from the folders
+its last reload found), and a running run's options take them when they changed, so an AGENTS.md or skill edit between
+two tool calls reaches the next request. It also lists tools in the prompt by name, so the same tools render the same
+whatever order they became active in. Without ContextUpdates nothing changes.
+
+Why: Pi sends a changed section as a system message, which most providers fold into the head, so a change rewrites the
+cached prefix. Dyna's Pi fork had this as `context-updates.ts` with `set_prompt_sections` and its P13 refresh; Dyna's
+state sections and its agents' AGENTS.md files change through a session's life.
+
+Locked by: `TestHostSectionsChangeThroughContextUpdates`, `TestAContextUpdateArrivesBeforeTheNextRequestOfARun`,
+`TestAResumedSessionSendsOnlyTheChangeSinceItsLastUpdate`, `TestAHostSectionWithABadNameIsRefused`,
+`TestTheLatestOfAnUpdateAndASystemMessageHoldsTheSections`, `TestAnAgentsFileEditReachesTheNextRequest`,
+`TestAToolActiveAgainChangesNoSection`, `TestHostSectionsReachASessionWithAPlainPrompt`, `TestASkillEditReachesTheNextRequest`
+(coding).
+
+Upstream: not offered (owner's decision pending).

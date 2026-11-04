@@ -688,3 +688,28 @@ func resolveResourceLoader(svcs *AgentSessionServices, supplied ResourceLoader) 
 	timings.Time("resourceLoader.reload")
 	return &resourceLoaderRef{loader: loader, promptFromLoader: true}, nil
 }
+
+// RefreshPromptResources rereads the context files and the skills at the paths the last reload and extension found,
+// without rediscovering packages or extensions. A Session with ContextUpdates calls it before each model request, so an
+// edit to an AGENTS.md or a skill reaches the model in the middle of a run (dyna patch P5, PATCHES.md). A failure to load
+// the skills leaves the previous ones.
+func (l *DefaultResourceLoader) RefreshPromptResources() error {
+	l.opMu.Lock()
+	defer l.opMu.Unlock()
+	agentsFiles := AgentsFilesResult{AgentsFiles: []ContextFile{}}
+	if !l.options.NoContextFiles {
+		agentsFiles.AgentsFiles = icodingagent.LoadProjectContextFiles(l.cwd, l.agentDir)
+	}
+	if l.options.AgentsFilesOverride != nil {
+		agentsFiles = l.options.AgentsFilesOverride(agentsFiles)
+	}
+	skills, err := l.skillsFromPaths(l.lastSkillPaths, l.resourceMetadata, &l.extensionSources)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.agentsFiles = agentsFiles.AgentsFiles
+	if err != nil {
+		return err
+	}
+	l.skills = skills
+	return nil
+}

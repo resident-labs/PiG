@@ -131,6 +131,10 @@ type harnessOptions struct {
 	// (test/suite/harness.ts createHarness streamFn), not through the model runtime: the faux provider reports a run aborted before its
 	// request as aborted, where the runtime's request setup rejects it with the signal's reason (lazy.ts lazyStream).
 	compatStream bool
+	// contextUpdates is SessionOptions.ContextUpdates (dyna patch P5).
+	contextUpdates bool
+	// systemPrompt is SessionOptions.SystemPrompt.
+	systemPrompt string
 }
 
 type recoveryHarness struct {
@@ -180,7 +184,7 @@ func newRecoveryHarness(t *testing.T, opts harnessOptions, responses ...scripted
 		}
 		runner = inproc.NewRunner(loaded, t.TempDir(), opts.runtime)
 	}
-	options := SessionOptions{Model: model, SkipBuiltinTools: !opts.defaultTools, Tools: opts.tools, Runner: runner, SystemPromptResources: opts.resources, AllowedTools: opts.allowedTools, ExcludedTools: opts.excludedTools}
+	options := SessionOptions{Model: model, SkipBuiltinTools: !opts.defaultTools, Tools: opts.tools, Runner: runner, SystemPromptResources: opts.resources, AllowedTools: opts.allowedTools, ExcludedTools: opts.excludedTools, ContextUpdates: opts.contextUpdates, SystemPrompt: opts.systemPrompt}
 	if opts.emptySessionManager {
 		options.existing = opts.sessionManager
 		if options.existing == nil {

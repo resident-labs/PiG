@@ -212,6 +212,9 @@ type Session struct {
 	streamFn  compaction.StreamFn
 	// compactionTrigger is SetCompactionTriggerTokens' value (dyna patch P3, PATCHES.md).
 	compactionTrigger atomic.Int64
+	// contextUpdates and hostSections are SessionOptions.ContextUpdates and SetHostPromptSections' sections (dyna patch P5).
+	contextUpdates bool
+	hostSections   atomic.Pointer[ai.OrderedSections]
 
 	// agentStartMu guards agentStartMessages: the custom messages the last
 	// before_agent_start dispatch returned, waiting for the prompt they join.
@@ -255,6 +258,10 @@ type SessionOptions struct {
 	// SystemPromptSections supplies the ordered prompt state assembled by the caller.
 	// When non-nil it takes precedence over SystemPrompt and is diffed on each prompt.
 	SystemPromptSections ai.OrderedSections
+
+	// ContextUpdates delivers a change to the prompt's sections as one user context update instead of a mid-conversation
+	// system message (dyna patch P5, session_context_updates.go).
+	ContextUpdates bool
 
 	// ResourceLoader supplies the skills, prompt templates, context files and system prompt text the Session expands, reports and builds its default system prompt from (Pi's createAgentSession resourceLoader). When nil, the Session uses a DefaultResourceLoader over the Services' cwd, agent directory and settings, which reloads the Services' settings, dropping their transient ApplyOverrides, and discovers resources at construction, as createAgentSession does. Supply NoResources to bind none and leave the system prompt to SystemPrompt, SystemPromptSections and SystemPromptResources.
 	ResourceLoader ResourceLoader
@@ -725,6 +732,7 @@ func NewSession(svcs *AgentSessionServices, opts SessionOptions) (*Session, erro
 		modelRuntime:            svcs.ModelRuntime(),
 		modelRegistry:           svcs.Registry(),
 		sessionDir:              opts.SessionDir,
+		contextUpdates:          opts.ContextUpdates,
 		noSession:               opts.NoSession,
 		runner:                  opts.Runner,
 		extensionHost:           opts.extensionHost,

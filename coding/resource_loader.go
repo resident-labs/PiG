@@ -109,6 +109,10 @@ type DefaultResourceLoaderOptions struct {
 	// ExtensionFactories are the inline and built-in extensions (resource-loader.ts extensionFactories): a bare factory or named input loads as
 	// `<inline:name>`; an input with Builtin supplies the code of its `builtin:<name>` path. They register against the loader's runtime.
 	ExtensionFactories []extension.InlineExtension
+	// InlineExtensionsFirst puts the ExtensionFactories ahead of the Package and settings extensions, so a tool of theirs wins a clash by name, as Pi's `--extension` paths do. Without it they follow them.
+	//
+	// dyna patch P10
+	InlineExtensionsFirst bool
 	// EventBus is the extension-to-extension bus the factories share; nil creates one.
 	EventBus extension.EventBus
 	// DisabledBuiltinExtensions names the built-in extensions whose `builtin:<name>` paths are left out of the extension set (resource-loader.ts disabledBuiltinExtensions).
@@ -217,7 +221,7 @@ func (l *DefaultResourceLoader) discover(ctx context.Context, preTrust *LoadExte
 	trusted := l.settings.IsProjectTrusted()
 	manager := packagemanager.NewPackageManager(packagemanager.PackageManagerOptions{CWD: l.cwd, SettingsManager: l.settings})
 	manager.AgentDir = l.agentDir
-	resolved, err := manager.Resolve(nil)
+	resolved, err := manager.ResolveContext(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("coding: %w", err)
 	}

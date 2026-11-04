@@ -59,7 +59,7 @@ func SettingsBaseDir(cwd, agentDir string, local bool) string {
 	return agentDir
 }
 
-func InstallPackageArtifacts(cwd, agentDir string, sm *codingagent.SettingsManager, pkg codingagent.PackageSource, local bool, progress ProgressCallback) error {
+func InstallPackageArtifacts(cwd, agentDir string, sm *codingagent.SettingsManager, pkg codingagent.PackageSource, local bool, progress ProgressCallback, opts ...InstallOption) error {
 	if local && !sm.IsProjectTrusted() {
 		return errors.New("Project is not trusted; refusing to access project package storage")
 	}
@@ -75,9 +75,9 @@ func InstallPackageArtifacts(cwd, agentDir string, sm *codingagent.SettingsManag
 			}
 			return nil
 		case "npm":
-			return InstallManagedNPM(cwd, agentDir, sm, pkg.Source, local)
+			return InstallManagedNPM(cwd, agentDir, sm, pkg.Source, local, opts...)
 		case "git":
-			return InstallManagedGit(cwd, agentDir, sm, pkg.Source, local)
+			return InstallManagedGit(cwd, agentDir, sm, pkg.Source, local, opts...)
 		default:
 			return fmt.Errorf("unsupported package source: %s", pkg.Source)
 		}
@@ -381,7 +381,7 @@ func InstallManagedNPM(cwd, agentDir string, sm *codingagent.SettingsManager, so
 		return err
 	}
 	args = append(args, NpmInstallArgs(manager, ref.Locator, installRoot, ref.NPMRegistry, opts...)...)
-	return RunPackageProcess("", command[0], args...)
+	return RunPackageProcessContext(resolveInstallOptions(opts).ctx, "", command[0], args...)
 }
 
 func NpmInstallArgs(manager, spec, installRoot, registry string, opts ...InstallOption) []string {
@@ -496,11 +496,11 @@ func InstallGitCheckout(sm *codingagent.SettingsManager, ref sourceref.Ref, chec
 	if !strings.Contains(repo, "://") && !strings.HasPrefix(repo, "git@") {
 		repo = "https://" + repo
 	}
-	if err := RunPackageProcess("", "git", "clone", GitCloneRepo(runtime.GOOS, repo), checkout); err != nil {
+	if err := RunPackageProcessContext(resolveInstallOptions(opts).ctx, "", "git", "clone", GitCloneRepo(runtime.GOOS, repo), checkout); err != nil {
 		return err
 	}
 	if ref.GitRef != "" {
-		if err := RunPackageProcess(checkout, "git", "checkout", ref.GitRef); err != nil {
+		if err := RunPackageProcessContext(resolveInstallOptions(opts).ctx, checkout, "git", "checkout", ref.GitRef); err != nil {
 			return err
 		}
 	}

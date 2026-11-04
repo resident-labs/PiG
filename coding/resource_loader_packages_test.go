@@ -1,14 +1,19 @@
 package coding
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
@@ -824,5 +829,50 @@ func TestDefaultLoaderPromptPathRejectionKeepsReloadedSkills(t *testing.T) {
 	}
 	if got := loader.GetPrompts().Prompts; len(got) != 0 {
 		t.Fatalf("prompts after the rejected reload = %+v, want none", got)
+	}
+}
+
+// dyna patch P9: the context of ReloadWith ends a Package install. The npm process is killed, the reload returns the context's error at once, and no process is left running.
+func TestDefaultLoaderEndsAnInstallWithItsContext(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not on PATH")
+	}
+	f := newResourceLoaderFixture(t)
+	t.Setenv("PI_OFFLINE", "")
+	t.Setenv("PIG_OFFLINE", "")
+	root := t.TempDir()
+	pidFile, script := filepath.Join(root, "pid"), filepath.Join(root, "npm.cjs")
+	writeResource(t, script, "if (process.argv.includes('install')) {\n  require('node:fs').writeFileSync(process.argv[2], String(process.pid));\n  setTimeout(() => {}, 60000);\n}\n")
+	settings, err := json.Marshal(map[string]any{"npmCommand": []string{node, script, pidFile, "--", "npm"}, "packages": []string{"npm:hung-pkg"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeResource(t, filepath.Join(f.agentDir, "settings.json"), string(settings))
+	loader := NewDefaultResourceLoader(DefaultResourceLoaderOptions{CWD: f.cwd, AgentDir: f.agentDir})
+	t.Cleanup(loader.Close)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := loader.ReloadWith(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the reload returned %v, want the context's deadline", err)
+	}
+	if took := time.Since(start); took > 10*time.Second {
+		t.Fatalf("the reload took %s after its context ended", took)
+	}
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("npm never started: %v", err)
+	}
+	pid, err := strconv.Atoi(string(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Signal(syscall.Signal(0)); err == nil {
+		t.Fatalf("npm (pid %d) is still running", pid)
 	}
 }

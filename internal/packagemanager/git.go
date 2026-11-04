@@ -42,7 +42,7 @@ func GitUpdateMarkerPath(checkout string) string {
 }
 
 func EnsureGitRef(checkout, packageRoot string, sm *codingagent.SettingsManager, target GitUpdateTarget, opts ...InstallOption) error {
-	if err := RunPackageProcess(checkout, "git", target.fetchArgs...); err != nil {
+	if err := RunPackageProcessContext(resolveInstallOptions(opts).ctx, checkout, "git", target.fetchArgs...); err != nil {
 		return err
 	}
 	local, err := RunPackageCapture(checkout, "git", "rev-parse", "HEAD")
@@ -64,7 +64,7 @@ func EnsureGitRef(checkout, packageRoot string, sm *codingagent.SettingsManager,
 	if err := os.WriteFile(marker, nil, 0o644); err != nil {
 		return err
 	}
-	if err := RunPackageProcess(checkout, "git", "reset", "--hard", commitRef); err != nil {
+	if err := RunPackageProcessContext(resolveInstallOptions(opts).ctx, checkout, "git", "reset", "--hard", commitRef); err != nil {
 		return err
 	}
 	return CleanAndInstallGitDependencies(checkout, packageRoot, marker, sm, opts...)
@@ -84,7 +84,7 @@ func InstallGitDependencies(packageRoot string, sm *codingagent.SettingsManager,
 		return err
 	}
 	args = append(args, installArgs...)
-	return RunPackageProcess(packageRoot, command[0], args...)
+	return RunPackageProcessContext(resolveInstallOptions(opts).ctx, packageRoot, command[0], args...)
 }
 
 func RepairMissingGitDependencies(packageRoot string, sm *codingagent.SettingsManager, opts ...InstallOption) error {
@@ -112,7 +112,7 @@ func RepairMissingGitDependencies(packageRoot string, sm *codingagent.SettingsMa
 }
 
 func CleanAndInstallGitDependencies(checkout, packageRoot, marker string, sm *codingagent.SettingsManager, opts ...InstallOption) error {
-	if err := RunPackageProcess(checkout, "git", "clean", "-fdx"); err != nil {
+	if err := RunPackageProcessContext(resolveInstallOptions(opts).ctx, checkout, "git", "clean", "-fdx"); err != nil {
 		// upstream: packages/coding-agent/src/core/package-manager.ts:cleanAndInstallGitDependencies
 		_ = RepairMissingGitDependencies(packageRoot, sm, opts...)
 		return err

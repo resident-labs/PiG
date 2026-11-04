@@ -1604,7 +1604,7 @@ func (p *anthropicProvider) buildParams(model *Model, transcript TranscriptConte
 	if userID, ok := opts.Metadata["user_id"].(string); ok {
 		req.Metadata = &anthMetadata{UserID: userID}
 	}
-	p.applySampling(&req, model, transcript, maxTokens, thinkingEnabled, ModelThinkingLevel(opts.Thinking), opts.ThinkingBudgets, opts.Temperature, opts.TemperatureSet || opts.Temperature != 0, params.activeEffort, params.effortMarkers, thinkingDisabled, anthropicThinkingDisplay(opts))
+	p.applySampling(&req, model, transcript, maxTokens, thinkingEnabled, ModelThinkingLevel(opts.Thinking), opts.ThinkingBudgets, opts.Temperature, opts.TemperatureSet || opts.Temperature != 0, params.activeEffort, params.effortMarkers, opts.ActiveEffortAtTopLevel, thinkingDisabled, anthropicThinkingDisplay(opts))
 	if opts.ThinkingEnabled != nil && model.ProviderMeta.Reasoning && params.activeEffort == "" {
 		req.Thinking, req.OutputConfig, req.MaxTokens = nil, nil, maxTokens
 		if *opts.ThinkingEnabled {
@@ -1630,19 +1630,19 @@ func (p *anthropicProvider) buildParams(model *Model, transcript TranscriptConte
 
 // applySampling sets thinking, output_config, the thinking-adjusted
 // max_tokens, and temperature.
-func (p *anthropicProvider) applySampling(req *anthRequest, model *Model, transcript TranscriptContext, maxTokens int, thinkingEnabled bool, level ModelThinkingLevel, budgets *ThinkingBudgets, temperature float64, temperatureSet bool, managedEffort AnthropicEffort, effortMarkers, thinkingDisabled bool, display AnthropicThinkingDisplay) {
+func (p *anthropicProvider) applySampling(req *anthRequest, model *Model, transcript TranscriptContext, maxTokens int, thinkingEnabled bool, level ModelThinkingLevel, budgets *ThinkingBudgets, temperature float64, temperatureSet bool, managedEffort AnthropicEffort, effortMarkers, activeEffortAtTopLevel, thinkingDisabled bool, display AnthropicThinkingDisplay) {
 	if managedEffort != "" {
 		if thinkingDisabled {
 			// No effort is sent, so the model default applies. Anthropic rejects block_binding with disabled thinking.
 			req.Thinking = &anthThinking{Type: "disabled"}
 		} else {
 			req.Thinking = &anthThinking{Type: "adaptive", Display: string(display)}
-			// pig divergence (D130): block_binding goes only with its beta, and without the mid-conversation markers the active effort is the top-level effort.
+			// pig divergence (D130): block_binding goes only with its beta, and without the mid-conversation markers, or with ActiveEffortAtTopLevel (dyna patch P8), the active effort is the top-level effort.
 			if slices.Contains(req.Betas, thinkingBindingControlsBeta) {
 				req.Thinking.BlockBinding = &anthBlockBinding{PrefixMismatchBehavior: "drop_block"}
 			}
 			req.OutputConfig = &anthOutputConfig{Effort: "high"}
-			if !effortMarkers {
+			if !effortMarkers || activeEffortAtTopLevel {
 				req.OutputConfig.Effort = managedEffort
 			}
 		}

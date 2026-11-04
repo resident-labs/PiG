@@ -75,6 +75,7 @@ func cacheWarmingStreamFn(session func() *Session) agent.StreamFn {
 
 // buildRequestOptions mirrors sdk.ts:310-338. Request presence wins over settings, including explicit zero, and the Session header hook runs after provider/header assembly.
 func (s *Session) buildRequestOptions(model *ai.Model, options ai.StreamOptions) (ai.StreamOptions, error) {
+	options.ActiveEffortAtTopLevel = s.activeEffortAtTopLevel
 	settings := s.SettingsManager()
 	retry := settings.GetProviderRetrySettings()
 	if options.TimeoutMs == nil {

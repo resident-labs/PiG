@@ -37,6 +37,8 @@ type CreateAgentSessionFromServicesOptions struct {
 	SessionStartEvent *extension.SessionStartEvent
 	// ContextUpdates is SessionOptions.ContextUpdates (dyna patch P5).
 	ContextUpdates bool
+	// ActiveEffortAtTopLevel is SessionOptions.ActiveEffortAtTopLevel (dyna patch P8).
+	ActiveEffortAtTopLevel bool
 }
 
 // CreateAgentSessionResult mirrors sdk.ts CreateAgentSessionResult.
@@ -137,6 +139,7 @@ func createAgentSessionOver(options CreateAgentSessionFromServicesOptions, resou
 		ExcludedTools:          selection.excluded,
 		ResourceLoader:         resourceLoader,
 		ContextUpdates:         options.ContextUpdates,
+		ActiveEffortAtTopLevel: options.ActiveEffortAtTopLevel,
 	})
 	if err != nil {
 		return CreateAgentSessionResult{}, err

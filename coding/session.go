@@ -953,7 +953,7 @@ func (s *Session) SendContent(ctx context.Context, content []ai.UserContentBlock
 // runs once the messages held meanwhile are appended, before the first request. The run owns cancellation and completes through
 // agent_settled.
 func (s *Session) SendContentWithPreflight(ctx context.Context, content []ai.UserContentBlock, preflight func()) ([]agent.AgentMessage, error) {
-	run, err := s.prepareContentRun(ctx, content, preflight)
+	run, err := s.prepareContentRun(ctx, content, nil, preflight)
 	if err != nil {
 		return nil, err
 	}
@@ -962,7 +962,7 @@ func (s *Session) SendContentWithPreflight(ctx context.Context, content []ai.Use
 
 // prepareContentRun is _startRun up to agent.prompt for a user prompt: it marks the Session busy, runs _prepareRun (the compaction check,
 // before_agent_start and image normalization), appends the messages held meanwhile, calls preflight and claims the Agent.
-func (s *Session) prepareContentRun(ctx context.Context, content []ai.UserContentBlock, preflight func()) (*PreparedPromptRun, error) {
+func (s *Session) prepareContentRun(ctx context.Context, content []ai.UserContentBlock, members map[string]json.RawMessage, preflight func()) (*PreparedPromptRun, error) {
 	if s.IsStreaming() {
 		return nil, errAgentAlreadyProcessing
 	}
@@ -984,6 +984,7 @@ func (s *Session) prepareContentRun(ctx context.Context, content []ai.UserConten
 	if err != nil {
 		return fail(err)
 	}
+	prepared.members = members
 	prepared.NormalizeImages()
 	if _, err := start.FlushHeldMessages(); err != nil {
 		return fail(err)
@@ -1844,28 +1845,35 @@ func (s *Session) AbortRetry() {
 
 // QueueSteer admits already-processed input before the next model call. Modes that own input dispatch use this boundary to avoid running handlers twice.
 func (s *Session) QueueSteer(text string, images []ai.ImageContent) {
+	_ = s.queueInput(text, images, nil, extension.DeliverAsSteer)
+}
+
+// queueInput admits already-processed input to the steering or follow-up queue, as a user message that carries members
+// (dyna patch P1, PATCHES.md). It fails only on members agent.NewUserMessage refuses, before anything is queued.
+func (s *Session) queueInput(text string, images []ai.ImageContent, members map[string]json.RawMessage, behavior extension.DeliverAs) error {
+	message, err := agent.NewUserMessage(BuildUserContent(text, images), time.Now().UnixMilli(), members)
+	if err != nil {
+		return err
+	}
 	s.queueMu.Lock()
-	s.queuedSteering = append(s.queuedSteering, text)
+	if behavior == extension.DeliverAsSteer {
+		s.queuedSteering = append(s.queuedSteering, text)
+	} else {
+		s.queuedFollowUp = append(s.queuedFollowUp, text)
+	}
 	s.queueMu.Unlock()
 	s.emitQueueUpdate()
-	s.agent.Steer(agent.AgentMessage{User: &agent.UserMessage{
-		Role:      agent.RoleUser,
-		Content:   BuildUserContent(text, images),
-		Timestamp: time.Now().UnixMilli(),
-	}})
+	if behavior == extension.DeliverAsSteer {
+		s.agent.Steer(message)
+	} else {
+		s.agent.FollowUp(message)
+	}
+	return nil
 }
 
 // QueueFollowUp admits already-processed input after the active turn. Modes that own input dispatch use this boundary to avoid running handlers twice.
 func (s *Session) QueueFollowUp(text string, images []ai.ImageContent) {
-	s.queueMu.Lock()
-	s.queuedFollowUp = append(s.queuedFollowUp, text)
-	s.queueMu.Unlock()
-	s.emitQueueUpdate()
-	s.agent.FollowUp(agent.AgentMessage{User: &agent.UserMessage{
-		Role:      agent.RoleUser,
-		Content:   BuildUserContent(text, images),
-		Timestamp: time.Now().UnixMilli(),
-	}})
+	_ = s.queueInput(text, images, nil, extension.DeliverAsFollowUp)
 }
 
 // GetSteeringMessages returns queued steering text in admission order.

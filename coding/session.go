@@ -3423,10 +3423,19 @@ func (s *Session) autoCompactAndDecide(ctx context.Context, reason string, willR
 // before awaiting session_compact_failed handlers, then returns false. The caller serializes with the
 // agent loop.
 func (s *Session) runAutoCompaction(ctx context.Context, reason string, willRetry bool) (bool, error) {
+	return s.runAutoCompactionFor(ctx, reason, willRetry, nil)
+}
+
+// runAutoCompactionFor is runAutoCompaction on the model and settings of a model transfer, which also learns how the
+// compaction ended, when transfer is set (dyna patch P4, PATCHES.md).
+func (s *Session) runAutoCompactionFor(ctx context.Context, reason string, willRetry bool, transfer *transferCompaction) (bool, error) {
 	model := s.Model()
 	settings, err := s.compactionSettings()
 	if err != nil {
 		return false, err
+	}
+	if transfer != nil {
+		model, settings = transfer.model, transfer.settings
 	}
 	if !s.beginCompaction() {
 		return false, nil
@@ -3459,6 +3468,9 @@ func (s *Session) runAutoCompaction(ctx context.Context, reason string, willRetr
 
 	s.emitCompactionEvent(agent.CompactionStartEvent{Reason: reason})
 	if compactCtx.Err() != nil {
+		if transfer != nil {
+			transfer.aborted = true
+		}
 		s.emitOrderedEventSync(agent.CompactionEndEvent{Reason: reason, Aborted: true})
 		s.emitSessionCompactFailed(ctx, extension.SessionCompactFailedEvent{Reason: reason, Aborted: true})
 		return false, nil
@@ -3492,9 +3504,15 @@ func (s *Session) runAutoCompaction(ctx context.Context, reason string, willRetr
 				errorMessage = "Context overflow recovery failed: " + err.Error()
 			}
 		}
+		if transfer != nil {
+			transfer.aborted, transfer.err = aborted, err
+		}
 		s.emitOrderedEventSync(agent.CompactionEndEvent{Reason: reason, Aborted: aborted, ErrorMessage: errorMessage})
 		s.emitSessionCompactFailed(ctx, extension.SessionCompactFailedEvent{Reason: reason, ErrorMessage: errorMessage, Aborted: aborted, FromExtension: fromExtension})
 		return false, nil
+	}
+	if transfer != nil {
+		transfer.compacted = true
 	}
 
 	s.refreshContext()

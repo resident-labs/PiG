@@ -452,7 +452,18 @@ func (s *Session) compactionSettings() (compaction.CompactionSettings, error) {
 		Enabled:          cfg.Enabled,
 		ReserveTokens:    cfg.ReserveTokens,
 		KeepRecentTokens: cfg.KeepRecentTokens,
+		TriggerTokens:    int(s.compactionTrigger.Load()),
 	}, nil
+}
+
+// SetCompactionTriggerTokens starts automatic compaction once the context passes tokens, when that comes before the
+// reserve's threshold; zero keeps the reserve's threshold alone. It holds for this Session only and is not saved, as a
+// command-line setting for one process is not.
+//
+// dyna patch P3 (PATCHES.md): Pi compacts only near the end of the context window. A host that runs several profiles on
+// one model needs each conversation compacted at its own size, without writing shared settings.
+func (s *Session) SetCompactionTriggerTokens(tokens int) {
+	s.compactionTrigger.Store(int64(tokens))
 }
 
 func estimateMessagesTokens(messages []agent.AgentMessage) int {

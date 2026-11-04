@@ -210,6 +210,8 @@ type Session struct {
 	// Override in tests to inject a fake.
 	completer compaction.SimpleCompleter
 	streamFn  compaction.StreamFn
+	// compactionTrigger is SetCompactionTriggerTokens' value (dyna patch P3, PATCHES.md).
+	compactionTrigger atomic.Int64
 
 	// agentStartMu guards agentStartMessages: the custom messages the last
 	// before_agent_start dispatch returned, waiting for the prompt they join.

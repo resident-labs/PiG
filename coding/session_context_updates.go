@@ -272,25 +272,36 @@ func (s *Session) withDeferredTools(sections ai.OrderedSections) (ai.OrderedSect
 }
 
 // compactionHead is the sections a compaction's head holds: the current ones and the deferred tools as they are now.
-// Nil without ContextUpdates keeps the conversation's current system message.
-func (s *Session) compactionHead() (ai.OrderedSections, error) {
+// Its tools are the schemas of the session's executable tools (dyna patch P11), so the conversation after it declares what it can run
+// and a tool a hook unloaded is neither declared again nor removed afterwards. Both are nil without ContextUpdates, which keeps the
+// conversation's current system message.
+func (s *Session) compactionHead() (ai.OrderedSections, []ai.ToolSchema, error) {
 	if !s.contextUpdates {
-		return nil, nil
+		return nil, nil, nil
 	}
 	s.toolRegistryMu.RLock()
 	defer s.toolRegistryMu.RUnlock()
 	sections, err := s.effectiveSystemSections()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return s.withDeferredTools(sections)
+	sections, err = s.withDeferredTools(sections)
+	if err != nil {
+		return nil, nil, err
+	}
+	executable := s.agent.Tools()
+	tools := make([]ai.ToolSchema, len(executable))
+	for i, tool := range executable {
+		tools[i] = tool.Schema()
+	}
+	return sections, tools, nil
 }
 
 // appendCompaction records a compaction in manager with the head compactionHead gives.
 func (s *Session) appendCompaction(manager *icodingagent.Session, summary, firstKeptEntryID string, tokensBefore int, details any, fromHook bool, usage *ai.Usage) (string, error) {
-	head, err := s.compactionHead()
+	head, tools, err := s.compactionHead()
 	if err != nil {
 		return "", err
 	}
-	return manager.AppendCompactionWithSections(summary, firstKeptEntryID, tokensBefore, details, fromHook, usage, head)
+	return manager.AppendCompactionWithSections(summary, firstKeptEntryID, tokensBefore, details, fromHook, usage, head, tools)
 }

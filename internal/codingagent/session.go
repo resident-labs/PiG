@@ -995,27 +995,28 @@ func (s *Session) AppendUsage(kind, provider, model string, usage ai.Usage, note
 // compaction retains no preceding entries. The entry also records the current
 // projected system state, when there is one, stamped with the entry time.
 func (s *Session) AppendCompaction(summary, firstKeptEntryID string, tokensBefore int, details any, fromHook bool, usage *ai.Usage) (string, error) {
-	return s.appendCompaction(summary, firstKeptEntryID, tokensBefore, details, fromHook, false, usage, nil)
+	return s.appendCompaction(summary, firstKeptEntryID, tokensBefore, details, fromHook, false, usage, nil, nil)
 }
 
 // AppendCompactionWithSections is AppendCompaction whose system message holds sections in place of the current system
-// message's, which the conversation after it starts from. Nil keeps the current ones.
+// message's, which the conversation after it starts from. Nil keeps the current ones. A non-nil tools, even an empty one, is
+// the tool declarations of the head in place of the transcript's; nil keeps the transcript's.
 //
-// dyna patch P7 (PATCHES.md): a session with context updates folds its current sections into each compaction's head.
-func (s *Session) AppendCompactionWithSections(summary, firstKeptEntryID string, tokensBefore int, details any, fromHook bool, usage *ai.Usage, sections ai.OrderedSections) (string, error) {
-	return s.appendCompaction(summary, firstKeptEntryID, tokensBefore, details, fromHook, false, usage, sections)
+// dyna patch P7, P11 (PATCHES.md): a session with context updates folds its current sections and its executable tools into each compaction's head.
+func (s *Session) AppendCompactionWithSections(summary, firstKeptEntryID string, tokensBefore int, details any, fromHook bool, usage *ai.Usage, sections ai.OrderedSections, tools []ai.ToolSchema) (string, error) {
+	return s.appendCompaction(summary, firstKeptEntryID, tokensBefore, details, fromHook, false, usage, sections, tools)
 }
 
 // AppendCompactionHookUndefined is AppendCompaction for a caller that leaves fromHook undefined, as an extension's SessionManager.appendCompaction may: the entry then has no fromHook member.
 func (s *Session) AppendCompactionHookUndefined(summary, firstKeptEntryID string, tokensBefore int, details any, usage *ai.Usage) (string, error) {
-	return s.appendCompaction(summary, firstKeptEntryID, tokensBefore, details, false, true, usage, nil)
+	return s.appendCompaction(summary, firstKeptEntryID, tokensBefore, details, false, true, usage, nil, nil)
 }
 
-func (s *Session) appendCompaction(summary, firstKeptEntryID string, tokensBefore int, details any, fromHook, fromHookUndefined bool, usage *ai.Usage, sections ai.OrderedSections) (string, error) {
+func (s *Session) appendCompaction(summary, firstKeptEntryID string, tokensBefore int, details any, fromHook, fromHookUndefined bool, usage *ai.Usage, sections ai.OrderedSections, tools []ai.ToolSchema) (string, error) {
 	now := time.Now().UTC()
 	// compactionSystemMessage only reads the context's latest system message, so it reads the kept projection rather than a copy of the
 	// whole context projected again.
-	systemMessage, err := compactionSystemMessage(s.BuildSessionProjectionView().Messages, now.UnixMilli(), sections)
+	systemMessage, err := compactionSystemMessage(s.BuildSessionProjectionView().Messages, now.UnixMilli(), sections, tools)
 	if err != nil {
 		return "", err
 	}

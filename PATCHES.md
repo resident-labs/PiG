@@ -195,3 +195,19 @@ Why: Pi loads `--extension` paths before Packages, so a host's own extension, wh
 Locked by: `TestDefaultResourceLoaderInlineExtensionsFirst` (coding): the order of the extension paths with and without the option.
 
 Upstream: not offered (owner's decision pending).
+
+## P11 A compaction head declares the executable tools; tool_search has a default limit
+
+What: two parts.
+(1) With `SessionOptions.ContextUpdates`, a compaction's head (`Session.appendCompaction` and the compaction draft of a session boundary, both through `Session.compactionHead`) declares the session's executable tools: its `toolsAdded` holds the schemas of `agent.state.tools`, not the tools the transcript declares. `AppendCompactionWithSections` takes the tools as a last argument; nil keeps the transcript's. Without `ContextUpdates` nothing changes.
+(2) `toolsearch.Options.DefaultLimit` is the number of tools a `tool_search` call without a `limit` loads, and the number the model-visible schema states (`Defaults to N.`). Zero keeps `toolsearch.DefaultLimit` (8), so PiG's behaviour is unchanged without it. An explicit `limit` argument wins. `searchTools()` in codemode scripts only ranks, loads nothing, and keeps `toolsearch.DefaultLimit`.
+
+Why: (1) a host's compaction hook (`session_before_compact` calling `ctx.SetActiveTools`) can unload a tool. The head named the transcript's tools, so the unloaded tool was declared again and then removed by a `toolsRemoved` note, and the saving arrived one compaction late. (2) Dyna wants a search to load 3 tools, and the schema text must not tell the model 8.
+
+Files: `coding/session_context_updates.go`, `coding/session_boundaries.go`, `internal/codingagent/session.go`, `internal/codingagent/session_manager_projection.go`, `coding/extension/builtin/toolsearch/tool.go`.
+
+Drop it: if upstream declares the executable tools in a compaction head, remove the `tools` argument and the `compactionHead` tools; if it makes the default limit configurable, use its option and delete `Options.DefaultLimit`.
+
+Locked by: `TestACompactionHeadDeclaresTheToolsAHookLeftActive`, `TestACompactionHeadWithoutAHookDeclaresEveryTool`, `TestABoundaryCompactionHeadDeclaresTheExecutableTools` (coding), `TestToolSearchDefaultLimitStaysEightWithoutTheOption`, `TestToolSearchDefaultLimitOptionSetsTheLimitAndTheSchemaText`, `TestToolSearchExplicitLimitWinsOverTheDefaultLimitOption` (toolsearch), `TestSearchToolsKeepsTheDefaultLimitOfEight` (codemode).
+
+Upstream: not offered (owner's decision, 2026-11-04).

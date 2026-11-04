@@ -109,7 +109,7 @@ func boundaryConversation(t *testing.T) *icodingagent.Session {
 	must(inner.AppendLabelChange(toolResult, new("checkpoint")))
 	must(inner.AppendContextEdit(note, &icodingagent.ContextEditReplacement{Content: json.RawMessage(`"edited note"`)}))
 	must(inner.AppendMessage(agent.AgentMessage{Assistant: &agent.AssistantMessage{Role: "assistant", Content: []ai.AssistantContentBlock{ai.TextContent{Text: "done"}}, StopReason: ai.StopReasonStop, Usage: usage, Provider: "faux", ModelID: "faux-1", Timestamp: 4}}))
-	if _, err := applyBoundaryDrafts(inner, []extension.SessionBoundaryDraft{{Type: "compaction", Summary: "summary of the start", FirstKeptEntryID: &toolResult}}, nil); err != nil {
+	if _, err := applyBoundaryDrafts(inner, []extension.SessionBoundaryDraft{{Type: "compaction", Summary: "summary of the start", FirstKeptEntryID: &toolResult}}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	must(inner.AppendMessage(agent.AgentMessage{User: &agent.UserMessage{Role: "user", Content: ai.UserContentBlocks{ai.TextContent{Text: "after compaction"}}, Timestamp: 5}}))

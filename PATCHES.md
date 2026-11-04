@@ -170,7 +170,8 @@ already sends the active effort there, so the option changes nothing for it. `Se
 Why: Dyna's Pi fork has sent the active effort at the top level since its "v2 effort fix" (`third_party/pi/DYNA.md`,
 pack level 11), so a session keeps the effort its profile chose on turns that carry markers, not "high". Upstream keeps `"high"` (Pi e3bc05e87).
 
-Locked by: `TestActiveEffortAtTopLevelReplacesTheHighDefault` (ai), `TestActiveEffortAtTopLevelReachesEveryRequest`
+Locked by: `TestActiveEffortAtTopLevelReplacesTheHighDefault` (ai), `TestActiveEffortAtTopLevelReachesEveryRequest`,
+`TestCreateAgentSessionFromServicesPassesActiveEffortAtTopLevel`
 (coding).
 
 Upstream: not offered (owner's decision pending).

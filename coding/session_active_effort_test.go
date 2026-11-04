@@ -49,3 +49,21 @@ func TestActiveEffortAtTopLevelReachesEveryRequest(t *testing.T) {
 		}
 	}
 }
+
+// dyna patch P8: CreateAgentSessionFromServicesOptions.ActiveEffortAtTopLevel reaches the Session it creates.
+func TestCreateAgentSessionFromServicesPassesActiveEffortAtTopLevel(t *testing.T) {
+	probe := &effortProbeProvider{}
+	model := &ai.Model{ID: "faux-1", DisplayName: "faux-1", Provider: newRequestOptionsProvider(probe, "opencode", nil), Capabilities: ai.ModelCapabilities{ContextWindow: 128_000}}
+	result, err := CreateAgentSessionFromServices(CreateAgentSessionFromServicesOptions{Services: newTestServicesSmallKeep(t), Model: model, ActiveEffortAtTopLevel: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer result.Session.Close()
+	drainSessionEvents(t, result.Session)
+	if _, err := result.Session.Send(context.Background(), "go"); err != nil {
+		t.Fatal(err)
+	}
+	if len(probe.seen) == 0 || !probe.seen[0] {
+		t.Fatalf("requests asked %v", probe.seen)
+	}
+}

@@ -12,6 +12,7 @@ import (
 
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
 	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
 )
 
@@ -42,11 +43,20 @@ type PromptOptions struct {
 	//
 	// upstream: agent-session.ts:302-303 (PromptOptions.preflightResult)
 	PreflightResult func(PromptDisposition)
+	// Members are recorded on the user message besides role, content and timestamp, and are not sent to the model
+	// (agent.NewUserMessage). A queued prompt keeps them.
+	//
+	// dyna patch P1 (PATCHES.md).
+	Members map[string]json.RawMessage
 }
 
 // QueueInputOptions supplies the input source for a direct queue operation.
 type QueueInputOptions struct {
 	Source extension.InputSource
+	// Members are recorded on the user message, as PromptOptions.Members are.
+	//
+	// dyna patch P1 (PATCHES.md).
+	Members map[string]json.RawMessage
 }
 
 // Steer awaits input handlers and skill/template expansion, rejects extension commands, and queues the result before the next model call.
@@ -69,8 +79,12 @@ func (s *Session) queueUserInput(ctx context.Context, text string, images []ai.I
 		}
 	}
 	source := extension.InputSourceUser
-	if options != nil && options.Source != "" {
-		source = options.Source
+	var members map[string]json.RawMessage
+	if options != nil {
+		members = options.Members
+		if options.Source != "" {
+			source = options.Source
+		}
 	}
 	text, images, handled, err := s.RunInputHandlers(ctx, text, images, source, string(behavior))
 	if err != nil {
@@ -81,10 +95,8 @@ func (s *Session) queueUserInput(ctx context.Context, text string, images []ai.I
 		return DispositionHandled, nil
 	}
 	text = s.expandPromptText(text)
-	if behavior == extension.DeliverAsSteer {
-		s.QueueSteer(text, images)
-	} else {
-		s.QueueFollowUp(text, images)
+	if err := s.queueInput(text, images, members, behavior); err != nil {
+		return "", err
 	}
 	return DispositionQueued, nil
 }
@@ -213,10 +225,10 @@ func (s *Session) preparePromptInvocation(ctx context.Context, text string, opti
 	}
 	if s.IsStreaming() {
 		switch options.StreamingBehavior {
-		case extension.DeliverAsSteer:
-			s.QueueSteer(text, images)
-		case extension.DeliverAsFollowUp:
-			s.QueueFollowUp(text, images)
+		case extension.DeliverAsSteer, extension.DeliverAsFollowUp:
+			if err := s.queueInput(text, images, options.Members, options.StreamingBehavior); err != nil {
+				return nil, err
+			}
 		default:
 			return nil, errAgentAlreadyProcessing
 		}
@@ -226,7 +238,7 @@ func (s *Session) preparePromptInvocation(ctx context.Context, text string, opti
 	if err := s.ValidatePromptModelAuth(ctx); err != nil {
 		return nil, err
 	}
-	return s.prepareContentRun(ctx, BuildUserContent(text, images), func() { notify(DispositionStarted) })
+	return s.prepareContentRun(ctx, BuildUserContent(text, images), options.Members, func() { notify(DispositionStarted) })
 }
 
 // ValidatePromptModelAuth rejects a new prompt before compaction and before_agent_start when no model is selected or its provider has no usable auth, as agent-session.ts:1673-1691 does: the published availability snapshot first, then a live auth check. Interactive mode runs the same check before it starts a turn.

@@ -9,6 +9,7 @@ import (
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
 	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
 )
 
@@ -21,6 +22,8 @@ type PreparedPrompt struct {
 	systemPrompt *string
 	// nextTurn holds the pending nextTurn messages the preparation took for the run. A nextTurn message queued after that waits for the next run.
 	nextTurn []agent.AgentMessage
+	// members are recorded on the user message (dyna patch P1, PATCHES.md).
+	members map[string]json.RawMessage
 	// run is the run's resolved before_agent_start result. Its options build the run's prompt (agent-session.ts:1747-1748); SelectedTools is an explicit loadout edit, and nil keeps the live active tools.
 	run icodingagent.BeforeAgentStartRun
 }
@@ -100,9 +103,12 @@ func (p *PreparedPrompt) takeNextTurn() {
 }
 
 // startingMessages is the starting batch of a user prompt's run: the user message, then the nextTurn messages the preparation took (agent-session.ts:1909-1925). The Agent's prepare-prompt hook appends the handlers' messages and the system patch.
-func (p *PreparedPrompt) startingMessages() []agent.AgentMessage {
-	user := agent.AgentMessage{User: &agent.UserMessage{Role: agent.RoleUser, Content: append(ai.UserContentBlocks(nil), p.content...), Timestamp: time.Now().UnixMilli()}}
-	return append([]agent.AgentMessage{user}, p.nextTurn...)
+func (p *PreparedPrompt) startingMessages() ([]agent.AgentMessage, error) {
+	user, err := agent.NewUserMessage(append(ai.UserContentBlocks(nil), p.content...), time.Now().UnixMilli(), p.members)
+	if err != nil {
+		return nil, err
+	}
+	return append([]agent.AgentMessage{user}, p.nextTurn...), nil
 }
 
 // PreparedPromptRun owns an admitted Session prompt across its first event and the remainder of execution.
@@ -147,11 +153,16 @@ func (s *Session) BeginPreparedPrompt(ctx context.Context, start *RunStart, p *P
 		start.Abandon()
 		return nil, context.Canceled
 	}
+	messages, err := p.startingMessages()
+	if err != nil {
+		start.Abandon()
+		return nil, err
+	}
 	// Keep claim and streaming publication atomic with the shell queue decision.
 	runCtx, cancel := context.WithCancel(ctx)
 	s.pendingBashMu.Lock()
 	s.runState.active.Store(true)
-	run, err := s.agent.BeginSendMessages(runCtx, p.startingMessages())
+	run, err := s.agent.BeginSendMessages(runCtx, messages)
 	if err != nil {
 		s.pendingBashMu.Unlock()
 		cancel()

@@ -26,8 +26,9 @@ const (
 	TransferAborted = "aborted"
 )
 
-// transferSummaryTimeout is the longest a model transfer waits for its summary before it uses a boundary instead.
-const transferSummaryTimeout = 10 * time.Minute
+// transferSummaryTimeout is the longest a model transfer waits for its summary before it uses a boundary instead. A
+// test shortens it.
+var transferSummaryTimeout = 10 * time.Minute
 
 // transferCompactAbove is the context size above which a transfer to another model compacts on the old one even when
 // the conversation fits: the new model starts with a cold prompt cache, and the old one still has its cache.
@@ -175,8 +176,8 @@ func (s *Session) appendTransferBoundary(reason string, settings compaction.Comp
 	if latest := icodingagent.GetLatestCompactionEntry(branch); latest != nil && len(latest.Summary)/4 <= settings.KeepRecentTokens {
 		previous = latest.Summary
 	}
-	if len(reason) > 300 {
-		reason = reason[:300]
+	if runes := []rune(reason); len(runes) > 300 {
+		reason = string(runes[:300])
 	}
 	summary := transferBoundary(s.inner.Path(), reason, previous) + compaction.FormatFileOperations(readFiles, modifiedFiles)
 

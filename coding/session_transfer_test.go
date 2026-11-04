@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
@@ -103,6 +104,95 @@ func TestTransferOfALargeConversationToAnotherModelCompacts(t *testing.T) {
 		recoveredUser("third"), recoveredAssistant(ai.StopReasonStop, ai.TextContent{Text: "c"}))
 	result, err := h.session.TransferModel(t.Context(), transferTarget(h, 1_000_000), ModelTransferOptions{ThinkingLevel: ai.ThinkingOff})
 	if err != nil || result.Path != TransferCompacted || result.TokensBefore <= transferCompactAbove {
+		t.Fatalf("%+v %v", result, err)
+	}
+}
+
+// contextHolds reports whether the session's context, as the next request would read it, holds text.
+func contextHolds(h *recoveryHarness, text string) bool {
+	for _, message := range h.session.Messages() {
+		raw, _ := message.MarshalJSON()
+		if strings.Contains(string(raw), text) {
+			return true
+		}
+	}
+	return false
+}
+
+// Over the trigger alone the conversation still works, so a failed summary moves it whole.
+func TestATransferOverTheTriggerOnlyKeepsTheConversation(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{settings: `{"retry":{"enabled":false}}`}, fauxError("overloaded"))
+	h.provider.wrap = true
+	longConversation(t, h)
+	result, err := h.session.TransferModel(t.Context(), h.session.Model(), ModelTransferOptions{ThinkingLevel: ai.ThinkingOff, CompactionTriggerTokens: 20_000})
+	if err != nil || result.Path != TransferUnchanged || !strings.Contains(result.Reason, "overloaded") || !contextHolds(h, "first word") {
+		t.Fatalf("%+v %v", result, err)
+	}
+}
+
+// The trigger bounds what a boundary keeps: a tail over it is left in the file.
+func TestABoundaryKeepsATailOnlyWithinTheTrigger(t *testing.T) {
+	for _, trigger := range []int{0, 4_000} {
+		h := newRecoveryHarness(t, harnessOptions{settings: `{"retry":{"enabled":false}}`}, fauxError("overloaded"))
+		h.provider.wrap = true
+		big, middle := strings.Repeat("word ", 12_000), strings.Repeat("tail ", 6_400)
+		recovered(t, h,
+			recoveredUser("first "+big), recoveredAssistant(ai.StopReasonStop, ai.TextContent{Text: "a"}),
+			recoveredUser("second "+big), recoveredAssistant(ai.StopReasonStop, ai.TextContent{Text: "b"}),
+			recoveredUser("last "+middle), recoveredAssistant(ai.StopReasonStop, ai.TextContent{Text: "c"}))
+		result, err := h.session.TransferModel(t.Context(), transferTarget(h, 32_000), ModelTransferOptions{ThinkingLevel: ai.ThinkingOff, CompactionTriggerTokens: trigger})
+		if err != nil || result.Path != TransferBoundary {
+			t.Fatalf("trigger %d: %+v %v", trigger, result, err)
+		}
+		if kept := contextHolds(h, "last tail"); kept != (trigger == 0) {
+			t.Fatalf("trigger %d: the tail kept is %v", trigger, kept)
+		}
+	}
+}
+
+// One tool result over the limit cannot be cut, so the boundary keeps no tail.
+func TestABoundaryKeepsNoTailOverTheLimit(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{settings: `{"retry":{"enabled":false}}`}, fauxError("overloaded"))
+	h.provider.wrap = true
+	recovered(t, h,
+		recoveredUser("go"), recoveredAssistant(ai.StopReasonToolUse, ai.ToolCall{ID: "call-1", Name: "bash", Arguments: ai.JsonObject{}}),
+		agent.AgentMessage{ToolResult: &agent.ToolResultMessage{Role: agent.RoleToolResult, ToolCallID: "call-1", ToolName: "bash", Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "huge " + strings.Repeat("output ", 20_000)}}, Timestamp: time.Now().UnixMilli()}},
+		recoveredAssistant(ai.StopReasonStop, ai.TextContent{Text: "c"}))
+	result, err := h.session.TransferModel(t.Context(), transferTarget(h, 32_000), ModelTransferOptions{ThinkingLevel: ai.ThinkingOff})
+	if err != nil || result.Path != TransferBoundary || contextHolds(h, "huge output") {
+		t.Fatalf("%+v %v, tail kept %v", result, err, contextHolds(h, "huge output"))
+	}
+}
+
+// A process that restarted on the target still holds the conversation of the model the branch records, so the
+// transfer counts as a change of model and summarizes on the recorded one. Here that model's endpoint does not
+// answer, so the summary fails and the conversation moves whole.
+func TestATransferSummarizesOnTheModelTheBranchRecords(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{settings: `{"retry":{"enabled":false}}`})
+	big := strings.Repeat("word ", 60_000)
+	recorded := recoveredAssistant(ai.StopReasonStop, ai.TextContent{Text: "a"})
+	recorded.Assistant.ModelID = "faux-auth"
+	recovered(t, h, recoveredUser("first "+big), recorded, recoveredUser("second "+big), recorded)
+	target := transferTarget(h, 1_000_000)
+	target.Provider = &scriptedProvider{}
+	h.session.agent.SetModel(target)
+	result, err := h.session.TransferModel(t.Context(), target, ModelTransferOptions{ThinkingLevel: ai.ThinkingOff})
+	if err != nil || result.Path != TransferSwitched || result.Reason == "" || target.Provider.(*scriptedProvider).callCount() != 0 {
+		t.Fatalf("%+v %v", result, err)
+	}
+}
+
+// A summary that takes too long gives way to the move.
+func TestATransferWhoseSummaryTimesOutMovesAnyway(t *testing.T) {
+	defer func(timeout time.Duration) { transferSummaryTimeout = timeout }(transferSummaryTimeout)
+	transferSummaryTimeout = 50 * time.Millisecond
+	h := newRecoveryHarness(t, harnessOptions{}, func(messages []ai.Message) *ai.AssistantMessage {
+		time.Sleep(200 * time.Millisecond)
+		return fauxReply("late", ai.StopReasonStop, 0)(messages)
+	})
+	longConversation(t, h)
+	result, err := h.session.TransferModel(t.Context(), transferTarget(h, 32_000), ModelTransferOptions{ThinkingLevel: ai.ThinkingOff})
+	if err != nil || result.Path != TransferBoundary || result.Reason != "the summary timed out" || h.session.Model().ID != "faux-2" {
 		t.Fatalf("%+v %v", result, err)
 	}
 }

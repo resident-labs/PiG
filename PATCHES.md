@@ -76,6 +76,8 @@ compacts on the new model with a cold cache. Dyna's Pi fork had the same as `Age
 
 Locked by: `TestTransferOfASmallConversation`, `TestTransferCompactsOnTheOldModelFirst`,
 `TestTransferLeavesABoundaryWhenNoSummaryFits`, `TestAStoppedTransferKeepsTheModel`,
-`TestTransferOfALargeConversationToAnotherModelCompacts` (coding).
+`TestTransferOfALargeConversationToAnotherModelCompacts`, `TestATransferOverTheTriggerOnlyKeepsTheConversation`,
+`TestABoundaryKeepsATailOnlyWithinTheTrigger`, `TestABoundaryKeepsNoTailOverTheLimit`,
+`TestATransferSummarizesOnTheModelTheBranchRecords`, `TestATransferWhoseSummaryTimesOutMovesAnyway` (coding).
 
 Upstream: not offered (owner's decision pending).

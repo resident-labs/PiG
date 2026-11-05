@@ -1016,7 +1016,7 @@ func (p *googleProvider) Stream(ctx context.Context, transcript TranscriptContex
 	// @google/genai does not retry, so retryGoogleRequest is the only retry layer: the transport retry is off for each attempt, and the
 	// request's retry budget (the per-request override, else retry.provider) moves to retryGoogleRequest.
 	retryOptions := providerRetryStreamOptions(requestContext, opts)
-	attemptContext := WithProviderMaxRetries(requestContext, 0)
+	attemptContext := withStreamStall(WithProviderMaxRetries(requestContext, 0), opts)
 	resp, err := RetryGoogleRequest(requestContext, func() (*http.Response, error) { //nolint:bodyclose // the attempt returns the open response and the SSE goroutine below closes its body
 		httpReq, err := newFetchRequest(attemptContext, http.MethodPost, endpoint, body.reader(), false)
 		if err != nil {
@@ -1062,12 +1062,19 @@ func (p *googleProvider) Stream(ctx context.Context, transcript TranscriptContex
 		if ctx.Err() != nil && errors.Is(err, errProviderRequestAborted) {
 			return nil, &nodeTransportError{message: "Request aborted", cause: ctx.Err()}
 		}
-		return nil, err
+		// pig divergence (D131): a pre-header watchdog expiry is an error response so the existing assistant retry policy and typed diagnostics see it.
+		if _, stalled := errors.AsType[*sseIdleError](err); !stalled {
+			return nil, err
+		}
 	}
 
 	builder := newObservedProviderBuilder(ctx, p.cfg.api, p.cfg.ProviderID, p.cfg.Model)
 	builder.modelCost = opts.ModelCost
 	builder.setProviderEventObserver(opts, providerEventModel(p.cfg.ModelMetadata, p.cfg.api, p.cfg.ProviderID, p.cfg.Model))
+	if err != nil {
+		builder.fail(StopReasonError, err)
+		return builder.stream, nil
+	}
 	builder.abort = abort
 	_, builder.managed = resp.Body.(*observedResponseBody)
 	streaming = true

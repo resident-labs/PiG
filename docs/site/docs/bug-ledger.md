@@ -16912,7 +16912,7 @@ Each divergence record is accounted for here. A divergence that fixes a Pi defec
 | D128 | OpenRouter image models that need the Images API are retried through `/images` (pi-mono #10652) | [BF-b730205](#bf-b730205) |
 | D129 | A Responses function call streamed with an empty call_id no longer wedges the session (pi-mono #10299) | [BF-0dff068](#bf-0dff068) |
 | D130 | A managed-effort Anthropic request sends each managed field only with its beta (Pi #10759) | [BF-5e3e346](#bf-5e3e346) |
-| D131 | A stalled SSE stream that still sends keepalives ends after the HTTP idle timeout (pi-mono #10761, #10762) | [BF-3651a90](#bf-3651a90) |
+| D131 | A stalled SSE stream that still sends keepalives ends after the semantic idle timeout (pi-mono #10761, #10762) | [BF-3651a90](#bf-3651a90) |
 | D132 | Session directories are created with mode 0700 (pi-mono #10770) | [BF-25c854d](#bf-25c854d) |
 | D134 | One SSE line is bounded at Node's maximum string length | deliberate difference |
 | D135 | clearQueue keeps queued extension custom messages (Pi #9886) | [BF-f98d129](#bf-f98d129) |
@@ -16949,6 +16949,7 @@ Each divergence record is accounted for here. A divergence that fixes a Pi defec
 | D187 | A native SDK holds a batch's first host calls and responses in call and answer order, where Pi's single… | deliberate difference |
 | D188 | Opening a store at an older Durable schema version keeps a copy of it first, where Pi upgrades it in place | deliberate difference |
 | D190 | The built-in file mutation queue also orders mutations of one existing file reached through a hard link or a… | [BF-648ff3e-13](#bf-648ff3e-13) |
+| D192 | OpenAI and Codex Responses requests ask for reasoning.summary "detailed" by default | deliberate difference |
 
 ## Fix-titled commits that are not bugs in a release
 

@@ -2,7 +2,7 @@ package ai
 
 import "testing"
 
-// D191: OpenAI and Codex Responses requests with a reasoning effort ask for reasoning.summary "detailed" unless ReasoningSummary says otherwise.
+// D192: OpenAI and Codex Responses requests with a reasoning effort ask for reasoning.summary "detailed" unless ReasoningSummary says otherwise.
 func TestResponsesRequestAsksForADetailedReasoningSummaryByDefault(t *testing.T) {
 	responses := func(providerID string, metadata *Model) Provider {
 		return NewOpenAIResponsesProvider(OpenAIResponsesConfig{APIKey: "k", Model: "m", ProviderID: providerID, BaseURL: "https://example.invalid/v1", ModelMetadata: metadata})

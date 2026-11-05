@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -16,38 +18,57 @@ import (
 // pig divergence (D131): Pi has no event-level timeout.
 const defaultStreamStall = 180 * time.Second
 
-// streamStall is the stall bound of one request: StreamOptions.StallTimeoutMs when set (zero or less disables it), else the shorter of defaultStreamStall and a configured httpIdleTimeoutMs.
+// streamStall is the request-start stall budget, independent of the legacy post-header semantic idle timeout. Zero or less disables only this budget.
 func streamStall(options StreamOptions) time.Duration {
-	if options.StallTimeoutMs != nil {
-		return time.Duration(max(*options.StallTimeoutMs, 0)) * time.Millisecond
+	if options.StallTimeoutMs == nil {
+		return defaultStreamStall
 	}
-	if idle := configuredHTTPIdleTimeout(); idle > 0 {
-		return min(idle, defaultStreamStall)
-	}
-	return defaultStreamStall
+	return time.Duration(min(max(int64(*options.StallTimeoutMs), 0), math.MaxInt64/int64(time.Millisecond))) * time.Millisecond
 }
 
-// sseIdleTransport aborts a model call that shows no semantic progress for the stream stall bound: the timer starts with the request, so connect and time to first byte count, and a text/event-stream body restarts it on each event. The byte-level idle
-// deadline (idleTimeoutConn) never fires while a gateway keeps sending comment lines or pings, so a stalled generation hung forever.
+type streamStallOptionsKey struct{}
+
+// withStreamStall marks a model streaming request at the StreamOptions boundary. Non-stream requests using the same clients keep their original context and timeout behavior.
+// dyna patch P13; pig divergence (D131): Pi has no request-start semantic stall budget.
+func withStreamStall(ctx context.Context, options StreamOptions) context.Context {
+	return context.WithValue(ctx, streamStallOptionsKey{}, streamStall(options))
+}
+
+type sseIdleTimer struct {
+	timer   *time.Timer
+	timeout time.Duration
+}
+
+// sseIdleTransport owns the request-start and legacy post-header semantic SSE budgets for typed model streams. Both reset on semantic progress; non-stream requests keep their original context and timeout behavior.
 // pig divergence (D131): Pi measures idleness on bytes only (pi-mono #10761, #10762); reasoning events keep keepalives counting.
 type sseIdleTransport struct{ base http.RoundTripper }
 
 func (t *sseIdleTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	options, _ := request.Context().Value(providerRequestOptionsKey{}).(StreamOptions)
-	timeout := streamStall(options)
-	if timeout <= 0 {
+	timeout, streaming := request.Context().Value(streamStallOptionsKey{}).(time.Duration)
+	if !streaming {
 		return t.base.RoundTrip(request)
 	}
 	ctx, cancel := context.WithCancelCause(request.Context())
-	timer := time.AfterFunc(timeout, func() { cancel(&sseIdleError{timeout: timeout}) })
+	var timers []sseIdleTimer
+	if timeout > 0 {
+		timers = append(timers, sseIdleTimer{timer: time.AfterFunc(timeout, func() { cancel(&sseIdleError{timeout: timeout}) }), timeout: timeout})
+	}
 	response, err := t.base.RoundTrip(request.WithContext(ctx))
 	if err != nil {
-		timer.Stop()
+		for _, idle := range timers {
+			idle.timer.Stop()
+		}
+		cause := context.Cause(ctx)
 		cancel(nil)
+		if stall, stalled := errors.AsType[*sseIdleError](cause); stalled {
+			return response, stall
+		}
 		return response, err
 	}
 	if mediaType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type")); response.Body == nil || mediaType != "text/event-stream" {
-		timer.Stop()
+		for _, idle := range timers {
+			idle.timer.Stop()
+		}
 		if response.Body == nil {
 			cancel(nil)
 			return response, nil
@@ -55,7 +76,23 @@ func (t *sseIdleTransport) RoundTrip(request *http.Request) (*http.Response, err
 		response.Body = &providerResponseBody{ReadCloser: response.Body, cancel: cancel}
 		return response, nil
 	}
-	response.Body = &sseIdleBody{ReadCloser: response.Body, ctx: ctx, cancel: cancel, timer: timer, timeout: timeout}
+	// The legacy D131 semantic idle budget begins at SSE headers, never during CONNECT or TLS. Headers do not reset the independent request-start budget.
+	if legacy := configuredHTTPIdleTimeout(); legacy > 0 {
+		timers = append(timers, sseIdleTimer{timer: time.AfterFunc(legacy, func() { cancel(&sseIdleError{timeout: legacy}) }), timeout: legacy})
+	}
+	body := &sseIdleBody{ReadCloser: response.Body, ctx: ctx, cancel: cancel, timers: timers}
+	abortDone := make(chan struct{})
+	stopAbort := context.AfterFunc(ctx, func() {
+		_ = body.closeBody()
+		close(abortDone)
+	})
+	body.stopAbort = func() {
+		if stopAbort() {
+			close(abortDone)
+		}
+		<-abortDone
+	}
+	response.Body = body
 	return response, nil
 }
 
@@ -67,14 +104,18 @@ func (t *sseIdleTransport) CloseIdleConnections() {
 
 // sseIdleBody restarts its timer whenever a data line of an event other than ping arrives. Comment lines and ping events are keepalives, except while the
 // stream is reasoning: a model that thinks silently behind a gateway's keepalives has not stalled, so after a reasoning or thinking event the keepalives
-// count as progress until an event that is not about reasoning arrives (owner sign-off 2026-10-10).
+// count as progress until an event that is not about reasoning arrives.
 type sseIdleBody struct {
 	io.ReadCloser
 	// ctx is the request context the stall timer cancels with an *sseIdleError cause; a read that fails because of it reports that error.
-	ctx     context.Context
-	cancel  context.CancelCauseFunc
-	timeout time.Duration
-	timer   *time.Timer
+	ctx       context.Context
+	cancel    context.CancelCauseFunc
+	timers    []sseIdleTimer
+	mu        sync.Mutex
+	stopped   bool
+	stopAbort func()
+	closeOnce sync.Once
+	closeErr  error
 
 	line []byte
 	ping bool
@@ -111,23 +152,47 @@ func (e *sseIdleError) Error() string {
 func (b *sseIdleBody) Read(buffer []byte) (int, error) {
 	count, err := b.ReadCloser.Read(buffer)
 	if err != nil {
-		b.timer.Stop()
+		b.stopTimers()
+		b.stopAbort()
 		if stall, stalled := errors.AsType[*sseIdleError](context.Cause(b.ctx)); stalled {
 			return count, stall
 		}
 		return count, err
 	}
 	if count > 0 && b.scan(buffer[:count]) {
-		b.timer.Reset(b.timeout)
+		b.mu.Lock()
+		if !b.stopped {
+			for _, idle := range b.timers {
+				idle.timer.Reset(idle.timeout)
+			}
+		}
+		b.mu.Unlock()
 	}
 	return count, err
 }
 
 func (b *sseIdleBody) Close() error {
-	b.timer.Stop()
-	err := b.ReadCloser.Close()
+	b.stopTimers()
+	b.stopAbort()
+	err := b.closeBody()
 	b.cancel(nil)
 	return err
+}
+
+// stopTimers serializes terminal cleanup with a buffered Read's progress reset, so a Read that finishes after Close cannot rearm a timer.
+func (b *sseIdleBody) stopTimers() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.stopped = true
+	for _, idle := range b.timers {
+		idle.timer.Stop()
+	}
+}
+
+// closeBody releases a custom Fetch body even when it does not observe request cancellation. The cancellation callback and Close share ownership and close it once.
+func (b *sseIdleBody) closeBody() error {
+	b.closeOnce.Do(func() { b.closeErr = b.ReadCloser.Close() })
+	return b.closeErr
 }
 
 // scan feeds bytes through a line tracker and reports whether a data line of a non-ping event completed. Line ends are found with a byte search, and a line that starts and ends in data is sniffed in place; only the part of a line that continues into the next read is kept.

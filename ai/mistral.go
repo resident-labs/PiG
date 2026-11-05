@@ -433,7 +433,7 @@ func (p *mistralProvider) Stream(ctx context.Context, transcript TranscriptConte
 		timeoutMs = *opts.TimeoutMs
 	}
 	// 42a3497d: the timeout covers only the wait for response headers; body stalls are left to the transport's idle timeout.
-	requestCtx, cancelRequest := context.WithCancelCause(ctx)
+	requestCtx, cancelRequest := context.WithCancelCause(withStreamStall(ctx, opts))
 	cancel := func() { cancelRequest(nil) }
 	headersTimedOut := fmt.Errorf("Mistral response headers timed out after %dms", timeoutMs)
 	headerTimer := time.AfterFunc(time.Duration(timeoutMs)*time.Millisecond, func() { cancelRequest(headersTimedOut) })
@@ -825,6 +825,8 @@ func (consumer *mistralChunkConsumer) terminalError() error {
 
 // fail is the catch block of upstream stream() (mistral-conversations.ts:169-179). It reports the error without ending open blocks: the message keeps whatever content had streamed.
 func (p *mistralProvider) fail(builder *assistantStreamBuilder, err error) {
+	// pig divergence (D180): transport failures retain their typed Go cause in diagnostics.
+	builder.recordTransportFailure(err)
 	partial := builder.partial
 	for index, block := range partial.Content {
 		if call, ok := block.(ToolCall); ok {

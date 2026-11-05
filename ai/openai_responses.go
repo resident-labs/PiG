@@ -577,7 +577,7 @@ func (p *openAIResponsesProvider) resolvedModel() *Model {
 }
 
 // defaultReasoningSummary is the reasoning.summary sent with a reasoning effort when StreamOptions.ReasoningSummary is empty; a request without a reasoning effort sends none. OpenAI and Codex models take "detailed"; other Responses providers keep Pi's "auto".
-// pig divergence (D191): Pi sends "auto", which returns bold headers only on sol; "detailed" returns the summary text.
+// dyna patch P13; pig divergence (D192): Pi sends "auto", which returns bold headers only on sol; "detailed" returns the summary text.
 func (p *openAIResponsesProvider) defaultReasoningSummary() string {
 	switch p.cfg.ProviderID {
 	case "openai", string(KnownProviderOpenaiCodex):

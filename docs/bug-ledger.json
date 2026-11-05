@@ -35764,7 +35764,7 @@
     },
     {
       "id": "D131",
-      "title": "A stalled SSE stream that still sends keepalives ends after the HTTP idle timeout (pi-mono #10761, #10762)",
+      "title": "A stalled SSE stream that still sends keepalives ends after the semantic idle timeout (pi-mono #10761, #10762)",
       "entry": "BF-3651a90"
     },
     {
@@ -35927,6 +35927,10 @@
       "id": "D190",
       "title": "The built-in file mutation queue also orders mutations of one existing file reached through a hard link or a…",
       "entry": "BF-648ff3e-13"
+    },
+    {
+      "id": "D192",
+      "title": "OpenAI and Codex Responses requests ask for reasoning.summary \"detailed\" by default"
     }
   ],
   "exemptCommits": {

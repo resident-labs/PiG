@@ -25,7 +25,7 @@ func withProviderRequestOptions(ctx context.Context, options StreamOptions) cont
 	if options.MaxRetryDelayMs != nil {
 		ctx = WithProviderRequestRetry(ctx, ProviderMaxRetries(ctx), options.MaxRetryDelayMs)
 	}
-	return context.WithValue(ctx, providerRequestOptionsKey{}, options)
+	return context.WithValue(withStreamStall(ctx, options), providerRequestOptionsKey{}, options)
 }
 
 // providerRequestTransport owns the SDK timeout for one header-establishment attempt. Like OpenAI/Anthropic fetchWithTimeout, receipt of response headers stops that timer; body lifetime remains owned by the request and body reader.

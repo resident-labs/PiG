@@ -212,15 +212,6 @@ Locked by: `TestACompactionHeadDeclaresTheToolsAHookLeftActive`, `TestACompactio
 
 Upstream: not offered (owner's decision, 2026-11-04).
 
-## P13 Stall watchdog and detailed reasoning summaries
-
-What: (1) `StreamOptions.StallTimeoutMs` bounds how long a model call may go without a semantic SSE event, connect and time to first byte included; the default is 180 s (a shorter configured `httpIdleTimeoutMs` wins), zero or less disables it. The watchdog is `sseIdleTransport`, the one transport every SSE provider client and every caller-supplied `Fetch` client goes through. A stall aborts the call with a typed cause that diagnostics record as `provider_transport_failure` with error name `StreamStallError`, and the call retries through the same path as a mid-stream `unexpected EOF`. Bedrock and the Codex WebSocket keep their own transports. (2) A Responses request to `openai` or `openai-codex` with a reasoning effort sends `reasoning.summary: "detailed"` when `ReasoningSummary` is empty; other providers keep `"auto"`.
-
-Why: a sol call showed nothing for 18 minutes until the owner restarted, and sol thinking showed bold headers only.
-
-Files: `ai/sse_event_idle.go`, `ai/http_transport.go`, `ai/transport_diagnostic.go`, `ai/types.go`, `ai/openai_responses.go`, `docs/parity/divergences/D131.md`, `D191.md`.
-
-Locked by: `TestStreamStallAfterEventsAbortsAndRetriesOnce`, `TestStreamStallBeforeTheFirstByteAborts`, `TestStreamWithSteadyEventsIsNeverAborted`, `TestStreamStallTimerIsStoppedWhenTheStreamCompletes` (ai), `TestResponsesRequestAsksForADetailedReasoningSummaryByDefault` (ai).
 ## P12 A call to a deferred tool by its exact name loads the tool and runs the call
 
 What: `agent.AgentOptions.ResolveUnloadedTool` (also `Agent.SetResolveUnloadedTool`, `AgentLoopConfig.ResolveUnloadedTool`, `ToolCallHooks.ResolveUnloadedTool`) is asked by `prepareToolCall`, the one place a call's tool name is resolved, when the name is not among the run's tools. A tool it returns runs the call, through the tool's own argument validation and the hooks as any call; nil keeps `Tool <name> not found`. `coding.Session` sets it to `loadDeferredTool` (`coding/session_tools.go`): with `SessionOptions.ContextUpdates`, a name that is exactly an admitted tool of exposure deferred or codemode and not active, while `tool_search` or `codemode` is active (the conditions under which the `deferred_tools` section lists it), is activated as `SetActiveToolsByName` does for a `tool_search` load, and its tool is returned. Matching is by the registry's typed entry for the exact name: another case, a prefix or a suffix finds none. A tool a call of the same batch already activated is returned as well. Without `ContextUpdates` nothing changes.
@@ -234,5 +225,17 @@ Files: `agent/tool_execution.go`, `agent/agent.go`, `agent/agent_loop.go`, `agen
 Drop it: if upstream resolves calls to deferred tools, use its mechanism and delete the resolver.
 
 Locked by: `TestADirectCallToADeferredToolLoadsItAndRunsTheCall`, `TestADirectCallToACodemodeListedToolLoadsIt`, `TestADirectCallAfterACompactionUnloadedTheToolRunsAndKeepsItLoaded`, `TestADirectCallToAnUnknownToolStaysNotFound`, `TestOnlyTheExactNameOfADeferredToolLoads`, `TestAnAutoLoadAddsOneToolAndEvictsNothing`, `TestAnAutoLoadedToolValidatesItsArguments`, `TestADirectCallWithoutContextUpdatesStaysNotFound` (coding).
+
+Upstream: not offered (owner's decision, 2026-11-04).
+
+## P13 Stall watchdog and detailed reasoning summaries
+
+What: (1) `StreamOptions.StallTimeoutMs` bounds semantic SSE idleness from the start of a streaming model request, including connect and time to the first event. Nil selects 180000 ms; a positive value overrides that budget; zero or less disables only that budget. Legacy `httpIdleTimeoutMs` still measures bytes after connection establishment and semantic SSE idleness after headers, independently. A shorter legacy budget can end an established stream first. The one shared watchdog is `sseIdleTransport`; typed options from each owning streaming boundary activate it for OpenAI Completions/Responses, Azure, Codex SSE, Anthropic, Google/Vertex, Mistral and pi-messages, including custom Fetch. Non-stream image, classifier and OAuth requests keep their original context and timeout behavior. A stall retains typed cause `sseIdleError`, closes even a custom body that ignores cancellation, records `provider_transport_failure` with error name `StreamStallError` and code `PIG_STREAM_STALL`, and uses the existing transport-failure retry policy. D131's progress rule remains: non-ping data resets the timers; comments and pings reset them only after a reasoning event, until a non-reasoning event arrives. Completion, failure and Close stop both timers and release the cancellation callback. Bedrock and the Codex WebSocket use other transports and remain excluded. (2) OpenAI and Codex Responses requests with a reasoning effort default to `reasoning.summary: "detailed"` when `ReasoningSummary` is empty; other providers keep `"auto"`; an explicit summary wins and a model without reasoning sends none (D192).
+
+Why: a sol call showed nothing for 18 minutes until the owner restarted, and sol thinking showed bold headers only. Dyna's sol route uses the covered OpenAI Responses SSE API.
+
+Files: `ai/sse_event_idle.go`, `ai/provider_request_options.go`, `ai/http_transport.go`, the Google/Mistral/pi-messages stream boundaries, `ai/transport_diagnostic.go`, `ai/types.go`, `ai/openai_responses.go`, `docs/parity/divergences/D131.md`, `docs/parity/divergences/D192.md`.
+
+Locked by: `TestStreamStallAfterEventsAbortsAndRetriesOnce`, `TestStreamStallBeforeTheFirstByteAborts`, `TestStreamWithSteadyEventsIsNeverAborted`, `TestStreamStallTimerIsStoppedWhenTheStreamCompletes`, `TestStreamStallBufferedReadCannotRearmATimerAfterClose`, `TestStreamStallOptionsReachEverySSEBoundary`, `TestStreamStallAbortsEverySSEProvider`, the custom Fetch/pre-header/legacy-budget regressions in `ai/stream_stall_boundary_test.go`, `TestOpenRouterImagesUpstream`, `TestHTTPIdleTimeoutBeginsAfterTLS`, and `TestResponsesRequestAsksForADetailedReasoningSummaryByDefault` (ai).
 
 Upstream: not offered (owner's decision, 2026-11-04).

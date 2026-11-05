@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -141,8 +142,10 @@ func TestStreamStallTimerIsStoppedWhenTheStreamCompletes(t *testing.T) {
 		cancel(cause)
 	}
 	const bound = 80 * time.Millisecond
-	body := &sseIdleBody{ReadCloser: io.NopCloser(&emptyReader{}), ctx: ctx, cancel: record, timeout: bound}
-	body.timer = time.AfterFunc(bound, func() { record(&sseIdleError{timeout: bound}) })
+	body := &sseIdleBody{ReadCloser: io.NopCloser(strings.NewReader("")), ctx: ctx, cancel: record, stopAbort: func() {}}
+	for _, timeout := range []time.Duration{bound, 2 * bound} {
+		body.timers = append(body.timers, sseIdleTimer{timer: time.AfterFunc(timeout, func() { record(&sseIdleError{timeout: timeout}) }), timeout: timeout})
+	}
 	if _, err := io.ReadAll(body); err != nil {
 		t.Fatal(err)
 	}
@@ -153,10 +156,6 @@ func TestStreamStallTimerIsStoppedWhenTheStreamCompletes(t *testing.T) {
 		t.Fatalf("the stall timer fired after the stream completed: %v", causes)
 	}
 }
-
-type emptyReader struct{}
-
-func (*emptyReader) Read([]byte) (int, error) { return 0, io.EOF }
 
 func TestStreamStallOptionDisablesTheWatchdog(t *testing.T) {
 	server, _ := stallServer(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
@@ -178,7 +177,7 @@ func TestStreamStallOptionDisablesTheWatchdog(t *testing.T) {
 func TestStreamStallDefaultsToOneHundredEightySeconds(t *testing.T) {
 	previous := ConfiguredHTTPIdleTimeoutMs()
 	t.Cleanup(func() { _ = ConfigureHTTPDispatcher(previous) })
-	if err := ConfigureHTTPDispatcher(DefaultHTTPIdleTimeoutMs); err != nil {
+	if err := ConfigureHTTPDispatcher(100); err != nil {
 		t.Fatal(err)
 	}
 	if got := streamStall(StreamOptions{}); got != 180*time.Second {
@@ -188,4 +187,44 @@ func TestStreamStallDefaultsToOneHundredEightySeconds(t *testing.T) {
 	if got := streamStall(StreamOptions{StallTimeoutMs: &override}); got != 5*time.Second {
 		t.Fatalf("overridden stall bound %s", got)
 	}
+}
+
+// A buffered Read may finish after Close. It must not rearm a timer that terminal cleanup already stopped.
+func TestStreamStallBufferedReadCannotRearmATimerAfterClose(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	body := &sseIdleBody{ctx: ctx, cancel: cancel, stopAbort: func() {}}
+	body.ReadCloser = &stallCloseDuringRead{close: func() { _ = body.Close() }}
+	body.timers = []sseIdleTimer{{timer: time.AfterFunc(time.Minute, func() { cancel(&sseIdleError{timeout: time.Minute}) }), timeout: time.Minute}}
+	if _, err := body.Read(make([]byte, len(stallTextChunk))); err != nil {
+		t.Fatal(err)
+	}
+	if body.timers[0].timer.Stop() {
+		t.Fatal("buffered Read rearmed a timer after Close stopped it")
+	}
+}
+
+type stallCloseDuringRead struct{ close func() }
+
+func (r *stallCloseDuringRead) Read(p []byte) (int, error) {
+	r.close()
+	return copy(p, stallTextChunk), nil
+}
+func (*stallCloseDuringRead) Close() error { return nil }
+
+func TestStreamStallGoogleBeforeHeadersProducesARetryableMessage(t *testing.T) {
+	server, attempts := stallServer(t, func(_ int, _ http.ResponseWriter, r *http.Request) { <-r.Context().Done() })
+	provider := fetchOptionProvider(APIGoogleGenerativeAI, server.URL)
+	defer func() { _ = provider.Close() }()
+	message, err := RetryAssistantCall(t.Context(), func() (AssistantMessage, error) {
+		stream, err := provider.Stream(t.Context(), NormalizeContext(Context{Messages: []Message{UserMessage{Content: UserText("hi")}}}), StreamOptions{StallTimeoutMs: new(40)})
+		if err != nil {
+			return AssistantMessage{}, err
+		}
+		return *stream.Result(), nil
+	}, &RetryPolicy{Enabled: true, MaxRetries: 1, BaseDelayMs: 1}, RetryCallbacks{})
+	if err != nil || attempts.Load() != 2 {
+		t.Fatalf("attempts=%d error=%v, want two retryable stalled responses", attempts.Load(), err)
+	}
+	stalledDiagnostic(t, message)
 }

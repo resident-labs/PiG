@@ -862,7 +862,7 @@ type StreamOptions struct {
 	TextVerbosity string `json:"textVerbosity,omitempty"`
 	// ReasoningEffort is the raw OpenAI-compatible or Mistral API effort. Unlike the provider-neutral Thinking level, it is mapped but not clamped so the provider can reject unsupported values.
 	ReasoningEffort string
-	// ReasoningSummary is the raw OpenAI Responses reasoning summary mode ("auto", "detailed" or "concise"). Empty sends "detailed" for OpenAI and Codex models (D191) and "auto" for other Responses providers, with a reasoning effort. Without an effort it requests medium effort.
+	// ReasoningSummary is the raw OpenAI Responses reasoning summary mode ("auto", "detailed" or "concise"). Empty sends "detailed" for OpenAI and Codex models (D192) and "auto" for other Responses providers, with a reasoning effort. On regular Responses an explicit summary without an effort requests medium effort; on Codex a summary alone does not request an effort.
 	ReasoningSummary string `json:"reasoningSummary,omitempty"`
 	// PromptMode is the raw Mistral prompt mode, independent of provider-neutral Thinking.
 	PromptMode string `json:"promptMode,omitempty"`
@@ -916,7 +916,7 @@ type StreamOptions struct {
 	Transport Transport
 	// TimeoutMs bounds the full Mistral request through SSE consumption, and response headers or stream idleness for other supported providers. Nil selects the provider default; zero remains explicit and follows the selected provider's timeout semantics.
 	TimeoutMs *int `json:"timeoutMs,omitempty"`
-	// StallTimeoutMs bounds how long a model call may go without a semantic SSE event, connect and time to first byte included; on expiry the call is aborted with a StreamStallError and retried through the transport-failure path. Nil selects 180000 (or a shorter configured httpIdleTimeoutMs); zero or less disables it. Comment lines and ping events do not count as events, except while the stream is reasoning (D131).
+	// StallTimeoutMs bounds how long an HTTP SSE model call may go without semantic progress, including connect and time to first byte; Bedrock event streams and Codex WebSockets do not use it. Nil selects 180000; a positive value overrides that budget; zero or less disables only this budget. The independent httpIdleTimeoutMs byte timeout starts after connection establishment, and its semantic SSE timeout starts after headers; either can end the call sooner. A stall reports StreamStallError through the transport-failure retry path. Comment lines and ping events count as progress only while the stream is reasoning (D131).
 	StallTimeoutMs *int `json:"stallTimeoutMs,omitempty"`
 	// WebSocketConnectTimeoutMs bounds only the opening handshake. Nil selects the provider default; zero explicitly disables it.
 	WebSocketConnectTimeoutMs *int `json:"websocketConnectTimeoutMs,omitempty"`

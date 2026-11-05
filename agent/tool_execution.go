@@ -335,7 +335,7 @@ func findTool(tools []AgentTool, name string) AgentTool {
 
 // toolCallHooks is the hook set every tool call of this run goes through.
 func (h *loopHost) toolCallHooks() ToolCallHooks {
-	return ToolCallHooks{BeforeToolCall: h.cfg.BeforeToolCall, AfterToolCall: h.cfg.AfterToolCall, BeforeToolCallHooks: h.cfg.BeforeToolCallHooks, AfterToolCallHooks: h.cfg.AfterToolCallHooks, PrepareToolResult: h.cfg.PrepareToolResult}
+	return ToolCallHooks{BeforeToolCall: h.cfg.BeforeToolCall, AfterToolCall: h.cfg.AfterToolCall, BeforeToolCallHooks: h.cfg.BeforeToolCallHooks, AfterToolCallHooks: h.cfg.AfterToolCallHooks, PrepareToolResult: h.cfg.PrepareToolResult, ResolveUnloadedTool: h.cfg.ResolveUnloadedTool}
 }
 
 // prepareToolCall looks the tool up, prepares and validates the arguments,
@@ -352,6 +352,9 @@ func (h *loopHost) prepareToolCall(ctx context.Context, call pendingToolCall) to
 // tools default to the context's (.upstream/v0.99.1/packages/agent/src/agent-loop.ts:707-716).
 func prepareToolCall(ctx context.Context, tools []AgentTool, hooks ToolCallHooks, call pendingToolCall) (outcome toolCallOutcome) {
 	tool := findTool(tools, call.name)
+	if tool == nil && hooks.ResolveUnloadedTool != nil {
+		tool = hooks.ResolveUnloadedTool(call.name)
+	}
 	if tool == nil {
 		return immediateOutcome(call, errorToolResult("Tool "+call.name+" not found"))
 	}

@@ -42,6 +42,7 @@ func (a *Agent) createLoopConfig(skipInitialSteeringPoll bool) AgentLoopConfig {
 	beforeToolCall, afterToolCall := a.BeforeToolCall, a.AfterToolCall
 	finishTurn, prepareRequest, prepareNextTurn := a.opts.FinishTurn, a.opts.PrepareRequest, a.nextTurnHook()
 	transformLLMMessages, prepareToolResult, sessionFile := a.opts.TransformLLMMessages, a.opts.PrepareToolResult, a.opts.SessionFile
+	resolveUnloadedTool := a.opts.ResolveUnloadedTool
 	a.stateMu.RUnlock()
 	if prepareNextTurn != nil {
 		// agent.ts:484-492 builds the closure only when a hook is set now, then reads both properties on every call: an assignment during the run redirects or clears what later turns call.
@@ -80,6 +81,7 @@ func (a *Agent) createLoopConfig(skipInitialSteeringPoll bool) AgentLoopConfig {
 		BeforeToolCallHooks: beforeToolCallHooks,
 		AfterToolCallHooks:  afterToolCallHooks,
 		PrepareToolResult:   prepareToolResult,
+		ResolveUnloadedTool: resolveUnloadedTool,
 		MaxTurns:            a.opts.MaxTurns,
 		SessionFile:         sessionFile,
 	}

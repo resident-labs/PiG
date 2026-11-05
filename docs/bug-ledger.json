@@ -27664,9 +27664,13 @@
       "platform": "All platforms",
       "class": "own",
       "fixedIn": "Unreleased",
-      "releaseNote": "Abort HTTP SSE model calls after 180 seconds without semantic progress and send the typed failure through existing retries (D131). Positive `StreamOptions.StallTimeoutMs` values replace the default; zero or less disables only the new budget. Preserve legacy idle timers and non-stream request contexts, close stalled custom Fetch bodies, and stop timers on completion.",
+      "releaseNote": "Abort HTTP SSE model calls after 180 seconds without semantic progress and send the typed failure through existing retries (D131). Positive `StreamOptions.StallTimeoutMs` values replace the default; zero or less disables only the new budget. Preserve legacy idle timers and non-stream request contexts, close stalled custom Fetch bodies, and stop timers on completion. Keep the request budget and cancellation active for non-SSE error bodies, and preserve typed body failures through provider error handling without classifying ordinary HTTP error text as a stall.",
       "origin": "release note",
       "commits": [
+        {
+          "hash": "a982e300b7",
+          "date": "2026-11-05"
+        },
         {
           "hash": "bd304691c2",
           "date": "2026-11-05"
@@ -27690,6 +27694,14 @@
         "ai/stream_stall_boundary_test.go::TestStreamStallOptionsReachEverySSEBoundary",
         "ai/stream_stall_boundary_test.go::TestStreamStallPiMessagesDiagnosticTracksTheStreamPhase",
         "ai/stream_stall_boundary_test.go::TestStreamStallRequestBudgetIsIndependentOfLegacyIdleBeforeHeaders",
+        "ai/stream_stall_response_test.go::TestStreamStallCompletedHTTPErrorTextDoesNotBecomeATypedStall",
+        "ai/stream_stall_response_test.go::TestStreamStallCompletedNonSSEResponseStopsTimersAndDetachesAbort",
+        "ai/stream_stall_response_test.go::TestStreamStallDisabledNonSSEResponseStillClosesOnCallerCancellation",
+        "ai/stream_stall_response_test.go::TestStreamStallMistralBeforeHeadersProducesARetryableMessage",
+        "ai/stream_stall_response_test.go::TestStreamStallNonSSEBytesCannotResetTheRequestBudget",
+        "ai/stream_stall_response_test.go::TestStreamStallNonSSEErrorBodyKeepsTypedCauseAcrossProviders",
+        "ai/stream_stall_response_test.go::TestStreamStallNonSSEResponseBodyStillAborts",
+        "ai/stream_stall_response_test.go::TestStreamStallUnmarkedNonSSEResponsesRemainUntouched",
         "ai/stream_stall_test.go::TestStreamStallAfterEventsAbortsAndRetriesOnce",
         "ai/stream_stall_test.go::TestStreamStallBeforeTheFirstByteAborts",
         "ai/stream_stall_test.go::TestStreamStallBufferedReadCannotRearmATimerAfterClose",

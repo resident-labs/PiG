@@ -1786,15 +1786,19 @@ SCRUTINIZED:approved
 
 What: Pi's `httpIdleTimeoutMs` (default 300000) is a byte-level body timeout. A gateway that silently loses the generation but keeps the connection alive with comment lines (`: keepalive`) or `ping` events resets that timer for ever, so a headless `pi -p` run parks without an error or a retry. PiG measures the same timeout on semantic progress for every `text/event-stream` response of the provider HTTP clients: the timer restarts when a `data:` line of an event other than `ping` arrives. A reasoning or thinking event also makes keepalives count: while the last event with data was a reasoning event (Anthropic `thinking`, `thinking_delta`, `signature_delta` and `redacted_thinking`, OpenAI `reasoning` items and `response.reasoning*` events, OpenRouter, DeepSeek and Mistral `reasoning`, `reasoning_content`, `reasoning_text` and `reasoning_details`, Gemini `thought` parts), comment lines and `ping` events restart the timer too, because a model that reasons silently behind a gateway has not stalled. Any later event that is not about reasoning ends that state. When it expires the response body fails with `SSE Event Timeout Error: no event for <N>ms`, which the provider reports like any body error (`terminated`, with that cause) so the agent's retry policy applies. The timeout is the configured `httpIdleTimeoutMs`; `0` disables it, as it disables the byte-level timeout. A stream whose events arrive within the timeout is never cut off, however long it runs.
 
-Why: a reasonable user expects a stalled stream to end with an error, and a long silent reasoning turn is not a stall (owner sign-off 2026-10-10). The default equals the existing setting, so no new setting or literal exists. A reasoning model that emits no event at all before its answer (for example Chat Completions reasoning that never streams) is still cut after `httpIdleTimeoutMs` of keepalives, because nothing marks it as reasoning.
+Why: a reasonable user expects a stalled stream to end with an error, and a long silent reasoning turn is not a stall (owner sign-off 2026-10-10). The legacy default equals the existing setting. A reasoning model that emits no event at all before its answer (for example Chat Completions reasoning that never streams) is still cut after `httpIdleTimeoutMs` of keepalives, because nothing marks it as reasoning.
 
 Scope: `ai/sse_event_idle.go` (`sseIdleTransport`), installed in `newStreamingHTTPClient` and `streamingHTTPClientNoRetry` (`ai/http_transport.go`): the OpenAI Completions and Responses, Anthropic, Google and Mistral streams that use those clients. Bedrock and the Codex WebSocket keep their own transports. A caller-supplied fetch function is not wrapped.
 
+Native OpenAI exception (Dyna P13, owner scope decision 2026-11-05): only native OpenAI Responses requests with provider ID `openai`, no Azure/Codex and no custom Fetch, additionally own a request-start semantic budget. `StreamOptions.StallTimeoutMs` defaults to 180000 ms; positive values override it; zero or less disables only the additional budget. It includes connection establishment, headers and non-SSE error-body consumption. Headers and non-SSE bytes do not reset it. SSE progress follows the unchanged legacy D131 scanner, including its reasoning keepalive policy. Expiry carries a private `openAIResponsesStallError`, records `StreamStallError` / `PIG_STREAM_STALL` and uses existing assistant retry/backoff. EOF and Close stop the new timer and detach or join cancellation cleanup. Legacy D131 timers and diagnostic names remain unchanged, including on this route. Every excluded provider/API, non-stream request and custom Fetch keeps fork-base behavior and receives no new option forwarding or wrapper. Anthropic is excluded from the additional budget as well.
+
 Owner decision: 2026-10-10, lead ruling "fix it ... idle measured on semantic progress (events), default equal to httpIdleTimeoutMs"; owner sign-off 2026-10-10: reasoning and thinking events count as progress, so silent long reasoning behind keepalives does not fail.
 
-Call-site markers: `ai/sse_event_idle.go`.
+Call-site markers: `ai/sse_event_idle.go`, `ai/openai_responses_stall.go`, `ai/openai_responses.go`, `ai/transport_diagnostic.go`.
 
 Evidence: `TestSSEStreamWithOnlyKeepalivesEndsAfterTheIdleTimeout` (comment keepalives and ping events), `TestSSEStreamWithSlowEventsIsNotCutOff`, `TestSSEKeepalivesAfterAReasoningEventDoNotEndTheStream` (900 ms of keepalives behind a reasoning event, three times the timeout, still finishes), `TestSSEKeepalivesAfterANonReasoningEventStillEndTheStream` (after text, after reasoning then text, after a role chunk and after a reasoning token tally the stream still ends) and `TestSSEIdleTrackerRecognizesReasoningEvents` (each provider shape, with and without spaces; a text delta that says "thinking" and Responses' reasoning config echo do not count) (`ai/sse_event_idle_test.go`). With the transport disabled the first test never ends (it fails at the package timeout); a mutant that counts `ping` events as progress also hangs it.
+
+Native exception evidence: `ai/stream_stall_test.go` exercises native HTTP request phases, stalled JSON error bodies, retry/backoff/limits, progress and cleanup. `ai/stream_stall_exclusions_test.go` runs the same negative guards against fork base and the patch for excluded APIs, custom Fetch, unmarked requests and legacy diagnostic classification.
 
 Parity allowance: Pi 1.4.0 has no event-level timeout; no paired scenario can hold a stream open with keepalives.
 
@@ -2528,5 +2532,21 @@ Evidence: `TestEditPreservesParallelAliasChanges` (`internal/codingagent/tools/m
 Parity allowance: `TestHardLinkAliasesDifferFromPi` runs the pinned Pi's queue and PiG's over two hard links of one file: Pi starts both callbacks (event counts 2, 3, 4), PiG starts the second after the first ends. The 120-run paired corpus `TestWithFileMutationQueueMatchesPi` has no hard link or case alias and is unchanged.
 
 Remove when: Pi orders hard-link aliases (and, on a case-insensitive filesystem where its `realpath` keeps case, case aliases) by file identity, or an owner decision reverses this one; then the identity check, its marker, the allowance test and this record go.
+
+SCRUTINIZED:approved
+
+## D192 Dyna's native OpenAI Responses route defaults reasoning.summary to detailed
+
+What: only native OpenAI Responses requests with provider ID `openai`, no Azure/Codex and no custom Fetch, default `reasoning.summary` to `"detailed"` when a reasoning effort is sent and no summary is explicit. All excluded routes retain fork base's `"auto"`. Explicit values and non-reasoning behavior remain unchanged.
+
+Why: observed sol turns with `"auto"` showed bold headers only; `"detailed"` returned summary text. The sample does not measure the marginal token cost of a detailed summary.
+
+Scope: the typed native OpenAI Responses boundary in `ai/openai_responses.go`. Anthropic, Completions, Azure, Codex, other Responses providers, images/non-stream requests and custom Fetch receive no new default.
+
+Evidence: `TestResponsesRequestAsksForADetailedReasoningSummaryByDefault` covers the native default, override, non-reasoning, Codex, Azure, other-provider and custom Fetch cases. One tiny real sol prompt recorded 333 input / 50 output / 23 reasoning / 383 total tokens with detailed, versus 333 / 56 / 23 / 389 with auto. This is not an isolated marginal-cost or billing measurement.
+
+Parity allowance: Pi defaults to auto; the hermetic payload test records this intentional native-route exception.
+
+Remove when: Pi's default produces the requested visible summary on Dyna's sol route or the owner removes this default.
 
 SCRUTINIZED:approved

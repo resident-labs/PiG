@@ -862,7 +862,7 @@ type StreamOptions struct {
 	TextVerbosity string `json:"textVerbosity,omitempty"`
 	// ReasoningEffort is the raw OpenAI-compatible or Mistral API effort. Unlike the provider-neutral Thinking level, it is mapped but not clamped so the provider can reject unsupported values.
 	ReasoningEffort string
-	// ReasoningSummary is the raw OpenAI Responses reasoning summary mode ("auto", "detailed" or "concise"). Without an effort it requests medium effort.
+	// ReasoningSummary is the raw OpenAI Responses reasoning summary mode ("auto", "detailed" or "concise"). Empty sends "detailed" only for native OpenAI Responses with provider ID "openai" (D192); custom Fetch, Azure, Codex and other providers keep "auto", with a reasoning effort. On regular Responses an explicit summary without an effort requests medium effort; on Codex a summary alone does not request an effort.
 	ReasoningSummary string `json:"reasoningSummary,omitempty"`
 	// PromptMode is the raw Mistral prompt mode, independent of provider-neutral Thinking.
 	PromptMode string `json:"promptMode,omitempty"`
@@ -916,6 +916,8 @@ type StreamOptions struct {
 	Transport Transport
 	// TimeoutMs bounds the full Mistral request through SSE consumption, and response headers or stream idleness for other supported providers. Nil selects the provider default; zero remains explicit and follows the selected provider's timeout semantics.
 	TimeoutMs *int `json:"timeoutMs,omitempty"`
+	// StallTimeoutMs bounds semantic idleness only for native OpenAI Responses with provider ID "openai", including connection establishment and non-SSE error bodies (D131). Nil selects 180000; positive overrides; zero or less disables the new budget. All other APIs/providers and custom Fetch ignore this option and retain legacy D131 behavior. SSE events and reasoning keepalives reset the budget under D131's progress policy. An expiry reports StreamStallError through existing retries; legacy idle diagnostics are unchanged.
+	StallTimeoutMs *int `json:"stallTimeoutMs,omitempty"`
 	// WebSocketConnectTimeoutMs bounds only the opening handshake. Nil selects the provider default; zero explicitly disables it.
 	WebSocketConnectTimeoutMs *int `json:"websocketConnectTimeoutMs,omitempty"`
 	MaxRetries                *int `json:"maxRetries,omitempty"`

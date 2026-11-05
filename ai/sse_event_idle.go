@@ -17,6 +17,14 @@ import (
 type sseIdleTransport struct{ base http.RoundTripper }
 
 func (t *sseIdleTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	// pig divergence (D131): only the native OpenAI Responses boundary selects the additional request budget.
+	if timeout, enabled := request.Context().Value(openAIResponsesStallKey{}).(time.Duration); enabled && timeout > 0 {
+		return t.roundTripOpenAIResponsesStall(request, timeout)
+	}
+	return t.roundTripLegacy(request)
+}
+
+func (t *sseIdleTransport) roundTripLegacy(request *http.Request) (*http.Response, error) {
 	response, err := t.base.RoundTrip(request)
 	if err != nil || response.Body == nil {
 		return response, err

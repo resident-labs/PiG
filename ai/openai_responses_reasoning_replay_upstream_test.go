@@ -154,7 +154,7 @@ func reasoningReplayEndpoint(t *testing.T, aborted, anthropic bool) string {
 		}
 		if !(count == 1 && anthropic) {
 			var reasoning map[string]string
-			if err := json.Unmarshal(payload["reasoning"], &reasoning); err != nil || !reflect.DeepEqual(reasoning, map[string]string{"effort": "high", "summary": "auto"}) {
+			if err := json.Unmarshal(payload["reasoning"], &reasoning); err != nil || !reflect.DeepEqual(reasoning, map[string]string{"effort": "high", "summary": "detailed"}) {
 				t.Errorf("replay request %d reasoning=%#v (decode: %v)", count, reasoning, err)
 				http.Error(w, "changed upstream reasoning effort", http.StatusBadRequest)
 				return

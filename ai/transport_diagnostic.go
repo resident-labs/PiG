@@ -43,6 +43,11 @@ func classifyTransportCause(transport *nodeTransportError) *transportCause {
 		}
 		return out
 	}
+	// pig divergence (D131): the native OpenAI request watchdog has its own cause; legacy idle errors keep their base classification.
+	if _, stalled := errors.AsType[*openAIResponsesStallError](cause); stalled {
+		out.name, out.code = "StreamStallError", "PIG_STREAM_STALL"
+		return out
+	}
 	if transport.headersTimeout {
 		out.name, out.code = "HeadersTimeoutError", "UND_ERR_HEADERS_TIMEOUT"
 		return out

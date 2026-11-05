@@ -227,3 +227,17 @@ Drop it: if upstream resolves calls to deferred tools, use its mechanism and del
 Locked by: `TestADirectCallToADeferredToolLoadsItAndRunsTheCall`, `TestADirectCallToACodemodeListedToolLoadsIt`, `TestADirectCallAfterACompactionUnloadedTheToolRunsAndKeepsItLoaded`, `TestADirectCallToAnUnknownToolStaysNotFound`, `TestOnlyTheExactNameOfADeferredToolLoads`, `TestAnAutoLoadAddsOneToolAndEvictsNothing`, `TestAnAutoLoadedToolValidatesItsArguments`, `TestADirectCallWithoutContextUpdatesStaysNotFound` (coding).
 
 Upstream: not offered (owner's decision, 2026-11-04).
+
+## P13 Dyna native OpenAI Responses watchdog and detailed summary
+
+What: only native OpenAI Responses with provider ID `openai`, no Azure/Codex and no custom Fetch, selects an additional request-start semantic budget and the detailed reasoning summary default. `StreamOptions.StallTimeoutMs` defaults to 180000 ms; positive overrides; zero or less disables the additional budget. The watchdog covers connection establishment and non-SSE error bodies, preserves typed `StreamStallError` / `PIG_STREAM_STALL` failures through existing retries, and stops its timer/cancellation callback at EOF or Close. Its progress policy reuses D131's unchanged scanner. Explicit summary values win; marginal summary cost is not measured (D192).
+
+Exclusions: Anthropic, Completions, Azure, Codex SSE/WebSocket, Google/Vertex, Mistral, pi-messages, Bedrock, other Responses providers, images/non-stream requests and every custom Fetch retain fork-base behavior. They receive no new wrapper, budget forwarding or summary default. The original D131 timers and diagnostic names remain unchanged.
+
+Why: Dyna sol uses native OpenAI Responses SSE. The owner limited P13 to that route on 2026-11-05.
+
+Files: `ai/openai_responses.go`, `ai/openai_responses_stall.go`, `ai/sse_event_idle.go`, `ai/transport_diagnostic.go`, `ai/types.go`, `docs/parity/divergences/D131.md`, `docs/parity/divergences/D192.md`.
+
+Locked by: native request-phase, retry/backoff/limit, progress and cleanup tests in `ai/stream_stall_test.go`; base-compatible excluded-route guards in `ai/stream_stall_exclusions_test.go`; `TestResponsesRequestAsksForADetailedReasoningSummaryByDefault`; unchanged legacy D131, TLS, Fetch and image regressions.
+
+Upstream: not offered (owner's decision, 2026-11-04).

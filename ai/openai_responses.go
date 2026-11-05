@@ -1395,6 +1395,8 @@ func (p *openAIResponsesProvider) Stream(ctx context.Context, transcript Transcr
 		p = p.cfg.azure.resolve(p, opts)
 	}
 	ctx = withProviderRequestOptions(ctx, opts)
+	// dyna patch P13; pig divergence (D131): only Dyna's native OpenAI Responses route selects the new request budget; all other routes retain their base behavior.
+	dynaResponses := p.cfg.azure == nil && !p.cfg.Codex && p.api() == APIOpenAIResponses && p.cfg.ProviderID == string(KnownProviderOpenai) && opts.Fetch == nil
 	// pig divergence (D48): the agent loop asks for the tool-flow repair.
 	if opts.RepairToolFlow {
 		transcript = transcript.withRepairedToolFlow()
@@ -1530,9 +1532,14 @@ func (p *openAIResponsesProvider) Stream(ctx context.Context, transcript Transcr
 				// The level travels in configuration_update items; reasoning.effort stays fixed so the prompt cache holds.
 				effort = configurationUpdateRequestEffort
 			}
+			summary := "auto"
+			// pig divergence (D192): Dyna's native OpenAI route requests the detailed summary; explicit values and all excluded routes retain their base behavior.
+			if dynaResponses {
+				summary = "detailed"
+			}
 			req.Reasoning = &respReasoning{
 				Effort:  effort,
-				Summary: cmp.Or(opts.ReasoningSummary, "auto"),
+				Summary: cmp.Or(opts.ReasoningSummary, summary),
 			}
 			req.Include = []string{"reasoning.encrypted_content"}
 		case opts.ReasoningSummary != "":
@@ -1668,7 +1675,11 @@ func (p *openAIResponsesProvider) Stream(ctx context.Context, transcript Transcr
 	if p.cfg.Codex {
 		newRequest = newFetchRequest
 	}
-	httpReq, err := newRequest(ctx, http.MethodPost, endpointURL, sseBody, opts.Fetch != nil)
+	requestContext := ctx
+	if dynaResponses {
+		requestContext = context.WithValue(ctx, openAIResponsesStallKey{}, openAIResponsesStallTimeout(opts))
+	}
+	httpReq, err := newRequest(requestContext, http.MethodPost, endpointURL, sseBody, opts.Fetch != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1787,7 +1798,11 @@ func (p *openAIResponsesProvider) streamResponse(ctx context.Context, httpReq *h
 	builder.managed = builder.managed || p.cfg.Codex
 	return builder.responseTurn(func() error {
 		if resp.StatusCode != http.StatusOK {
-			b, _ := readWebText(resp.Body)
+			b, readErr := readWebText(resp.Body)
+			// pig divergence (D131): an expired native OpenAI request budget remains a typed transport failure while reading an error response.
+			if _, stalled := errors.AsType[*openAIResponsesStallError](readErr); stalled {
+				return readErr
+			}
 			if p.cfg.Codex {
 				return fmt.Errorf("openai-responses: HTTP %d: %s", resp.StatusCode, string(b))
 			}

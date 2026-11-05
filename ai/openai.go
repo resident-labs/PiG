@@ -1781,7 +1781,11 @@ func (p *openAIProvider) streamResponse(ctx context.Context, request *http.Reque
 	_, builder.managed = resp.Body.(*observedResponseBody)
 	return builder.responseTurn(func() error {
 		if resp.StatusCode != http.StatusOK {
-			body, _ := readWebText(resp.Body)
+			body, readErr := readWebText(resp.Body)
+			// pig divergence (D131): a watchdog-expired error body remains a typed transport failure.
+			if _, stalled := errors.AsType[*sseIdleError](readErr); stalled {
+				return readErr
+			}
 			return openAIHTTPError(resp.StatusCode, body)
 		}
 		if err := observeProviderResponse(ctx, opts, resp, &Model{ID: p.cfg.Model, ProviderMeta: ProviderMetadata{ProviderID: p.cfg.ProviderID, API: APIOpenAICompletions}}); err != nil {

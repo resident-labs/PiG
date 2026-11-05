@@ -1797,7 +1797,11 @@ func (p *openAIResponsesProvider) streamResponse(ctx context.Context, httpReq *h
 	builder.managed = builder.managed || p.cfg.Codex
 	return builder.responseTurn(func() error {
 		if resp.StatusCode != http.StatusOK {
-			b, _ := readWebText(resp.Body)
+			b, readErr := readWebText(resp.Body)
+			// pig divergence (D131): a watchdog-expired error body remains a typed transport failure.
+			if _, stalled := errors.AsType[*sseIdleError](readErr); stalled {
+				return readErr
+			}
 			if p.cfg.Codex {
 				return fmt.Errorf("openai-responses: HTTP %d: %s", resp.StatusCode, string(b))
 			}

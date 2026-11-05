@@ -1051,8 +1051,12 @@ func (p *googleProvider) Stream(ctx context.Context, transcript TranscriptContex
 			return nil, err
 		}
 		if resp.StatusCode != http.StatusOK {
-			b, _ := readWebText(resp.Body)
+			b, readErr := readWebText(resp.Body)
 			_ = resp.Body.Close()
+			// pig divergence (D131): a watchdog-expired error body remains a typed transport failure.
+			if _, stalled := errors.AsType[*sseIdleError](readErr); stalled {
+				return nil, readErr
+			}
 			return nil, googleHTTPError(resp, b)
 		}
 		return resp, nil
@@ -1062,7 +1066,7 @@ func (p *googleProvider) Stream(ctx context.Context, transcript TranscriptContex
 		if ctx.Err() != nil && errors.Is(err, errProviderRequestAborted) {
 			return nil, &nodeTransportError{message: "Request aborted", cause: ctx.Err()}
 		}
-		// pig divergence (D131): a pre-header watchdog expiry is an error response so the existing assistant retry policy and typed diagnostics see it.
+		// pig divergence (D131): a watchdog expiry before the message stream starts is an error response so the existing assistant retry policy and typed diagnostics see it.
 		if _, stalled := errors.AsType[*sseIdleError](err); !stalled {
 			return nil, err
 		}

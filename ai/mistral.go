@@ -493,9 +493,9 @@ func (p *mistralProvider) Stream(ctx context.Context, transcript TranscriptConte
 		}
 		// The Mistral SDK's fetch rejection is the error itself ("fetch failed" for a transport failure); the Go client's "Post <url>:" decoration is not part of it.
 		if requestError, ok := err.(*url.Error); ok { //nolint:errorlint // Only the direct client.Do decoration is stripped.
-			return nil, requestError.Err
+			return p.requestFailure(ctx, opts, model, requestError.Err)
 		}
-		return nil, err
+		return p.requestFailure(ctx, opts, model, err)
 	}
 
 	if observed, ok := resp.Body.(*observedResponseBody); ok {
@@ -523,7 +523,7 @@ func (p *mistralProvider) Stream(ctx context.Context, transcript TranscriptConte
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		errBody, err := readWebText(responseBody)
 		if err != nil {
-			return nil, err
+			return p.requestFailure(ctx, opts, model, err)
 		}
 		errText := truncateMistralError(strings.Trim(string(errBody), mistralJSWhitespace))
 		if errText == "" {
@@ -547,6 +547,19 @@ func (p *mistralProvider) Stream(ctx context.Context, transcript TranscriptConte
 			return nil
 		})
 	}()
+	return builder.stream, nil
+}
+
+// requestFailure keeps ordinary request failures immediate, but returns a watchdog expiry as an error response for assistant retry and transport diagnostics.
+// pig divergence (D131): a watchdog expiry before the message stream starts is a typed error response.
+func (p *mistralProvider) requestFailure(ctx context.Context, opts StreamOptions, model *Model, err error) (*AssistantMessageEventStream, error) {
+	if _, stalled := errors.AsType[*sseIdleError](err); !stalled {
+		return nil, err
+	}
+	builder := newObservedProviderBuilder(ctx, outputAPI(p.cfg.ModelMetadata, APIMistralConversations), p.cfg.ProviderID, p.cfg.Model)
+	builder.modelCost = opts.ModelCost
+	builder.setProviderEventObserver(opts, model)
+	p.fail(builder, err)
 	return builder.stream, nil
 }
 

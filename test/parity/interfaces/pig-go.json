@@ -49613,6 +49613,17 @@
       "shapeHash": "sha256:99041fc9166dca03f54e6212f467997c6cc77f54ccf6d4fa9262775b3ad7ee54"
     },
     {
+      "id": "go:github.com/MichaelKinsy/PiG/ai#mistralProvider.requestFailure",
+      "package": "github.com/MichaelKinsy/PiG/ai",
+      "name": "mistralProvider.requestFailure",
+      "kind": "function",
+      "exported": false,
+      "shape": {
+        "type": "func(ctx context.Context, opts StreamOptions, model *Model, err error) (*AssistantMessageEventStream, error)"
+      },
+      "shapeHash": "sha256:b02636360c2cb893fb935341942b612109120db86eb510549dde9ead31123c5a"
+    },
+    {
       "id": "go:github.com/MichaelKinsy/PiG/ai#mistralProvider.resolveModel",
       "package": "github.com/MichaelKinsy/PiG/ai",
       "name": "mistralProvider.resolveModel",

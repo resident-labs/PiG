@@ -65,22 +65,21 @@ func (t *sseIdleTransport) RoundTrip(request *http.Request) (*http.Response, err
 		}
 		return response, err
 	}
-	if mediaType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type")); response.Body == nil || mediaType != "text/event-stream" {
+	if response.Body == nil {
 		for _, idle := range timers {
 			idle.timer.Stop()
 		}
-		if response.Body == nil {
-			cancel(nil)
-			return response, nil
-		}
-		response.Body = &providerResponseBody{ReadCloser: response.Body, cancel: cancel}
+		cancel(nil)
 		return response, nil
 	}
-	// The legacy D131 semantic idle budget begins at SSE headers, never during CONNECT or TLS. Headers do not reset the independent request-start budget.
-	if legacy := configuredHTTPIdleTimeout(); legacy > 0 {
-		timers = append(timers, sseIdleTimer{timer: time.AfterFunc(legacy, func() { cancel(&sseIdleError{timeout: legacy}) }), timeout: legacy})
+	mediaType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
+	// The legacy D131 semantic idle budget begins at SSE headers, never during CONNECT or TLS. Every acquired response keeps the independent request-start budget and cancellation ownership, including non-SSE error bodies.
+	if mediaType == "text/event-stream" {
+		if legacy := configuredHTTPIdleTimeout(); legacy > 0 {
+			timers = append(timers, sseIdleTimer{timer: time.AfterFunc(legacy, func() { cancel(&sseIdleError{timeout: legacy}) }), timeout: legacy})
+		}
 	}
-	body := &sseIdleBody{ReadCloser: response.Body, ctx: ctx, cancel: cancel, timers: timers}
+	body := &sseIdleBody{ReadCloser: response.Body, ctx: ctx, cancel: cancel, timers: timers, nonSSE: mediaType != "text/event-stream"}
 	abortDone := make(chan struct{})
 	stopAbort := context.AfterFunc(ctx, func() {
 		_ = body.closeBody()
@@ -102,15 +101,15 @@ func (t *sseIdleTransport) CloseIdleConnections() {
 	}
 }
 
-// sseIdleBody restarts its timer whenever a data line of an event other than ping arrives. Comment lines and ping events are keepalives, except while the
-// stream is reasoning: a model that thinks silently behind a gateway's keepalives has not stalled, so after a reasoning or thinking event the keepalives
-// count as progress until an event that is not about reasoning arrives.
+// sseIdleBody owns cancellation and timer cleanup for every acquired typed stream response. Only SSE bodies reset timers on semantic progress; non-SSE bodies retain the request-start budget without interpreting their bytes as events.
+// Within SSE, data lines other than ping count as progress. Comment lines and pings count only after a reasoning or thinking event, until a non-reasoning event arrives.
 type sseIdleBody struct {
 	io.ReadCloser
 	// ctx is the request context the stall timer cancels with an *sseIdleError cause; a read that fails because of it reports that error.
 	ctx       context.Context
 	cancel    context.CancelCauseFunc
 	timers    []sseIdleTimer
+	nonSSE    bool
 	mu        sync.Mutex
 	stopped   bool
 	stopAbort func()
@@ -159,7 +158,7 @@ func (b *sseIdleBody) Read(buffer []byte) (int, error) {
 		}
 		return count, err
 	}
-	if count > 0 && b.scan(buffer[:count]) {
+	if !b.nonSSE && count > 0 && b.scan(buffer[:count]) {
 		b.mu.Lock()
 		if !b.stopped {
 			for _, idle := range b.timers {

@@ -31,6 +31,9 @@ type ToolCallHooks struct {
 	BeforeToolCallHooks []BeforeToolCallHook
 	AfterToolCallHooks  []AfterToolCallHook
 	PrepareToolResult   func(context.Context, AgentToolResult) AgentToolResult
+	// ResolveUnloadedTool answers a call whose name is not among the tools the call resolves against: it returns the tool the
+	// name denotes once the owner has loaded it, or nil when the name is not one the owner can load (dyna patch P12, PATCHES.md).
+	ResolveUnloadedTool func(name string) AgentTool
 }
 
 // RunToolCallOptions configures RunToolCall. Mirrors upstream RunToolCallOptions

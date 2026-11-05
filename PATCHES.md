@@ -212,7 +212,7 @@ Locked by: `TestACompactionHeadDeclaresTheToolsAHookLeftActive`, `TestACompactio
 
 Upstream: not offered (owner's decision, 2026-11-04).
 
-## P12 Stall watchdog and detailed reasoning summaries
+## P13 Stall watchdog and detailed reasoning summaries
 
 What: (1) `StreamOptions.StallTimeoutMs` bounds how long a model call may go without a semantic SSE event, connect and time to first byte included; the default is 180 s (a shorter configured `httpIdleTimeoutMs` wins), zero or less disables it. The watchdog is `sseIdleTransport`, the one transport every SSE provider client and every caller-supplied `Fetch` client goes through. A stall aborts the call with a typed cause that diagnostics record as `provider_transport_failure` with error name `StreamStallError`, and the call retries through the same path as a mid-stream `unexpected EOF`. Bedrock and the Codex WebSocket keep their own transports. (2) A Responses request to `openai` or `openai-codex` with a reasoning effort sends `reasoning.summary: "detailed"` when `ReasoningSummary` is empty; other providers keep `"auto"`.
 
@@ -221,5 +221,18 @@ Why: a sol call showed nothing for 18 minutes until the owner restarted, and sol
 Files: `ai/sse_event_idle.go`, `ai/http_transport.go`, `ai/transport_diagnostic.go`, `ai/types.go`, `ai/openai_responses.go`, `docs/parity/divergences/D131.md`, `D191.md`.
 
 Locked by: `TestStreamStallAfterEventsAbortsAndRetriesOnce`, `TestStreamStallBeforeTheFirstByteAborts`, `TestStreamWithSteadyEventsIsNeverAborted`, `TestStreamStallTimerIsStoppedWhenTheStreamCompletes` (ai), `TestResponsesRequestAsksForADetailedReasoningSummaryByDefault` (ai).
+## P12 A call to a deferred tool by its exact name loads the tool and runs the call
+
+What: `agent.AgentOptions.ResolveUnloadedTool` (also `Agent.SetResolveUnloadedTool`, `AgentLoopConfig.ResolveUnloadedTool`, `ToolCallHooks.ResolveUnloadedTool`) is asked by `prepareToolCall`, the one place a call's tool name is resolved, when the name is not among the run's tools. A tool it returns runs the call, through the tool's own argument validation and the hooks as any call; nil keeps `Tool <name> not found`. `coding.Session` sets it to `loadDeferredTool` (`coding/session_tools.go`): with `SessionOptions.ContextUpdates`, a name that is exactly an admitted tool of exposure deferred or codemode and not active, while `tool_search` or `codemode` is active (the conditions under which the `deferred_tools` section lists it), is activated as `SetActiveToolsByName` does for a `tool_search` load, and its tool is returned. Matching is by the registry's typed entry for the exact name: another case, a prefix or a suffix finds none. A tool a call of the same batch already activated is returned as well. Without `ContextUpdates` nothing changes.
+
+Why: after a compaction the model remembers tools the host unloaded, and the head names them in `deferred_tools`; its direct calls failed with "not found" and the transcript filled with failed calls.
+
+Interaction with unloading: the tool joins the active tools after the ones already there, with no eviction, as a `tool_search` load does. PiG has no load limit or eviction; P11's limit of 3 is the number of matches one `tool_search` call loads, and unloading is a host's `session_before_compact` hook calling `SetActiveToolsByName`. A tool loaded by a call is unloaded by that hook like any other.
+
+Files: `agent/tool_execution.go`, `agent/agent.go`, `agent/agent_loop.go`, `agent/run_tool_call.go`, `agent/standalone_loop.go`, `coding/session_tools.go`, `coding/session.go`.
+
+Drop it: if upstream resolves calls to deferred tools, use its mechanism and delete the resolver.
+
+Locked by: `TestADirectCallToADeferredToolLoadsItAndRunsTheCall`, `TestADirectCallToACodemodeListedToolLoadsIt`, `TestADirectCallAfterACompactionUnloadedTheToolRunsAndKeepsItLoaded`, `TestADirectCallToAnUnknownToolStaysNotFound`, `TestOnlyTheExactNameOfADeferredToolLoads`, `TestAnAutoLoadAddsOneToolAndEvictsNothing`, `TestAnAutoLoadedToolValidatesItsArguments`, `TestADirectCallWithoutContextUpdatesStaysNotFound` (coding).
 
 Upstream: not offered (owner's decision, 2026-11-04).

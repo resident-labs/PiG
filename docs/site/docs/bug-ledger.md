@@ -925,6 +925,7 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 | [BF-d64f8ed](#bf-d64f8ed) | `durable.StorageRequestError` and `durable.SessionFailed` are Pi's error classes of the same names… | PiG's own defect | All platforms | 0.5.0 |
 | [BF-d6aaf72](#bf-d6aaf72) | A `setTimeout(0)` or `setImmediate` callback that an extension queues while an RPC stdin command runs (a… | PiG's own defect | All platforms | 0.5.2 |
 | [BF-d6e0dca](#bf-d6e0dca) | The extension SDK surface matrix and the extension API pages say that `setEditorComponent` and… | PiG's own defect | All platforms | 0.5.0 |
+| [BF-d6eafcd](#bf-d6eafcd) | Abort HTTP SSE model calls after 180 seconds without semantic progress and send the typed failure through… | PiG's own defect | All platforms | Unreleased |
 | [BF-d7855fd](#bf-d7855fd) | A subprocess extension's message, entry or tool renderer, or tool renderer resolver, that was busy past the… | PiG's own defect | All platforms | 0.5.0 |
 | [BF-d7bfea6](#bf-d7bfea6) | A git source whose ref has no repository (`git:#v1`) no longer panics, and a ref split out of an opaque-path… | PiG's own defect | All platforms | 0.5.0 |
 | [BF-d7c7f86](#bf-d7c7f86) | fix(runtimecell): start a packed cell's members in order so a later member's factory cannot take the factory… | PiG's own defect | All platforms | Unreleased |
@@ -13744,6 +13745,20 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Fix commits:** `d6e0dca953` (2026-10-09)
 - **Tests:** `automation/ci/bugledger/bugledger_test.go::TestEveryNewDivergenceIsAccountedFor`
 - **Release note:** The extension SDK surface matrix and the extension API pages say that `setEditorComponent` and `getEditorComponent` exist in the Go, Rust and Python SDKs and that the getter returns the factory the extension installed. They described the Go getter as always returning nil and the Rust and Python getters as missing.
+
+### BF-d6eafcd
+
+**Abort HTTP SSE model calls after 180 seconds without semantic progress and send the typed failure through…**
+
+- **Source:** PiG's own defect
+- **Symptom:** Abort HTTP SSE model calls after 180 seconds without semantic progress and send the typed failure through existing retries (D131).
+- **Root cause:** A model call with no semantic SSE event for 180 s (connect and first byte included) aborts with StreamStallError and retries through the transport-failure path. OpenAI and Codex Responses requests ask for reasoning.summary detailed by default.
+- **User impact:** An operation failed or was rejected
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `bd304691c2` (2026-11-05), `d6eafcdc9c` (2026-11-05)
+- **Tests:** `ai/max_thinking_upstream_test.go::TestMaxThinkingUpstream`, `ai/openai_codex_request_test.go::TestOpenAICodexResponses_RequestMatchesCodexProtocol`, `ai/openai_codex_sse_upstream_test.go::TestCodexSSEAndPayloadUpstream`, `ai/reasoning_summary_default_test.go::TestResponsesRequestAsksForADetailedReasoningSummaryByDefault`, `ai/stream_stall_boundary_test.go::TestStreamStallAbortsEverySSEProvider`, `ai/stream_stall_boundary_test.go::TestStreamStallCustomFetchClosesUncooperativeBody`, `ai/stream_stall_boundary_test.go::TestStreamStallCustomFetchPreservesCauseBeforeHeaders`, `ai/stream_stall_boundary_test.go::TestStreamStallDisabledBudgetKeepsLegacySSEIdleTimeout` and 13 more in docs/bug-ledger.json
+- **Release note:** Abort HTTP SSE model calls after 180 seconds without semantic progress and send the typed failure through existing retries (D131). Positive `StreamOptions.StallTimeoutMs` values replace the default; zero or less disables only the new budget. Preserve legacy idle timers and non-stream request contexts, close stalled custom Fetch bodies, and stop timers on completion.
 
 ### BF-d7855fd
 

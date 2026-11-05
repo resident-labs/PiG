@@ -27655,6 +27655,52 @@
       ]
     },
     {
+      "id": "BF-d6eafcd",
+      "title": "Abort HTTP SSE model calls after 180 seconds without semantic progress and send the typed failure through…",
+      "symptom": "Abort HTTP SSE model calls after 180 seconds without semantic progress and send the typed failure through existing retries (D131).",
+      "rootCause": "A model call with no semantic SSE event for 180 s (connect and first byte included) aborts with StreamStallError and retries through the transport-failure path. OpenAI and Codex Responses requests ask for reasoning.summary detailed by default.",
+      "rootCauseSource": "commit",
+      "userImpact": "An operation failed or was rejected",
+      "platform": "All platforms",
+      "class": "own",
+      "fixedIn": "Unreleased",
+      "releaseNote": "Abort HTTP SSE model calls after 180 seconds without semantic progress and send the typed failure through existing retries (D131). Positive `StreamOptions.StallTimeoutMs` values replace the default; zero or less disables only the new budget. Preserve legacy idle timers and non-stream request contexts, close stalled custom Fetch bodies, and stop timers on completion.",
+      "origin": "release note",
+      "commits": [
+        {
+          "hash": "bd304691c2",
+          "date": "2026-11-05"
+        },
+        {
+          "hash": "d6eafcdc9c",
+          "date": "2026-11-05"
+        }
+      ],
+      "tests": [
+        "ai/max_thinking_upstream_test.go::TestMaxThinkingUpstream",
+        "ai/openai_codex_request_test.go::TestOpenAICodexResponses_RequestMatchesCodexProtocol",
+        "ai/openai_codex_sse_upstream_test.go::TestCodexSSEAndPayloadUpstream",
+        "ai/reasoning_summary_default_test.go::TestResponsesRequestAsksForADetailedReasoningSummaryByDefault",
+        "ai/stream_stall_boundary_test.go::TestStreamStallAbortsEverySSEProvider",
+        "ai/stream_stall_boundary_test.go::TestStreamStallCustomFetchClosesUncooperativeBody",
+        "ai/stream_stall_boundary_test.go::TestStreamStallCustomFetchPreservesCauseBeforeHeaders",
+        "ai/stream_stall_boundary_test.go::TestStreamStallDisabledBudgetKeepsLegacySSEIdleTimeout",
+        "ai/stream_stall_boundary_test.go::TestStreamStallHeadersDoNotExtendTheRequestStartBudget",
+        "ai/stream_stall_boundary_test.go::TestStreamStallLeavesNonStreamRequestsUnchanged",
+        "ai/stream_stall_boundary_test.go::TestStreamStallOptionsReachEverySSEBoundary",
+        "ai/stream_stall_boundary_test.go::TestStreamStallPiMessagesDiagnosticTracksTheStreamPhase",
+        "ai/stream_stall_boundary_test.go::TestStreamStallRequestBudgetIsIndependentOfLegacyIdleBeforeHeaders",
+        "ai/stream_stall_test.go::TestStreamStallAfterEventsAbortsAndRetriesOnce",
+        "ai/stream_stall_test.go::TestStreamStallBeforeTheFirstByteAborts",
+        "ai/stream_stall_test.go::TestStreamStallBufferedReadCannotRearmATimerAfterClose",
+        "ai/stream_stall_test.go::TestStreamStallDefaultsToOneHundredEightySeconds",
+        "ai/stream_stall_test.go::TestStreamStallGoogleBeforeHeadersProducesARetryableMessage",
+        "ai/stream_stall_test.go::TestStreamStallOptionDisablesTheWatchdog",
+        "ai/stream_stall_test.go::TestStreamStallTimerIsStoppedWhenTheStreamCompletes",
+        "ai/stream_stall_test.go::TestStreamWithSteadyEventsIsNeverAborted"
+      ]
+    },
+    {
       "id": "BF-d7855fd",
       "title": "A subprocess extension's message, entry or tool renderer, or tool renderer resolver, that was busy past the…",
       "symptom": "A subprocess extension's message, entry or tool renderer, or tool renderer resolver, that was busy past the five-second renderer inactivity boundary no longer leaves its card on the fallback until the next resize: the host asks again once the extension answers the abandoned request, and an extension that keeps missing the boundary is asked again after a backoff that starts at five seconds and doubles to one minute.",

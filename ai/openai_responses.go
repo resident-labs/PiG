@@ -576,18 +576,8 @@ func (p *openAIResponsesProvider) resolvedModel() *Model {
 	return model
 }
 
-// defaultReasoningSummary is the reasoning.summary sent with a reasoning effort when StreamOptions.ReasoningSummary is empty; a request without a reasoning effort sends none. OpenAI and Codex models take "detailed"; other Responses providers keep Pi's "auto".
-// dyna patch P13; pig divergence (D192): Pi sends "auto", which returns bold headers only on sol; "detailed" returns the summary text.
-func (p *openAIResponsesProvider) defaultReasoningSummary() string {
-	switch p.cfg.ProviderID {
-	case "openai", string(KnownProviderOpenaiCodex):
-		return "detailed"
-	}
-	return "auto"
-}
-
 // applyCodexReasoning is openai-codex-responses.ts buildRequestBody's reasoning: a given effort is mapped through the model's levels ("none" through
-// its off entry) and sent unless that maps to null, with the summary defaulting to defaultReasoningSummary; with no effort a reasoning model whose off is not null sends
+// its off entry) and sent unless that maps to null, with the summary defaulting to "auto"; with no effort a reasoning model whose off is not null sends
 // its off effort. A summary alone requests nothing.
 func (p *openAIResponsesProvider) applyCodexReasoning(req *respRequest, opts StreamOptions) {
 	model := p.resolvedModel()
@@ -607,7 +597,7 @@ func (p *openAIResponsesProvider) applyCodexReasoning(req *respRequest, opts Str
 			effort = new(requested)
 		}
 		if effort != nil {
-			req.Reasoning = &respReasoning{Effort: *effort, Summary: cmp.Or(opts.ReasoningSummary, p.defaultReasoningSummary())}
+			req.Reasoning = &respReasoning{Effort: *effort, Summary: cmp.Or(opts.ReasoningSummary, "auto")}
 		}
 		return
 	}
@@ -1405,6 +1395,8 @@ func (p *openAIResponsesProvider) Stream(ctx context.Context, transcript Transcr
 		p = p.cfg.azure.resolve(p, opts)
 	}
 	ctx = withProviderRequestOptions(ctx, opts)
+	// dyna patch P13; pig divergence (D131): only Dyna's native OpenAI Responses route selects the new request budget; all other routes retain their base behavior.
+	dynaResponses := p.cfg.azure == nil && !p.cfg.Codex && p.api() == APIOpenAIResponses && p.cfg.ProviderID == string(KnownProviderOpenai) && opts.Fetch == nil
 	// pig divergence (D48): the agent loop asks for the tool-flow repair.
 	if opts.RepairToolFlow {
 		transcript = transcript.withRepairedToolFlow()
@@ -1540,9 +1532,14 @@ func (p *openAIResponsesProvider) Stream(ctx context.Context, transcript Transcr
 				// The level travels in configuration_update items; reasoning.effort stays fixed so the prompt cache holds.
 				effort = configurationUpdateRequestEffort
 			}
+			summary := "auto"
+			// pig divergence (D192): Dyna's native OpenAI route requests the detailed summary; explicit values and all excluded routes retain their base behavior.
+			if dynaResponses {
+				summary = "detailed"
+			}
 			req.Reasoning = &respReasoning{
 				Effort:  effort,
-				Summary: cmp.Or(opts.ReasoningSummary, p.defaultReasoningSummary()),
+				Summary: cmp.Or(opts.ReasoningSummary, summary),
 			}
 			req.Include = []string{"reasoning.encrypted_content"}
 		case opts.ReasoningSummary != "":
@@ -1678,7 +1675,11 @@ func (p *openAIResponsesProvider) Stream(ctx context.Context, transcript Transcr
 	if p.cfg.Codex {
 		newRequest = newFetchRequest
 	}
-	httpReq, err := newRequest(ctx, http.MethodPost, endpointURL, sseBody, opts.Fetch != nil)
+	requestContext := ctx
+	if dynaResponses {
+		requestContext = context.WithValue(ctx, openAIResponsesStallKey{}, openAIResponsesStallTimeout(opts))
+	}
+	httpReq, err := newRequest(requestContext, http.MethodPost, endpointURL, sseBody, opts.Fetch != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1798,8 +1799,8 @@ func (p *openAIResponsesProvider) streamResponse(ctx context.Context, httpReq *h
 	return builder.responseTurn(func() error {
 		if resp.StatusCode != http.StatusOK {
 			b, readErr := readWebText(resp.Body)
-			// pig divergence (D131): a watchdog-expired error body remains a typed transport failure.
-			if _, stalled := errors.AsType[*sseIdleError](readErr); stalled {
+			// pig divergence (D131): an expired native OpenAI request budget remains a typed transport failure while reading an error response.
+			if _, stalled := errors.AsType[*openAIResponsesStallError](readErr); stalled {
 				return readErr
 			}
 			if p.cfg.Codex {

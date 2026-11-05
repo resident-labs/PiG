@@ -2,38 +2,23 @@ package ai
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// D131: a model call with no semantic SSE event for StreamOptions.StallTimeoutMs, connect and first byte included, aborts with StreamStallError and retries through the transport-failure path.
+const stallTextChunk = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"output\":[]}}\n\n"
+const stallFinishChunk = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[]}}\n\n"
 
-const stallTextChunk = `data: {"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"x"}}]}` + "\n\n"
-const stallFinishChunk = `data: {"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"!"},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n\n"
-
-// stallServer runs behavior for each request, numbered from 1; it returns when the client goes away.
-func stallServer(t *testing.T, behavior func(attempt int, w http.ResponseWriter, r *http.Request)) (*httptest.Server, *atomic.Int32) {
-	t.Helper()
-	var attempts atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The server notices a closed connection only once the request body is read.
-		_, _ = io.Copy(io.Discard, r.Body)
-		behavior(int(attempts.Add(1)), w, r)
-	}))
-	t.Cleanup(server.Close)
-	return server, &attempts
-}
-
-func stallCall(server *httptest.Server, stallMs int) func() (AssistantMessage, error) {
+func stallCall(ctx context.Context, server *httptest.Server, timeout int) func() (AssistantMessage, error) {
 	return func() (AssistantMessage, error) {
-		provider := NewOpenAIProvider(OpenAIConfig{Model: "m", APIKey: "k", BaseURL: server.URL})
-		stream, err := provider.Stream(context.Background(), NormalizeContext(Context{Messages: []Message{UserMessage{Content: UserText("hi")}}}), StreamOptions{StallTimeoutMs: &stallMs})
+		provider := NewOpenAIResponsesProvider(OpenAIResponsesConfig{Model: "m", APIKey: "k", ProviderID: "openai", BaseURL: server.URL})
+		defer func() { _ = provider.Close() }()
+		stream, err := provider.Stream(ctx, NormalizeContext(Context{Messages: []Message{UserMessage{Content: UserText("hi")}}}), StreamOptions{StallTimeoutMs: &timeout, MaxRetries: new(0)})
 		if err != nil {
 			return AssistantMessage{}, err
 		}
@@ -41,190 +26,188 @@ func stallCall(server *httptest.Server, stallMs int) func() (AssistantMessage, e
 	}
 }
 
-func holdUntilGone(w http.ResponseWriter, r *http.Request) {
-	w.(http.Flusher).Flush()
-	<-r.Context().Done()
-}
-
 func stalledDiagnostic(t *testing.T, message AssistantMessage) {
 	t.Helper()
 	for _, diagnostic := range message.Diagnostics {
-		if diagnostic.Type == "provider_transport_failure" && diagnostic.Error != nil && diagnostic.Error.Name == "StreamStallError" {
+		if diagnostic.Type == "provider_transport_failure" && diagnostic.Error != nil && diagnostic.Error.Name == "StreamStallError" && diagnostic.Error.Code == "PIG_STREAM_STALL" {
 			return
 		}
 	}
-	t.Fatalf("no provider_transport_failure diagnostic named StreamStallError: %+v (error %q)", message.Diagnostics, message.ErrorMessage)
+	t.Fatalf("no typed native stall diagnostic: %+v, error=%q", message.Diagnostics, message.ErrorMessage)
 }
 
-func TestStreamStallAfterEventsAbortsAndRetriesOnce(t *testing.T) {
-	server, attempts := stallServer(t, func(attempt int, w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, stallTextChunk)
-		if attempt == 1 {
-			holdUntilGone(w, r)
-			return
-		}
-		_, _ = io.WriteString(w, stallFinishChunk)
-	})
-	var failures []AssistantMessage
-	var retries atomic.Int32
-	call := stallCall(server, 200)
-	final, err := RetryAssistantCall(t.Context(), func() (AssistantMessage, error) {
-		message, err := call()
-		if message.StopReason == StopReasonError {
-			failures = append(failures, message)
-		}
-		return message, err
-	}, &RetryPolicy{Enabled: true, MaxRetries: 3, BaseDelayMs: 1}, RetryCallbacks{OnRetryScheduled: func(int, int, int, string) error { retries.Add(1); return nil }})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if final.StopReason != StopReasonStop || attempts.Load() != 2 || retries.Load() != 1 || len(failures) != 1 {
-		t.Fatalf("stop=%s attempts=%d retries=%d failures=%d error=%q", final.StopReason, attempts.Load(), retries.Load(), len(failures), final.ErrorMessage)
-	}
-	stalledDiagnostic(t, failures[0])
-}
-
-func TestStreamStallBeforeTheFirstByteAborts(t *testing.T) {
-	for name, silence := range map[string]func(http.ResponseWriter, *http.Request){
-		"before response headers": func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() },
-		"after headers": func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "text/event-stream")
-			holdUntilGone(w, r)
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			server, _ := stallServer(t, func(_ int, w http.ResponseWriter, r *http.Request) { silence(w, r) })
-			start := time.Now()
-			message, err := stallCall(server, 200)()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if message.StopReason != StopReasonError || time.Since(start) > 5*time.Second {
-				t.Fatalf("stop=%s after %s error=%q", message.StopReason, time.Since(start), message.ErrorMessage)
-			}
-			if !IsRetryableAssistantError(message) {
-				t.Fatalf("the stall error is not retryable: %q", message.ErrorMessage)
+func TestStreamStallNativeRequestPhases(t *testing.T) {
+	for _, phase := range []string{"before headers", "before first event", "after event", "503 JSON body"} {
+		t.Run(phase, func(t *testing.T) {
+			server, _ := stallServer(t, func(_ int, w http.ResponseWriter, r *http.Request) {
+				if phase != "before headers" {
+					w.Header().Set("Content-Type", "text/event-stream")
+					if phase == "503 JSON body" {
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusServiceUnavailable)
+					}
+					if phase == "after event" {
+						_, _ = io.WriteString(w, stallTextChunk)
+					}
+					w.(http.Flusher).Flush()
+				}
+				<-r.Context().Done()
+			})
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			message, err := stallCall(ctx, server, 40)()
+			if err != nil || ctx.Err() != nil || message.StopReason != StopReasonError || !IsRetryableAssistantError(message) {
+				t.Fatalf("caller=%v stop=%s err=%v message=%q", ctx.Err(), message.StopReason, err, message.ErrorMessage)
 			}
 			stalledDiagnostic(t, message)
 		})
 	}
 }
 
-func TestStreamWithSteadyEventsIsNeverAborted(t *testing.T) {
-	server, attempts := stallServer(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		for range 12 {
-			_, _ = io.WriteString(w, stallTextChunk)
-			w.(http.Flusher).Flush()
-			time.Sleep(60 * time.Millisecond)
-		}
-		_, _ = io.WriteString(w, stallFinishChunk)
-	})
-	message, err := stallCall(server, 250)()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if message.StopReason != StopReasonStop || attempts.Load() != 1 {
-		t.Fatalf("stop=%s attempts=%d error=%q", message.StopReason, attempts.Load(), message.ErrorMessage)
-	}
-}
-
-// A stream that completed leaves no armed timer: the stall cancel never fires after the body reached its end.
-func TestStreamStallTimerIsStoppedWhenTheStreamCompletes(t *testing.T) {
-	var mu sync.Mutex
-	var causes []error
-	ctx, cancel := context.WithCancelCause(t.Context())
-	record := func(cause error) {
-		mu.Lock()
-		causes = append(causes, cause)
-		mu.Unlock()
-		cancel(cause)
-	}
-	const bound = 80 * time.Millisecond
-	body := &sseIdleBody{ReadCloser: io.NopCloser(strings.NewReader("")), ctx: ctx, cancel: record, stopAbort: func() {}}
-	for _, timeout := range []time.Duration{bound, 2 * bound} {
-		body.timers = append(body.timers, sseIdleTimer{timer: time.AfterFunc(timeout, func() { record(&sseIdleError{timeout: timeout}) }), timeout: timeout})
-	}
-	if _, err := io.ReadAll(body); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(4 * bound)
-	mu.Lock()
-	defer mu.Unlock()
-	if len(causes) != 0 {
-		t.Fatalf("the stall timer fired after the stream completed: %v", causes)
-	}
-}
-
-func TestStreamStallOptionDisablesTheWatchdog(t *testing.T) {
-	server, _ := stallServer(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, stallTextChunk)
+func TestStreamStallNativeRetryBackoffAndLimit(t *testing.T) {
+	server, attempts := stallServer(t, func(_ int, w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
 		w.(http.Flusher).Flush()
-		time.Sleep(400 * time.Millisecond)
-		_, _ = io.WriteString(w, stallFinishChunk)
+		<-r.Context().Done()
 	})
-	message, err := stallCall(server, 0)()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if message.StopReason != StopReasonStop {
-		t.Fatalf("stop=%s error=%q", message.StopReason, message.ErrorMessage)
-	}
-}
-
-func TestStreamStallDefaultsToOneHundredEightySeconds(t *testing.T) {
-	previous := ConfiguredHTTPIdleTimeoutMs()
-	t.Cleanup(func() { _ = ConfigureHTTPDispatcher(previous) })
-	if err := ConfigureHTTPDispatcher(100); err != nil {
-		t.Fatal(err)
-	}
-	if got := streamStall(StreamOptions{}); got != 180*time.Second {
-		t.Fatalf("default stall bound %s", got)
-	}
-	override := 5000
-	if got := streamStall(StreamOptions{StallTimeoutMs: &override}); got != 5*time.Second {
-		t.Fatalf("overridden stall bound %s", got)
-	}
-}
-
-// A buffered Read may finish after Close. It must not rearm a timer that terminal cleanup already stopped.
-func TestStreamStallBufferedReadCannotRearmATimerAfterClose(t *testing.T) {
-	ctx, cancel := context.WithCancelCause(t.Context())
-	defer cancel(nil)
-	body := &sseIdleBody{ctx: ctx, cancel: cancel, stopAbort: func() {}}
-	body.ReadCloser = &stallCloseDuringRead{close: func() { _ = body.Close() }}
-	body.timers = []sseIdleTimer{{timer: time.AfterFunc(time.Minute, func() { cancel(&sseIdleError{timeout: time.Minute}) }), timeout: time.Minute}}
-	if _, err := body.Read(make([]byte, len(stallTextChunk))); err != nil {
-		t.Fatal(err)
-	}
-	if body.timers[0].timer.Stop() {
-		t.Fatal("buffered Read rearmed a timer after Close stopped it")
-	}
-}
-
-type stallCloseDuringRead struct{ close func() }
-
-func (r *stallCloseDuringRead) Read(p []byte) (int, error) {
-	r.close()
-	return copy(p, stallTextChunk), nil
-}
-func (*stallCloseDuringRead) Close() error { return nil }
-
-func TestStreamStallGoogleBeforeHeadersProducesARetryableMessage(t *testing.T) {
-	server, attempts := stallServer(t, func(_ int, _ http.ResponseWriter, r *http.Request) { <-r.Context().Done() })
-	provider := fetchOptionProvider(APIGoogleGenerativeAI, server.URL)
-	defer func() { _ = provider.Close() }()
-	message, err := RetryAssistantCall(t.Context(), func() (AssistantMessage, error) {
-		stream, err := provider.Stream(t.Context(), NormalizeContext(Context{Messages: []Message{UserMessage{Content: UserText("hi")}}}), StreamOptions{StallTimeoutMs: new(40)})
-		if err != nil {
-			return AssistantMessage{}, err
-		}
-		return *stream.Result(), nil
-	}, &RetryPolicy{Enabled: true, MaxRetries: 1, BaseDelayMs: 1}, RetryCallbacks{})
-	if err != nil || attempts.Load() != 2 {
-		t.Fatalf("attempts=%d error=%v, want two retryable stalled responses", attempts.Load(), err)
+	var delays []int
+	message, err := RetryAssistantCall(t.Context(), stallCall(t.Context(), server, 40), &RetryPolicy{Enabled: true, MaxRetries: 2, BaseDelayMs: 3}, RetryCallbacks{OnRetryScheduled: func(_ int, _ int, delay int, _ string) error { delays = append(delays, delay); return nil }})
+	if err != nil || attempts.Load() != 3 || len(delays) != 2 || delays[0] != 3 || delays[1] != 6 {
+		t.Fatalf("attempts=%d delays=%v err=%v", attempts.Load(), delays, err)
 	}
 	stalledDiagnostic(t, message)
 }
+
+func TestStreamStallNativeRetryCanRecover(t *testing.T) {
+	server, attempts := stallServer(t, func(attempt int, w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, stallTextChunk)
+		if attempt == 1 {
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+			return
+		}
+		_, _ = io.WriteString(w, stallFinishChunk)
+	})
+	message, err := RetryAssistantCall(t.Context(), stallCall(t.Context(), server, 40), &RetryPolicy{Enabled: true, MaxRetries: 1, BaseDelayMs: 1}, RetryCallbacks{})
+	if err != nil || attempts.Load() != 2 || message.StopReason != StopReasonStop {
+		t.Fatalf("attempts=%d stop=%s err=%v message=%q", attempts.Load(), message.StopReason, err, message.ErrorMessage)
+	}
+}
+
+// D131's progress scanner is tested with stopped timers so scheduler delay cannot stand in for semantic idleness.
+func TestStreamStallNativeSemanticProgress(t *testing.T) {
+	for _, tc := range []struct {
+		name, prefix, bytes string
+		sse, resets         bool
+	}{
+		{"data event", "", stallTextChunk, true, true},
+		{"ordinary comment", "", ": keepalive\n\n", true, false},
+		{"ordinary ping", "", "event: ping\ndata: {}\n\n", true, false},
+		{"reasoning comment", "event: response.reasoning_summary_text.delta\ndata: {}\n\n", ": keepalive\n\n", true, true},
+		{"non-SSE bytes", "", stallTextChunk, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
+			body := &openAIResponsesStallBody{ReadCloser: io.NopCloser(strings.NewReader(tc.bytes)), ctx: ctx, cancel: cancel, sse: tc.sse, timeout: time.Hour, timer: time.AfterFunc(time.Hour, func() {}), stopAbort: func() {}}
+			defer func() { _ = body.Close() }()
+			body.timer.Stop()
+			if tc.prefix != "" {
+				body.progress.scan([]byte(tc.prefix))
+			}
+			if _, err := body.Read(make([]byte, len(tc.bytes))); err != nil {
+				t.Fatal(err)
+			}
+			if reset := body.timer.Stop(); reset != tc.resets {
+				t.Fatalf("reset=%v, want %v", reset, tc.resets)
+			}
+		})
+	}
+}
+
+func TestStreamStallNativeKeepaliveBytesDoNotPreventExpiry(t *testing.T) {
+	server, _ := stallServer(t, func(_ int, w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, ": keepalive\n\n")
+		w.(http.Flusher).Flush()
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				_, _ = io.WriteString(w, ": keepalive\n\n")
+				w.(http.Flusher).Flush()
+			}
+		}
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	message, err := stallCall(ctx, server, 40)()
+	if err != nil || ctx.Err() != nil {
+		t.Fatalf("caller=%v err=%v", ctx.Err(), err)
+	}
+	stalledDiagnostic(t, message)
+}
+
+func TestStreamStallNativeDefaultAndDisable(t *testing.T) {
+	if got := openAIResponsesStallTimeout(StreamOptions{}); got != 180*time.Second {
+		t.Fatal(got)
+	}
+	for _, value := range []int{0, -1} {
+		server, _ := stallServer(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
+			time.Sleep(80 * time.Millisecond)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, stallFinishChunk)
+		})
+		message, err := stallCall(t.Context(), server, value)()
+		if err != nil || message.StopReason != StopReasonStop {
+			t.Fatalf("disabled=%d stop=%s err=%v", value, message.StopReason, err)
+		}
+	}
+}
+
+func TestStreamStallNativeCleanup(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	body := &openAIResponsesStallBody{ReadCloser: io.NopCloser(strings.NewReader("")), ctx: ctx, cancel: cancel, timeout: time.Minute, timer: time.AfterFunc(time.Minute, func() { cancel(&openAIResponsesStallError{}) }), stopAbort: func() {}}
+	if _, err := io.ReadAll(body); err != nil {
+		t.Fatal(err)
+	}
+	if body.timer.Stop() {
+		t.Fatal("EOF left the request timer armed")
+	}
+	if context.Cause(ctx) != nil {
+		t.Fatal(context.Cause(ctx))
+	}
+	if err := body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(context.Cause(ctx), context.Canceled) {
+		t.Fatal(context.Cause(ctx))
+	}
+}
+
+func TestStreamStallNativeCloseCannotRearmBufferedRead(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	body := &openAIResponsesStallBody{ctx: ctx, cancel: cancel, sse: true, timeout: time.Minute, timer: time.AfterFunc(time.Minute, func() { cancel(&openAIResponsesStallError{}) }), stopAbort: func() {}}
+	body.ReadCloser = &stallBufferedRead{close: func() { _ = body.Close() }}
+	if _, err := body.Read(make([]byte, len(stallTextChunk))); err != nil {
+		t.Fatal(err)
+	}
+	if body.timer.Stop() {
+		t.Fatal("buffered Read rearmed a stopped native timer")
+	}
+}
+
+type stallBufferedRead struct{ close func() }
+
+func (r *stallBufferedRead) Read(p []byte) (int, error) {
+	r.close()
+	return copy(p, stallTextChunk), nil
+}
+func (*stallBufferedRead) Close() error { return nil }

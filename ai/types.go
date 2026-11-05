@@ -862,7 +862,7 @@ type StreamOptions struct {
 	TextVerbosity string `json:"textVerbosity,omitempty"`
 	// ReasoningEffort is the raw OpenAI-compatible or Mistral API effort. Unlike the provider-neutral Thinking level, it is mapped but not clamped so the provider can reject unsupported values.
 	ReasoningEffort string
-	// ReasoningSummary is the raw OpenAI Responses reasoning summary mode ("auto", "detailed" or "concise"). Empty sends "detailed" for OpenAI and Codex models (D192) and "auto" for other Responses providers, with a reasoning effort. On regular Responses an explicit summary without an effort requests medium effort; on Codex a summary alone does not request an effort.
+	// ReasoningSummary is the raw OpenAI Responses reasoning summary mode ("auto", "detailed" or "concise"). Empty sends "detailed" only for native OpenAI Responses with provider ID "openai" (D192); custom Fetch, Azure, Codex and other providers keep "auto", with a reasoning effort. On regular Responses an explicit summary without an effort requests medium effort; on Codex a summary alone does not request an effort.
 	ReasoningSummary string `json:"reasoningSummary,omitempty"`
 	// PromptMode is the raw Mistral prompt mode, independent of provider-neutral Thinking.
 	PromptMode string `json:"promptMode,omitempty"`
@@ -916,7 +916,7 @@ type StreamOptions struct {
 	Transport Transport
 	// TimeoutMs bounds the full Mistral request through SSE consumption, and response headers or stream idleness for other supported providers. Nil selects the provider default; zero remains explicit and follows the selected provider's timeout semantics.
 	TimeoutMs *int `json:"timeoutMs,omitempty"`
-	// StallTimeoutMs bounds how long an HTTP SSE model call may go without semantic progress, including connect and time to first byte; Bedrock event streams and Codex WebSockets do not use it. The budget and cancellation also cover non-SSE response bodies, whose bytes never reset the budget. Nil selects 180000; a positive value overrides that budget; zero or less disables only this budget. The independent httpIdleTimeoutMs byte timeout starts after connection establishment, and its semantic SSE timeout starts after SSE headers; either can end the call sooner. A stall reports StreamStallError through the transport-failure retry path. Comment lines and ping events count as progress only while the stream is reasoning (D131).
+	// StallTimeoutMs bounds semantic idleness only for native OpenAI Responses with provider ID "openai", including connection establishment and non-SSE error bodies (D131). Nil selects 180000; positive overrides; zero or less disables the new budget. All other APIs/providers and custom Fetch ignore this option and retain legacy D131 behavior. SSE events and reasoning keepalives reset the budget under D131's progress policy. An expiry reports StreamStallError through existing retries; legacy idle diagnostics are unchanged.
 	StallTimeoutMs *int `json:"stallTimeoutMs,omitempty"`
 	// WebSocketConnectTimeoutMs bounds only the opening handshake. Nil selects the provider default; zero explicitly disables it.
 	WebSocketConnectTimeoutMs *int `json:"websocketConnectTimeoutMs,omitempty"`

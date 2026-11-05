@@ -102,7 +102,7 @@ func (p *piMessagesProvider) Stream(ctx context.Context, transcript TranscriptCo
 func (p *piMessagesProvider) run(ctx context.Context, transcript TranscriptContext, opts StreamOptions, stream *AssistantMessageEventStream, convert *piMessagesEventConverter) {
 	response, err := p.send(ctx, transcript, opts) // pi-messages.ts:383-413 payload, `await fetch`, `await onResponse`, status check.
 	if err != nil {
-		_ = stream.Push(p.errorEvent(ctx, err, false))
+		_ = stream.Push(p.errorEvent(ctx, err))
 		return
 	}
 	defer func() { _ = response.Body.Close() }()
@@ -129,7 +129,6 @@ func (p *piMessagesProvider) consumeBody(ctx context.Context, stream *AssistantM
 
 // consume is the `for await` over readPiMessagesEvents with the try/catch around it (pi-messages.ts:432-448).
 func (p *piMessagesProvider) consume(ctx context.Context, stream *AssistantMessageEventStream, convert *piMessagesEventConverter, loop *piMessagesEventLoop) {
-	eventsEmitted := false
 	err := loop.run(func(raw json.RawMessage) (bool, error) {
 		if err := convert.observeEvent(loop.turn, raw); err != nil { // pi-messages.ts:415
 			return false, err
@@ -141,7 +140,6 @@ func (p *piMessagesProvider) consume(ctx context.Context, stream *AssistantMessa
 			if pushErr := stream.push(event, replaced); pushErr != nil {
 				return false, pushErr
 			}
-			eventsEmitted = true
 			if isTerminalEvent(event) {
 				return true, nil
 			}
@@ -151,9 +149,9 @@ func (p *piMessagesProvider) consume(ctx context.Context, stream *AssistantMessa
 	switch {
 	case err == nil:
 	case errors.Is(err, errPiMessagesEventsEnded):
-		_ = stream.Push(p.errorEvent(ctx, fmt.Errorf("%s %w", p.cfg.ProviderID, err), eventsEmitted)) // pi-messages.ts:443
+		_ = stream.Push(p.errorEvent(ctx, fmt.Errorf("%s %w", p.cfg.ProviderID, err))) // pi-messages.ts:443
 	default:
-		_ = stream.Push(p.errorEvent(ctx, err, eventsEmitted))
+		_ = stream.Push(p.errorEvent(ctx, err))
 	}
 }
 
@@ -200,7 +198,7 @@ func (p *piMessagesProvider) send(ctx context.Context, transcript TranscriptCont
 	if err != nil {
 		return nil, err
 	}
-	request, err := newFetchRequest(withStreamStall(ctx, opts), http.MethodPost, endpoint, bytes.NewReader(body), opts.Fetch != nil)
+	request, err := newFetchRequest(ctx, http.MethodPost, endpoint, bytes.NewReader(body), opts.Fetch != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -361,7 +359,7 @@ func truncateDiagnosticString(value string) string {
 
 // errorEvent is createErrorEvent (pi-messages.ts:325-346). aborted is options.signal.aborted at the time of the catch, and an abort
 // that surfaced as a cancellation reports the signal's reason the way fetch rejects with it.
-func (p *piMessagesProvider) errorEvent(ctx context.Context, err error, eventsEmitted bool) ErrorEvent {
+func (p *piMessagesProvider) errorEvent(ctx context.Context, err error) ErrorEvent {
 	aborted := ctx.Err() != nil
 	reason := StopReasonError
 	if aborted {
@@ -374,12 +372,6 @@ func (p *piMessagesProvider) errorEvent(ctx context.Context, err error, eventsEm
 		Content: []AssistantContentBlock{}, API: outputAPI(p.cfg.ModelMetadata, APIPiMessages), Provider: p.cfg.ProviderID, Model: p.cfg.Model,
 		// createErrorEvent's object literal lists errorMessage before timestamp (pi-messages.ts:323-335).
 		StopReason: reason, ErrorMessage: err.Error(), Timestamp: time.Now().UnixMilli(), ErrorBeforeTimestamp: true,
-	}
-	// pig divergence (D180): transport failures retain their typed Go cause in diagnostics; caller aborts do not.
-	if !aborted {
-		if diagnostic, ok := transportFailureDiagnostic(err, eventsEmitted); ok {
-			AppendAssistantMessageDiagnostic(message, diagnostic)
-		}
 	}
 	var responseError *PiMessagesResponseError
 	if !aborted && errors.As(err, &responseError) {

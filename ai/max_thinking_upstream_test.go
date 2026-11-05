@@ -71,7 +71,7 @@ func TestMaxThinkingUpstream(t *testing.T) {
 			m := mustGeneratedModel(t, "openai-codex", id)
 			p := NewOpenAICodexResponsesProvider(OpenAICodexResponsesConfig{APIKey: codexTestToken(t, "acc_test"), Model: m.ID, ProviderID: m.Provider, BaseURL: m.BaseURL, Compat: m.Compat})
 			payload := captureCatalogPayload(t, p, StreamOptions{Thinking: ThinkingLevelMax, IsReasoning: m.Reasoning, Transport: TransportSSE})
-			assertCatalogJSON(t, payload["reasoning"], `{"effort":"max","summary":"detailed"}`)
+			assertCatalogJSON(t, payload["reasoning"], `{"effort":"max","summary":"auto"}`)
 		})
 	}
 }

@@ -87,8 +87,8 @@ func TestOpenAICodexResponses_RequestMatchesCodexProtocol(t *testing.T) {
 	if got := capturedBody["parallel_tool_calls"]; got != true {
 		t.Errorf("parallel_tool_calls = %v, want true", got)
 	}
-	if got := capturedBody["reasoning"]; !jsonObjectsEqual(got, map[string]any{"effort": "high", "summary": "detailed"}) {
-		t.Errorf("reasoning = %#v, want high/detailed (D191)", got)
+	if got := capturedBody["reasoning"]; !jsonObjectsEqual(got, map[string]any{"effort": "high", "summary": "auto"}) {
+		t.Errorf("reasoning = %#v, want high/auto", got)
 	}
 	if got := capturedBody["prompt_cache_key"]; got != "sess" {
 		t.Errorf("prompt_cache_key = %v, want sess", got)

@@ -2,95 +2,42 @@ package ai
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
-	"math"
 	"mime"
 	"net/http"
 	"sync"
 	"time"
 )
 
-// defaultStreamStall is how long a model call may go without a semantic SSE event, connect and time to first byte included, before it is aborted and retried.
-// pig divergence (D131): Pi has no event-level timeout.
-const defaultStreamStall = 180 * time.Second
-
-// streamStall is the request-start stall budget, independent of the legacy post-header semantic idle timeout. Zero or less disables only this budget.
-func streamStall(options StreamOptions) time.Duration {
-	if options.StallTimeoutMs == nil {
-		return defaultStreamStall
-	}
-	return time.Duration(min(max(int64(*options.StallTimeoutMs), 0), math.MaxInt64/int64(time.Millisecond))) * time.Millisecond
-}
-
-type streamStallOptionsKey struct{}
-
-// withStreamStall marks a model streaming request at the StreamOptions boundary. Non-stream requests using the same clients keep their original context and timeout behavior.
-// dyna patch P13; pig divergence (D131): Pi has no request-start semantic stall budget.
-func withStreamStall(ctx context.Context, options StreamOptions) context.Context {
-	return context.WithValue(ctx, streamStallOptionsKey{}, streamStall(options))
-}
-
-type sseIdleTimer struct {
-	timer   *time.Timer
-	timeout time.Duration
-}
-
-// sseIdleTransport owns the request-start and legacy post-header semantic SSE budgets for typed model streams. Both reset on semantic progress; non-stream requests keep their original context and timeout behavior.
+// sseIdleTransport ends a text/event-stream response that makes no semantic progress for the configured HTTP idle timeout. The byte-level idle
+// deadline (idleTimeoutConn) never fires while a gateway keeps sending comment lines or pings, so a stalled generation hung forever.
 // pig divergence (D131): Pi measures idleness on bytes only (pi-mono #10761, #10762); reasoning events keep keepalives counting.
 type sseIdleTransport struct{ base http.RoundTripper }
 
 func (t *sseIdleTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	timeout, streaming := request.Context().Value(streamStallOptionsKey{}).(time.Duration)
-	if !streaming {
-		return t.base.RoundTrip(request)
+	// pig divergence (D131): only the native OpenAI Responses boundary selects the additional request budget.
+	if timeout, enabled := request.Context().Value(openAIResponsesStallKey{}).(time.Duration); enabled && timeout > 0 {
+		return t.roundTripOpenAIResponsesStall(request, timeout)
 	}
-	ctx, cancel := context.WithCancelCause(request.Context())
-	var timers []sseIdleTimer
-	if timeout > 0 {
-		timers = append(timers, sseIdleTimer{timer: time.AfterFunc(timeout, func() { cancel(&sseIdleError{timeout: timeout}) }), timeout: timeout})
-	}
-	response, err := t.base.RoundTrip(request.WithContext(ctx))
-	if err != nil {
-		for _, idle := range timers {
-			idle.timer.Stop()
-		}
-		cause := context.Cause(ctx)
-		cancel(nil)
-		if stall, stalled := errors.AsType[*sseIdleError](cause); stalled {
-			return response, stall
-		}
+	return t.roundTripLegacy(request)
+}
+
+func (t *sseIdleTransport) roundTripLegacy(request *http.Request) (*http.Response, error) {
+	response, err := t.base.RoundTrip(request)
+	if err != nil || response.Body == nil {
 		return response, err
 	}
-	if response.Body == nil {
-		for _, idle := range timers {
-			idle.timer.Stop()
-		}
-		cancel(nil)
+	timeout := configuredHTTPIdleTimeout()
+	if timeout <= 0 {
 		return response, nil
 	}
-	mediaType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
-	// The legacy D131 semantic idle budget begins at SSE headers, never during CONNECT or TLS. Every acquired response keeps the independent request-start budget and cancellation ownership, including non-SSE error bodies.
-	if mediaType == "text/event-stream" {
-		if legacy := configuredHTTPIdleTimeout(); legacy > 0 {
-			timers = append(timers, sseIdleTimer{timer: time.AfterFunc(legacy, func() { cancel(&sseIdleError{timeout: legacy}) }), timeout: legacy})
-		}
+	if mediaType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type")); mediaType != "text/event-stream" {
+		return response, nil
 	}
-	body := &sseIdleBody{ReadCloser: response.Body, ctx: ctx, cancel: cancel, timers: timers, nonSSE: mediaType != "text/event-stream"}
-	abortDone := make(chan struct{})
-	stopAbort := context.AfterFunc(ctx, func() {
-		_ = body.closeBody()
-		close(abortDone)
-	})
-	body.stopAbort = func() {
-		if stopAbort() {
-			close(abortDone)
-		}
-		<-abortDone
-	}
+	body := &sseIdleBody{ReadCloser: response.Body, timeout: timeout}
+	body.timer = time.AfterFunc(timeout, body.expire)
 	response.Body = body
 	return response, nil
 }
@@ -101,20 +48,16 @@ func (t *sseIdleTransport) CloseIdleConnections() {
 	}
 }
 
-// sseIdleBody owns cancellation and timer cleanup for every acquired typed stream response. Only SSE bodies reset timers on semantic progress; non-SSE bodies retain the request-start budget without interpreting their bytes as events.
-// Within SSE, data lines other than ping count as progress. Comment lines and pings count only after a reasoning or thinking event, until a non-reasoning event arrives.
+// sseIdleBody restarts its timer whenever a data line of an event other than ping arrives. Comment lines and ping events are keepalives, except while the
+// stream is reasoning: a model that thinks silently behind a gateway's keepalives has not stalled, so after a reasoning or thinking event the keepalives
+// count as progress until an event that is not about reasoning arrives (owner sign-off 2026-10-10).
 type sseIdleBody struct {
 	io.ReadCloser
-	// ctx is the request context the stall timer cancels with an *sseIdleError cause; a read that fails because of it reports that error.
-	ctx       context.Context
-	cancel    context.CancelCauseFunc
-	timers    []sseIdleTimer
-	nonSSE    bool
-	mu        sync.Mutex
-	stopped   bool
-	stopAbort func()
-	closeOnce sync.Once
-	closeErr  error
+	timeout time.Duration
+	timer   *time.Timer
+
+	mu      sync.Mutex
+	expired bool
 
 	line []byte
 	ping bool
@@ -141,57 +84,39 @@ const (
 	sseLineOther
 )
 
-// sseIdleError is the typed cause of a stall abort: no semantic event for timeout. Diagnostics record it as StreamStallError, apart from SocketError.
 type sseIdleError struct{ timeout time.Duration }
 
 func (e *sseIdleError) Error() string {
 	return fmt.Sprintf("SSE Event Timeout Error: no event for %dms", e.timeout.Milliseconds())
 }
 
+func (b *sseIdleBody) expire() {
+	b.mu.Lock()
+	b.expired = true
+	b.mu.Unlock()
+	_ = b.ReadCloser.Close()
+}
+
 func (b *sseIdleBody) Read(buffer []byte) (int, error) {
 	count, err := b.ReadCloser.Read(buffer)
-	if err != nil {
-		b.stopTimers()
-		b.stopAbort()
-		if stall, stalled := errors.AsType[*sseIdleError](context.Cause(b.ctx)); stalled {
-			return count, stall
-		}
-		return count, err
+	b.mu.Lock()
+	expired := b.expired
+	b.mu.Unlock()
+	if expired && err != nil {
+		return count, &sseIdleError{timeout: b.timeout}
 	}
-	if !b.nonSSE && count > 0 && b.scan(buffer[:count]) {
-		b.mu.Lock()
-		if !b.stopped {
-			for _, idle := range b.timers {
-				idle.timer.Reset(idle.timeout)
-			}
-		}
-		b.mu.Unlock()
+	if count > 0 && b.scan(buffer[:count]) {
+		b.timer.Reset(b.timeout)
+	}
+	if err != nil {
+		b.timer.Stop()
 	}
 	return count, err
 }
 
 func (b *sseIdleBody) Close() error {
-	b.stopTimers()
-	b.stopAbort()
-	err := b.closeBody()
-	b.cancel(nil)
-	return err
-}
-
-// stopTimers serializes terminal cleanup with a buffered Read's progress reset, so a Read that finishes after Close cannot rearm a timer.
-func (b *sseIdleBody) stopTimers() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.stopped = true
-	for _, idle := range b.timers {
-		idle.timer.Stop()
-	}
-}
-
-// closeBody releases a custom Fetch body even when it does not observe request cancellation. The cancellation callback and Close share ownership and close it once.
-func (b *sseIdleBody) closeBody() error {
-	b.closeOnce.Do(func() { b.closeErr = b.ReadCloser.Close() })
-	return b.closeErr
+	b.timer.Stop()
+	return b.ReadCloser.Close()
 }
 
 // scan feeds bytes through a line tracker and reports whether a data line of a non-ping event completed. Line ends are found with a byte search, and a line that starts and ends in data is sniffed in place; only the part of a line that continues into the next read is kept.

@@ -60,7 +60,7 @@ func providerHTTPClient(configured, fetch *http.Client) *http.Client {
 	}
 	client := *configured
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	transport := &nodeFetchTransport{base: &sseIdleTransport{base: fetchTransport{client: fetch}}}
+	transport := &nodeFetchTransport{base: fetchTransport{client: fetch}}
 	if retry, ok := configured.Transport.(*retryTransport); ok {
 		transport.base = &providerRequestTransport{base: transport.base}
 		wrapped := *retry

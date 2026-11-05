@@ -1239,12 +1239,8 @@ func (p *anthropicProvider) streamResponse(ctx, requestContext context.Context, 
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
-		b, readErr := readWebText(resp.Body)
+		b, _ := readWebText(resp.Body)
 		_ = resp.Body.Close()
-		// pig divergence (D131): a watchdog-expired error body remains a typed transport failure.
-		if _, stalled := errors.AsType[*sseIdleError](readErr); stalled {
-			return readErr
-		}
 		// pig divergence (D37): retry once without rejected thinking signatures.
 		var retry *anthropicOutgoing
 		strictLimitMessage, strictLimitsExceeded := anthropicStrictToolLimitsExceeded(resp.StatusCode, b)
@@ -1275,12 +1271,8 @@ func (p *anthropicProvider) streamResponse(ctx, requestContext context.Context, 
 			return err
 		}
 		if resp.StatusCode != http.StatusOK {
-			b2, readErr := readWebText(resp.Body)
+			b2, _ := readWebText(resp.Body)
 			_ = resp.Body.Close()
-			// pig divergence (D131): a watchdog expiry on a fallback response remains a typed transport failure.
-			if _, stalled := errors.AsType[*sseIdleError](readErr); stalled {
-				return readErr
-			}
 			return anthHTTPError(resp.StatusCode, b2)
 		}
 	}

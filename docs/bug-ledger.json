@@ -27656,15 +27656,15 @@
     },
     {
       "id": "BF-d6eafcd",
-      "title": "Abort HTTP SSE model calls after 180 seconds without semantic progress and send the typed failure through…",
-      "symptom": "Abort HTTP SSE model calls after 180 seconds without semantic progress and send the typed failure through existing retries (D131).",
+      "title": "Bound semantic idleness only on native OpenAI Responses requests with provider ID `openai` and no custom…",
+      "symptom": "Bound semantic idleness only on native OpenAI Responses requests with provider ID `openai` and no custom Fetch (D131).",
       "rootCause": "A model call with no semantic SSE event for 180 s (connect and first byte included) aborts with StreamStallError and retries through the transport-failure path. OpenAI and Codex Responses requests ask for reasoning.summary detailed by default.",
       "rootCauseSource": "commit",
       "userImpact": "An operation failed or was rejected",
       "platform": "All platforms",
       "class": "own",
       "fixedIn": "Unreleased",
-      "releaseNote": "Abort HTTP SSE model calls after 180 seconds without semantic progress and send the typed failure through existing retries (D131). Positive `StreamOptions.StallTimeoutMs` values replace the default; zero or less disables only the new budget. Preserve legacy idle timers and non-stream request contexts, close stalled custom Fetch bodies, and stop timers on completion. Keep the request budget and cancellation active for non-SSE error bodies, and preserve typed body failures through provider error handling without classifying ordinary HTTP error text as a stall.",
+      "releaseNote": "Bound semantic idleness only on native OpenAI Responses requests with provider ID `openai` and no custom Fetch (D131). The independent request-start budget defaults to 180 seconds, covers connection establishment and non-SSE error bodies, and sends a typed failure through existing retry/backoff. Positive `StreamOptions.StallTimeoutMs` overrides the budget; zero or less disables it. EOF and Close release the new timer and cancellation callback. Existing legacy D131 behavior and diagnostics remain unchanged.",
       "origin": "release note",
       "commits": [
         {
@@ -27684,32 +27684,7 @@
         "ai/max_thinking_upstream_test.go::TestMaxThinkingUpstream",
         "ai/openai_codex_request_test.go::TestOpenAICodexResponses_RequestMatchesCodexProtocol",
         "ai/openai_codex_sse_upstream_test.go::TestCodexSSEAndPayloadUpstream",
-        "ai/reasoning_summary_default_test.go::TestResponsesRequestAsksForADetailedReasoningSummaryByDefault",
-        "ai/stream_stall_boundary_test.go::TestStreamStallAbortsEverySSEProvider",
-        "ai/stream_stall_boundary_test.go::TestStreamStallCustomFetchClosesUncooperativeBody",
-        "ai/stream_stall_boundary_test.go::TestStreamStallCustomFetchPreservesCauseBeforeHeaders",
-        "ai/stream_stall_boundary_test.go::TestStreamStallDisabledBudgetKeepsLegacySSEIdleTimeout",
-        "ai/stream_stall_boundary_test.go::TestStreamStallHeadersDoNotExtendTheRequestStartBudget",
-        "ai/stream_stall_boundary_test.go::TestStreamStallLeavesNonStreamRequestsUnchanged",
-        "ai/stream_stall_boundary_test.go::TestStreamStallOptionsReachEverySSEBoundary",
-        "ai/stream_stall_boundary_test.go::TestStreamStallPiMessagesDiagnosticTracksTheStreamPhase",
-        "ai/stream_stall_boundary_test.go::TestStreamStallRequestBudgetIsIndependentOfLegacyIdleBeforeHeaders",
-        "ai/stream_stall_response_test.go::TestStreamStallCompletedHTTPErrorTextDoesNotBecomeATypedStall",
-        "ai/stream_stall_response_test.go::TestStreamStallCompletedNonSSEResponseStopsTimersAndDetachesAbort",
-        "ai/stream_stall_response_test.go::TestStreamStallDisabledNonSSEResponseStillClosesOnCallerCancellation",
-        "ai/stream_stall_response_test.go::TestStreamStallMistralBeforeHeadersProducesARetryableMessage",
-        "ai/stream_stall_response_test.go::TestStreamStallNonSSEBytesCannotResetTheRequestBudget",
-        "ai/stream_stall_response_test.go::TestStreamStallNonSSEErrorBodyKeepsTypedCauseAcrossProviders",
-        "ai/stream_stall_response_test.go::TestStreamStallNonSSEResponseBodyStillAborts",
-        "ai/stream_stall_response_test.go::TestStreamStallUnmarkedNonSSEResponsesRemainUntouched",
-        "ai/stream_stall_test.go::TestStreamStallAfterEventsAbortsAndRetriesOnce",
-        "ai/stream_stall_test.go::TestStreamStallBeforeTheFirstByteAborts",
-        "ai/stream_stall_test.go::TestStreamStallBufferedReadCannotRearmATimerAfterClose",
-        "ai/stream_stall_test.go::TestStreamStallDefaultsToOneHundredEightySeconds",
-        "ai/stream_stall_test.go::TestStreamStallGoogleBeforeHeadersProducesARetryableMessage",
-        "ai/stream_stall_test.go::TestStreamStallOptionDisablesTheWatchdog",
-        "ai/stream_stall_test.go::TestStreamStallTimerIsStoppedWhenTheStreamCompletes",
-        "ai/stream_stall_test.go::TestStreamWithSteadyEventsIsNeverAborted"
+        "ai/reasoning_summary_default_test.go::TestResponsesRequestAsksForADetailedReasoningSummaryByDefault"
       ]
     },
     {
@@ -35822,7 +35797,7 @@
     },
     {
       "id": "D131",
-      "title": "A stalled SSE stream that still sends keepalives ends after the semantic idle timeout (pi-mono #10761, #10762)",
+      "title": "A stalled SSE stream that still sends keepalives ends after the HTTP idle timeout (pi-mono #10761, #10762)",
       "entry": "BF-3651a90"
     },
     {
@@ -35988,7 +35963,7 @@
     },
     {
       "id": "D192",
-      "title": "OpenAI and Codex Responses requests ask for reasoning.summary \"detailed\" by default"
+      "title": "Dyna's native OpenAI Responses route defaults reasoning.summary to detailed"
     }
   ],
   "exemptCommits": {

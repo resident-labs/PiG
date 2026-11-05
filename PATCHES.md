@@ -211,3 +211,19 @@ Drop it: if upstream declares the executable tools in a compaction head, remove 
 Locked by: `TestACompactionHeadDeclaresTheToolsAHookLeftActive`, `TestACompactionHeadWithoutAHookDeclaresEveryTool`, `TestABoundaryCompactionHeadDeclaresTheExecutableTools` (coding), `TestToolSearchDefaultLimitStaysEightWithoutTheOption`, `TestToolSearchDefaultLimitOptionSetsTheLimitAndTheSchemaText`, `TestToolSearchExplicitLimitWinsOverTheDefaultLimitOption` (toolsearch), `TestSearchToolsKeepsTheDefaultLimitOfEight` (codemode).
 
 Upstream: not offered (owner's decision, 2026-11-04).
+
+## P12 A call to a deferred tool by its exact name loads the tool and runs the call
+
+What: `agent.AgentOptions.ResolveUnloadedTool` (also `Agent.SetResolveUnloadedTool`, `AgentLoopConfig.ResolveUnloadedTool`, `ToolCallHooks.ResolveUnloadedTool`) is asked by `prepareToolCall`, the one place a call's tool name is resolved, when the name is not among the run's tools. A tool it returns runs the call, through the tool's own argument validation and the hooks as any call; nil keeps `Tool <name> not found`. `coding.Session` sets it to `loadDeferredTool` (`coding/session_tools.go`): with `SessionOptions.ContextUpdates`, a name that is exactly an admitted tool of exposure deferred or codemode and not active, while `tool_search` or `codemode` is active (the conditions under which the `deferred_tools` section lists it), is activated as `SetActiveToolsByName` does for a `tool_search` load, and its tool is returned. Matching is by the registry's typed entry for the exact name: another case, a prefix or a suffix finds none. A tool a call of the same batch already activated is returned as well. Without `ContextUpdates` nothing changes.
+
+Why: after a compaction the model remembers tools the host unloaded, and the head names them in `deferred_tools`; its direct calls failed with "not found" and the transcript filled with failed calls.
+
+Interaction with unloading: the tool joins the active tools after the ones already there, with no eviction, as a `tool_search` load does. PiG has no load limit or eviction; P11's limit of 3 is the number of matches one `tool_search` call loads, and unloading is a host's `session_before_compact` hook calling `SetActiveToolsByName`. A tool loaded by a call is unloaded by that hook like any other.
+
+Files: `agent/tool_execution.go`, `agent/agent.go`, `agent/agent_loop.go`, `agent/run_tool_call.go`, `agent/standalone_loop.go`, `coding/session_tools.go`, `coding/session.go`.
+
+Drop it: if upstream resolves calls to deferred tools, use its mechanism and delete the resolver.
+
+Locked by: `TestADirectCallToADeferredToolLoadsItAndRunsTheCall`, `TestADirectCallToACodemodeListedToolLoadsIt`, `TestADirectCallAfterACompactionUnloadedTheToolRunsAndKeepsItLoaded`, `TestADirectCallToAnUnknownToolStaysNotFound`, `TestOnlyTheExactNameOfADeferredToolLoads`, `TestAnAutoLoadAddsOneToolAndEvictsNothing`, `TestAnAutoLoadedToolValidatesItsArguments`, `TestADirectCallWithoutContextUpdatesStaysNotFound` (coding).
+
+Upstream: not offered (owner's decision, 2026-11-04).

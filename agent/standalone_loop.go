@@ -52,6 +52,8 @@ type AgentLoopConfig struct {
 	BeforeToolCallHooks []BeforeToolCallHook
 	AfterToolCallHooks  []AfterToolCallHook
 	PrepareToolResult   func(context.Context, AgentToolResult) AgentToolResult
+	// ResolveUnloadedTool is ToolCallHooks.ResolveUnloadedTool for every call of the run.
+	ResolveUnloadedTool func(name string) AgentTool
 
 	// MaxTurns stops a run after that many turns; zero is unlimited, as upstream.
 	MaxTurns int

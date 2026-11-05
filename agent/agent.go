@@ -778,6 +778,9 @@ type AgentOptions struct {
 	// PrepareToolResult processes the final extension-modified result before
 	// events and persistence. Processing failures preserve the original result.
 	PrepareToolResult func(context.Context, AgentToolResult) AgentToolResult
+	// ResolveUnloadedTool answers a tool call whose name is not among the agent's tools (dyna patch P12, PATCHES.md): it returns the
+	// tool the name denotes once the owner has loaded it, or nil for a name it cannot load. Nil leaves such a call "not found".
+	ResolveUnloadedTool func(name string) AgentTool
 	// FinishTurn runs after a turn's assistant message and tool results and
 	// before TurnEndEvent; it may end the run or request one more request.
 	FinishTurn FinishTurn
@@ -1768,6 +1771,13 @@ func (a *Agent) SetPrepareToolResult(fn func(context.Context, AgentToolResult) A
 	a.stateMu.Lock()
 	defer a.stateMu.Unlock()
 	a.opts.PrepareToolResult = fn
+}
+
+// SetResolveUnloadedTool replaces the resolver of calls to tools that are not loaded, for later runs.
+func (a *Agent) SetResolveUnloadedTool(fn func(name string) AgentTool) {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	a.opts.ResolveUnloadedTool = fn
 }
 
 // PrepareToolResultHook returns the current tool-result hook, or nil.

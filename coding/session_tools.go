@@ -8,6 +8,7 @@ import (
 
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding/extension"
 	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/prompts"
 	"github.com/MichaelKinsy/PiG/tui/widthx"
@@ -41,6 +42,36 @@ func (s *Session) SetActiveToolsByName(names []string) {
 			break
 		}
 	}
+}
+
+// loadDeferredTool resolves a tool call whose name is not among the agent's tools (dyna patch P12, PATCHES.md). A name the deferred_tools
+// section lists, as it was written, is activated like a tool_search load and its tool is returned, so the call runs; the tool stays active
+// until a host unloads it. Any other name returns nil. The section lists the registry's deferred and codemode tools that are not active
+// while tool_search or codemode is, in a session with context updates (withDeferredTools).
+func (s *Session) loadDeferredTool(name string) agent.AgentTool {
+	if !s.contextUpdates {
+		return nil
+	}
+	s.loadout.applyMu.Lock()
+	defer s.loadout.applyMu.Unlock()
+	s.toolRegistryMu.Lock()
+	defer s.toolRegistryMu.Unlock()
+	active := s.ActiveToolNames()
+	// A tool a call of the same batch loaded is active, but the run's own tool list still lacks it.
+	if !slices.Contains(active, name) {
+		entry, listed := s.toolRegistry.entry(name)
+		exposure := toolExposureOf(entry.registration.Definition)
+		if !listed || (exposure != extension.ToolExposureDeferred && exposure != extension.ToolExposureCodemode) || !(slices.Contains(active, "tool_search") || slices.Contains(active, "codemode")) {
+			return nil
+		}
+		s.setActiveToolsByName(append(active, name))
+	}
+	for _, tool := range s.agent.Tools() {
+		if tool.Name() == name {
+			return tool
+		}
+	}
+	return nil
 }
 
 // ReapplyActiveTools applies the Session's own selection again after a mode replaced the agent's tool list, as interactive mode does when it rebuilds its tools on reload. Unlike SetActiveToolsByName it is not a new loadout, so the pending tools of a restored or reloaded loadout stay pending.

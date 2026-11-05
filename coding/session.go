@@ -757,6 +757,7 @@ func NewSession(svcs *AgentSessionServices, opts SessionOptions) (*Session, erro
 		},
 	}
 	sess.resourceLoader.Store(resourceLoader)
+	agent.SetResolveUnloadedTool(sess.loadDeferredTool)
 	sess.SetScopedModels(opts.ScopedModels)
 	var initialToolNames []string
 	for _, tool := range allTools {

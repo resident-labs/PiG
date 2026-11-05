@@ -576,8 +576,18 @@ func (p *openAIResponsesProvider) resolvedModel() *Model {
 	return model
 }
 
+// defaultReasoningSummary is the reasoning.summary sent with a reasoning effort when StreamOptions.ReasoningSummary is empty; a request without a reasoning effort sends none. OpenAI and Codex models take "detailed"; other Responses providers keep Pi's "auto".
+// pig divergence (D191): Pi sends "auto", which returns bold headers only on sol; "detailed" returns the summary text.
+func (p *openAIResponsesProvider) defaultReasoningSummary() string {
+	switch p.cfg.ProviderID {
+	case "openai", string(KnownProviderOpenaiCodex):
+		return "detailed"
+	}
+	return "auto"
+}
+
 // applyCodexReasoning is openai-codex-responses.ts buildRequestBody's reasoning: a given effort is mapped through the model's levels ("none" through
-// its off entry) and sent unless that maps to null, with the summary defaulting to "auto"; with no effort a reasoning model whose off is not null sends
+// its off entry) and sent unless that maps to null, with the summary defaulting to defaultReasoningSummary; with no effort a reasoning model whose off is not null sends
 // its off effort. A summary alone requests nothing.
 func (p *openAIResponsesProvider) applyCodexReasoning(req *respRequest, opts StreamOptions) {
 	model := p.resolvedModel()
@@ -597,7 +607,7 @@ func (p *openAIResponsesProvider) applyCodexReasoning(req *respRequest, opts Str
 			effort = new(requested)
 		}
 		if effort != nil {
-			req.Reasoning = &respReasoning{Effort: *effort, Summary: cmp.Or(opts.ReasoningSummary, "auto")}
+			req.Reasoning = &respReasoning{Effort: *effort, Summary: cmp.Or(opts.ReasoningSummary, p.defaultReasoningSummary())}
 		}
 		return
 	}
@@ -1532,7 +1542,7 @@ func (p *openAIResponsesProvider) Stream(ctx context.Context, transcript Transcr
 			}
 			req.Reasoning = &respReasoning{
 				Effort:  effort,
-				Summary: cmp.Or(opts.ReasoningSummary, "auto"),
+				Summary: cmp.Or(opts.ReasoningSummary, p.defaultReasoningSummary()),
 			}
 			req.Include = []string{"reasoning.encrypted_content"}
 		case opts.ReasoningSummary != "":

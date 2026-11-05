@@ -43,6 +43,10 @@ func classifyTransportCause(transport *nodeTransportError) *transportCause {
 		}
 		return out
 	}
+	if _, stalled := errors.AsType[*sseIdleError](cause); stalled {
+		out.name, out.code = "StreamStallError", "PIG_STREAM_STALL"
+		return out
+	}
 	if transport.headersTimeout {
 		out.name, out.code = "HeadersTimeoutError", "UND_ERR_HEADERS_TIMEOUT"
 		return out

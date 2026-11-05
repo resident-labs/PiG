@@ -216,7 +216,7 @@ func TestCodexSSEAndPayloadUpstream(t *testing.T) {
 				t.Fatal(err)
 			}
 			_ = stream.Result()
-			assertShapeJSON(t, body["reasoning"], fmt.Sprintf(`{"effort":%q,"summary":"auto"}`, tc.want))
+			assertShapeJSON(t, body["reasoning"], fmt.Sprintf(`{"effort":%q,"summary":"detailed"}`, tc.want))
 		})
 	}
 	// .upstream/v0.87.1/packages/ai/test/openai-codex-stream.test.ts:847

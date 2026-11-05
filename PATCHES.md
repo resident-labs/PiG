@@ -211,3 +211,15 @@ Drop it: if upstream declares the executable tools in a compaction head, remove 
 Locked by: `TestACompactionHeadDeclaresTheToolsAHookLeftActive`, `TestACompactionHeadWithoutAHookDeclaresEveryTool`, `TestABoundaryCompactionHeadDeclaresTheExecutableTools` (coding), `TestToolSearchDefaultLimitStaysEightWithoutTheOption`, `TestToolSearchDefaultLimitOptionSetsTheLimitAndTheSchemaText`, `TestToolSearchExplicitLimitWinsOverTheDefaultLimitOption` (toolsearch), `TestSearchToolsKeepsTheDefaultLimitOfEight` (codemode).
 
 Upstream: not offered (owner's decision, 2026-11-04).
+
+## P12 Stall watchdog and detailed reasoning summaries
+
+What: (1) `StreamOptions.StallTimeoutMs` bounds how long a model call may go without a semantic SSE event, connect and time to first byte included; the default is 180 s (a shorter configured `httpIdleTimeoutMs` wins), zero or less disables it. The watchdog is `sseIdleTransport`, the one transport every SSE provider client and every caller-supplied `Fetch` client goes through. A stall aborts the call with a typed cause that diagnostics record as `provider_transport_failure` with error name `StreamStallError`, and the call retries through the same path as a mid-stream `unexpected EOF`. Bedrock and the Codex WebSocket keep their own transports. (2) A Responses request to `openai` or `openai-codex` with a reasoning effort sends `reasoning.summary: "detailed"` when `ReasoningSummary` is empty; other providers keep `"auto"`.
+
+Why: a sol call showed nothing for 18 minutes until the owner restarted, and sol thinking showed bold headers only.
+
+Files: `ai/sse_event_idle.go`, `ai/http_transport.go`, `ai/transport_diagnostic.go`, `ai/types.go`, `ai/openai_responses.go`, `docs/parity/divergences/D131.md`, `D191.md`.
+
+Locked by: `TestStreamStallAfterEventsAbortsAndRetriesOnce`, `TestStreamStallBeforeTheFirstByteAborts`, `TestStreamWithSteadyEventsIsNeverAborted`, `TestStreamStallTimerIsStoppedWhenTheStreamCompletes` (ai), `TestResponsesRequestAsksForADetailedReasoningSummaryByDefault` (ai).
+
+Upstream: not offered (owner's decision, 2026-11-04).

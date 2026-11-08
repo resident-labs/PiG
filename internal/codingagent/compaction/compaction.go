@@ -795,12 +795,12 @@ func splitForContextWindow(messages []agent.AgentMessage, model *ai.Model, reser
 	if model == nil || model.Capabilities.ContextWindow <= 0 || len(messages) < 2 {
 		return [][]agent.AgentMessage{messages}
 	}
-	// The summary a request carries and the one it asks for are each bounded by the model's output limit, which summary
-	// requests use since Pi 6fcb4867; without a known limit, by the reserve as before.
-	maxTokens := capMaxTokens((8*reserveTokens)/10, nil)
-	if model.Capabilities.MaxOutputTokens > 0 {
-		maxTokens = model.Capabilities.MaxOutputTokens
-	}
+	// The summary a request carries and the one it asks for are each estimated at the reserve's summary budget, as before
+	// Pi 6fcb4867, and never more than the model's output limit. Summary requests have no output cap since then, but
+	// estimating with the model's whole output limit left a 272,000-token window about 11,000 tokens a chunk: a
+	// 250,000-token history became 22 requests in a row, each rewriting the whole summary. A chunk whose request
+	// still overflows is halved by generateSummaryAdaptive.
+	maxTokens := capMaxTokens((8*reserveTokens)/10, model)
 	overhead := ceilQuarter(len(SummarizationSystemPrompt)+len(UPDATE_SUMMARIZATION_PROMPT)+len(customInstructions)) + 2*maxTokens
 	room := int(float64(model.Capabilities.ContextWindow-overhead) * summarizationInputShare)
 	if room <= 0 {

@@ -250,7 +250,7 @@ Why: a box whose remote-catalog cache is empty resolved terra from an older chat
 
 Files: `ai/models_generated.go`.
 
-## P15 Compaction chunks are sized with the reserve's summary budget
+## P15 Compaction chunks are sized with the reserve's summary budget (superseded by P16)
 
 What: `splitForContextWindow` estimates the summary a chunk request carries and the one it asks for at the reserve's budget (0.8 × reserveTokens), capped by the model's output limit, instead of the whole output limit.
 
@@ -259,5 +259,17 @@ Why: with a 128,000 output limit a 272,000-token window left about 11,000 tokens
 Files: `internal/codingagent/compaction/compaction.go`, `internal/codingagent/compaction/split_budget_test.go`.
 
 Locked by: `TestSplitForContextWindowDoesNotReserveTheWholeOutputLimit`; the D167 tests still pass.
+
+Upstream: not offered (owner's decision, 2026-11-04).
+
+## P16 Compaction extends the live request instead of chunking a serialized copy
+
+What: a compaction sends the session's latest request unchanged (same transcript, system message, tools, options and session ID, prompt caching on), the messages added since, and one user message asking for the summary (`LIVE_SUMMARIZATION_PROMPT`), as opencode's `summarize` does. A request the provider rejects as too long is sent again without the oldest fifth of the conversation (system messages kept, cut at a user or assistant message), as Codex trims its history. A reply that calls a tool gets one reminder. The D167 compaction chunking (`splitForContextWindow`, `generateSummaryAdaptive`, the split-turn chunk move) and P15 are removed; `GenerateSummary*` is Pi's single request again. Pi's standalone serialized request stays only when there is no live request to extend: before the first request, after a model change or a rewrite of the conversation, or with a caller-supplied completer or stream function.
+
+Why: Pi's summary request re-reads the whole serialized conversation with caching off. On sol a 256k compaction took 30–80 minutes (P15's numbers); the live request reads the prefix from the prompt cache and is one request. Owner, 2026-11-08: "properly remove it. Don't bust cache but use the simple system that opencode does."
+
+Files: `internal/codingagent/compaction/live.go`, `internal/codingagent/compaction/compaction.go`, `coding/session_summarization_auth.go`, `coding/session_cache_warming.go`, `coding/session.go`; removed chunk tests in `over_window_history_test.go`, `over_window_review_test.go`, `split_budget_test.go`.
+
+Locked by: `TestCompactLiveExtendsTheLiveRequest`, `TestCompactLiveDropsTheOldestMessagesOnOverflow`, `TestDropOldestCutsOneLongTurnAtAnAssistantMessage`, `TestCompactLiveNudgesOnceAfterAToolCall`; branch-summary halving (still D167) unchanged.
 
 Upstream: not offered (owner's decision, 2026-11-04).

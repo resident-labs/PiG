@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"slices"
 
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
@@ -27,6 +28,10 @@ type summarizationRequest struct {
 }
 
 func (s *Session) runDefaultCompaction(ctx context.Context, prep compaction.CompactionPreparation, model *ai.Model, customInstructions, reason string) (compaction.CompactionResult, error) {
+	if live, ok := s.liveCompactionRequest(model); ok {
+		retry, retryCallbacks := s.summarizationRetryOptions("compaction", reason)
+		return compaction.CompactLive(ctx, prep, live, customInstructions, retry, retryCallbacks)
+	}
 	request, err := s.prepareSummarizationRequest(ctx, model)
 	if err != nil {
 		return compaction.CompactionResult{}, err
@@ -38,6 +43,42 @@ func (s *Session) runDefaultCompaction(ctx context.Context, prep compaction.Comp
 		streamFn = compaction.CompleterStreamFn(request.completer)
 	}
 	return compaction.Compact(ctx, prep, request.model, request.apiKey, request.headers, customInstructions, request.thinkingLevel, streamFn, request.env, retry, retryCallbacks, "")
+}
+
+// sessionRequest is one request the agent sent: its model, transcript and options, and the agent messages it was built from.
+type sessionRequest struct {
+	model      *ai.Model
+	transcript ai.TranscriptContext
+	options    ai.StreamOptions
+	messages   []agent.AgentMessage
+}
+
+// liveCompactionRequest is the request a compaction on model extends (dyna patch P16, PATCHES.md): the agent's latest
+// request, byte for byte, followed by the messages added since, so the summary reads the conversation from the prompt
+// cache. There is none when that request was on another model, when the conversation was rewritten since, before the
+// first request, or when a caller supplied its own completer or stream function; Pi's standalone summary request is
+// sent then.
+func (s *Session) liveCompactionRequest(model *ai.Model) (compaction.LiveRequest, bool) {
+	last := s.lastRequest.Load()
+	if s.completer != nil || s.streamFn != nil || last == nil || model == nil || providerID(last.model) != providerID(model) || last.model.ID != model.ID {
+		return compaction.LiveRequest{}, false
+	}
+	current := s.agent.MessagesSnapshot()
+	if len(last.messages) > len(current) || !slices.EqualFunc(last.messages, current[:len(last.messages)], sameAgentMessage) {
+		return compaction.LiveRequest{}, false
+	}
+	// A summary request reaches extensions only through the header hook, as Pi's does: the agent's payload, response and
+	// stream-event observers would take it for an agent reply.
+	options := last.options
+	options.OnPayload, options.OnResponse, options.OnProviderStreamEvent, options.ProviderStreamEventWanted = nil, nil, nil, nil
+	return compaction.LiveRequest{
+		Model:    last.model,
+		Messages: append(last.transcript.Messages(), agent.ConvertToLLM(current[len(last.messages):])...),
+		Options:  options,
+		Stream: func(ctx context.Context, model *ai.Model, request ai.Context, options ai.StreamOptions) *ai.AssistantMessageEventStream {
+			return s.modelRuntime.StreamSimple(ctx, model, request, options)
+		},
+	}, true
 }
 
 // withoutDeletedHeaders drops the headers an auth result deletes; summary requests take only header values.

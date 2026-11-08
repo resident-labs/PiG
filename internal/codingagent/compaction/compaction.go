@@ -734,97 +734,7 @@ func GenerateSummaryWithUsageUsing(
 	callbacks ai.RetryCallbacks,
 	sessionID string,
 ) (string, *ai.Usage, error) {
-	chunks := splitForContextWindow(messages, model, reserveTokens, previousSummary, customInstructions)
-	if len(chunks) <= 1 {
-		return generateSummaryAdaptive(ctx, messages, model, reserveTokens, apiKey, headers, customInstructions, previousSummary, thinkingLevel, completer, streamFn, env, retry, callbacks, sessionID)
-	}
-	// pig divergence (D167): pi sends the whole history in one request, so a history longer than the model's context window fails with the provider's overflow error and the session can never be compacted. PiG summarizes it window-sized chunk by chunk, each chunk updating the summary of the one before (the UPDATE_SUMMARIZATION_PROMPT path pi uses for a previous compaction).
-	summary := previousSummary
-	var usage *ai.Usage
-	for _, chunk := range chunks {
-		var chunkUsage *ai.Usage
-		var err error
-		summary, chunkUsage, err = generateSummaryAdaptive(ctx, chunk, model, reserveTokens, apiKey, headers, customInstructions, summary, thinkingLevel, completer, streamFn, env, retry, callbacks, sessionID)
-		if err != nil {
-			return "", nil, err
-		}
-		usage = combineUsage(usage, chunkUsage)
-	}
-	return summary, usage, nil
-}
-
-// generateSummaryAdaptive summarizes messages in one request and, when the provider answers with a context overflow, in two halves, the second updating the summary of the first, until a single message is left.
-func generateSummaryAdaptive(
-	ctx context.Context,
-	messages []agent.AgentMessage,
-	model *ai.Model,
-	reserveTokens int,
-	apiKey string,
-	headers map[string]string,
-	customInstructions string,
-	previousSummary string,
-	thinkingLevel ai.ModelThinkingLevel,
-	completer SimpleCompleter,
-	streamFn StreamFn,
-	env map[string]string,
-	retry *ai.RetryPolicy,
-	callbacks ai.RetryCallbacks,
-	sessionID string,
-) (string, *ai.Usage, error) {
-	summary, usage, err := generateSummaryChunk(ctx, messages, model, reserveTokens, apiKey, headers, customInstructions, previousSummary, thinkingLevel, completer, streamFn, env, retry, callbacks, sessionID)
-	if err == nil || len(messages) < 2 || !ai.IsContextOverflow(ai.AssistantMessage{StopReason: ai.StopReasonError, ErrorMessage: err.Error()}, 0) {
-		return summary, usage, err
-	}
-	middle := len(messages) / 2
-	summary, firstUsage, err := generateSummaryAdaptive(ctx, messages[:middle], model, reserveTokens, apiKey, headers, customInstructions, previousSummary, thinkingLevel, completer, streamFn, env, retry, callbacks, sessionID)
-	if err != nil {
-		return "", nil, err
-	}
-	summary, secondUsage, err := generateSummaryAdaptive(ctx, messages[middle:], model, reserveTokens, apiKey, headers, customInstructions, summary, thinkingLevel, completer, streamFn, env, retry, callbacks, sessionID)
-	if err != nil {
-		return "", nil, err
-	}
-	return summary, combineUsage(firstUsage, secondUsage), nil
-}
-
-// summarizationInputShare is the share of the room a summary request has left that its conversation text may fill by character estimate, because the estimate is four characters per token.
-const summarizationInputShare = 0.75
-
-// splitForContextWindow splits messages into consecutive chunks whose serialized text fits one summary request of the model's context window: the window minus the summary the request carries and the one it asks for, the instructions, and a quarter of what is left. A history that fits, a model without a known window, and a single message larger than a chunk each stay whole.
-func splitForContextWindow(messages []agent.AgentMessage, model *ai.Model, reserveTokens int, previousSummary, customInstructions string) [][]agent.AgentMessage {
-	if model == nil || model.Capabilities.ContextWindow <= 0 || len(messages) < 2 {
-		return [][]agent.AgentMessage{messages}
-	}
-	// The summary a request carries and the one it asks for are each estimated at the reserve's summary budget, as before
-	// Pi 6fcb4867, and never more than the model's output limit. Summary requests have no output cap since then, but
-	// estimating with the model's whole output limit left a 272,000-token window about 11,000 tokens a chunk: a
-	// 250,000-token history became 22 requests in a row, each rewriting the whole summary. A chunk whose request
-	// still overflows is halved by generateSummaryAdaptive.
-	maxTokens := capMaxTokens((8*reserveTokens)/10, model)
-	overhead := ceilQuarter(len(SummarizationSystemPrompt)+len(UPDATE_SUMMARIZATION_PROMPT)+len(customInstructions)) + 2*maxTokens
-	room := int(float64(model.Capabilities.ContextWindow-overhead) * summarizationInputShare)
-	if room <= 0 {
-		return [][]agent.AgentMessage{messages}
-	}
-	sizes := make([]int, len(messages))
-	total := 0
-	for index := range messages {
-		sizes[index] = ceilQuarter(jsLength(SerializeConversation(convertToLlm(messages[index:index+1])))) + 1
-		total += sizes[index]
-	}
-	if total <= room {
-		return [][]agent.AgentMessage{messages}
-	}
-	var chunks [][]agent.AgentMessage
-	start, used := 0, 0
-	for index, size := range sizes {
-		if used > 0 && used+size > room {
-			chunks = append(chunks, messages[start:index])
-			start, used = index, 0
-		}
-		used += size
-	}
-	return append(chunks, messages[start:])
+	return generateSummaryChunk(ctx, messages, model, reserveTokens, apiKey, headers, customInstructions, previousSummary, thinkingLevel, completer, streamFn, env, retry, callbacks, sessionID)
 }
 
 // generateSummaryChunk is one summary request: the body of compaction.ts generateSummaryWithUsage.
@@ -998,12 +908,6 @@ func Compact(
 
 	if prep.IsSplitTurn && len(prep.TurnPrefixMessages) > 0 {
 		history, prefix := prep.MessagesToSummarize, prep.TurnPrefixMessages
-		if chunks := splitForContextWindow(prefix, model, prep.Settings.ReserveTokens, prep.PreviousSummary, customInstructions); len(chunks) > 1 {
-			// pig divergence (D167): pi sends the whole turn prefix in one request. A prefix longer than the window moves all but its last window-sized part into the chunked history summary.
-			last := chunks[len(chunks)-1]
-			history = append(slices.Clip(history), prefix[:len(prefix)-len(last)]...)
-			prefix = last
-		}
 		historySummary := cmp.Or(prep.PreviousSummary, "No prior history.")
 		var historyUsage *ai.Usage
 		if len(history) > 0 {

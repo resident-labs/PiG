@@ -230,6 +230,8 @@ type Session struct {
 	// equivalent Session through NewSession.
 	callerHooks callerHooks
 	warming     sessionCacheWarming
+	// lastRequest is the latest request the agent sent through the default stream function, which a compaction extends (dyna patch P16).
+	lastRequest atomic.Pointer[sessionRequest]
 }
 
 type callerHooks struct {

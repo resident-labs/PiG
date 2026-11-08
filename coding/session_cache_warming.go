@@ -62,6 +62,7 @@ func cacheWarmingStreamFn(session func() *Session) agent.StreamFn {
 			if err != nil {
 				return nil, err
 			}
+			s.lastRequest.Store(&sessionRequest{model: model, transcript: transcript, options: options, messages: s.agent.MessagesSnapshot()})
 			s.startCacheWarming(model, transcript, options)
 			// The transcript is validated and immutable, so the runtime shares its messages and does not validate them again.
 			return s.modelRuntime.StreamSimple(ctx, model, transcript.FrozenContext(), options), nil

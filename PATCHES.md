@@ -241,3 +241,23 @@ Files: `ai/openai_responses.go`, `ai/openai_responses_stall.go`, `ai/sse_event_i
 Locked by: native request-phase, retry/backoff/limit, progress and cleanup tests in `ai/stream_stall_test.go`; base-compatible excluded-route guards in `ai/stream_stall_exclusions_test.go`; `TestResponsesRequestAsksForADetailedReasoningSummaryByDefault`; unchanged legacy D131, TLS, Fetch and image regressions.
 
 Upstream: not offered (owner's decision, 2026-11-04).
+
+## P14 gpt-6.1-terra in the generated openai catalog
+
+What: `ai/models_generated.go` gains the openai `gpt-6.1-terra` entry, copied from pi-in-go.dev's `/api/models/providers/openai` (Responses, reasoning, 272,000 window, text and image).
+
+Why: a box whose remote-catalog cache is empty resolved terra from an older chat model's defaults (Completions, reasoning off, a small window) and compacted every ~50k tokens. Remove when the generated catalog includes terra.
+
+Files: `ai/models_generated.go`.
+
+## P15 Compaction chunks are sized with the reserve's summary budget
+
+What: `splitForContextWindow` estimates the summary a chunk request carries and the one it asks for at the reserve's budget (0.8 × reserveTokens), capped by the model's output limit, instead of the whole output limit.
+
+Why: with a 128,000 output limit a 272,000-token window left about 11,000 tokens a chunk, so a sol compaction at 256k was 22 sequential requests each rewriting the whole summary: 94–135k output tokens and 30–80 minutes (Dyna transcripts, 2026-11-05 to 11-08). A chunk whose request still overflows is halved as before (D167).
+
+Files: `internal/codingagent/compaction/compaction.go`, `internal/codingagent/compaction/split_budget_test.go`.
+
+Locked by: `TestSplitForContextWindowDoesNotReserveTheWholeOutputLimit`; the D167 tests still pass.
+
+Upstream: not offered (owner's decision, 2026-11-04).

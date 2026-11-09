@@ -17,7 +17,7 @@ const descriptionIntro = "Run JavaScript that calls other tools. The input is ra
 
 const describeGlobals = "Globals:\n" +
 	"- `text(value)`, `image(dataUrlOrImageBlock)`, `console.log(...)`, and top-level `return` add output; `exit()` ends the script. With several text items, each starts with a `==> text N/M <==` line, and `console` lines follow the other output in one `<console_output>` block. `image()` also saves the image to a temp file and the result names its path.\n" +
-	"- `store(key, value)` and `load(key)` keep JSON values across codemode calls.\n" +
+	"- `store(key, value)` and `load(key)` keep small JSON values (up to 256 KB, such as IDs or summaries) across codemode calls; large data goes to a file.\n" +
 	"- `ALL_TOOLS`, `await searchTools(query, { limit?, namespace? })`, `await describeTool(name)`, `await describeNamespace(name)`: find unlisted tools, such as MCP tools."
 
 func TestCodemodeDescriptionDocumentsDescribeNamespaceAndAlwaysCarriesTheSearchGuidance(t *testing.T) {

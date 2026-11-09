@@ -273,3 +273,13 @@ Files: `internal/codingagent/compaction/live.go`, `internal/codingagent/compacti
 Locked by: `TestCompactLiveExtendsTheLiveRequest`, `TestCompactLiveDropsTheOldestMessagesOnOverflow`, `TestDropOldestCutsOneLongTurnAtAnAssistantMessage`, `TestCompactLiveNudgesOnceAfterAToolCall`; branch-summary halving (still D167) unchanged.
 
 Upstream: not offered (owner's decision, 2026-11-04).
+
+## P18 Select only system-message bodies when restoring the tool loadout
+
+What: the constructor uses GetSystemMessages, filtering branch slot metadata before decoding. It keeps every ancestor system message, including before compaction, in the same order. Other history payloads remain lazy. Tool replay validation is unchanged.
+
+Why: restoring a compacted session decoded all historical tool-result bodies just to select system messages. Synthetic 100 MiB compacted histories spent seconds in this constructor traversal.
+
+Locked by: TestSystemMessagesMatchWholeBranchAcrossCompactionAndForks and TestP18ReplayMatchesWholeBranchIncludingPreCompactionToolErrors.
+
+Upstream: not offered (owner decision, 2026-11-04).

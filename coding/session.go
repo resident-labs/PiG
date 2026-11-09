@@ -815,12 +815,8 @@ func replayedTranscriptIf(replay bool, inner *icodingagent.Session) ([]agent.Age
 //
 // upstream: agent-session.ts:1815-1844 (_restoreToolsFromTranscript)
 func replayedTranscript(inner *icodingagent.Session) ([]agent.AgentMessage, error) {
-	var systems []agent.AgentMessage
-	for _, entry := range inner.GetBranch() {
-		if message, ok := icodingagent.AsMessage(entry); ok && message.Message.System != nil {
-			systems = append(systems, message.Message)
-		}
-	}
+	// dyna patch P18: preserve whole-branch replay without decoding non-system payloads.
+	systems := inner.GetSystemMessages()
 	return systems, agent.ToolReplayError(systems)
 }
 

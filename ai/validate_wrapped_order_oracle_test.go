@@ -56,7 +56,7 @@ func TestValidateToolArgumentsKeepsTheSourceOrderOfWrappedObjectsLikePi(t *testi
 		got, err := ValidateToolArgumentsJSON("probe", json.RawMessage(probe.Schema), json.RawMessage(probe.Args))
 		have, want := string(got), strings.TrimSpace(string(expected[i].Ok))
 		if err != nil {
-			have = "ERR " + err.Error()
+			have = "ERR " + piError(err)
 		}
 		if expected[i].Err != nil {
 			want = "ERR " + *expected[i].Err

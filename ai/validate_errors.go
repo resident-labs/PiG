@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"net/url"
@@ -201,7 +202,9 @@ func (s *argumentSchema) argumentErrorsAt(order schemaObjectOrder, value any, pa
 		emit("must be equal to constant")
 	}
 	if _, exists := s.fields["enum"]; exists && !s.checkKeyword("enum", value) {
-		emit("must be equal to one of the allowed values")
+		// Dyna patch P17: name the allowed values, so a model can pick one without guessing again.
+		allowed, _ := json.Marshal(s.value("enum"))
+		emit("must be equal to one of the allowed values: " + string(allowed))
 	}
 	if condition := s.child("if"); condition != nil {
 		branch := "else"

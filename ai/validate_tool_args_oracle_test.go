@@ -205,7 +205,7 @@ func TestValidateToolArgumentsMatchesPiOnSeededSchemas(t *testing.T) {
 		same := false
 		switch {
 		case err != nil && want.Err != nil:
-			same = err.Error() == *want.Err
+			same = piError(err) == *want.Err
 		case err == nil && want.Err == nil:
 			if json.Unmarshal(got, &gotValue) == nil && json.Unmarshal(want.Ok, &wantValue) == nil {
 				same = reflect.DeepEqual(gotValue, wantValue)
@@ -215,7 +215,7 @@ func TestValidateToolArgumentsMatchesPiOnSeededSchemas(t *testing.T) {
 			if differing++; differing <= 8 {
 				have := string(got)
 				if err != nil {
-					have = "ERR " + err.Error()
+					have = "ERR " + piError(err)
 				}
 				wantText := string(want.Ok)
 				if want.Err != nil {

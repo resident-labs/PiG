@@ -46,7 +46,7 @@ func TestValidateToolArgumentsComparesNumbersAndStringsLikePi(t *testing.T) {
 		got, err := ValidateToolArgumentsJSON("probe", json.RawMessage(probe.Schema), json.RawMessage(probe.Args))
 		have, want := string(got), strings.TrimSpace(string(expected[i].Ok))
 		if err != nil {
-			have = "ERR " + err.Error()
+			have = "ERR " + piError(err)
 			rejected++
 		}
 		if expected[i].Err != nil {

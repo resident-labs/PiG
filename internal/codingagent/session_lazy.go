@@ -196,6 +196,9 @@ func (s *Session) lazyAtLocked(i int) bool {
 // resident as a LazyEntry, and any other entry read from its record. The caller holds s.mu.
 func (s *Session) entryHandlesLocked(indexes []int32) []SessionEntry {
 	out := make([]SessionEntry, len(indexes))
+	if len(indexes) == 0 {
+		return out
+	}
 	s.handleMu.Lock()
 	if grow := len(s.slots) - len(s.handles); grow > 0 {
 		s.handles = append(s.handles, make([]sessionentry.LazyEntry, grow)...)
@@ -296,6 +299,30 @@ type HandleReads struct{ *Session }
 
 // GetEntries is Session.GetEntries with lazy message entries.
 func (r HandleReads) GetEntries() []SessionEntry { return r.entryHandles() }
+
+// GetEntriesSince selects the append-order suffix after the first occurrence of since
+// before constructing handles. Empty since returns all entries. Discarded prefix
+// records are not read, so their stale-read diagnostics intentionally disappear.
+func (r HandleReads) GetEntriesSince(since string) ([]SessionEntry, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	start := 0
+	if since != "" {
+		i, ok := r.slotOf(since)
+		if !ok {
+			return nil, fmt.Errorf("Entry not found: %s", since)
+		}
+		if first, duplicate := r.byID.first[since]; duplicate {
+			i = first
+		}
+		start = i + 1
+	}
+	indexes := make([]int32, len(r.slots)-start)
+	for j := range indexes {
+		indexes[j] = int32(start + j)
+	}
+	return r.entryHandlesLocked(indexes), nil
+}
 
 // GetBranch is Session.GetBranch with lazy message entries.
 func (r HandleReads) GetBranch(fromID ...string) []SessionEntry { return r.branchHandles(fromID...) }

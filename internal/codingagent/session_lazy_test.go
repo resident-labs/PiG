@@ -174,7 +174,10 @@ func TestLazyEntryOfAChangedRecordIsAnError(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			entries := HandleReads{Session: session}.GetEntries()
+			entries, err := (HandleReads{Session: session}).GetEntriesSince("")
+			if err != nil {
+				t.Fatal(err)
+			}
 			var target *sessionentry.LazyEntry
 			for _, entry := range entries {
 				if lazy, ok := entry.(*sessionentry.LazyEntry); ok {

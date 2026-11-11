@@ -1441,7 +1441,7 @@ commandLoop:
 				writeRPC(rpcError(env.ID, "get_entries", err.Error()))
 				continue
 			}
-			entries, err := rpcEntriesSince(codingagent.HandleReads{Session: sess().Inner()}.GetEntries(), cmd.Since)
+			entries, err := (codingagent.HandleReads{Session: sess().Inner()}).GetEntriesSince(cmd.Since)
 			if err != nil {
 				writeRPC(rpcError(env.ID, "get_entries", err.Error()))
 				continue

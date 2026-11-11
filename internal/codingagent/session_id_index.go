@@ -9,6 +9,7 @@ type idIndex struct {
 	seed  maphash.Seed
 	table []int32
 	n     int
+	first map[string]int // Only duplicate IDs: incremental reads select the first occurrence.
 }
 
 // idIndexMinTable is the size of an index's first table.
@@ -36,6 +37,14 @@ func (x *idIndex) find(slots []entrySlot, id string) (int, bool) {
 func (x *idIndex) set(slots []entrySlot, idx int) {
 	if 4*(x.n+1) > 3*len(x.table) {
 		x.grow(slots)
+	}
+	if old, ok := x.find(slots, slots[idx].id); ok {
+		if x.first == nil {
+			x.first = make(map[string]int)
+		}
+		if _, exists := x.first[slots[idx].id]; !exists {
+			x.first[slots[idx].id] = old
+		}
 	}
 	x.put(slots, slots[idx].id, idx)
 }

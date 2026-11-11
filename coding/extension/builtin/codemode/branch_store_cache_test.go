@@ -27,6 +27,11 @@ func (m *measuredBranch) GetEntry(id string) (codingagent.SessionEntry, bool) {
 	return m.s.GetEntry(id)
 }
 
+func (m *measuredBranch) GetEntryHandle(id string) (codingagent.SessionEntry, bool) {
+	m.reads++
+	return m.s.GetEntryHandle(id)
+}
+
 func TestBranchStoreCacheReadsOnlyNewEntries(t *testing.T) {
 	m := &measuredBranch{s: codingagent.NewSession("test", t.TempDir())}
 	c := &branchStoreCache{}
@@ -65,6 +70,23 @@ func TestBranchStoreCacheReadsOnlyNewEntries(t *testing.T) {
 	// Replacing a session must discard the previous checkpoint.
 	m.s = codingagent.NewSession("replacement", t.TempDir())
 	if got := c.read(m); len(got) != 0 {
+		t.Fatal(got)
+	}
+}
+
+// Metadata reads must never fall back to payload decoding on a capable manager.
+type metadataOnlyBranch struct{ *measuredBranch }
+
+func (m metadataOnlyBranch) GetEntry(string) (codingagent.SessionEntry, bool) {
+	panic("codemode decoded a message-capable entry read")
+}
+
+func TestBranchStoreCacheColdUsesMetadata(t *testing.T) {
+	m := metadataOnlyBranch{&measuredBranch{s: codingagent.NewSession("cold", t.TempDir())}}
+	if _, err := m.s.AppendCustomEntry(StoreEntryType, StoreEntryData{Set: map[string]json.RawMessage{"x": json.RawMessage(`1`)}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := (&branchStoreCache{}).read(m); string(got["x"]) != "1" {
 		t.Fatal(got)
 	}
 }

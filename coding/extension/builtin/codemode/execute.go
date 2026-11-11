@@ -431,6 +431,14 @@ func (c *branchStoreCache) read(manager extension.ReadonlySessionManager) map[st
 	defer c.mu.Unlock()
 	id := manager.GetSessionId()
 	leaf := manager.GetLeafID()
+	// Session hosts can expose metadata handles; other managers retain decoded reads.
+	readEntry := manager.GetEntry
+	if handles, ok := manager.(interface {
+		GetEntryHandle(string) (codingagent.SessionEntry, bool)
+	}); ok {
+		readEntry = handles.GetEntryHandle
+	}
+
 	var entries []codingagent.SessionEntry
 	found := false
 	for next := leaf; next != nil; {
@@ -438,7 +446,7 @@ func (c *branchStoreCache) read(manager extension.ReadonlySessionManager) map[st
 			found = true
 			break
 		}
-		entry, ok := manager.GetEntry(*next)
+		entry, ok := readEntry(*next)
 		if !ok {
 			break
 		}

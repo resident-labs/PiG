@@ -416,6 +416,67 @@ func storeOf(branch []codingagent.SessionEntry) map[string]json.RawMessage {
 	return store
 }
 
+// branchStoreCache retains one immutable branch checkpoint per tool definition. New
+// entries are read back to that checkpoint; a branch switch or replacement rebuilds
+// from the root. Script writes are observed only after the host appends them.
+type branchStoreCache struct {
+	mu        sync.Mutex
+	sessionID string
+	leaf      string
+	values    map[string]json.RawMessage
+}
+
+func (c *branchStoreCache) read(manager extension.ReadonlySessionManager) map[string]json.RawMessage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	id := manager.GetSessionId()
+	leaf := manager.GetLeafID()
+	var entries []codingagent.SessionEntry
+	found := false
+	for next := leaf; next != nil; {
+		if id == c.sessionID && c.values != nil && *next == c.leaf {
+			found = true
+			break
+		}
+		entry, ok := manager.GetEntry(*next)
+		if !ok {
+			break
+		}
+		entries = append(entries, entry)
+		next = entry.Base().ParentID
+	}
+	values := map[string]json.RawMessage{}
+	if found {
+		maps.Copy(values, c.values)
+	}
+	// Replay only custom records, in root-to-leaf order, preserving deletion.
+	for _, entry := range slices.Backward(entries) {
+		if entry.Base().Type != "custom" {
+			continue
+		}
+		raw, err := json.Marshal(entry)
+		var fields struct {
+			CustomType string          `json:"customType"`
+			Data       json.RawMessage `json:"data"`
+		}
+		if err != nil || json.Unmarshal(raw, &fields) != nil || fields.CustomType != StoreEntryType {
+			continue
+		}
+		set, deleted, ok := storeEntryData(fields.Data)
+		if ok {
+			for _, key := range deleted {
+				delete(values, key)
+			}
+			maps.Copy(values, set)
+		}
+	}
+	c.sessionID, c.leaf, c.values = id, "", values
+	if leaf != nil {
+		c.leaf = *leaf
+	}
+	return maps.Clone(values)
+}
+
 // session is the part of the session a tool reaches through its context: the branch to read `load()` values from and
 // the entry writer for `store()`.
 //
@@ -754,7 +815,11 @@ func Execute(ctx context.Context, toolCallID string, params json.RawMessage, onU
 
 	var store map[string]json.RawMessage
 	if session := sessionOf(tc); session != nil {
-		store = storeOf(session.branch())
+		if options.storeCache == nil {
+			store = storeOf(session.branch())
+		} else {
+			store = options.storeCache.read(session.manager)
+		}
 	}
 	result, err := box.Execute(ctx, parsed.Code, sandbox.ExecuteOptions{Store: store})
 	if err != nil {

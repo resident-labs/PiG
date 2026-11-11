@@ -47,7 +47,57 @@ func TestExecuteRealSessionProfile(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Candidate A prototype: prepare a sidecar, then reopen the session before timing its first use.
+	var snapshotPath string
+	if os.Getenv("CODEMODE_REAL_SNAPSHOT") == "1" {
+		cache := &branchStoreCache{}
+		cache.read(m)
+		data, err := json.Marshal(struct {
+			ID, Leaf string
+			Values   map[string]json.RawMessage
+		}{cache.sessionID, cache.leaf, cache.values})
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshotPath = filepath.Join(dir, "store.json")
+		if err := os.WriteFile(snapshotPath, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		m.s, err = codingagent.NewSessionManagerWithDir(dir, dir).Open(copyPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	start := time.Now()
+	if snapshotPath != "" {
+		data, err := os.ReadFile(snapshotPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var snapshot struct {
+			ID, Leaf string
+			Values   map[string]json.RawMessage
+		}
+		if err := json.Unmarshal(data, &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for next := m.GetLeafID(); next != nil; {
+			if *next == snapshot.Leaf {
+				found = true
+				break
+			}
+			entry, ok := m.GetEntryHandle(*next)
+			if !ok {
+				break
+			}
+			next = entry.Base().ParentID
+		}
+		if !found || snapshot.ID != m.GetSessionId() {
+			t.Fatal("invalid snapshot")
+		}
+		options.storeCache = &branchStoreCache{sessionID: snapshot.ID, leaf: snapshot.Leaf, values: snapshot.Values}
+	}
 	run()
 	t.Logf("first Execute: %s", time.Since(start))
 	if out := os.Getenv("CODEMODE_REAL_PROFILE"); out != "" {

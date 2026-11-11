@@ -289,7 +289,7 @@ func materializeTree(nodes []*SessionTreeNode) {
 
 // HandleReads is a Session whose entry reads return each message entry that is not resident as a sessionentry.LazyEntry, for the readers in
 // this module that read entries only through the error-returning sessionentry funnel (ReadRaws, MaterializeAll): RPC get_entries and
-// get_tree, extension session reads and branch summary collection. It is never handed to code outside the module: the Session's own
+// get_tree, extension session reads and branch summary collection. Metadata-only readers may use GetEntryHandle without reading payloads. HandleReads is never handed to code outside the module: the Session's own
 // GetEntries, GetBranch, GetTree and GetEntry return decoded entries. TestLazyEntriesLeaveOnlyByTheReviewedRoutes keeps its uses, and those of
 // the unexported handle reads, to the files that consume them so.
 type HandleReads struct{ *Session }
@@ -305,6 +305,11 @@ func (r HandleReads) GetTree() []*SessionTreeNode { return r.treeHandles() }
 
 // GetEntry is Session.GetEntry with a lazy message entry.
 func (r HandleReads) GetEntry(id string) (SessionEntry, bool) {
+	return r.Session.GetEntryHandle(id)
+}
+
+// GetEntryHandle reads entry metadata without decoding message payloads. Callers that inspect payloads must use the error-returning sessionentry read funnel.
+func (r *Session) GetEntryHandle(id string) (SessionEntry, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	idx, ok := r.slotOf(id)

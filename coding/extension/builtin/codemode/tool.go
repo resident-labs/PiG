@@ -17,6 +17,7 @@ import (
 
 // Options configures the extension.
 type Options struct {
+	storeCache *branchStoreCache
 	// GetSettings returns the effective settings, read on every use: `codemode.mode` and `codemode.inlineBudget`.
 	// Nil means the defaults (mode `on`, the default budget).
 	GetSettings func() extension.Settings
@@ -253,6 +254,7 @@ func prepareLoadout(loadout extension.ToolLoadout, options Options) *extension.T
 //
 // Ports packages/coding-agent/src/extensions/codemode/tool.ts (createCodemodeToolDefinition).
 func Definition(options Options) extension.ToolDefinition {
+	options.storeCache = &branchStoreCache{}
 	// No tools are listed, so no schema reference is decoded and rendering cannot fail.
 	description, _ := CreateDescription(nil, DescriptionOptions{Models: options.Models})
 	return extension.ToolDefinition{

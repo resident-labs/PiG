@@ -216,6 +216,7 @@ func (r *loopRun) loop() error {
 			}
 			if gate := r.h.cfg.BeforeRequest; gate != nil {
 				if err := gate(r.ctx); err != nil {
+					r.endRun()
 					return err
 				}
 			}

@@ -27,7 +27,8 @@ func TestBeforeRequestHoldsFirstRequestAndReadsQueuedSteer(t *testing.T) {
 	if provider.calls() != 0 {
 		t.Fatal("request escaped gate")
 	}
-	a.Steer(userMessage("redirect"))
+	redirect := userMessage("redirect")
+	a.Steer(redirect)
 	close(release)
 	if err := <-done; err != nil {
 		t.Fatal(err)
@@ -37,7 +38,7 @@ func TestBeforeRequestHoldsFirstRequestAndReadsQueuedSteer(t *testing.T) {
 	}
 	found := false
 	for _, m := range a.Messages() {
-		if m.User != nil && reflect.DeepEqual(m.User, userMessage("redirect").User) {
+		if m.User != nil && reflect.DeepEqual(m.User, redirect.User) {
 			found = true
 		}
 	}

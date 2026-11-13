@@ -39,6 +39,8 @@ type AgentLoopConfig struct {
 	// SystemPromptOverride projects a replacement system prompt onto every request without rewriting the transcript.
 	SystemPromptOverride func() *string
 
+	// BeforeRequest may block before each request, before queued steering is read. An error ends the run.
+	BeforeRequest   func(context.Context) error
 	FinishTurn      FinishTurn
 	PrepareRequest  PrepareRequest
 	PrepareNextTurn PrepareNextTurn

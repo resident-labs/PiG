@@ -74,6 +74,7 @@ func (a *Agent) createLoopConfig(skipInitialSteeringPoll bool) AgentLoopConfig {
 		GetFollowUpMessages: a.followUpQueue.Drain,
 		FinishTurn:          finishTurn,
 		PrepareRequest:      prepareRequest,
+		BeforeRequest:       a.opts.BeforeRequest,
 		PrepareNextTurn:     prepareNextTurn,
 		ToolExecution:       toolExecution,
 		BeforeToolCall:      beforeToolCall,
@@ -202,7 +203,7 @@ func (r *loopRun) loop() error {
 	var lastCompletedTurn *AgentTurnContext
 	explicitContinuation := false
 	// Check for steering messages at start (user may have typed while waiting).
-	pendingMessages := r.h.steering()
+	var pendingMessages []AgentMessage
 	for {
 		hasMoreToolCalls := true
 		for hasMoreToolCalls || len(pendingMessages) > 0 {
@@ -212,6 +213,14 @@ func (r *loopRun) loop() error {
 				// finished task.
 				r.endRun()
 				return fmt.Errorf("%w (%d turns)", ErrMaxTurnsReached, limit)
+			}
+			if gate := r.h.cfg.BeforeRequest; gate != nil {
+				if err := gate(r.ctx); err != nil {
+					return err
+				}
+			}
+			if len(pendingMessages) == 0 || r.h.cfg.BeforeRequest != nil {
+				pendingMessages = append(pendingMessages, r.h.steering()...)
 			}
 			var preparedMessages []AgentMessage
 			if lastCompletedTurn != nil {

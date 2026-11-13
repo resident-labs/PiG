@@ -787,6 +787,8 @@ type AgentOptions struct {
 	// PrepareRequest runs immediately before every provider request and may
 	// replace the context, model, and thinking level for the run.
 	PrepareRequest PrepareRequest
+	// BeforeRequest may block before each request, before queued steering is read. An error ends the run.
+	BeforeRequest func(context.Context) error
 	// ConvertToLlm converts the transformed agent context to provider messages.
 	// The run waits for it and reports conversion failures through its lifecycle.
 	// Nil uses the standard message conversion.
@@ -2352,4 +2354,11 @@ func cloneAssistantMessage(msg *AssistantMessage) *AssistantMessage {
 		cp.DurationMs = new(*msg.DurationMs)
 	}
 	return &cp
+}
+
+// SetBeforeRequest installs a request gate for subsequent runs. Nil removes it.
+func (a *Agent) SetBeforeRequest(fn func(context.Context) error) {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	a.opts.BeforeRequest = fn
 }

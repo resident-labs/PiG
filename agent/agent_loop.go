@@ -219,6 +219,7 @@ func (r *loopRun) loop() error {
 					return err
 				}
 			}
+			// Without a gate keep the old single poll; with a gate read steering after the hold.
 			if len(pendingMessages) == 0 || r.h.cfg.BeforeRequest != nil {
 				pendingMessages = append(pendingMessages, r.h.steering()...)
 			}

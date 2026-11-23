@@ -10,8 +10,8 @@ const descriptionIntro = "Run JavaScript that calls other tools. The input is ra
 	"- Optional first line: `// @options: {\"max_output_tokens\": 10000, \"timeout_ms\": 60000}`"
 
 const compactIntro = "Run raw JavaScript in QuickJS, not JSON or a code fence. Top-level `await` and `return` work; no Node, filesystem, network or timers.\n" +
-	"Call `await tools.<name>({args})`; it returns the declared object or tool text. Check errors in returned objects too. Unfinished calls are cancelled on exit.\n" +
-	"Optional first line: `// @options: {\"max_output_tokens\": %d, \"timeout_ms\": 60000}` (defaults). Longer text keeps its ends and names the full-output file."
+	"`await tools.<name>({ ...args })` returns text (including truncation notices) or the declared object. Failures reject with an Error unless the tool returns an object; check its fields. Unfinished calls are cancelled on exit.\n" +
+	"Optional first line: `// @options: {\"max_output_tokens\": %d, \"timeout_ms\": 60000}`. The displayed output budget is the default; no timeout is set unless requested. Truncated text keeps its ends and names the full-output file."
 
 // describeGlobals lists the script globals, one line each. The details live in DocsPath.
 //

@@ -296,4 +296,6 @@ What: `SessionOptions.ReadMaxLines` and `ReadMaxBytes` override the native read 
 
 Why: Dyna keeps tool output in later requests, so smaller defaults reduce recurring input while users can still recover the full result.
 
+Locked by: `TestReadConfiguredOutputCaps` and `TestConfiguredOutputBudget`.
+
 Upstream: not offered (owner decision, 2026-11-04).

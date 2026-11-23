@@ -50,10 +50,14 @@ func (t *ReadTool) Name() string  { return "read" }
 func (t *ReadTool) Label() string { return "" }
 
 func (t *ReadTool) Schema() ai.ToolSchema {
-	maxLines, maxBytes := t.outputLimits()
+	description := "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete."
+	if t.MaxLines > 0 || t.MaxBytes > 0 {
+		maxLines, maxBytes := t.outputLimits()
+		description = fmt.Sprintf("Read text or images (jpg, png, gif, webp, bmp). Images are attachments. Text shows at most %d lines or %s, whichever comes first; use offset/limit to continue.", maxLines, FormatSize(maxBytes))
+	}
 	return toolSchemaWithParameters(ai.ToolSchema{
 		Name:                "read",
-		Description:         fmt.Sprintf("Read text or images (jpg, png, gif, webp, bmp). Images are attachments. Text shows at most %d lines or %s, whichever comes first; use offset/limit to continue.", maxLines, FormatSize(maxBytes)),
+		Description:         description,
 		ConstrainedSampling: strictToolSampling(),
 		PromptGuidelines: []string{
 			"Use read to examine files instead of cat or sed.",

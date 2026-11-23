@@ -9,6 +9,10 @@ const descriptionIntro = "Run JavaScript that calls other tools. The input is ra
 	"- `await tools.<name>({ ...args })` resolves to a string, the text you would see with any truncation notice, or an object if the tool's declaration says so, and rejects with an Error on failure. A tool whose declaration returns an object resolves on failure too when it returned that object; check its fields. Calls still running when the script ends are cancelled.\n" +
 	"- Optional first line: `// @options: {\"max_output_tokens\": 10000, \"timeout_ms\": 60000}`"
 
+const compactIntro = "Run raw JavaScript in QuickJS, not JSON or a code fence. Top-level `await` and `return` work; no Node, filesystem, network or timers.\n" +
+	"Call `await tools.<name>({args})`; it returns the declared object or tool text. Check errors in returned objects too. Unfinished calls are cancelled on exit.\n" +
+	"Optional first line: `// @options: {\"max_output_tokens\": %d, \"timeout_ms\": 60000}` (defaults). Longer text keeps its ends and names the full-output file."
+
 // describeGlobals lists the script globals, one line each. The details live in DocsPath.
 //
 // Ports packages/coding-agent/src/extensions/codemode/tool.ts (describeGlobals).

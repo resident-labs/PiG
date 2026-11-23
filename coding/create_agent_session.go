@@ -39,6 +39,8 @@ type CreateAgentSessionFromServicesOptions struct {
 	ContextUpdates bool
 	// ActiveEffortAtTopLevel is SessionOptions.ActiveEffortAtTopLevel (dyna patch P8).
 	ActiveEffortAtTopLevel bool
+	// ReadMaxLines and ReadMaxBytes are as in [SessionOptions].
+	ReadMaxLines, ReadMaxBytes int
 }
 
 // CreateAgentSessionResult mirrors sdk.ts CreateAgentSessionResult.
@@ -140,6 +142,8 @@ func createAgentSessionOver(options CreateAgentSessionFromServicesOptions, resou
 		ResourceLoader:         resourceLoader,
 		ContextUpdates:         options.ContextUpdates,
 		ActiveEffortAtTopLevel: options.ActiveEffortAtTopLevel,
+		ReadMaxLines:           options.ReadMaxLines,
+		ReadMaxBytes:           options.ReadMaxBytes,
 	})
 	if err != nil {
 		return CreateAgentSessionResult{}, err

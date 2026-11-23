@@ -314,6 +314,9 @@ type SessionOptions struct {
 	// caller-supplied and extension tools.
 	SkipBuiltinTools bool
 
+	// ReadMaxLines and ReadMaxBytes override the built-in read output caps; zero keeps PiG's defaults (Dyna).
+	ReadMaxLines, ReadMaxBytes int
+
 	// AllowedTools, if non-nil, is the allowlist filter applied at
 	// agent-loop time. nil = no restriction; non-nil empty = block
 	// every tool. Mirrors agent-frontmatter `tools:` field. Entries are tool

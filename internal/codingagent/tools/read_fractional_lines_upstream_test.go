@@ -36,7 +36,7 @@ func TestReadFractionalOffsetAndLimitLikePi(t *testing.T) {
 		{name: "offset 7.5 beyond end", text: five, offset: num(7.5), want: "error: Offset 7.5 is beyond end of file (6 lines total)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			result, err := readTextResult(readParams{Path: "f.txt", Offset: tc.offset, Limit: tc.limit}, []byte(tc.text))
+			result, err := (&ReadTool{}).readTextResult(readParams{Path: "f.txt", Offset: tc.offset, Limit: tc.limit}, []byte(tc.text))
 			got := ""
 			if err != nil {
 				got = "error: " + err.Error()

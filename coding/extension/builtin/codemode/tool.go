@@ -29,6 +29,8 @@ type Options struct {
 	//
 	// Ports packages/coding-agent/src/extensions/codemode/index.ts (CodemodeExtensionOptions.inlineBudget).
 	InlineBudget *int
+	// DefaultMaxOutputTokens caps script output unless a script sets max_output_tokens. Zero keeps PiG's default.
+	DefaultMaxOutputTokens int
 	// CacheDir holds wazero's on-disk compilation cache for the sandbox module; empty compiles in memory.
 	CacheDir string
 	// Models declares and serves the `models` namespace of the tool [Definition] (createCodemodeToolDefinition's
@@ -71,6 +73,13 @@ func (o Options) inlineBudget() *int {
 		}
 	}
 	return nil
+}
+
+func (o Options) maxOutputTokens() int {
+	if o.DefaultMaxOutputTokens > 0 {
+		return o.DefaultMaxOutputTokens
+	}
+	return defaultMaxOutputTokens
 }
 
 // promptSnippet and promptGuidelines are upstream's codemodeToolSystemPromptContribution.
@@ -230,7 +239,7 @@ func prepareLoadout(loadout extension.ToolLoadout, options Options) *extension.T
 		defaultBudget := DefaultInlineBudget
 		budget = &defaultBudget
 	}
-	description, err := CreateDescription(listed, DescriptionOptions{Models: options.Models, Namespaces: namespaces, Guidelines: guidelines, Deferred: deferred, InlineBudget: budget})
+	description, err := CreateDescription(listed, DescriptionOptions{Models: options.Models, Namespaces: namespaces, Guidelines: guidelines, Deferred: deferred, InlineBudget: budget, DefaultMaxOutputTokens: options.DefaultMaxOutputTokens})
 	if err != nil {
 		panic(err) // upstream: see above, a thrown prepareLoadout.
 	}
@@ -256,7 +265,7 @@ func prepareLoadout(loadout extension.ToolLoadout, options Options) *extension.T
 func Definition(options Options) extension.ToolDefinition {
 	options.storeCache = &branchStoreCache{}
 	// No tools are listed, so no schema reference is decoded and rendering cannot fail.
-	description, _ := CreateDescription(nil, DescriptionOptions{Models: options.Models})
+	description, _ := CreateDescription(nil, DescriptionOptions{Models: options.Models, DefaultMaxOutputTokens: options.DefaultMaxOutputTokens})
 	return extension.ToolDefinition{
 		Name:             ToolName,
 		Label:            ToolName,

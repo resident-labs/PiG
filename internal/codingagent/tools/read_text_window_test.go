@@ -111,7 +111,7 @@ func TestReadTextResultMatchesWholeFileDecode(t *testing.T) {
 			p.Limit = &numbers[rng.IntN(len(numbers))]
 		}
 		want, wantErr := referenceReadTextResult(p, decodeText(data))
-		got, gotErr := readTextResult(p, data)
+		got, gotErr := (&ReadTool{}).readTextResult(p, data)
 		if fmt.Sprint(gotErr) != fmt.Sprint(wantErr) || !reflect.DeepEqual(got, want) {
 			t.Fatalf("readTextResult(%+v, %q):\n got  %+v, %v\n want %+v, %v", p, data, got, gotErr, want, wantErr)
 		}

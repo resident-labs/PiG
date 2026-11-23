@@ -31,7 +31,8 @@ type ReadTool struct {
 	AutoResizeImages *bool
 	ResizeOptions    *ai.ModelImageResizeOptions
 	// Operations delegates the file reads; nil selects the local filesystem (upstream options.operations).
-	Operations *ReadOperations
+	Operations         *ReadOperations
+	MaxLines, MaxBytes int
 }
 
 // ReadOperations is upstream's ReadOperations: pluggable file reads, for example over SSH.
@@ -49,9 +50,10 @@ func (t *ReadTool) Name() string  { return "read" }
 func (t *ReadTool) Label() string { return "" }
 
 func (t *ReadTool) Schema() ai.ToolSchema {
+	maxLines, maxBytes := t.outputLimits()
 	return toolSchemaWithParameters(ai.ToolSchema{
 		Name:                "read",
-		Description:         "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
+		Description:         fmt.Sprintf("Read text or images (jpg, png, gif, webp, bmp). Images are attachments. Text shows at most %d lines or %s, whichever comes first; use offset/limit to continue.", maxLines, FormatSize(maxBytes)),
 		ConstrainedSampling: strictToolSampling(),
 		PromptGuidelines: []string{
 			"Use read to examine files instead of cat or sed.",
@@ -61,6 +63,17 @@ func (t *ReadTool) Schema() ai.ToolSchema {
 		"offset":{"type":"number","description":"Line number to start reading from (1-indexed)"},
 		"limit":{"type":"number","description":"Maximum number of lines to read"}
 	}}`)
+}
+
+func (t *ReadTool) outputLimits() (lines, bytes int) {
+	lines, bytes = t.MaxLines, t.MaxBytes
+	if lines <= 0 {
+		lines = DefaultMaxLines
+	}
+	if bytes <= 0 {
+		bytes = DefaultMaxBytes
+	}
+	return lines, bytes
 }
 
 func (t *ReadTool) ExecutionMode() agent.ToolExecutionMode { return agent.ToolModeParallel }
@@ -242,7 +255,7 @@ func (t *ReadTool) Execute(ctx context.Context, _ string, rawParams json.RawMess
 		result.StructuredContent = readStructuredContent(result.Content)
 		return result, nil
 	}
-	result, err := readTextResult(p, data)
+	result, err := t.readTextResult(p, data)
 	if err != nil {
 		return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: err.Error()}}, Details: map[string]any{}, IsError: true, Thrown: true}, nil
 	}
@@ -331,7 +344,7 @@ func decodeText(data []byte) string {
 
 // readTextResult mirrors the text branch of upstream read.ts execute over the file's bytes. Upstream decodes the file and splits it into
 // lines; this counts the lines and decodes only the selected ones.
-func readTextResult(p readParams, data []byte) (agent.AgentToolResult, error) {
+func (t *ReadTool) readTextResult(p readParams, data []byte) (agent.AgentToolResult, error) {
 	totalFileLines := bytes.Count(data, []byte{'\n'}) + 1
 	lineCount := float64(totalFileLines)
 	// Line numbers stay JavaScript numbers as in read.ts:160-199: a fractional offset or limit shows up in the
@@ -373,7 +386,8 @@ func readTextResult(p readParams, data []byte) (agent.AgentToolResult, error) {
 	} else {
 		selected = selectedText(totalFileLines)
 	}
-	tr := TruncateHead(selected, TruncationOptions{})
+	maxLines, maxBytes := t.outputLimits()
+	tr := TruncateHead(selected, truncationLimits(maxBytes, maxLines))
 
 	var output string
 	var truncation *TruncationResult
@@ -385,8 +399,8 @@ func readTextResult(p readParams, data []byte) (agent.AgentToolResult, error) {
 		}
 		firstLineSize := FormatSize(len(selectedText(sliceStart + 1)))
 		line := itoa(sliceStart + 1)
-		output = "[Line " + line + " is " + firstLineSize + ", exceeds " + FormatSize(DefaultMaxBytes) + " limit. Use bash: sed -n '" + line + "p' " +
-			p.Path + " | head -c " + itoa(DefaultMaxBytes) + "]"
+		output = "[Line " + line + " is " + firstLineSize + ", exceeds " + FormatSize(maxBytes) + " limit. Use bash: sed -n '" + line + "p' " +
+			p.Path + " | head -c " + itoa(maxBytes) + "]"
 		truncation = &tr
 	case tr.Truncated:
 		endLineDisplay := startLineDisplay + float64(tr.OutputLines) - 1
@@ -397,7 +411,7 @@ func readTextResult(p readParams, data []byte) (agent.AgentToolResult, error) {
 				". Use offset=" + jsNumber(nextOffset) + " to continue.]"
 		} else {
 			output += "\n\n[Showing lines " + jsNumber(startLineDisplay) + "-" + jsNumber(endLineDisplay) + " of " + itoa(totalFileLines) +
-				" (" + FormatSize(DefaultMaxBytes) + " limit). Use offset=" + jsNumber(nextOffset) + " to continue.]"
+				" (" + FormatSize(maxBytes) + " limit). Use offset=" + jsNumber(nextOffset) + " to continue.]"
 		}
 		truncation = &tr
 	case hasUserLimit && startLine+userLimitedLines < lineCount:

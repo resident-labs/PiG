@@ -872,7 +872,7 @@ func Execute(ctx context.Context, toolCallID string, params json.RawMessage, onU
 		items = append(items, ai.TextContent{Text: fmt.Sprintf("Note: models.generateImages() returned %d image%s that the script did not show. Show each image block of result.output with image(block).", generated, plural)})
 	}
 
-	maxTokens := int64(defaultMaxOutputTokens)
+	maxTokens := int64(options.maxOutputTokens())
 	if parsed.Options.MaxOutputTokens != nil {
 		maxTokens = *parsed.Options.MaxOutputTokens
 	}

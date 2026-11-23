@@ -76,6 +76,8 @@ type DescriptionOptions struct {
 	// InlineBudget is the estimated tokens (characters / 4) the tool sections may use; tools that do not fit are
 	// left out like deferred tools. Nil lists every tool that is not deferred.
 	InlineBudget *int
+	// DefaultMaxOutputTokens names the default output budget in the generated help.
+	DefaultMaxOutputTokens int
 }
 
 // toDeclaration is what a script sees of a tool: its description followed by its prompt guidelines, which the system
@@ -225,7 +227,11 @@ func CreateDescription(tools []extension.AgentTool, options DescriptionOptions) 
 	})
 	shown := selectCatalog(ordered, options.InlineBudget)
 
-	sections := []string{descriptionIntro, describeGlobals(options.Models)}
+	intro := descriptionIntro
+	if options.DefaultMaxOutputTokens > 0 {
+		intro = fmt.Sprintf(compactIntro, options.DefaultMaxOutputTokens)
+	}
+	sections := []string{intro, describeGlobals(options.Models)}
 	if len(declarations) == 0 {
 		return strings.Join(sections, "\n\n"), nil
 	}

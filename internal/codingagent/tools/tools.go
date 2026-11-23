@@ -163,6 +163,8 @@ type ReadToolOptions struct {
 	ResizeOptions *ai.ModelImageResizeOptions
 	// Operations delegates file reads; nil is the local filesystem.
 	Operations *ReadOperations
+	// Zero retains the upstream limit.
+	MaxLines, MaxBytes int
 }
 
 // BashToolOptions is upstream's BashToolOptions (bash.ts:214-226).
@@ -253,7 +255,7 @@ func orEmpty[T any](options *T) T {
 // CreateReadTool is upstream's createReadTool (read.ts:222).
 func CreateReadTool(cwd string, options *ReadToolOptions) *ReadTool {
 	o := orEmpty(options)
-	return &ReadTool{CWD: cwd, AutoResizeImages: o.AutoResizeImages, ResizeOptions: o.ResizeOptions, Operations: o.Operations}
+	return &ReadTool{CWD: cwd, AutoResizeImages: o.AutoResizeImages, ResizeOptions: o.ResizeOptions, Operations: o.Operations, MaxLines: o.MaxLines, MaxBytes: o.MaxBytes}
 }
 
 // CreateBashTool is upstream's createBashTool (bash.ts:434).

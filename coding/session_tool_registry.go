@@ -253,7 +253,14 @@ func createSessionToolRegistry(services *AgentSessionServices, opts SessionOptio
 		var baseTools []agent.AgentTool
 		var overrideKeys []string
 		if opts.BaseToolsOverride == nil {
-			baseTools = tools.CreateAllTools(services.CWD(), tools.ToolsOptionsFromSettings(services.Settings(), filepath.Join(services.AgentDir(), "bin")))
+			options := tools.ToolsOptionsFromSettings(services.Settings(), filepath.Join(services.AgentDir(), "bin"))
+			if opts.ReadMaxLines > 0 || opts.ReadMaxBytes > 0 {
+				if options.Read == nil {
+					options.Read = &tools.ReadToolOptions{}
+				}
+				options.Read.MaxLines, options.Read.MaxBytes = opts.ReadMaxLines, opts.ReadMaxBytes
+			}
+			baseTools = tools.CreateAllTools(services.CWD(), options)
 		} else {
 			// upstream: agent-session.ts:3614-3620: an override is the minimal definition createToolDefinitionFromAgentTool synthesizes, with no built-in prompt snippet.
 			for _, entry := range opts.BaseToolsOverride {

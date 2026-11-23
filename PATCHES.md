@@ -289,3 +289,11 @@ Why: restoring a compacted session decoded all historical tool-result bodies jus
 Locked by: TestSystemMessagesMatchWholeBranchAcrossCompactionAndForks and TestP18ReplayMatchesWholeBranchIncludingPreCompactionToolErrors.
 
 Upstream: not offered (owner decision, 2026-11-04).
+
+## P20 Smaller tool output budgets for embedded sessions
+
+What: `SessionOptions.ReadMaxLines` and `ReadMaxBytes` override the native read tool's caps without changing file reads, image handling or paging. `codemode.Options.DefaultMaxOutputTokens` sets the script output budget and mentions it in the help; a script can still set `max_output_tokens` itself. Zero preserves PiG's limits.
+
+Why: Dyna keeps tool output in later requests, so smaller defaults reduce recurring input while users can still recover the full result.
+
+Upstream: not offered (owner decision, 2026-11-04).

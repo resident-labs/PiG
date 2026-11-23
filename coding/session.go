@@ -2321,8 +2321,13 @@ func (s *Session) resolveCompleter() compaction.SimpleCompleter {
 	if s.completer != nil {
 		return s.completer
 	}
-	return compaction.ProviderCompleter{StreamFn: s.agent.EffectiveStreamFunction()}
+	stream := s.agent.EffectiveStreamFunction()
+	return compaction.ProviderCompleter{StreamFn: func(ctx context.Context, model *ai.Model, transcript ai.TranscriptContext, options ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
+		return stream(context.WithValue(ctx, standaloneSummaryKey{}, true), model, transcript, options)
+	}}
 }
+
+type standaloneSummaryKey struct{}
 
 // AgentSessionEventListener is a Session event listener (agent-session.ts:240 `(event: AgentSessionEvent) => void`).
 type AgentSessionEventListener func(agent.AgentEvent)
@@ -3449,13 +3454,13 @@ func (s *Session) runAutoCompactionFor(ctx context.Context, reason string, willR
 		return false, err
 	}
 	if transfer != nil {
-		model, settings = transfer.model, transfer.settings
+		settings = transfer.settings
 	}
 	if !s.beginCompaction() {
 		return false, nil
 	}
 	defer s.finishCompaction()
-	if model == nil {
+	if model == nil && transfer == nil {
 		return false, nil
 	}
 
@@ -3483,7 +3488,7 @@ func (s *Session) runAutoCompactionFor(ctx context.Context, reason string, willR
 	s.emitCompactionEvent(agent.CompactionStartEvent{Reason: reason})
 	if compactCtx.Err() != nil {
 		if transfer != nil {
-			transfer.aborted = true
+			transfer.aborted = errors.Is(compactCtx.Err(), context.Canceled)
 		}
 		s.emitOrderedEventSync(agent.CompactionEndEvent{Reason: reason, Aborted: true})
 		s.emitSessionCompactFailed(ctx, extension.SessionCompactFailedEvent{Reason: reason, Aborted: true})
@@ -3496,9 +3501,13 @@ func (s *Session) runAutoCompactionFor(ctx context.Context, reason string, willR
 	cancelledByExtension := isCompactionCancelled(err)
 	if err == nil && result == nil {
 		// upstream: agent-session.ts:3034-3080 (_runDefaultCompaction after the session_before_compact hook).
-		generated, compactErr := s.runDefaultCompaction(compactCtx, *prep, model, "", reason)
-		err = compactErr
-		if compactErr == nil {
+		var generated compaction.CompactionResult
+		if transfer != nil {
+			generated, err = s.summarizeTransfer(compactCtx, *prep, reason, transfer)
+		} else {
+			generated, err = s.runDefaultCompaction(compactCtx, *prep, model, "", reason)
+		}
+		if err == nil {
 			result = generatedCompactionData(generated)
 		}
 	}
@@ -3519,7 +3528,9 @@ func (s *Session) runAutoCompactionFor(ctx context.Context, reason string, willR
 			}
 		}
 		if transfer != nil {
-			transfer.aborted, transfer.err = aborted, err
+			// Record the compaction's cancellation, not the state of its parent deadline during cleanup.
+			transfer.aborted = errors.Is(compactCtx.Err(), context.Canceled) || cancelledByExtension
+			transfer.err = err
 		}
 		s.emitOrderedEventSync(agent.CompactionEndEvent{Reason: reason, Aborted: aborted, ErrorMessage: errorMessage})
 		s.emitSessionCompactFailed(ctx, extension.SessionCompactFailedEvent{Reason: reason, ErrorMessage: errorMessage, Aborted: aborted, FromExtension: fromExtension})

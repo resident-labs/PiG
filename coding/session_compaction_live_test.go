@@ -32,9 +32,16 @@ func (p *liveProbeProvider) Stream(_ context.Context, transcript ai.TranscriptCo
 // A compaction's summary request is the agent's latest request with the messages since and the summary prompt
 // appended, on the same session ID and with prompt caching left as the agent's (dyna patch P16).
 func TestCompactionExtendsTheAgentsLatestRequest(t *testing.T) {
+	for _, mode := range []string{"manual", "transfer"} {
+		t.Run(mode, func(t *testing.T) { checkCompactionRequestPrefix(t, mode == "transfer") })
+	}
+}
+
+func checkCompactionRequestPrefix(t *testing.T, transfer bool) {
+	t.Helper()
 	probe := &liveProbeProvider{}
 	model := &ai.Model{ID: "faux-1", DisplayName: "faux-1", Provider: newRequestOptionsProvider(probe, "opencode", nil), Capabilities: ai.ModelCapabilities{ContextWindow: 128_000}}
-	sess, err := NewSession(newTestServicesSmallKeep(t), SessionOptions{Model: model, SkipBuiltinTools: true})
+	sess, err := NewSession(newTestServicesSmallKeep(t), SessionOptions{Model: model})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +54,14 @@ func TestCompactionExtendsTheAgentsLatestRequest(t *testing.T) {
 	}
 	drainSessionEvents(t, sess)
 	agentRequests := len(probe.requests)
-	if _, err := sess.Compact(context.Background(), ""); err != nil {
+	if transfer {
+		target := *model
+		target.ID = "faux-2"
+		result, err := sess.TransferModel(t.Context(), &target, ModelTransferOptions{CompactionTriggerTokens: 1})
+		if err != nil || result.Path != TransferCompacted || !strings.HasSuffix(result.Reason, "/faux-1") {
+			t.Fatalf("transfer = %+v, %v", result, err)
+		}
+	} else if _, err := sess.Compact(t.Context(), ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := len(probe.requests) - agentRequests; got != 1 {

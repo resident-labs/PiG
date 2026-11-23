@@ -45,34 +45,95 @@ func TestTransferOfASmallConversation(t *testing.T) {
 	}
 }
 
+func TestSameModelTransferIgnoresAnEmptyRecordedModelID(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{})
+	missing := recoveredAssistant(ai.StopReasonError)
+	missing.Assistant.ModelID = ""
+	recovered(t, h, recoveredUser("hi"), missing)
+	result, err := h.session.TransferModel(t.Context(), h.session.Model(), ModelTransferOptions{})
+	if err != nil || result.Path != TransferUnchanged {
+		t.Fatalf("transfer = %+v, %v", result, err)
+	}
+}
+
 func TestTransferCompactsOnTheOldModelFirst(t *testing.T) {
-	var summarizedBy string
-	h := newRecoveryHarness(t, harnessOptions{}, func(messages []ai.Message) *ai.AssistantMessage {
-		return fauxReply("the summary", ai.StopReasonStop, 0)(messages)
-	})
-	h.session.Subscribe(func(e agent.AgentEvent) {
-		if _, ok := e.(agent.CompactionStartEvent); ok {
-			summarizedBy = h.session.Model().ID
-		}
-	})
+	h := newRecoveryHarness(t, harnessOptions{}, fauxReply("the summary", ai.StopReasonStop, 0))
+	target := transferTarget(h, 32_000)
+	fallback := &scriptedProvider{}
+	target.Provider = fallback
 	longConversation(t, h)
-	result, err := h.session.TransferModel(t.Context(), transferTarget(h, 32_000), ModelTransferOptions{ThinkingLevel: ai.ThinkingOff})
-	if err != nil || result.Path != TransferCompacted || result.TokensAfter >= result.TokensBefore || h.session.Model().ID != "faux-2" {
+	result, err := h.session.TransferModel(t.Context(), target, ModelTransferOptions{ThinkingLevel: ai.ThinkingOff})
+	if err != nil || result.Path != TransferCompacted || result.Reason != "summarized by faux/faux-1" || result.TokensAfter >= result.TokensBefore || h.session.Model().ID != "faux-2" {
 		t.Fatalf("%+v %v on %s", result, err, h.session.Model().ID)
 	}
-	if summarizedBy != "faux-1" {
-		t.Fatalf("summarized on %q", summarizedBy)
+	if h.provider.callCount() != 1 || fallback.callCount() != 0 {
+		t.Fatalf("summary calls: old %d, new %d", h.provider.callCount(), fallback.callCount())
+	}
+}
+
+func TestTransferFallsBackToTheNewModelAfterAnError(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{settings: `{"retry":{"enabled":false}}`}, fauxError("old model unavailable"))
+	target := transferTarget(h, 32_000)
+	fallback := &scriptedProvider{responses: []scriptedResponse{func(messages []ai.Message) *ai.AssistantMessage {
+		if h.provider.callCount() != 1 {
+			t.Error("the new model summarized before the old model was tried")
+		}
+		return fauxReply("the fallback summary", ai.StopReasonStop, 0)(messages)
+	}}}
+	target.Provider = fallback
+	longConversation(t, h)
+	result, err := h.session.TransferModel(t.Context(), target, ModelTransferOptions{ThinkingLevel: ai.ThinkingOff})
+	if err != nil || result.Path != TransferCompacted || result.Reason != "summarized by faux/faux-2" || h.session.Model().ID != "faux-2" || fallback.callCount() != 1 {
+		t.Fatalf("%+v %v on %s, new model calls %d", result, err, h.session.Model().ID, fallback.callCount())
+	}
+}
+
+func TestFailedFallbackDoesNotReplaceTheLiveCompactionPrefix(t *testing.T) {
+	for _, path := range []string{TransferAborted, TransferSwitched} {
+		t.Run(path, func(t *testing.T) {
+			reply := fauxReply("reply", ai.StopReasonStop, 0)
+			h := newRecoveryHarness(t, harnessOptions{settings: `{"retry":{"enabled":false}}`}, reply, reply, reply, fauxError("old model unavailable"))
+			for range 3 {
+				if _, err := h.session.Send(t.Context(), "a question long enough to keep apart from the next one"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			old := h.session.Model()
+			if _, ok := h.session.liveCompactionRequest(old); !ok {
+				t.Fatal("the old model must start with a live prefix")
+			}
+			target := transferTarget(h, 128_000)
+			fallback := &scriptedProvider{responses: []scriptedResponse{func(messages []ai.Message) *ai.AssistantMessage {
+				if path == TransferAborted {
+					h.session.RequestAbort()
+				}
+				return fauxError("new model failed")(messages)
+			}}}
+			target.Provider = fallback
+			result, err := h.session.TransferModel(t.Context(), target, ModelTransferOptions{CompactionTriggerTokens: 1})
+			if err != nil || result.Path != path || fallback.callCount() != 1 {
+				t.Fatalf("transfer = %+v, %v; fallback calls = %d", result, err, fallback.callCount())
+			}
+			if _, ok := h.session.liveCompactionRequest(old); !ok {
+				t.Fatal("the fallback erased the old model's live prefix")
+			}
+			if _, ok := h.session.liveCompactionRequest(target); ok {
+				t.Fatal("the fallback request is not the conversation's live prefix")
+			}
+		})
 	}
 }
 
 // A summary that fails leaves the new model a boundary that names the session file, which keeps every entry.
 func TestTransferLeavesABoundaryWhenNoSummaryFits(t *testing.T) {
 	h := newRecoveryHarness(t, harnessOptions{settings: `{"retry":{"enabled":false}}`}, fauxError("overloaded"))
-	h.provider.wrap = true
+	target := transferTarget(h, 32_000)
+	fallback := &scriptedProvider{responses: []scriptedResponse{fauxError("context too long")}}
+	target.Provider = fallback
 	longConversation(t, h)
-	result, err := h.session.TransferModel(t.Context(), transferTarget(h, 32_000), ModelTransferOptions{ThinkingLevel: ai.ThinkingOff})
-	if err != nil || result.Path != TransferBoundary || !strings.Contains(result.Reason, "overloaded") || h.session.Model().ID != "faux-2" {
-		t.Fatalf("%+v %v", result, err)
+	result, err := h.session.TransferModel(t.Context(), target, ModelTransferOptions{ThinkingLevel: ai.ThinkingOff})
+	if err != nil || result.Path != TransferBoundary || !strings.Contains(result.Reason, "overloaded") || !strings.Contains(result.Reason, "context too long") || h.session.Model().ID != "faux-2" || h.provider.callCount() != 1 || fallback.callCount() != 1 {
+		t.Fatalf("%+v %v; summary calls: old %d, new %d", result, err, h.provider.callCount(), fallback.callCount())
 	}
 	data, err := os.ReadFile(h.session.Path())
 	if err != nil {
@@ -84,13 +145,18 @@ func TestTransferLeavesABoundaryWhenNoSummaryFits(t *testing.T) {
 }
 
 func TestAStoppedTransferKeepsTheModel(t *testing.T) {
-	h := newRecoveryHarness(t, harnessOptions{}, fauxReply("the summary", ai.StopReasonStop, 0))
+	var h *recoveryHarness
+	h = newRecoveryHarness(t, harnessOptions{}, func([]ai.Message) *ai.AssistantMessage {
+		h.session.RequestAbort()
+		return fauxError("interrupted")(nil)
+	})
+	target := transferTarget(h, 32_000)
+	fallback := &scriptedProvider{}
+	target.Provider = fallback
 	longConversation(t, h)
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	result, err := h.session.TransferModel(ctx, transferTarget(h, 32_000), ModelTransferOptions{ThinkingLevel: ai.ThinkingOff})
-	if err != nil || result.Path != TransferAborted || h.session.Model().ID != "faux-1" {
-		t.Fatalf("%+v %v on %s", result, err, h.session.Model().ID)
+	result, err := h.session.TransferModel(t.Context(), target, ModelTransferOptions{ThinkingLevel: ai.ThinkingOff})
+	if err != nil || result.Path != TransferAborted || h.session.Model().ID != "faux-1" || h.provider.callCount() != 1 || fallback.callCount() != 0 {
+		t.Fatalf("%+v %v on %s; summary calls: old %d, new %d", result, err, h.session.Model().ID, h.provider.callCount(), fallback.callCount())
 	}
 }
 
@@ -165,8 +231,8 @@ func TestABoundaryKeepsNoTailOverTheLimit(t *testing.T) {
 }
 
 // A process that restarted on the target still holds the conversation of the model the branch records, so the
-// transfer counts as a change of model and summarizes on the recorded one. Here that model's endpoint does not
-// answer, so the summary fails and the conversation moves whole.
+// transfer counts as a change of model and summarizes on the recorded one. Here both providers fail, so the
+// conversation moves whole because it fits.
 func TestATransferSummarizesOnTheModelTheBranchRecords(t *testing.T) {
 	h := newRecoveryHarness(t, harnessOptions{settings: `{"retry":{"enabled":false}}`})
 	big := strings.Repeat("word ", 60_000)
@@ -174,11 +240,50 @@ func TestATransferSummarizesOnTheModelTheBranchRecords(t *testing.T) {
 	recorded.Assistant.ModelID = "faux-auth"
 	recovered(t, h, recoveredUser("first "+big), recorded, recoveredUser("second "+big), recorded)
 	target := transferTarget(h, 1_000_000)
-	target.Provider = &scriptedProvider{}
+	fallback := &scriptedProvider{responses: []scriptedResponse{fauxError("target unavailable")}}
+	target.Provider = fallback
 	h.session.agent.SetModel(target)
 	result, err := h.session.TransferModel(t.Context(), target, ModelTransferOptions{ThinkingLevel: ai.ThinkingOff})
-	if err != nil || result.Path != TransferSwitched || result.Reason == "" || target.Provider.(*scriptedProvider).callCount() != 0 {
-		t.Fatalf("%+v %v", result, err)
+	if err != nil || result.Path != TransferSwitched || !strings.Contains(result.Reason, "old model:") || !strings.Contains(result.Reason, "target unavailable") || fallback.callCount() != 1 {
+		t.Fatalf("%+v %v, new model calls %d", result, err, fallback.callCount())
+	}
+}
+
+func TestTransferFallsBackWhenTheRecordedModelIsNoLongerRegistered(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{})
+	recorded := recoveredAssistant(ai.StopReasonStop, ai.TextContent{Text: "a"})
+	recorded.Assistant.ModelID = "removed-model"
+	big := strings.Repeat("word ", 12_000)
+	recovered(t, h, recoveredUser("first "+big), recorded, recoveredUser("second "+big), recorded, recoveredUser("third"), recorded)
+	target := transferTarget(h, 32_000)
+	fallback := &scriptedProvider{responses: []scriptedResponse{fauxReply("the fallback summary", ai.StopReasonStop, 0)}}
+	target.Provider = fallback
+	h.session.agent.SetModel(target) // a restarted process was opened on the target
+	result, err := h.session.TransferModel(t.Context(), target, ModelTransferOptions{})
+	if err != nil || result.Path != TransferCompacted || result.Reason != "summarized by faux/faux-2" || fallback.callCount() != 1 {
+		t.Fatalf("transfer = %+v, %v; fallback calls = %d", result, err, fallback.callCount())
+	}
+}
+
+func TestTransferFallsBackAfterATimeoutOnlyWithMostOfTheBudgetLeft(t *testing.T) {
+	for _, budget := range []time.Duration{8 * time.Minute, 4 * time.Minute} {
+		t.Run(budget.String(), func(t *testing.T) {
+			h := newRecoveryHarness(t, harnessOptions{settings: `{"retry":{"enabled":false}}`}, fauxError("provider request timed out"))
+			target := transferTarget(h, 32_000)
+			fallback := &scriptedProvider{responses: []scriptedResponse{fauxReply("the fallback summary", ai.StopReasonStop, 0)}}
+			target.Provider = fallback
+			longConversation(t, h)
+			ctx, cancel := context.WithTimeout(t.Context(), budget)
+			defer cancel()
+			result, err := h.session.TransferModel(ctx, target, ModelTransferOptions{ThinkingLevel: ai.ThinkingOff})
+			path, calls := TransferCompacted, 1
+			if budget < transferSummaryTimeout/2 {
+				path, calls = TransferBoundary, 0
+			}
+			if err != nil || result.Path != path || fallback.callCount() != calls {
+				t.Fatalf("%+v %v, new model calls %d", result, err, fallback.callCount())
+			}
+		})
 	}
 }
 

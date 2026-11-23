@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/MichaelKinsy/PiG/agent"
@@ -26,8 +27,7 @@ const (
 	TransferAborted = "aborted"
 )
 
-// transferSummaryTimeout is the longest a model transfer waits for its summary before it uses a boundary instead. A
-// test shortens it.
+// transferSummaryTimeout bounds both summary attempts together. A test shortens it.
 var transferSummaryTimeout = 10 * time.Minute
 
 // transferCompactAbove is the context size above which a transfer to another model compacts on the old one even when
@@ -46,24 +46,27 @@ type ModelTransferResult struct {
 	Path         string
 	TokensBefore int
 	TokensAfter  int
-	// Reason says why a compaction the transfer wanted did not happen or was not enough.
+	// Reason says which model summarized, or why the transfer could not use a summary.
 	Reason string
 }
 
-// transferCompaction is a compaction a model transfer asks for, on the model that held the conversation, and how it went.
+// transferCompaction holds the source and optional fallback for one compaction, and its outcome.
 type transferCompaction struct {
-	model     *ai.Model
-	settings  compaction.CompactionSettings
-	compacted bool
-	aborted   bool
-	err       error
+	source, fallback *ai.Model
+	sourceErr        error // set before compaction if the recorded source could not be found
+	settings         compaction.CompactionSettings
+	summarizedBy     *ai.Model
+	compacted        bool
+	aborted          bool
+	err              error
 }
 
 // TransferModel moves the conversation to target between runs. A conversation that fits and is small switches at once.
 // Otherwise it is compacted first, on the model that last held it, because that model can read all of it and still has
-// its prompt cache. If compaction fails, times out or leaves too much, the session switches anyway: a conversation that
-// fits stays whole, and one that does not leaves target a boundary that names the session file. The session file keeps
-// every entry on all paths. Abort cancels the compaction, and the model does not change.
+// its prompt cache. If the old model fails, the target gets one compaction attempt within the same time budget.
+// If no summary fits, the session switches anyway: a conversation that fits stays whole, and one that does not
+// leaves target a boundary that names the session file. The session file keeps every entry on all paths.
+// Abort cancels the compaction and leaves the model unchanged.
 //
 // dyna patch P4 (PATCHES.md): Pi checks the context against a new model only at its next request, when it may already
 // be too large for it, and compacts on the new model with a cold cache. A host that moves sessions between models needs
@@ -77,10 +80,20 @@ func (s *Session) TransferModel(ctx context.Context, target *ai.Model, options M
 	}
 	// A process that restarted on target still has the conversation of the model the branch records.
 	source := s.Model()
-	if recorded := GetBranchSelection(s.currentBranch(), s.modelRuntime.GetModel); recorded != nil && !recorded.Unresolvable {
+	var sourceErr error
+	if recorded := GetBranchSelection(s.currentBranch(), s.modelRuntime.GetModel); recorded != nil && !recorded.Unresolvable &&
+		recorded.Provider != "" && recorded.ModelID != "" &&
+		(source == nil || providerID(source) != recorded.Provider || source.ID != recorded.ModelID) {
 		if model := s.modelRuntime.GetModel(recorded.Provider, recorded.ModelID); model != nil {
 			source = model
+		} else if source == nil || ai.ModelsAreEqual(source, target) {
+			// After a restart the old model might no longer be registered. A running session still owns its model.
+			source = nil
+			sourceErr = fmt.Errorf("old model %s/%s is no longer registered", recorded.Provider, recorded.ModelID)
 		}
+	}
+	if source == nil && sourceErr == nil {
+		sourceErr = errors.New("no old model selected")
 	}
 	configured, err := s.SettingsManager().GetCompactionSettings(target)
 	if err != nil {
@@ -110,6 +123,9 @@ func (s *Session) TransferModel(ctx context.Context, target *ai.Model, options M
 	}
 
 	before := contextTokens()
+	if ctx.Err() != nil {
+		return ModelTransferResult{Path: TransferAborted, TokensBefore: before, TokensAfter: before}, nil
+	}
 	if !exceeds(settings) && !(changesModel && before > transferCompactAbove) {
 		return ModelTransferResult{Path: unchanged, TokensBefore: before, TokensAfter: before}, apply()
 	}
@@ -119,46 +135,89 @@ func (s *Session) TransferModel(ctx context.Context, target *ai.Model, options M
 	if settings.TriggerTokens > 0 {
 		limit = min(limit, settings.TriggerTokens)
 	}
-	run := &transferCompaction{model: source, settings: settings}
+	run := &transferCompaction{source: source, sourceErr: sourceErr, settings: settings}
+	if changesModel {
+		run.fallback = target
+	}
 	run.settings.KeepRecentTokens = max(1, min(settings.KeepRecentTokens, limit/2))
 	summaryCtx, cancel := context.WithTimeout(ctx, transferSummaryTimeout)
+	defer cancel()
 	_, err = s.runAutoCompactionFor(summaryCtx, "threshold", false, run)
-	timedOut := errors.Is(summaryCtx.Err(), context.DeadlineExceeded)
-	cancel()
 	if err != nil {
 		return ModelTransferResult{}, err
 	}
-	if run.aborted && !timedOut {
+	timedOut := errors.Is(summaryCtx.Err(), context.DeadlineExceeded)
+	if ctx.Err() != nil || run.aborted {
 		return ModelTransferResult{Path: TransferAborted, TokensBefore: before, TokensAfter: contextTokens()}, nil
-	}
-	var reason string
-	switch {
-	case timedOut:
-		reason = "the summary timed out"
-	case run.compacted:
-		reason = "the summary left too much context"
-	case run.err != nil:
-		reason = run.err.Error()
-	default:
-		reason = "there was nothing to summarize"
 	}
 	// Only the hard limit forces a boundary: over the trigger alone, the conversation still works.
 	whole := settings
 	whole.TriggerTokens = 0
 	fits := !exceeds(whole)
+	var reason string
+	switch {
+	case run.compacted && !fits:
+		reason = "the summary left too much context"
+		if model := run.summarizedBy; model != nil {
+			reason = fmt.Sprintf("the summary by %s/%s left too much context", providerID(model), model.ID)
+		}
+	case run.compacted:
+		if model := run.summarizedBy; model != nil {
+			reason = fmt.Sprintf("summarized by %s/%s", providerID(model), model.ID)
+		}
+	case timedOut:
+		reason = "the summary timed out"
+	case run.err != nil:
+		reason = run.err.Error()
+	default:
+		reason = "there was nothing to summarize"
+	}
 	if err := apply(); err != nil {
 		return ModelTransferResult{}, err
 	}
 	if fits {
+		path := unchanged
 		if run.compacted {
-			return ModelTransferResult{Path: TransferCompacted, TokensBefore: before, TokensAfter: contextTokens()}, nil
+			path = TransferCompacted
 		}
-		return ModelTransferResult{Path: unchanged, TokensBefore: before, TokensAfter: contextTokens(), Reason: reason}, nil
+		return ModelTransferResult{Path: path, TokensBefore: before, TokensAfter: contextTokens(), Reason: reason}, nil
 	}
 	if err := s.appendTransferBoundary(reason, run.settings, limit); err != nil {
 		return ModelTransferResult{}, err
 	}
 	return ModelTransferResult{Path: TransferBoundary, TokensBefore: before, TokensAfter: contextTokens(), Reason: reason}, nil
+}
+
+// summarizeTransfer keeps both attempts inside one compaction so an abort cancels either model and stops the fallback.
+func (s *Session) summarizeTransfer(ctx context.Context, prep compaction.CompactionPreparation, reason string, run *transferCompaction) (compaction.CompactionResult, error) {
+	var result compaction.CompactionResult
+	err := run.sourceErr
+	if run.source != nil {
+		result, err = s.runDefaultCompaction(ctx, prep, run.source, "", reason)
+		if err == nil {
+			run.summarizedBy = run.source
+			return result, nil
+		}
+	}
+	if run.fallback == nil || ctx.Err() != nil {
+		return result, err
+	}
+	// Providers can report an earlier timeout as text in an error response, independently of our overall deadline.
+	deadline, _ := ctx.Deadline()
+	message := strings.ToLower(err.Error())
+	if run.source != nil && time.Until(deadline) <= transferSummaryTimeout/2 &&
+		(errors.Is(err, context.DeadlineExceeded) || strings.Contains(message, "timeout") || strings.Contains(message, "timed out") || strings.Contains(message, "deadline exceeded") || strings.Contains(message, "etimedout")) {
+		return result, err
+	}
+	result, fallbackErr := s.runDefaultCompaction(ctx, prep, run.fallback, "", reason)
+	if fallbackErr != nil {
+		if run.source == nil {
+			return result, fmt.Errorf("%v; new model: %w", err, fallbackErr)
+		}
+		return result, fmt.Errorf("old model: %v; new model: %w", err, fallbackErr)
+	}
+	run.summarizedBy = run.fallback
+	return result, nil
 }
 
 // appendTransferBoundary compacts without a model. The summary tells the new model where the session file is, and the

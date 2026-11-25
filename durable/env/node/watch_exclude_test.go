@@ -19,14 +19,14 @@ func TestWatchTargetExcludeSkipsHiddenAndNamedEntries(t *testing.T) {
 	mustDo(t, env.CreateDir(background, "tree/nested", nil))
 	var mu sync.Mutex
 	var reported []string
-	watcher := must(env.Watch(background, []durableenv.WatchTarget{{Path: "tree", Recursive: true, Exclude: &durableenv.WatchExclude{Hidden: true, Names: []string{"skip"}}}}, func(change durableenv.WatchChange) {
-		if paths, ok := change.(durableenv.WatchChangePaths); ok {
+	watcher := must(env.Watch(background, []durableenv.WatchTarget{{Path: "tree", Recursive: true, Exclude: &durableenv.WatchExclude{Hidden: true, Names: []string{"skip"}}}}, func(change durableenv.FileChange) {
+		if paths, ok := change.(durableenv.FileChangePaths); ok {
 			mu.Lock()
 			reported = append(reported, paths.Paths...)
 			mu.Unlock()
 		}
 	}))
-	defer func() { _ = watcher.Close(background) }()
+	defer func() { _ = watcher.Stop(background) }()
 	has := func(suffix string) bool {
 		mu.Lock()
 		defer mu.Unlock()

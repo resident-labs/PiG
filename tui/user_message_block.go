@@ -29,11 +29,11 @@ type UserMessageComponent struct {
 // NewUserMessageComponent preserves source list markers and backslash escapes in user text. It is Pi's constructor(text,
 // markdownTheme = getMarkdownTheme(), outputPad = 1, markdownTransformers = []) (user-message.ts:18-31): a nil
 // markdownTheme is the active theme's, outputPad is the horizontal padding (Pi keeps any value; a negative one cannot be repeated, so it is 0), and markdownTransformers run
-// in order on each render as the display-only transform createMarkdownTransform("user", false, markdownTransformers).
-func NewUserMessageComponent(text string, markdownTheme *MarkdownTheme, outputPad int, markdownTransformers []markdowntransform.MarkdownTransformer) *UserMessageComponent {
+// in order on each render as the display-only transform createMarkdownTransform("user", false, markdownTransformers, messageId, timestamp); messageID and timestamp are the persisted entry's, empty for a live message (user-message.ts:18-33).
+func NewUserMessageComponent(text string, markdownTheme *MarkdownTheme, outputPad int, markdownTransformers []markdowntransform.MarkdownTransformer, messageID, timestamp string) *UserMessageComponent {
 	var transform func(string, int) string
 	if len(markdownTransformers) > 0 {
-		transform = markdowntransform.CreateMarkdownTransform(markdowntransform.MarkdownMessageUser, false, markdownTransformers)
+		transform = markdowntransform.CreateMarkdownTransform(markdowntransform.MarkdownMessageUser, false, markdownTransformers, messageID, timestamp)
 	}
 	block := &UserMessageComponent{content: text, outputPad: max(0, outputPad), markdownTheme: markdownTheme, transform: transform}
 	block.rebuild()
@@ -53,6 +53,7 @@ func (u *UserMessageComponent) rebuild() {
 	if u.inner == nil {
 		background := &DefaultTextStyle{BgColor: func(text string) string { return UserMessageBgOpen() + text + BgClose() }}
 		u.inner = NewMarkdownWithOptions(u.content, u.outputPad, 1, u.markdownTheme, background, &MarkdownOptions{PreserveOrderedListMarkers: true, PreserveBackslashEscapes: true, Transform: u.transform})
+		u.inner.FinishStreaming()
 		u.Add(u.inner)
 	} else {
 		u.inner.paddingX = u.outputPad
@@ -80,19 +81,7 @@ func (u *UserMessageComponent) SetMarkdownTransformState(fn func() string) {
 
 // SetAsyncMarkdownTransform installs an off-loop rewrite that completes before the message content is painted.
 func (u *UserMessageComponent) SetAsyncMarkdownTransform(transform *AsyncMarkdownTransform) {
-	if transform != nil {
-		options := *transform
-		completed := options.Invalidate
-		options.Invalidate = func() {
-			// Completion dirties the rendered frame, not the logical transform revision.
-			u.Container.Invalidate()
-			if completed != nil {
-				completed()
-			}
-		}
-		transform = &options
-	}
-	u.inner.AsyncTransform = transform
+	u.inner.AsyncTransform = completionDirtying(&u.invalidatable, transform)
 	u.Invalidate()
 }
 

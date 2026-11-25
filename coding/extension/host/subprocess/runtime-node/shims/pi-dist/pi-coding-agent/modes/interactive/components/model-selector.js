@@ -1,14 +1,16 @@
 import { modelsAreEqual } from "../../../../pi-ai/sdk-bundle/index.js";
-import { Container, fuzzyFilter, getKeybindings, Input, Spacer, Text, } from "../../../../../pi-tui.mjs";
+import { Container, fuzzyFilter, getKeybindings, getSelectPageIndex, Input, Spacer, Text, } from "../../../../../pi-tui.mjs";
 import { refreshModelCatalogs } from "../model-catalog-refresh.js";
-import { getModelSelectorSearchText } from "../model-search.js";
+import { getDistinctModelName, getModelSelectorSearchText } from "../model-search.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { keyDisplayText, keyHint } from "./keybinding-hints.js";
+const MAX_VISIBLE = 10;
 /**
  * Component that renders a model selector with search
  */
 export class ModelSelectorComponent extends Container {
+    capturesViewportInput = true;
     searchInput;
     // Focusable implementation - propagate to searchInput for IME cursor positioning
     _focused = false;
@@ -253,9 +255,8 @@ export class ModelSelectorComponent extends Container {
     }
     updateList() {
         this.listContainer.clear();
-        const maxVisible = 10;
-        const startIndex = Math.max(0, Math.min(this.selectedIndex - Math.floor(maxVisible / 2), this.filteredModels.length - maxVisible));
-        const endIndex = Math.min(startIndex + maxVisible, this.filteredModels.length);
+        const startIndex = Math.max(0, Math.min(this.selectedIndex - Math.floor(MAX_VISIBLE / 2), this.filteredModels.length - MAX_VISIBLE));
+        const endIndex = Math.min(startIndex + MAX_VISIBLE, this.filteredModels.length);
         // Show visible slice of filtered models
         for (let i = startIndex; i < endIndex; i++) {
             const item = this.filteredModels[i];
@@ -268,8 +269,10 @@ export class ModelSelectorComponent extends Container {
             const cursor = isSelected ? theme.fg("accent", "→ ") : "  ";
             const currentMarker = isCurrent ? theme.fg("accent", "✓ ") : "  ";
             const modelText = isSelected ? theme.fg("accent", item.id) : item.id;
+            const name = getDistinctModelName({ id: item.id, name: item.model.name });
+            const nameText = name ? theme.fg("muted", ` (${name})`) : "";
             const providerBadge = theme.fg("muted", `[${item.provider}]`);
-            const line = `${cursor}${currentMarker}${modelText} ${providerBadge}${defaultBadge}`;
+            const line = `${cursor}${currentMarker}${modelText}${nameText} ${providerBadge}${defaultBadge}`;
             this.listContainer.addChild(new Text(line, 0, 0));
         }
         // Add scroll indicator if needed
@@ -300,6 +303,7 @@ export class ModelSelectorComponent extends Container {
     }
     handleInput(keyData) {
         const kb = getKeybindings();
+        const pageIndex = getSelectPageIndex(kb, keyData, this.selectedIndex, this.filteredModels.length, MAX_VISIBLE);
         if (kb.matches(keyData, "tui.input.tab")) {
             if (this.scopedModelItems.length > 0) {
                 const nextScope = this.scope === "all" ? "scoped" : "all";
@@ -322,6 +326,13 @@ export class ModelSelectorComponent extends Container {
             if (this.filteredModels.length === 0)
                 return;
             this.selectedIndex = this.selectedIndex === this.filteredModels.length - 1 ? 0 : this.selectedIndex + 1;
+            this.updateList();
+        }
+        // Page up/down
+        else if (pageIndex !== undefined) {
+            if (this.filteredModels.length === 0)
+                return;
+            this.selectedIndex = pageIndex;
             this.updateList();
         }
         // Enter

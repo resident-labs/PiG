@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,7 +62,7 @@ func resolveAppMode(mode string, print, stdinIsTTY, stdoutIsTTY bool) appMode {
 }
 
 // isPlainRuntimeMetadataCommand preserves stdout only for metadata without explicit mode/print options.
-// Ports packages/coding-agent/src/main.ts:129-130.
+// Ports packages/coding-agent/src/main.ts (lines 129-130).
 func isPlainRuntimeMetadataCommand(flags Args) bool {
 	return !flags.Print && !flags.modeSet && (flags.Help || flags.ListModelsAll || flags.ListModels != "")
 }
@@ -97,8 +98,17 @@ func (m appMode) extensionMode() extension.ExtensionMode {
 }
 
 func normalizeRuntimeExtensionConfigs(configs []subprocess.ExtConfig) []subprocess.ExtConfig {
-	all := make([]subprocess.ExtConfig, 0, len(configs)+len(fusepack.FusedConfigs()))
-	all = append(all, fusepack.FusedConfigs()...)
+	return withFusedExtensionConfigs(fusepack.FusedConfigs(), configs)
+}
+
+// withFusedExtensionConfigs puts the Binary's fused extensions ahead of configs, less the ones an overlay removed (D202).
+func withFusedExtensionConfigs(fused, configs []subprocess.ExtConfig) []subprocess.ExtConfig {
+	all := make([]subprocess.ExtConfig, 0, len(configs)+len(fused))
+	for _, cfg := range fused {
+		if !droppedBinaryMembers[cfg.Name] {
+			all = append(all, cfg)
+		}
+	}
 	all = append(all, configs...)
 	return mergeExtConfigs(all)
 }
@@ -117,6 +127,10 @@ func newSubprocessExtensionHost(cwd string, mode extension.ExtensionMode, regist
 		return subprocess.TerminalCapabilitiesPayload{Images: string(caps.Images), TrueColor: caps.TrueColor, Hyperlinks: caps.Hyperlinks}
 	})
 	bridge.SetThemeFunc(codingagent.ActiveExtensionThemeWire)
+	// The pig command draws the editors an extension's view holds in every mode; an embedder that does not leaves the call out and does not link the terminal editor.
+	subprocess.EnableEditorViews()
+	// Likewise the pig command serves the TuiAltScreens an extension constructs; an embedder that does not leaves the call out and does not link their renderer.
+	subprocess.EnableTuiAltScreens()
 	subprocess.SetThemeLoader(codingagent.LoadExtensionTheme)
 	host.SetUIBridge(bridge)
 	host.SetSessionGraph(coding.NewSessionGraph())
@@ -204,14 +218,18 @@ func loadSubprocessExtensions(ctx context.Context, cwd string, mode extension.Ex
 	return loadFinalSubprocessExtensions(ctx, cwd, mode, registry, configs, embedded, reloadConfigs, nil, nil)
 }
 
-func loadFinalSubprocessExtensions(ctx context.Context, cwd string, mode extension.ExtensionMode, registry *codingagent.ModelRegistry, configs []subprocess.ExtConfig, embedded []subprocess.EmbeddedCell, reloadConfigs func() []subprocess.ExtConfig, preloaded *startupExtensionSet, beforeStart func()) ([]extension.Extension, *subprocess.Host, *subprocess.UIBridge, []error) {
-	configs = normalizeRuntimeExtensionConfigs(configs)
+func loadFinalSubprocessExtensions(ctx context.Context, cwd string, mode extension.ExtensionMode, registry *codingagent.ModelRegistry, configs []subprocess.ExtConfig, embedded []subprocess.EmbeddedCell, reloadConfigs func() []subprocess.ExtConfig, preloaded *startupExtensionSet, beforeStart func(needsStagedSDK bool)) ([]extension.Extension, *subprocess.Host, *subprocess.UIBridge, []error) {
+	return loadSubprocessExtensionSet(ctx, cwd, mode, registry, normalizeRuntimeExtensionConfigs(configs), embedded, reloadConfigs, preloaded, beforeStart)
+}
+
+// loadSubprocessExtensionSet loads configs as given, without adding the Binary's fused extensions.
+func loadSubprocessExtensionSet(ctx context.Context, cwd string, mode extension.ExtensionMode, registry *codingagent.ModelRegistry, configs []subprocess.ExtConfig, embedded []subprocess.EmbeddedCell, reloadConfigs func() []subprocess.ExtConfig, preloaded *startupExtensionSet, beforeStart func(needsStagedSDK bool)) ([]extension.Extension, *subprocess.Host, *subprocess.UIBridge, []error) {
 	if len(configs) == 0 && len(embedded) == 0 && (preloaded == nil || preloaded.host == nil) {
 		return nil, nil, nil, nil
 	}
 	// What only an extension reads (the staged SDKs, the docs bundle) is written before this load starts one.
 	if beforeStart != nil {
-		beforeStart()
+		beforeStart(loadNeedsStagedSDK(configs, embedded, preloaded))
 	}
 
 	var host *subprocess.Host
@@ -250,6 +268,20 @@ func loadFinalSubprocessExtensions(ctx context.Context, cwd string, mode extensi
 	return loaded, host, bridge, loadErrs
 }
 
+// loadNeedsStagedSDK reports whether a load reads the staged SDKs. Source extensions build against them, and an embedded cell is started from
+// the Binary's cell pack. An extension fused into a Piglet Binary runs in this process from its compiled factory, so a Binary whose only
+// extensions are fused stages nothing before its first prompt.
+// pig additive (D31): a fused extension needs no staged SDK.
+func loadNeedsStagedSDK(configs []subprocess.ExtConfig, embedded []subprocess.EmbeddedCell, preloaded *startupExtensionSet) bool {
+	if len(embedded) > 0 {
+		return true
+	}
+	if slices.ContainsFunc(configs, func(cfg subprocess.ExtConfig) bool { return !subprocess.RunsFused(cfg) }) {
+		return true
+	}
+	return preloaded != nil && slices.ContainsFunc(preloaded.configs, func(cfg subprocess.ExtConfig) bool { return !subprocess.RunsFused(cfg) })
+}
+
 // startupExtensionSet owns the pre-trust host until the final extension set has
 // been selected, including early exit and failed-load paths.
 type startupExtensionSet struct {
@@ -266,16 +298,22 @@ func (s *startupExtensionSet) close() {
 
 var stopStartupExtensions = func() {}
 
-// flushExtensionHostVirtualModels binds the virtual models host's extensions register to registry, as Pi's createAgentSessionServices does after it loads extensions (agent-session-services.ts:182-193): the registrations queued while the extensions loaded apply now, after the provider registrations and before the awaited local refresh and model resolution, so --model and a restored selection can name them. Each failed registration becomes the error diagnostic `Extension "<path>" error: <message>`. Later registrations apply at once and return their error to the extension (runner.ts:497-541). A nil host has nothing to bind.
-func flushExtensionHostVirtualModels(host *subprocess.Host, registry *coding.ModelRegistry) []codingagent.AgentSessionRuntimeDiagnostic {
+// flushExtensionHostRegistrations applies the registrations host's extensions queued while they loaded, as Pi's createAgentSessionServices does after it loads extensions (agent-session-services.ts:157-193): the provider registrations apply first, then the native providers and the virtual models, so --model and a restored selection can name them. Each failed registration becomes the error diagnostic `Extension "<path>" error: <message>` and the extension stays loaded. The provider and native provider actions the host already bound keep serving later registrations (they start the registration refresh); the registry's own bind where the host bound none. Later registrations apply at once and return their error to the extension (runner.ts:497-541). A nil host has nothing to bind.
+func flushExtensionHostRegistrations(host *subprocess.Host, registry *coding.ModelRegistry) []codingagent.AgentSessionRuntimeDiagnostic {
 	if host == nil || registry == nil {
 		return nil
 	}
 	var diagnostics []codingagent.AgentSessionRuntimeDiagnostic
-	host.Runtime().BindProviderActions(extension.ProviderActions{
-		RegisterVirtualModel:   registry.RegisterVirtualModel,
-		UnregisterVirtualModel: registry.UnregisterVirtualModel,
-	}, func(err *extension.ExtensionError) {
+	runtime := host.Runtime()
+	actions := runtime.BoundProviderActions()
+	if actions.RegisterProvider == nil {
+		actions.RegisterProvider = registry.RegisterExtensionProvider
+	}
+	if actions.UnregisterProvider == nil {
+		actions.UnregisterProvider = registry.UnregisterProvider
+	}
+	actions.RegisterVirtualModel, actions.UnregisterVirtualModel = registry.RegisterVirtualModel, registry.UnregisterVirtualModel
+	runtime.BindProviderActions(actions, func(err *extension.ExtensionError) {
 		diagnostics = append(diagnostics, codingagent.AgentSessionRuntimeDiagnostic{Type: "error", Message: fmt.Sprintf(`Extension "%s" error: %s`, err.ExtensionPath, err.Error)})
 	})
 	return diagnostics

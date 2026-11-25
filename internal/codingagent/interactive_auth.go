@@ -1,5 +1,7 @@
 package codingagent
 
+// Ports packages/coding-agent/src/modes/interactive/interactive-mode.ts (showOAuthSelector, showLoginDialog, updateAvailableProviderCount, footer wiring).
+
 import (
 	"context"
 	"fmt"
@@ -164,6 +166,7 @@ func (m *InteractiveMode) newLoginDialog(name string, cancel func(), titleOverri
 	}, "", titleOverride...)
 	dialog.SetMaskSecretInput(m.maskSecretInput())
 	dialog.SetCopyToClipboard(copyToClipboard, m.requestRender)
+	dialog.SetOpenBrowser(OpenBrowser)
 	return dialog
 }
 
@@ -369,14 +372,15 @@ func (m *InteractiveMode) runLoginRegisteredOAuth(loginCtx context.Context, prov
 		OnPrompt:        func(value ai.OAuthPrompt) (string, error) { return prompt(context.Background(), value) },
 		OnPromptContext: prompt,
 		OnDeviceCode: func(info ai.OAuthDeviceCodeInfo) {
-			showDeviceCode(dlg, tui.OAuthDeviceCodeInfo{UserCode: info.UserCode, VerificationURI: info.VerificationURI, IntervalSeconds: info.IntervalSeconds, ExpiresInSeconds: info.ExpiresInSeconds})
+			showDeviceCode(dlg, tui.OAuthDeviceCodeInfo{UserCode: info.UserCode, VerificationURI: info.VerificationURI, OpenBrowserOnConfirm: info.OpenBrowserOnConfirm, CopyCodeOnConfirm: info.CopyCodeOnConfirm, IntervalSeconds: info.IntervalSeconds, ExpiresInSeconds: info.ExpiresInSeconds})
 			notify()
 		},
 		OnAuth: func(info ai.OAuthAuthInfo) {
 			dlg.ShowAuth(info.URL, info.Instructions)
+			target := tui.LoginBrowserTarget(info.URL)
 			notify()
-			if !parityHarnessEnabled() {
-				_ = openBrowser(info.URL)
+			if target != "" && !parityHarnessEnabled() {
+				_ = openBrowser(target)
 			}
 		},
 		OnManualCodeInput:        func() (string, error) { return manualCode(context.Background(), manualCodeMessage) },
@@ -556,14 +560,15 @@ func (m *InteractiveMode) runLoginOpenAICodex(loginCtx context.Context) error {
 			return loginMethod, nil
 		},
 		OnDeviceCode: func(info ai.OAuthDeviceCodeInfo) {
-			showDeviceCode(dlg, tui.OAuthDeviceCodeInfo{UserCode: info.UserCode, VerificationURI: info.VerificationURI, IntervalSeconds: info.IntervalSeconds, ExpiresInSeconds: info.ExpiresInSeconds})
+			showDeviceCode(dlg, tui.OAuthDeviceCodeInfo{UserCode: info.UserCode, VerificationURI: info.VerificationURI, OpenBrowserOnConfirm: info.OpenBrowserOnConfirm, CopyCodeOnConfirm: info.CopyCodeOnConfirm, IntervalSeconds: info.IntervalSeconds, ExpiresInSeconds: info.ExpiresInSeconds})
 			notify()
 		},
 		OnAuth: func(info ai.OAuthAuthInfo) {
 			dlg.ShowAuth(info.URL, info.Instructions)
+			target := tui.LoginBrowserTarget(info.URL)
 			notify()
-			if !parityHarnessEnabled() {
-				_ = openBrowser(info.URL)
+			if target != "" && !parityHarnessEnabled() {
+				_ = openBrowser(target)
 			}
 		},
 		OnManualCodeInput: func() (string, error) {
@@ -825,6 +830,7 @@ func (m *InteractiveMode) newFooter() *FooterComponent {
 	footer := NewFooterComponentForSession(m, NewFooterDataProvider())
 	footer.SetSubscriptionResolver(m.footerUsingSubscription)
 	footer.SetModel(m.opts.Model)
+	footer.SetThinkingLevel(m.sessionThinkingLevel())
 	return footer
 }
 
@@ -859,11 +865,11 @@ func notifyAuthDialog(dlg *tui.LoginDialogComponent, event ai.AuthEvent) {
 	switch e := event.(type) {
 	case ai.AuthURLEvent:
 		dlg.ShowAuth(e.URL, e.Instructions)
-		if !parityHarnessEnabled() {
-			_ = openBrowser(e.URL)
+		if target := tui.LoginBrowserTarget(e.URL); target != "" && !parityHarnessEnabled() {
+			_ = openBrowser(target)
 		}
 	case ai.AuthDeviceCodeEvent:
-		info := tui.OAuthDeviceCodeInfo{UserCode: e.UserCode, VerificationURI: e.VerificationURI}
+		info := tui.OAuthDeviceCodeInfo{UserCode: e.UserCode, VerificationURI: e.VerificationURI, OpenBrowserOnConfirm: e.OpenBrowserOnConfirm, CopyCodeOnConfirm: e.CopyCodeOnConfirm}
 		if e.IntervalSeconds != nil {
 			info.IntervalSeconds = *e.IntervalSeconds
 		}
@@ -911,7 +917,9 @@ func browserCommand(target string) *exec.Cmd {
 		cmd = "xdg-open"
 		args = []string{target}
 	}
+	//nolint:gosec // G204 (class a): program is the literal open, rundll32 or xdg-open by OS, with no shell; the single argument is the sign-in URL of the provider's login flow, as Pi's openBrowser passes it.
 	command := exec.Command(cmd, args...)
+	command.Dir = "/"
 	// Upstream's spawn finds the launcher with libuv's search on Windows.
 	nodespawn.SetProgram(command)
 	detachLauncher(command)

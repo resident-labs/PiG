@@ -29,6 +29,12 @@ type ChildSession interface {
 	Abort(ctx context.Context) error
 	// BindExtensions is AgentSession.bindExtensions({}).
 	BindExtensions(ctx context.Context) error
+	// EmitExtensionEvent is `hasHandlers(type)` then `extensionRunner.emit(event)` on the session's runner; event is one of the events the runner's generic emit takes. emitted is false, and nothing ran, when no handler is registered for the type.
+	EmitExtensionEvent(ctx context.Context, event json.RawMessage) (result json.RawMessage, emitted bool, err error)
+	// RefreshContext is AgentSession.refreshContext.
+	RefreshContext()
+	// SessionManagerObject is AgentSession.sessionManager as a session graph object over the log the session appends to.
+	SessionManagerObject() SessionGraphObject
 	// State is the session's current state.
 	State() ChildSessionState
 	// Messages is AgentSession.messages in Pi's JSON shape.
@@ -350,6 +356,29 @@ func (h *Host) handleChildSessionCall(ctx context.Context, conn *Conn, call *Cal
 			return nil, err
 		}
 		return &CallResultPayload{}, nil
+	case CallChildSessionEmit:
+		var emit ChildSessionEmit
+		if err := json.Unmarshal(call.Args, &emit); err != nil {
+			return nil, fmt.Errorf("decode %s: %w", call.Method, err)
+		}
+		// The handlers may call the host (a dialog, waitForIdle): the call's lane advances here.
+		extension.CallInitiated(ctx)
+		answer, emitted, err := session.EmitExtensionEvent(ctx, emit.Event)
+		if err != nil {
+			return nil, err
+		}
+		result, err := json.Marshal(ChildSessionEmitResult{Emitted: emitted, Result: answer})
+		return &CallResultPayload{Result: result}, err
+	case CallChildSessionRefreshContext:
+		session.RefreshContext()
+		return &CallResultPayload{}, nil
+	case CallChildSessionSessionManager:
+		handle, err := h.sessionGraphObjects.add(conn, session.SessionManagerObject())
+		if err != nil {
+			return nil, err
+		}
+		result, err := json.Marshal(ChildSessionManagerHandle{Handle: handle})
+		return &CallResultPayload{Result: result}, err
 	case CallChildSessionState:
 		result, err := json.Marshal(session.State())
 		return &CallResultPayload{Result: result}, err
@@ -422,21 +451,20 @@ func (h *Host) childSessionTools(conn *Conn, create ChildSessionCreate) ([]exten
 	definitions := make([]extension.ToolDefinition, 0, len(create.CustomTools))
 	for _, tool := range create.CustomTools {
 		definition := extension.ToolDefinition{
-			Name:                 tool.Name,
-			Label:                tool.Label,
-			Description:          tool.Description,
-			Parameters:           tool.Parameters,
-			ValidationParameters: tool.ValidationParameters,
-			ConstrainedSampling:  tool.ConstrainedSampling,
-			PromptSnippet:        tool.PromptSnippet,
-			PromptGuidelines:     tool.PromptGuidelines,
-			ExecutionMode:        extension.ToolExecutionMode(tool.ExecutionMode),
-			Execute:              h.toolExecuteFunc(tool.Name, target),
-			OutputSchema:         tool.OutputSchema,
-			Exposure:             extension.ToolExposure(tool.Exposure),
-			Namespace:            tool.Namespace,
-			Annotations:          tool.Annotations,
-			DefaultActive:        tool.DefaultActive,
+			Name:                tool.Name,
+			Label:               tool.Label,
+			Description:         tool.Description,
+			Parameters:          tool.Parameters,
+			ConstrainedSampling: tool.ConstrainedSampling,
+			PromptSnippet:       tool.PromptSnippet,
+			PromptGuidelines:    tool.PromptGuidelines,
+			ExecutionMode:       extension.ToolExecutionMode(tool.ExecutionMode),
+			Execute:             h.toolExecuteFunc(tool.Name, target),
+			OutputSchema:        tool.OutputSchema,
+			Exposure:            extension.ToolExposure(tool.Exposure),
+			Namespace:           tool.Namespace,
+			Annotations:         tool.Annotations,
+			DefaultActive:       tool.DefaultActive,
 			ReserveCallOrder: func(json.RawMessage) *extension.CallOrder {
 				place := conn.toolOrder.Reserve()
 				return &extension.CallOrder{Wait: place.Wait, Release: place.Release}

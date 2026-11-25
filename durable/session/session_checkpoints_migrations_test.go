@@ -1,6 +1,7 @@
 package session_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -364,13 +365,21 @@ func TestSessionDocumentMigrations(t *testing.T) {
 		// An observer of the older shape.
 		watch := watchDoc(t, harness, ctx, old)
 		frames := &watchRecorder{}
-		watch.Start(func(_ ctxT, value obj, ops []durable.Op) error { frames.record(value, ops); return nil })
+		watch.Start(func(_ context.Context, change durable.WatchCall[obj]) error {
+			value, ops := change.Value, change.Ops
+			frames.record(value, ops)
+			return nil
+		})
 		expectEqual(t, snapshot(t, harness.Session, current), delta.JsonObjectOf("count", 4))
 		value := snapshot(t, harness.Session, current)
 		// An observer of the new shape: the migration changes nothing it sees.
 		currentWatch := watchDoc(t, harness, ctx, current)
 		currentFrames := &watchRecorder{}
-		currentWatch.Start(func(_ ctxT, value obj, ops []durable.Op) error { currentFrames.record(value, ops); return nil })
+		currentWatch.Start(func(_ context.Context, change durable.WatchCall[obj]) error {
+			value, ops := change.Value, change.Ops
+			currentFrames.record(value, ops)
+			return nil
+		})
 		touch(t, harness, current)
 		flush(harness)
 		base := harness.Storage.LastCommit()[0].(durable.DocumentChangeWrite)
@@ -383,7 +392,7 @@ func TestSessionDocumentMigrations(t *testing.T) {
 		}
 		// The migration-only base is published, so the older-shape watch receives the new value as a root replacement.
 		documents := sessiontest.DocumentChanges(harness.Publications.Last())
-		if len(documents) != 1 || *documents[0].Version != 3 || len(documents[0].Ops) != 0 {
+		if len(documents) != 1 || documents[0].Version != 3 || len(documents[0].Ops) != 0 {
 			t.Fatal("one migration-only publication")
 		}
 		expectEqual(t, documents[0].Value, delta.JsonObjectOf("count", 4))
@@ -689,7 +698,11 @@ func TestSessionTrackerCacheAcrossDefinitionVersions(t *testing.T) {
 		touch(t, harness, cacheV1Doc)
 		watch := watchDoc(t, harness, ctx, cacheV1Doc)
 		delivered := make(chan []durable.Op, 1)
-		watch.Start(func(_ ctxT, _ obj, ops []durable.Op) error { delivered <- ops; return nil })
+		watch.Start(func(_ context.Context, change durable.WatchCall[obj]) error {
+			ops := change.Ops
+			delivered <- ops
+			return nil
+		})
 		commit(t, harness.Session, func(tx durable.Tx) error {
 			_, err := mustDoc(t, tx, cacheV2Doc).Array("names").Push("second")
 			return err

@@ -6,7 +6,7 @@ Most hosted providers accept an API key, and some also accept a browser or devic
 
 ## Built-in providers
 
-PiG ships the same built-in chat providers and classifier models as Pi 1.4.0. `typesafe` has only classifier models, and `cloudflare-workers-ai`, `openai`, `opencode`, `openrouter` and `vercel-ai-gateway` list them beside their chat models. The provider key is the first part of a `provider/model` spec. The wire column lists the APIs that the provider's built-in chat models use.
+PiG ships the same built-in chat providers and classifier models as Pi 1.5.0. `typesafe` has only classifier models, and `cloudflare-workers-ai`, `openai`, `opencode`, `openrouter` and `vercel-ai-gateway` list them beside their chat models. The provider key is the first part of a `provider/model` spec. The wire column lists the APIs that the provider's built-in chat models use.
 
 | Provider key | Name | Wire | Credential |
 |---|---|---|---|
@@ -37,7 +37,7 @@ PiG ships the same built-in chat providers and classifier models as Pi 1.4.0. `t
 | `openai-codex` | OpenAI Codex (ChatGPT subscription) | `openai-codex-responses` | OAuth via `pig login openai-codex` |
 | `opencode` | OpenCode Zen | `anthropic-messages`, `google-generative-ai`, `openai-completions`, `openai-responses` | `OPENCODE_API_KEY` |
 | `opencode-go` | OpenCode Go | `anthropic-messages`, `openai-completions`, `openai-responses` | `OPENCODE_API_KEY` |
-| `openrouter` | OpenRouter | `anthropic-messages`, `openai-completions` | `OPENROUTER_API_KEY` or OAuth |
+| `openrouter` | OpenRouter | `anthropic-messages`, `openai-completions` | `OPENROUTER_API_KEY` or OAuth. Every model also lists its `:nitro` and `:floor` routing variants (D199, see [Models](models.md)). |
 | `qwen-token-plan` | Qwen Token Plan | `openai-completions` | `QWEN_TOKEN_PLAN_API_KEY` |
 | `qwen-token-plan-cn` | Qwen Token Plan (China) | `openai-completions` | `QWEN_TOKEN_PLAN_CN_API_KEY` |
 | `qwen-token-plan-individual` | Qwen Token Plan (Individual) | `openai-completions` | `QWEN_TOKEN_PLAN_API_KEY` |
@@ -89,7 +89,7 @@ PiG stores credentials in `~/.pig/agent/auth.json`. Agent startup creates a miss
 
 `auth.json` can contain API keys and OAuth tokens. Keep it private and do not commit it.
 
-Interactive login prompts marked as secret use PiG's `maskSecretInput` setting (default `true`). **Mask secret input** in `/settings` shows dots, a character count and the last four characters while typing, then retains only the masked preview after submission. Inputs shorter than five characters show no suffix. Set `maskSecretInput` to `false` to restore Pi 1.4.0's plain-text behavior. This configurable feature is recorded as divergence D80. Ordinary text and manual-code prompts remain visible. Credentials still belong in `auth.json` or the provider's credential store; the setting protects dialog and authentication-diagnostic output, not credential storage.
+Interactive login prompts marked as secret use PiG's `maskSecretInput` setting (default `true`). **Mask secret input** in `/settings` shows dots, a character count and the last four characters while typing, then retains only the masked preview after submission. Inputs shorter than five characters show no suffix. Set `maskSecretInput` to `false` to restore Pi 1.5.0's plain-text behavior. This configurable feature is recorded as divergence D80. Ordinary text and manual-code prompts remain visible. Credentials still belong in `auth.json` or the provider's credential store; the setting protects dialog and authentication-diagnostic output, not credential storage.
 
 ### Load an API key from a command
 
@@ -211,6 +211,11 @@ export AWS_REGION=us-west-2    # AWS_DEFAULT_REGION also works
 ```
 
 ECS task credentials and IRSA work through the standard `AWS_CONTAINER_CREDENTIALS_*` and `AWS_WEB_IDENTITY_TOKEN_FILE` variables.
+
+Two differences from Pi involve `AWS_BEARER_TOKEN_BEDROCK`:
+
+- An empty `AWS_BEARER_TOKEN_BEDROCK` (exported with no value, as a workflow does for an unset secret) counts as no token: PiG signs with the credentials it finds. Pi's AWS SDK treats the variable as set and fails the request before sending it (D195).
+- With `AWS_BEDROCK_SKIP_AUTH=1`, a token in the process environment is not sent over an `http://` endpoint: PiG's request fails with "bearer token with HTTP request requires HTTPS". Pi sends the `Authorization: Bearer` header in clear text there (D196). Use an `https://` endpoint or unset the variable.
 
 ### Cloudflare AI Gateway
 

@@ -345,10 +345,22 @@ type ParseDateResult struct {
 	Ms *float64 `json:"ms"`
 }
 
-// CallHighlightCode (ext→host) is pi-coding-agent's highlightCode (theme.ts), or getMarkdownTheme().highlightCode when Markdown is set: the lines of code highlighted
+// CallHighlightCode (ext→host) is pi-coding-agent's highlightCode (theme.ts), which getMarkdownTheme().highlightCode is too: the lines of code highlighted
 // for lang by the host's highlight.js port and drawn with a theme. The args are a HighlightCodeArgs and the result a HighlightCodeResult. It reads no session or extension
 // state, so it may arrive before the register frame.
 const CallHighlightCode = "highlight.code"
+
+// CallTypeEngine (ext→host) is one member of TypeBox's `Type` namespace that computes a schema (Pick, Omit, Partial, KeyOf, Mapped, Conditional, Extends, Script, ...), run by the
+// host's one port of TypeBox's type engine (internal/typebox/engine) so every SDK returns what Pi's `Type` returns. The args are a TypeEngineArgs: the member and its arguments in
+// the engine's wire form (JSON, with an envelope for the hidden members a schema carries); the result is `{"value": <wire>}`, or `{"error": {"name", "message"}}` for what TypeBox
+// throws. It reads no session or extension state, so it may arrive before the register frame (Type.X runs while the factory is loading).
+const CallTypeEngine = "type.engine"
+
+// TypeEngineArgs is the argument of CallTypeEngine. Args is the JSON list of the wire values of the member's arguments.
+type TypeEngineArgs struct {
+	Member string          `json:"member"`
+	Args   json.RawMessage `json:"args"`
+}
 
 // CallLoadTheme (ext→host) is the theme initTheme(name) installs as pi-coding-agent's process-global theme: the registered theme of that name, or the system theme
 // for an absent name or one no theme has, as initTheme falls back. The args are a LoadThemeArgs and the result a LoadThemeResult. It may arrive before the register frame.
@@ -357,10 +369,9 @@ const CallLoadTheme = "theme.load"
 // HighlightCodeArgs is the argument of CallHighlightCode. Theme is the palette (the shape of ready.state.theme) of the theme to draw with: the one the extension
 // installed with initTheme. An absent Theme draws with the host's active theme, which the extension's own global theme replicates.
 type HighlightCodeArgs struct {
-	Code     string          `json:"code"`
-	Lang     string          `json:"lang,omitempty"`
-	Markdown bool            `json:"markdown,omitempty"`
-	Theme    json.RawMessage `json:"theme,omitempty"`
+	Code  string          `json:"code"`
+	Lang  string          `json:"lang,omitempty"`
+	Theme json.RawMessage `json:"theme,omitempty"`
 }
 
 // HighlightCodeResult is the result of CallHighlightCode: Pi's array of highlighted lines.

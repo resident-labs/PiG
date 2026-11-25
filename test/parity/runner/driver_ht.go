@@ -194,8 +194,10 @@ func (htDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scenar
 
 	// Register cleanup.
 	t.Cleanup(func() {
+		//nolint:gosec // G204 (class a): program is literal ht; args are "stop" plus a generated session name beginning with "parity-".
 		_ = exec.Command("ht", "stop", sessionName).Run()
 		time.Sleep(200 * time.Millisecond)
+		//nolint:gosec // G204 (class a): program is literal ht; args are "remove" plus the same generated session name.
 		_ = exec.Command("ht", "remove", sessionName).Run()
 	})
 
@@ -250,26 +252,14 @@ func (htDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scenar
 	// Capture ANSI version for escaped_output_equal comparisons.
 	viewAnsi, _ := htOutput(ctx, "view", sessionName, "--format", "ansi")
 
-	raw := string(viewOut)
-	escaped := string(viewAnsi)
+	return htFinalResult(sc.Name, bin.Label, cfg, scenarioCaptureUse(sc), string(viewOut), string(viewAnsi), elapsed)
+}
 
-	// Strip trailing "cursor: R,C" status line that ht appends.
-	raw = stripHTCursorLine(raw)
-	escaped = stripHTCursorLine(escaped)
-
-	// Apply crop using CaptureStart/CaptureEnd patterns (same as tmux driver).
-	plain := raw
-	if cfg.CaptureStart != "" || cfg.CaptureEnd != "" || cfg.CaptureEndRegex != "" {
-		plain = cropCapture(plain, cfg.CaptureStart, cfg.CaptureEnd, cfg.CaptureEndRegex, cfg.CaptureStartLast)
-		escaped = cropCapture(escaped, cfg.CaptureStart, cfg.CaptureEnd, cfg.CaptureEndRegex, cfg.CaptureStartLast)
-	}
-
-	return Result{
-		Output:    strings.TrimRight(plain, "\n"),
-		Escaped:   strings.TrimRight(escaped, "\n"),
-		RuntimeMs: elapsed,
-		ReadyOK:   true,
-	}
+// htFinalResult builds the run's result from the two views ht gave: it strips the trailing "cursor: R,C" status line ht appends and crops the captures a comparator reads to the scenario's capture markers (same as the tmux driver). A crop failure keeps the whole captures in the result, so the artifacts hold them next to the error.
+func htFinalResult(scenario, binary string, cfg TmuxDriverConfig, use captureUse, view, viewAnsi string, elapsedMs int64) Result {
+	plain, escaped, err := cropCaptures(cfg, use, stripHTCursorLine(view), stripHTCursorLine(viewAnsi))
+	return withFinalCaptures(Result{RuntimeMs: elapsedMs, ReadyOK: true}, scenario, binary, cfg, use,
+		strings.TrimRight(plain, "\n"), strings.TrimRight(escaped, "\n"), err)
 }
 
 // htOutput runs ht and returns its stdout: the session JSON or the screen the
@@ -277,6 +267,7 @@ func (htDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scenar
 // must not enter either, so it is kept only to explain a failure.
 func htOutput(ctx context.Context, args ...string) ([]byte, error) {
 	var stderr bytes.Buffer
+	//nolint:gosec // G204 (class a): program is literal ht; args come from htOutput callers, including scenario keys in "send <session> <keys>" with no `--`.
 	command := exec.CommandContext(ctx, "ht", args...)
 	command.Stderr = &stderr
 	output, err := command.Output()

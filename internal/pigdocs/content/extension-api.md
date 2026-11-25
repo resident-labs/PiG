@@ -102,6 +102,9 @@ All UI calls return after the user dismisses the dialog; pair them with `Context
 shell. The extension sends replaceable line snapshots. PiG sends ordered input
 events only while that overlay owns terminal focus.
 
+An inline component (no `overlay: true`) can pass `blocked: { kind, message }` to report the
+terminal's program status as blocked while it is visible.
+
 Go components implement `RemoteComponent`. Implement
 `RemoteComponentInvalidator` when a timer changes component state. Rust
 components implement `set_invalidate` on `RemoteComponent`. Python components
@@ -301,7 +304,7 @@ so PiG versions sharing a config root never replace each other's SDK. PiG adds
 a temporary filesystem replacement during the build. The authored file contains
 no machine-specific path.
 
-Build PiG and Go extensions with Go 1.27.3. The generated module keeps Go 1.26
+Build PiG and Go extensions with Go 1.27.4. The generated module keeps Go 1.26
 as its language floor:
 
 ```go.mod

@@ -5,11 +5,18 @@ package daemon
 // Ports packages/env/daemon/src/sys/unix.rs
 
 import (
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
 	"syscall"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/MichaelKinsy/PiG/internal/nodefs"
 )
 
 const pathSeparator = "/"
@@ -27,13 +34,59 @@ func openReadOnly(path string, noFollow bool) (*os.File, error) {
 	return os.OpenFile(path, flags, 0)
 }
 
+// rustIOError is the text Rust's io::Error shows for a failure of the system: the system's message, capitalized as the C
+// library writes it, and " (os error N)". It reports false for an error that names no system error.
+func rustIOError(err error) (string, bool) {
+	errno, ok := errors.AsType[syscall.Errno](err)
+	if !ok {
+		if !errors.Is(err, exec.ErrNotFound) {
+			return "", false
+		}
+		errno = syscall.ENOENT
+	}
+	text := errno.Error()
+	first, size := utf8.DecodeRuneInString(text)
+	//portlint:allow utf16units Rust io::Error text, not a JS string: size is the UTF-8 byte length DecodeRuneInString returned for the first rune
+	return fmt.Sprintf("%c%s (os error %d)", unicode.ToUpper(first), text[size:], int(errno)), true
+}
+
+// libuvNames are the codes the daemon names (sys/unix.rs:os_error_name); any other error is UNKNOWN.
+var libuvNames = map[string]bool{
+	"EPERM": true, "ENOENT": true, "EIO": true, "EBADF": true, "EAGAIN": true, "ENOMEM": true, "EACCES": true, "EBUSY": true,
+	"EEXIST": true, "EXDEV": true, "ENOTDIR": true, "EISDIR": true, "EINVAL": true, "ENFILE": true, "EMFILE": true,
+	"ETXTBSY": true, "EFBIG": true, "ENOSPC": true, "EROFS": true, "EMLINK": true, "ENAMETOOLONG": true, "ENOTEMPTY": true,
+	"ELOOP": true, "ENOSYS": true, "ENOTSUP": true,
+}
+
+func libuvName(code string) string {
+	if libuvNames[code] {
+		return code
+	}
+	return "UNKNOWN"
+}
+
+// openDirectory is opendir(3): the directory is opened as one, so a file, however unreadable, is ENOTDIR before any
+// permission check.
+func openDirectory(path string) (*os.File, error) {
+	for {
+		descriptor, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return nil, &os.PathError{Op: "open", Path: path, Err: err}
+		}
+		return os.NewFile(uintptr(descriptor), path), nil
+	}
+}
+
 // isLinkRefusal reports whether an O_NOFOLLOW open failed because the final component is a symbolic link.
 func isLinkRefusal(err error) bool {
 	return errnoIs(err, syscall.ELOOP) || errnoIs(err, syscall.EMLINK)
 }
 
-// openForRead is Node's open(path, "r"): any kind of file, blocking.
-func openForRead(path string) (*os.File, error) { return os.OpenFile(path, os.O_RDONLY, 0) }
+// openForRead is Node's open(path, "r"): any kind of file, blocking. A FIFO is opened where no signal can interrupt the wait for a writer, as libuv opens it on a worker thread (see nodefs.OpenFile).
+func openForRead(path string) (*os.File, error) { return nodefs.OpenFile(path, os.O_RDONLY, 0) }
 
 // identity is the device and inode of a path's metadata, which identify a file across renames.
 func identity(_ string, info os.FileInfo, _ bool) (dev, ino uint64) {
@@ -102,4 +155,24 @@ func defaultChildSignals() {
 			signal.Notify(make(chan os.Signal, 1), ignored...)
 		}
 	})
+}
+
+// notifyExitSignals delivers the number of SIGTERM, SIGINT or SIGHUP, whichever arrives first, instead of dying at once
+// (sys/unix.rs on_exit_signal). The returned function stops the delivery.
+func notifyExitSignals() (<-chan int, func()) {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	numbers := make(chan int, 1)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case received := <-signals:
+			numbers <- int(received.(syscall.Signal))
+		case <-done:
+		}
+	}()
+	return numbers, func() {
+		signal.Stop(signals)
+		close(done)
+	}
 }

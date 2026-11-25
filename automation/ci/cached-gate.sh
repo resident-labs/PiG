@@ -24,7 +24,7 @@ fi
 if command -v sha256sum >/dev/null 2>&1; then hasher=(sha256sum); else hasher=(shasum -a 256); fi
 # The gate's own outputs are not its inputs.
 excludes=()
-for dir in "${outs[@]}"; do excludes+=(":(exclude)$dir"); done
+for dir in ${outs[@]+"${outs[@]}"}; do excludes+=(":(exclude)$dir"); done
 key=$(
   {
     go version
@@ -32,7 +32,7 @@ key=$(
     readlink .upstream/current 2>/dev/null || true
     git ls-files --stage
     git diff --no-ext-diff --binary
-    git ls-files --others --exclude-standard -z -- . "${excludes[@]}" | xargs -0 -r "${hasher[@]}"
+    git ls-files --others --exclude-standard -z -- . ${excludes[@]+"${excludes[@]}"} | xargs -0 -r "${hasher[@]}"
   } | "${hasher[@]}" | cut -c1-40
 )
 store="${PIG_CACHE_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}}/pig-gates/$name"
@@ -40,7 +40,7 @@ entry="$store/$key"
 
 if [[ -f "$entry/ok" ]]; then
   cat "$entry/log"
-  for i in "${!outs[@]}"; do
+  for ((i = 0; i < ${#outs[@]}; i++)); do
     rm -rf "${outs[i]}"
     mkdir -p "${outs[i]}"
     tar -C "${outs[i]}" -xf "$entry/out-$i.tar"
@@ -53,11 +53,13 @@ fi
 mkdir -p "$store"
 tmp=$(mktemp -d "$store/.run.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
-status=0
-"$@" > >(tee "$tmp/log") 2>&1 || status=$?
-wait
+# A pipeline, not tee in a process substitution: bash does not wait for a process substitution, so a tee that starts after the gate has finished wrote its log into a directory already moved into the store, and the stored entry had no log.
+set +e
+"$@" 2>&1 | tee "$tmp/log"
+status=${PIPESTATUS[0]}
+set -e
 if [[ $status -eq 0 ]]; then
-  for i in "${!outs[@]}"; do
+  for ((i = 0; i < ${#outs[@]}; i++)); do
     tar -C "${outs[i]}" -cf "$tmp/out-$i.tar" .
   done
   touch "$tmp/ok"

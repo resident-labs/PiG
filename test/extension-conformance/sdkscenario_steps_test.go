@@ -83,6 +83,8 @@ func (r *scenarioRig) runStep(step sdkscenarios.Step, lines *[]string) {
 		r.observeRegistrations(lines)
 	case "tool":
 		r.runTool(ctx, step, lines)
+	case "tool-wire":
+		r.runToolWire(ctx, step, lines)
 	case "tool-call-event":
 		r.runToolCallEvent(ctx, step, lines)
 	case "footer-state":
@@ -246,6 +248,8 @@ func loadCause(err error) string {
 		text = after
 	}
 	cause, _, _ := strings.Cut(text, " (packed")
+	// A Go, Rust, Python or Lisp runner reports why it failed on its stderr, whose log path differs on every run; the note before it is the host's.
+	cause, _, _ = strings.Cut(cause, " (register handshake")
 	return cause
 }
 
@@ -311,6 +315,8 @@ func (r *scenarioRig) loadPeer(lines *[]string) {
 		r.t.Fatalf("load the peer extension: %v", err)
 	}
 	r.loaded = append(r.loaded, *loaded)
+	// A mode applies the registrations a load queued once it has loaded (agent-session-services.ts, runner.ts bindCore).
+	applyQueuedRegistrations(r.host)
 	scenariof(lines, "peer loaded")
 }
 
@@ -782,6 +788,7 @@ func (r *scenarioRig) reload(step sdkscenarios.Step, lines *[]string) {
 		return
 	}
 	r.loaded = loaded
+	applyQueuedRegistrations(r.host)
 	scenariof(lines, "reload loaded=%d", len(loaded))
 }
 

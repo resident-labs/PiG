@@ -4,9 +4,16 @@ package harness
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"slices"
 	"sync"
+	"sync/atomic"
+	"time"
 
+	"github.com/MichaelKinsy/PiG/chord"
 	"github.com/MichaelKinsy/PiG/durable"
+	"github.com/MichaelKinsy/PiG/durable/session"
 	"github.com/MichaelKinsy/PiG/durable/storage"
 )
 
@@ -27,6 +34,11 @@ type controlledStorage struct {
 	findGate      *gate
 	commitFailure error
 	closeFailure  error
+	// adopting is set while adopt runs, the storage's synchronous step: code that sees it set runs inside Storage.Commit's
+	// adopt (session-support.ts ControlledStorage.adopting).
+	adopting atomic.Bool
+	// afterAdopt runs once, in the next commit's synchronous step right after adopt returned.
+	afterAdopt func()
 }
 
 func newControlledStorage() *controlledStorage {
@@ -83,9 +95,11 @@ func (s *controlledStorage) commitAt(index int) []durable.StorageWrite {
 	return s.commits[index]
 }
 
-func (s *controlledStorage) Commit(ctx context.Context, writes []durable.StorageWrite, adopt func(durable.Seq)) (durable.Seq, error) {
+// Commit records and holds the call, then refuses its first batch if a failure is set (nothing stored), or commits it in
+// memory, adopting set while each receipt runs and afterAdopt run after the first one (session-support.ts
+// ControlledStorage.commit).
+func (s *controlledStorage) Commit(ctx context.Context, batches [][]durable.StorageWrite, receive func(index int, seq durable.Seq)) (durable.CommitResult, error) {
 	s.mu.Lock()
-	s.commits = append(s.commits, append([]durable.StorageWrite(nil), writes...))
 	held := s.commitGate
 	s.mu.Unlock()
 	if held != nil {
@@ -99,12 +113,114 @@ func (s *controlledStorage) Commit(ctx context.Context, writes []durable.Storage
 	}
 	s.mu.Lock()
 	failure := s.commitFailure
-	s.commitFailure = nil
+	recorded := batches
+	if failure != nil {
+		s.commitFailure = nil
+		recorded = batches[:1]
+	}
+	for _, writes := range recorded {
+		s.commits = append(s.commits, append([]durable.StorageWrite(nil), writes...))
+	}
 	s.mu.Unlock()
 	if failure != nil {
-		return 0, failure
+		return durable.CommitResult{Refused: failure}, nil
 	}
-	return s.MemoryStorage.Commit(ctx, writes, adopt)
+	return s.MemoryStorage.Commit(ctx, batches, func(index int, seq durable.Seq) {
+		s.adopting.Store(true)
+		func() {
+			defer s.adopting.Store(false)
+			receive(index, seq)
+		}()
+		s.mu.Lock()
+		after := s.afterAdopt
+		s.afterAdopt = nil
+		s.mu.Unlock()
+		if after != nil {
+			after()
+		}
+	})
+}
+
+var errReclaimFailed = errors.New("reclaim failed")
+
+// lateWork is how long lateResolvingStorage works after adopting: a macrotask upstream, long enough here for the Session to
+// notice a commit parked in work after adopt on an unloaded machine. It is not a guarantee: the Session publishes once
+// the storage's goroutine is parked in a wait, which under heavy load can take longer, so a gap that needs what adopt
+// published (host listeners, the waits it resolved) waits for that effect itself.
+const lateWork = 25 * time.Millisecond
+
+// lateResolvingStorage is controlled storage whose commits resolve a scheduling turn after they adopted the batch, as a
+// storage with work after durability does (JSONL reclaims sidecars): code woken inside adopt runs before the commit
+// resolves. gap runs in that work and rejectAfterAdopt makes a commit it matches fail there, durable and adopted, as a
+// failed reclaim does; each fires once (session-support.ts LateResolvingStorage).
+type lateResolvingStorage struct {
+	*controlledStorage
+	// committing is set from a commit's start until it resolves.
+	committing atomic.Bool
+	hookMu     sync.Mutex
+	gap        func(writes []durable.StorageWrite) bool
+	reject     func(writes []durable.StorageWrite) bool
+}
+
+func newLateResolvingStorage() *lateResolvingStorage {
+	return &lateResolvingStorage{controlledStorage: newControlledStorage()}
+}
+
+func (s *lateResolvingStorage) setGap(gap func(writes []durable.StorageWrite) bool) {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	s.gap = gap
+}
+
+func (s *lateResolvingStorage) setRejectAfterAdopt(reject func(writes []durable.StorageWrite) bool) {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	s.reject = reject
+}
+
+func (s *lateResolvingStorage) Commit(ctx context.Context, batches [][]durable.StorageWrite, receive func(index int, seq durable.Seq)) (durable.CommitResult, error) {
+	s.committing.Store(true)
+	defer s.committing.Store(false)
+	result, err := s.controlledStorage.Commit(ctx, batches, receive)
+	if err != nil {
+		return durable.CommitResult{}, err
+	}
+	stored := batches[:result.Stored]
+	time.Sleep(lateWork)
+	s.hookMu.Lock()
+	gap := s.gap
+	s.hookMu.Unlock()
+	if gap != nil && slices.ContainsFunc(stored, gap) {
+		s.hookMu.Lock()
+		s.gap = nil
+		s.hookMu.Unlock()
+		// What the gap started runs before the commit resolves.
+		time.Sleep(lateWork)
+	}
+	s.hookMu.Lock()
+	reject := s.reject
+	s.hookMu.Unlock()
+	if reject != nil && slices.ContainsFunc(stored, reject) {
+		s.hookMu.Lock()
+		s.reject = nil
+		s.hookMu.Unlock()
+		return durable.CommitResult{}, errReclaimFailed
+	}
+	return result, nil
+}
+
+// refusingAt commits batches through commit up to the first one refuses matches, which it refuses with err: what a storage
+// does whose own check refuses that batch (session-support.ts refusingAt).
+func refusingAt(ctx context.Context, commit func(ctx context.Context, batches [][]durable.StorageWrite, receive func(index int, seq durable.Seq)) (durable.CommitResult, error), batches [][]durable.StorageWrite, receive func(index int, seq durable.Seq), refuses func(writes []durable.StorageWrite) bool, refusal error) (durable.CommitResult, error) {
+	at := slices.IndexFunc(batches, refuses)
+	if at < 0 {
+		return commit(ctx, batches, receive)
+	}
+	result, err := commit(ctx, batches[:at], receive)
+	if err != nil || result.Stored < at {
+		return result, err
+	}
+	return durable.CommitResult{Stored: at, Refused: refusal}, nil
 }
 
 func (s *controlledStorage) Close(ctx context.Context) error {
@@ -116,13 +232,56 @@ func (s *controlledStorage) Close(ctx context.Context) error {
 	return s.closeFailure
 }
 
-// documentChanges returns the document changes of a publication.
-func documentChanges(publication durable.CommitPublication) []durable.DocumentChange {
+// documentChanges returns the document changes among the changes of a publication: durable.DocumentChange (a creation or
+// update) and durable.DocumentRetireChange (a retirement), in order; documentValues keeps only the former.
+func documentChanges(publication []durable.CommitChange) []durable.DocumentCommitChange {
+	var changes []durable.DocumentCommitChange
+	for _, change := range publication {
+		switch change.(type) {
+		case durable.DocumentChange, durable.DocumentRetireChange:
+			changes = append(changes, change.(durable.DocumentCommitChange))
+		}
+	}
+	return changes
+}
+
+// documentValues returns the document changes of a publication that carry a value: creations and updates, no retirements
+// (session-support.ts documentValues).
+func documentValues(publication []durable.CommitChange) []durable.DocumentChange {
 	var changes []durable.DocumentChange
-	for _, change := range publication.Changes {
+	for _, change := range publication {
 		if document, ok := change.(durable.DocumentChange); ok {
 			changes = append(changes, document)
 		}
 	}
 	return changes
+}
+
+// followCommits follows every commit as memory adopts it, deferred ones before they are stored, as views and document
+// watches do; ObserveCommits sees only what was stored (session-support.ts followCommits).
+func followCommits(harness Harness, listener func(context.Context, session.ObservedCommit)) func() {
+	return harness.(*harnessImpl).FollowCommits(listener)
+}
+
+// commitsObserver is a CommitObserver that runs advance for each publication and ignores the end (session-support.ts
+// openTestSession's observer).
+type commitsObserver struct {
+	advance func(context.Context, durable.CommitPublication)
+}
+
+func (observer commitsObserver) Advance(ctx context.Context, publication durable.CommitPublication) {
+	observer.advance(ctx, publication)
+}
+
+func (commitsObserver) End(durable.WatchEnd) {}
+
+// onValue is a watch listener for value calls: Durable's watches never send a failed call (their failures end them), so
+// one here fails the listener, which ends the watch listener_error (session-support.ts onValue).
+func onValue[T any](listener func(context.Context, chord.WatchCall[T]) error) func(context.Context, chord.WatchCall[T]) error {
+	return func(ctx context.Context, call chord.WatchCall[T]) error {
+		if call.Kind != chord.WatchCallValue {
+			return fmt.Errorf("unexpected %v watch call", call.Kind)
+		}
+		return listener(ctx, call)
+	}
 }

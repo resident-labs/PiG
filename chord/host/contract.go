@@ -250,25 +250,25 @@ type Description struct {
 // A description travels as a hold's contract token (wire.go), so it is declared once more as the schema that validates
 // it (contract.ts DescriptionSchema). A schema member is checked only for being an object (contract.ts SchemaObject).
 var (
-	schemaObject            = object(nil)
-	memberDescriptionSchema = Schema{"anyOf": []any{
+	schemaObject            = object()
+	memberDescriptionSchema = union(
 		// Absent args: the method takes none. Absent result: it returns nothing.
-		object([]string{"kind"}, "kind", literal(MemberMethod), "args", schemaObject, "result", schemaObject),
-		object([]string{"kind", "schema"}, "kind", literal(MemberState), "schema", schemaObject),
-		object([]string{"kind", "id"}, "kind", literal(MemberOpaque), "id", Schema{"type": "string"}),
-	}}
+		object("kind", literal(MemberMethod), "args", opt(schemaObject), "result", opt(schemaObject)),
+		object("kind", literal(MemberState), "schema", schemaObject),
+		object("kind", literal(MemberOpaque), "id", str()),
+	)
 	// contract.ts PlacementSchema: a closed { name } or a closed { prefix, key }.
-	placementSchema = Schema{"anyOf": []any{
-		closed(object([]string{"name"}, "name", Schema{"type": "string", "minLength": 1})),
-		closed(object([]string{"prefix", "key"}, "prefix", Schema{"type": "string", "minLength": 1}, "key", Schema{"type": "string", "minLength": 1})),
-	}}
-	descriptionSchema = object([]string{"name", "scope", "version", "input", "variants"},
-		"name", Schema{"type": "string", "minLength": 1},
-		"scope", Schema{"anyOf": []any{literal(string(ScopeRemote)), literal(string(ScopeLocal))}},
+	placementSchema = union(
+		closed(object("name", str("minLength", float64(1)))),
+		closed(object("prefix", str("minLength", float64(1)), "key", str("minLength", float64(1)))),
+	)
+	descriptionSchema = object(
+		"name", str("minLength", float64(1)),
+		"scope", union(literal(string(ScopeRemote)), literal(string(ScopeLocal))),
 		"version", integer(),
 		"input", schemaObject,
 		// Remote types only (required there): where their objects live.
-		"host", placementSchema,
+		"host", opt(placementSchema),
 		"variants", record(record(memberDescriptionSchema)),
 	)
 )
@@ -302,9 +302,6 @@ type Contract struct {
 	Fingerprint string
 	Remote      *RemoteDef
 	Local       *LocalDef
-	// decoded marks a token whose schemas came over a link as JSON. TypeBox's Clean only acts on schemas it built
-	// itself (their "~kind"), so a decoded token strips nothing.
-	decoded bool
 }
 
 // reservedMembers are names a reference uses itself; members may not use them.
@@ -414,7 +411,6 @@ func contractFromDescription(description Description) (*Contract, error) {
 		Input:       description.Input,
 		Description: description,
 		Fingerprint: Hash64(CanonicalJSON(description)),
-		decoded:     true,
 	}, nil
 }
 
@@ -577,7 +573,8 @@ func (description Description) jsonValue() any {
 // wireValue is the description as Pi's JSON.stringify writes it on a link (connection.ts:324 sends the description
 // object): name, scope, version, input, then variants and members in their own-key order, each member as
 // { kind, args, result }, { kind, schema } or { kind, id }; an undefined schema is left out. A schema's own keys are
-// written sorted: Schema is a Go map.
+// written in their declared order when the schema was decoded from a wire description (nested ordered objects) and sorted
+// for a Go map.
 func (description Description) wireValue() *chordjson.Object {
 	out := chordjson.ObjectOf("name", description.Name, "scope", string(description.Scope), "version", float64(description.Version))
 	setSchema(out, "input", description.Input)
@@ -614,7 +611,7 @@ func setSchema(object *chordjson.Object, key string, schema Schema) {
 	if schema == nil {
 		return
 	}
-	value, err := chordjson.Decode([]byte(CanonicalJSON(schema)))
+	value, err := chordjson.Decode([]byte(OrderedJSON(schema)))
 	if err != nil {
 		panic(err)
 	}
@@ -629,10 +626,10 @@ func (description Description) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON reads a wire description, keeping the order of its variants and members.
 func (description *Description) UnmarshalJSON(data []byte) error {
 	var wire struct {
-		Name    string `json:"name"`
-		Scope   string `json:"scope"`
-		Version int    `json:"version"`
-		Input   Schema `json:"input"`
+		Name    string          `json:"name"`
+		Scope   string          `json:"scope"`
+		Version int             `json:"version"`
+		Input   json.RawMessage `json:"input"`
 		Host    *struct {
 			Name   *string `json:"name"`
 			Prefix *string `json:"prefix"`
@@ -646,7 +643,11 @@ func (description *Description) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	*description = Description{Name: wire.Name, Scope: ContractScope(wire.Scope), Version: wire.Version, Input: wire.Input}
+	input, err := decodeSchema(wire.Input)
+	if err != nil {
+		return err
+	}
+	*description = Description{Name: wire.Name, Scope: ContractScope(wire.Scope), Version: wire.Version, Input: input}
 	if wire.Host != nil {
 		switch {
 		case wire.Host.Name != nil:
@@ -684,18 +685,45 @@ func (description *Description) UnmarshalJSON(data []byte) error {
 		var out Fields[MemberDescription]
 		for name := range members.All() {
 			var member struct {
-				Kind   string `json:"kind"`
-				Args   Schema `json:"args"`
-				Result Schema `json:"result"`
-				Schema Schema `json:"schema"`
-				ID     string `json:"id"`
+				Kind   string          `json:"kind"`
+				Args   json.RawMessage `json:"args"`
+				Result json.RawMessage `json:"result"`
+				Schema json.RawMessage `json:"schema"`
+				ID     string          `json:"id"`
 			}
 			if err := json.Unmarshal(membersRaw[name], &member); err != nil {
 				return err
 			}
-			out = append(out, Field[MemberDescription]{Name: name, Value: MemberDescription{Kind: member.Kind, Args: member.Args, Result: member.Result, Schema: member.Schema, ID: member.ID}})
+			args, err := decodeSchema(member.Args)
+			if err != nil {
+				return err
+			}
+			result, err := decodeSchema(member.Result)
+			if err != nil {
+				return err
+			}
+			state, err := decodeSchema(member.Schema)
+			if err != nil {
+				return err
+			}
+			out = append(out, Field[MemberDescription]{Name: name, Value: MemberDescription{Kind: member.Kind, Args: args, Result: result, Schema: state, ID: member.ID}})
 		}
 		description.Variants = append(description.Variants, Field[Fields[MemberDescription]]{Name: kind, Value: out})
 	}
 	return nil
+}
+
+// decodeSchema reads a schema from its JSON text; its objects keep the order the sender wrote them in, as JSON.parse does,
+// so the schema is written back and validated in that order. An absent or null schema is nil, as the wire writes an
+// undefined one.
+func decodeSchema(data json.RawMessage) (Schema, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	value, err := chordjson.Decode(data)
+	if err != nil {
+		return nil, err
+	}
+	object, _ := value.(*chordjson.Object)
+	return object, nil
 }

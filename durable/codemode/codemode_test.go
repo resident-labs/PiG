@@ -20,6 +20,7 @@ import (
 	cm "github.com/MichaelKinsy/PiG/codemode"
 	"github.com/MichaelKinsy/PiG/durable"
 	"github.com/MichaelKinsy/PiG/durable/harness"
+	"github.com/MichaelKinsy/PiG/durable/session/sessiontest"
 )
 
 func expectText(t *testing.T, got string, isError bool, want string, wantError bool) {
@@ -84,7 +85,7 @@ func TestDurableCodeMode(t *testing.T) {
 		// the journal (with one processor, 2's tool can return and 1's result still post first).
 		arrived := newGate()
 		f.onFirstOpen = func(opened harness.Harness) {
-			unsubscribe := opened.SubscribeCommits(func(_ context.Context, publication durable.CommitPublication) {
+			unsubscribe := sessiontest.ObserveCommitsFunc(opened, func(_ context.Context, publication durable.CommitPublication) {
 				for _, change := range publication.Changes {
 					document, ok := change.(durable.DocumentChange)
 					if !ok || document.Record.Kind != "pi.codemode.journal" || document.Value == nil {
@@ -792,9 +793,17 @@ func TestDurableCodeMode(t *testing.T) {
 	// Pi 1.2.0 packages/durable/test/codemode.test.ts:812 "times a script out across a restart, without admitting new calls"
 	t.Run("times a script out across a restart, without admitting new calls", func(t *testing.T) {
 		f := codemodeChat(t)
+		// The deadline is the stored one (Pi durable/src/codemode/codemode.ts:419, checked on resume at :456-458), and the Harness clock stands
+		// still until the restart, where Pi's test sleeps 400 ms: no real time, however starved the machine, can pass it
+		// before tools.hold ran (restart waits for that and would never return) or before the Harness closed. The VM's own
+		// timer (codemode/src/runtime/execution.ts:214-217, started with the VM, given the time left at codemode.ts:472) runs in real time, so
+		// the first run starts without it (execution.ts:549 starts one without timeoutMs).
+		clock := newManualClock()
+		f.setup.now = clock.now
+		f.vm.noTimer.Store(true)
 		opened, root := f.restart(t, `// @options: {"timeout_ms": 300}
 			await tools.hold({}); await tools.echo({ text: "late" });`, func(harness.Harness, durable.TaskId) {
-			time.Sleep(400 * time.Millisecond)
+			clock.advance(400 * time.Millisecond)
 		})
 		text, isError := resultText(t, root)
 		if !isError || !strings.Contains(text, "deadline passed") {
@@ -913,7 +922,7 @@ func TestDurableCodeMode(t *testing.T) {
 		// document's last commit).
 		var orderMu sync.Mutex
 		var lastJournalOnly, lastRun, commits int
-		unsubscribe := opened.SubscribeCommits(func(_ context.Context, publication durable.CommitPublication) {
+		unsubscribe := sessiontest.ObserveCommitsFunc(opened, func(_ context.Context, publication durable.CommitPublication) {
 			orderMu.Lock()
 			defer orderMu.Unlock()
 			commits++
@@ -962,7 +971,7 @@ func TestDurableCodeMode(t *testing.T) {
 		opened, root := f.setup.open(t, openSqlite(t, filepath.Join(t.TempDir(), "session.sqlite")))
 		mustSubmitDone(t, root)
 		text, isError := resultText(t, root)
-		expectText(t, text, isError, "Validation failed for tool \"echo\":\n  - root: must be object\n\nReceived arguments:\n[\n  1\n]", false)
+		expectText(t, text, isError, "Validation failed for tool \"echo\":\n  - root: expected object, got array\n\nReceived arguments:\n[\n  1\n]", false)
 		if got := nestedCount(t, opened); got != 0 {
 			t.Fatalf("%d nested calls, want 0", got)
 		}

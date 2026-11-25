@@ -1,5 +1,5 @@
-import { Container, fuzzyFilter, getKeybindings, Input, Key, matchesKey, Spacer, Text, } from "../../../../../pi-tui.mjs";
-import { getModelSearchText } from "../model-search.js";
+import { Container, fuzzyFilter, getKeybindings, getSelectPageIndex, Input, Key, matchesKey, Spacer, Text, } from "../../../../../pi-tui.mjs";
+import { getDistinctModelName, getModelSearchText } from "../model-search.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { keyDisplayText } from "./keybinding-hints.js";
@@ -61,6 +61,7 @@ function getSortedIds(enabledIds, allIds) {
  * Changes are session-only until explicitly persisted with Ctrl+S.
  */
 export class ScopedModelsSelectorComponent extends Container {
+    capturesViewportInput = true;
     modelsById = new Map();
     allIds = [];
     enabledIds = null;
@@ -194,9 +195,11 @@ export class ScopedModelsSelectorComponent extends Container {
             const id = item.model?.id ?? item.fullId;
             const styledId = item.model ? id : theme.strikethrough(id);
             const modelText = isSelected ? theme.fg("accent", styledId) : styledId;
+            const name = item.model ? getDistinctModelName(item.model) : undefined;
+            const nameText = name ? theme.fg("muted", ` (${name})`) : "";
             const providerBadge = theme.fg("muted", item.model ? ` [${item.model.provider}]` : " [unavailable]");
             const status = item.model && item.enabled ? theme.fg("accent", "✓ ") : "  ";
-            this.listContainer.addChild(new Text(`${prefix}${status}${modelText}${providerBadge}`, 0, 0));
+            this.listContainer.addChild(new Text(`${prefix}${status}${modelText}${nameText}${providerBadge}`, 0, 0));
         }
         // Add scroll indicator if needed
         if (startIndex > 0 || endIndex < this.filteredItems.length) {
@@ -222,6 +225,14 @@ export class ScopedModelsSelectorComponent extends Container {
             if (this.filteredItems.length === 0)
                 return;
             this.selectedIndex = this.selectedIndex === this.filteredItems.length - 1 ? 0 : this.selectedIndex + 1;
+            this.updateList();
+            return;
+        }
+        const pageIndex = getSelectPageIndex(kb, data, this.selectedIndex, this.filteredItems.length, this.maxVisible);
+        if (pageIndex !== undefined) {
+            if (this.filteredItems.length === 0)
+                return;
+            this.selectedIndex = pageIndex;
             this.updateList();
             return;
         }

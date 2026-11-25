@@ -31,6 +31,7 @@ func shellWithoutTimeout(ctx context.Context, payload string) (string, bool) {
 }
 
 func TestMain(m *testing.M) {
+	EnableTestFauxProvider()
 	if runtime.GOOS != "windows" {
 		configvalue.SetExecutorForTest(shellWithoutTimeout)
 	}
@@ -53,6 +54,11 @@ func TestMain(m *testing.M) {
 	}
 	if err := os.Setenv("PIG_HOME", filepath.Join(testRoot, "pig")); err != nil {
 		fmt.Fprintln(os.Stderr, "set isolated PIG_HOME:", err)
+		_ = os.RemoveAll(testRoot)
+		os.Exit(2)
+	}
+	if err := trustTestCertificateAuthority(testRoot); err != nil {
+		fmt.Fprintln(os.Stderr, "trust the test certificate authority:", err)
 		_ = os.RemoveAll(testRoot)
 		os.Exit(2)
 	}

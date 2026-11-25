@@ -30,6 +30,26 @@ git commit --signoff
 
 The sign-off certifies that you have the right to submit the contribution under the project license. It is not a copyright assignment or a cryptographic signature.
 
+One commit needs no sign-off: the merge of `main` that GitHub's **Update branch** button adds to a pull request. GitHub commits it, nobody can add the line to it, and it holds no contribution of its own. The pre-flight exempts it only when it has exactly two parents, GitHub committed it and verifies its signature, its second parent is on the base branch, and its tree is the one git's own merge of the two parents writes; a merge you make yourself, a merge of another branch, and a merge with a conflict resolution or an edit need the line like every other commit, and so does every commit the pull request adds on either side of the merge.
+
+### Signing off a commit afterwards
+
+If a commit you authored lacks the sign-off and its history cannot be rewritten, add a later commit to the same pull request that signs it off. Author it as the same identity (name and email) as the unsigned commit, or as another identity that `automation/ci/dco-identities.txt` lists as the same person, with an empty change and a remediation block in the message:
+
+```text
+I, Jane Doe, retroactively sign off on these commits:
+0123456789abcdef0123456789abcdef01234567 fix the parser
+89abcdef01 add the flag
+
+Signed-off-by: Jane Doe <jane@example.com>
+```
+
+```bash
+git commit --allow-empty --signoff -S -F message.txt
+```
+
+Each row is a commit SHA (at least 10 hex characters) followed by its subject, and the block ends at the first blank line. `automation/ci/check-dco.sh` accepts an unsigned commit only if a later commit in the pull request has the same author (or a mapped identity of that person), names the unsigned commit in a block whose lead line carries the author's name, and has its own `Signed-off-by` line for its own author. `dco-identities.txt` lists one person per line, identities joined by ` = `; changing it needs the maintainer review CODEOWNERS requires. A remediation by someone else, or one that precedes the commit it names, does not count. Prefer amending the commit while the branch is still private.
+
 PiG does not require a Contributor License Agreement.
 
 ## Signed commits
@@ -61,6 +81,8 @@ git rebase --exec 'git commit --amend -S --no-edit' <base>
 ```
 
 A default rebase drops merge commits, including any conflict resolution they contain, so rebase onto the current `main` first to make the branch linear. These commands rewrite commit IDs. Coordinate with a maintainer before replacing commits already pushed. Keep each DCO sign-off in the commit message.
+
+One commit is not yours: when CI's bookkeeping job finds committed derived files out of date on a pull request from this repository, the autofix workflow adds a single `Regenerate stale derived files` commit as `github-actions[bot]`. GitHub signs it (Verified) and it carries the bot's `Signed-off-by` and an `Autofix: derived files` trailer. Pull it (`git pull --ff-only`) before you push more; from a fork, CI comments the `make` commands to run instead. See `.github/AGENTS.md`.
 
 If you cannot set up signing, say so in the pull request. A maintainer can land your change in a maintainer-signed commit that credits you with a `Co-authored-by:` trailer, which GitHub shows as Verified. Re-signing a commit that keeps you as its author is not enough if your account uses vigilant mode, because GitHub then marks it only Partially verified.
 
@@ -102,11 +124,14 @@ installing software.
 7. Run the relevant local tests early across applicable provider shapes, not only Copilot or `test-faux`.
 8. If you change exported Go API, CLI flags, settings, parity scenarios, or docs mirrors, run `make generate` and commit the result. CI's drift gates compare these files.
 9. If a commit is titled as a fix (`Fix ...`, `fix: ...` or `<area>: fix ...`) and changes shipped code, or a changelog `### Fixed` section gains an item, run `make bug-ledger` and commit `docs/bug-ledger.json` and `docs/site/docs/bug-ledger.md`. `make bug-ledger-check` fails without them. The ledger lists entries by ID and carries no totals, and `make bug-ledger` changes only the entries your branch adds, so two branches that each add a fix merge without a conflict and a merge of `main` needs no regeneration; a release runs `make bug-ledger-refresh`. A fix of something that never shipped carries a `Bug-Ledger: exempt <category>: <reason>` trailer. A follow-up of an earlier fix carries `Bug-Ledger: see <commit>`. A user-facing change goes in a fragment `changelog.d/<lane>-<sha>.md`, where `<sha>` is a commit of your branch; every `### Fixed` bullet ends with `<!-- fix: <sha> -->` naming the commit that fixes it, so the ledger never guesses and never credits a squash commit's tests to your bullet. `make changelog-check` fails a bullet without a marker and a marker or fragment name that names a commit `HEAD` does not reach; after a rebase, squash or amend, rename the fragment and update its markers to the commits that replaced them. A squash commit on `main` can keep a replaced commit nameable instead: a `Fix-Commit: <full 40-hex sha>` trailer in its message, one per replaced commit, makes a marker or fragment name that is a prefix (7 or more digits) of that sha resolve to the squash commit, and the ledger then attributes the squash commit's diff to the bullet (an abbreviated trailer, a trailer for another sha, or no trailer does not resolve; a commit `HEAD` reaches is never replaced by a trailer). It needs the full history (`git fetch --unshallow` in a shallow clone).
-10. Run `make check` before requesting review.
+10. Run `make check` before requesting review, and `make fixture-guard` before every push: fixtures must be minimal synthetic shapes generated in the test, never captured provider output (reasoning text, encrypted blobs, billing rows, ids, or your paths).
 11. Sign off and cryptographically sign every commit. Confirm that GitHub marks each signature **Verified**.
 12. Describe the problem, change, verification, and any divergence in the pull request.
 
 A documentation-only or mechanical change can explain why it does not need an issue.
+
+A pull request that adds a feature can carry fix-titled commits that repair code the same pull request adds, and commits already public cannot be retitled. Nothing released was broken, so `Fix: yes` would force a bug-ledger entry and a `### Fixed` line that are not true, and `Fix: no` fails the pre-flight for the titles. Ask a maintainer for a `fix-title-exempt` entry in `automation/ci/preflight/config.yaml`: the maintainer adds it in a separate, reviewed pull request, because the pre-flight reads main's configuration. The entry names your pull request, a written reason, and the exact full shas it exempts. A fix-titled commit you push later is not exempt until a maintainer reviews the list again, and the exemption never covers a changelog `### Fixed` line or a `Fix: yes` answer. A fix of something that shipped is never exempt: it gets its ledger entry.
+
 
 Maintainers squash-merge pull requests, which keeps you as the commit author, so you appear on GitHub's contributors page. When a maintainer lands your change inside a larger commit, the commit carries a `Co-authored-by:` trailer for you.
 
@@ -121,7 +146,8 @@ A pull request must:
 - include tests or explain why the existing tests prove the change;
 - update `docs/parity/DIVERGENCES.md` for an approved observable difference;
 - update extension conformance coverage for an SDK contract change;
-- update SBOM, notice, or provenance inputs when dependencies or copied material change; and
+- update SBOM, notice, or provenance inputs when dependencies or copied material change;
+- update `vendorHash` in `nix/package.nix` when Go modules change (the `Nix vendor hash` check prints the value; `nix/vendor-hash.sh update` computes it where Nix is installed); and
 - resolve review findings before merge.
 
 Do not edit generated files by hand. Use the repository generator named by the file or gate.

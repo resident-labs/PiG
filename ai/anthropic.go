@@ -1,6 +1,6 @@
 package ai
 
-// Mirrors upstream .upstream/current/packages/ai/src/providers/anthropic.ts.
+// Ports packages/ai/src/api/anthropic-messages.ts (stream, buildParams, convertMessages, convertTools, mapStopReason and the strict-tool fallback).
 
 import (
 	"bytes"
@@ -264,6 +264,9 @@ func (t anthTool) wire() (anthToolWire, error) {
 // anthLegacyInputSchemaOrder is the member order of the literal { type, properties, required } (anthropic-messages.ts:1589-1593, :207).
 var anthLegacyInputSchemaOrder = []string{"type", "properties", "required"}
 
+// anthLegacyDefinitionKeys are the root members the legacy literal appends after required, in order, when present (anthropic-messages.ts convertTools).
+var anthLegacyDefinitionKeys = []string{"$defs", "definitions"}
+
 // deferredToolPlaceholder mirrors upstream DEFERRED_TOOL_PLACEHOLDER: a stable
 // deferred tool declared whenever native tool changes are in use. Anthropic adds
 // hidden prompt scaffolding for mid-conversation tool changes; declaring the
@@ -303,14 +306,14 @@ type anthEventMessageStart struct {
 type anthEventContentBlockStart struct {
 	Index        int `json:"index"`
 	ContentBlock struct {
-		Type      string `json:"type"` // "text" | "thinking" | "redacted_thinking" | "tool_use"
-		ID        string `json:"id,omitempty"`
-		Name      string `json:"name,omitempty"`
-		Text      string `json:"text,omitempty"`
-		Thinking  string `json:"thinking,omitempty"`
-		Signature string `json:"signature,omitempty"`
-		Input     any    `json:"input,omitempty"`
-		Data      string `json:"data,omitempty"` // redacted_thinking
+		Type      string         `json:"type"` // "text" | "thinking" | "redacted_thinking" | "tool_use"
+		ID        string         `json:"id,omitempty"`
+		Name      string         `json:"name,omitempty"`
+		Text      string         `json:"text,omitempty"`
+		Thinking  string         `json:"thinking,omitempty"`
+		Signature string         `json:"signature,omitempty"`
+		Input     anthStartInput `json:"input"`
+		Data      string         `json:"data,omitempty"` // redacted_thinking
 	} `json:"content_block"`
 }
 
@@ -321,13 +324,16 @@ type anthBlockIndex struct {
 }
 
 func (index *anthBlockIndex) UnmarshalJSON(raw []byte) error {
+	//portlint:allow numbers `b.index === event.index` (anthropic-messages.ts content_block_delta): a content block index is a small integer; Atoi reads the plain spelling and the fallback below reads 1e0 and 1.0 as JS numbers, and a string, null, or fractional index matches no block
 	value, err := strconv.Atoi(string(raw))
 	if err != nil {
 		// A spelling such as 1e0 is the number 1 in JS; a non-integer or a non-number matches no block.
+		//portlint:allow numbers raw is valid JSON: ParseFloat reads a number token as JSON.parse does and rejects strings, null, booleans, objects and arrays, none of which equals a block's numeric index
 		number, floatErr := strconv.ParseFloat(string(raw), 64)
 		if floatErr != nil || number != math.Trunc(number) || math.Abs(number) > 1<<53 {
 			return nil
 		}
+		//portlint:allow numbers number is finite, integral and within 2^53 by the check above
 		value = int(number)
 	}
 	*index = anthBlockIndex{value: value, present: true}
@@ -343,6 +349,9 @@ type anthEventContentBlockDelta struct {
 		Thinking    string `json:"thinking,omitempty"`
 		PartialJSON string `json:"partial_json,omitempty"`
 		Signature   string `json:"signature,omitempty"`
+		// NoPartialJSON is "null" or "undefined" for an input_json_delta whose partial_json is null or absent: ToolCallArgumentsStream.append reads
+		// its length, which throws, where `+=` would have appended the word.
+		NoPartialJSON string `json:"-"`
 	} `json:"delta"`
 }
 
@@ -778,17 +787,10 @@ var anthropicStrictUnsupportedKeywords = []string{
 // anthropicStrictStringFormats are the string formats strict mode accepts (ANTHROPIC_STRICT_STRING_FORMATS).
 var anthropicStrictStringFormats = []string{"date-time", "time", "date", "duration", "email", "hostname", "uri", "ipv4", "ipv6", "uuid"}
 
-// anthropicStrictToolLimitMessages are the texts of Anthropic's 400s for a strict tool set over its limits: grammar size, tool count and union parameters.
+// anthropicStrictToolLimitsExceeded reports whether a rejected request is the APIError Pi downgrades: status 400, error type
+// invalid_request_error, and an SDK message that carries one of the strict tool limit texts (isStrictToolLimitErrorMessage). It returns that message.
 //
 // upstream: packages/ai/src/api/anthropic-messages.ts:stream (the strict tool fallback's error test, :664-677)
-var anthropicStrictToolLimitMessages = []string{
-	"The compiled grammar is too large",
-	"Too many strict tools (",
-	"Schemas contains too many parameters with union types (",
-}
-
-// anthropicStrictToolLimitsExceeded reports whether a rejected request is the APIError Pi downgrades: status 400, error type
-// invalid_request_error, and an SDK message that contains one of the strict tool limit texts. It returns that message.
 func anthropicStrictToolLimitsExceeded(status int, body []byte) (string, bool) {
 	if status != http.StatusBadRequest {
 		return "", false
@@ -798,20 +800,14 @@ func anthropicStrictToolLimitsExceeded(status int, body []byte) (string, bool) {
 		return "", false
 	}
 	message := anthHTTPErrorMessage(status, body)
-	for _, limit := range anthropicStrictToolLimitMessages {
-		if strings.Contains(message, limit) {
-			return message, true
-		}
-	}
-	return "", false
+	return message, isStrictToolLimitErrorMessage(message)
 }
 
 // anthropicMarksPreferredStrict reports whether a converted tool is strict because its constrainedSampling prefers strict: the
 // definitions that make hasPreferredStrictTools true (anthropic-messages.ts:1184-1191).
 func anthropicMarksPreferredStrict(tools []ToolSchema, definitions []anthTool) bool {
 	for i, definition := range definitions {
-		config := tools[i].ConstrainedSampling
-		if definition.Strict != nil && *definition.Strict && config != nil && config.Type == ConstrainedSamplingJSONSchema && config.Strict == ConstrainedSamplingStrictPrefer {
+		if definition.Strict != nil && *definition.Strict && prefersJSONSchemaStrictSampling(tools[i]) {
 			return true
 		}
 	}
@@ -842,7 +838,7 @@ func anthConvertTools(tools []ToolSchema, isOAuthToken, supportsEagerToolInputSt
 	out := make([]anthTool, len(tools))
 	for i, tool := range tools {
 		var strict *bool
-		if config := tool.ConstrainedSampling; !disablePreferredStrictTools || config == nil || config.Type != ConstrainedSamplingJSONSchema || config.Strict != ConstrainedSamplingStrictPrefer {
+		if !disablePreferredStrictTools || !prefersJSONSchemaStrictSampling(tool) {
 			var err error
 			if strict, err = resolveJSONSchemaStrictSampling(tool, supportsStrictTools, anthropicStrictUnsupportedKeyword); err != nil {
 				return nil, err
@@ -875,9 +871,33 @@ func anthConvertTools(tools []ToolSchema, isOAuthToken, supportsEagerToolInputSt
 	return out, nil
 }
 
+// anthKeepsLegacySchemaOrder reports whether the object at path survives into the legacy input_schema: properties and the root definitions.
+func anthKeepsLegacySchemaOrder(path string) bool {
+	if anthIsOrIsUnder(path, "properties") {
+		return true
+	}
+	for _, key := range anthLegacyDefinitionKeys {
+		if anthIsOrIsUnder(path, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// anthIsOrIsUnder reports whether path is the root member key or a path below it.
+func anthIsOrIsUnder(path, key string) bool {
+	rest, ok := strings.CutPrefix(path, "/")
+	if !ok {
+		return false
+	}
+	rest, ok = strings.CutPrefix(rest, key)
+	return ok && (rest == "" || rest[0] == '/')
+}
+
 // anthInputSchema builds a tool's input_schema and its member order as convertTools does (anthropic-messages.ts:1588-1600): the legacy
-// literal { type: "object", properties: schema.properties ?? {}, required: schema.required ?? [] }, which a strict schema follows
-// in a spread, so the literal's members overwrite the parameters' in place and append the ones the parameters lack.
+// literal { type: "object", properties: schema.properties ?? {}, required: schema.required ?? [], ...$defs, ...definitions }, where
+// $defs and definitions are present only when the parameters have them. A strict schema follows the literal in a spread, so the
+// literal's members overwrite the parameters' in place and append the ones the parameters lack.
 func anthInputSchema(parameters map[string]any, parameterOrder schemaObjectOrder, strict bool) (map[string]any, schemaObjectOrder) {
 	properties, required := parameters["properties"], parameters["required"]
 	if properties == nil {
@@ -898,12 +918,21 @@ func anthInputSchema(parameters map[string]any, parameterOrder schemaObjectOrder
 		}
 		order[""] = root
 	} else {
-		schema = make(map[string]any, len(anthLegacyInputSchemaOrder))
-		order[""] = anthLegacyInputSchemaOrder
+		// Shared definitions stay so property $refs resolve; other root keywords stay out because Anthropic rejects root
+		// anyOf/oneOf/allOf with a 400 (Pi 4a6a58eb5, #9557). A key the schema lacks is omitted, not written as null.
+		schema = make(map[string]any, len(anthLegacyInputSchemaOrder)+len(anthLegacyDefinitionKeys))
+		root := slices.Clone(anthLegacyInputSchemaOrder)
+		for _, key := range anthLegacyDefinitionKeys {
+			if definitions, ok := parameters[key]; ok {
+				schema[key] = definitions
+				root = append(root, key)
+			}
+		}
+		order[""] = root
 	}
 	schema["type"], schema["properties"], schema["required"] = "object", properties, required
 	for path, members := range parameterOrder {
-		if path == "" || !strict && path != "/properties" && !strings.HasPrefix(path, "/properties/") {
+		if path == "" || !strict && !anthKeepsLegacySchemaOrder(path) {
 			continue
 		}
 		order[path] = members
@@ -1641,7 +1670,8 @@ func (p *anthropicProvider) applySampling(req *anthRequest, model *Model, transc
 			if slices.Contains(req.Betas, thinkingBindingControlsBeta) {
 				req.Thinking.BlockBinding = &anthBlockBinding{PrefixMismatchBehavior: "drop_block"}
 			}
-			req.OutputConfig = &anthOutputConfig{Effort: "high"}
+			// upstream: anthropic-messages.ts buildParams (Pi e3bc05e87). Effort markers set the level for every reply, and the top-level effort is part of the cached prompt, so it stays fixed. It is "low" because organizations can cap effort and reject requests containing any level above the cap.
+			req.OutputConfig = &anthOutputConfig{Effort: "low"}
 			if !effortMarkers || activeEffortAtTopLevel {
 				req.OutputConfig.Effort = managedEffort
 			}
@@ -1885,6 +1915,11 @@ func coerceAnthropicDelta(data []byte) (anthEventContentBlockDelta, bool) {
 		case value == nil:
 			*member = "null"
 		}
+		if ev.Delta.Type == "input_json_delta" && (ev.Delta.PartialJSON == "undefined" || ev.Delta.PartialJSON == "null") {
+			if _, present := fields["partial_json"]; !present || fields["partial_json"] == nil {
+				ev.Delta.NoPartialJSON = ev.Delta.PartialJSON
+			}
+		}
 	}
 	return ev, true
 }
@@ -1907,26 +1942,11 @@ func anthropicDeltaMember(ev *anthEventContentBlockDelta) *string {
 	return nil
 }
 
-// findAnthropicBlock is `blocks.findIndex((b) => b.index === event.index)`; it returns -1 when no open block carries the index.
-func findAnthropicBlock(content []AssistantContentBlock, index int) int {
-	want := scratchIndexFor(index)
-	for i, block := range content {
-		switch block := block.(type) {
-		case TextContent:
-			if block.scratch == want {
-				return i
-			}
-		case ThinkingContent:
-			if block.scratch == want {
-				return i
-			}
-		case ToolCall:
-			if block.scratch.hasIndex && block.scratch.index == index {
-				return i
-			}
-		}
-	}
-	return -1
+// anthropicOpenBlock is the stream state of an open Anthropic content block, kept off the content block: where it sits in the
+// output and, for a tool call, the reader of its argument deltas.
+type anthropicOpenBlock struct {
+	contentIndex int
+	args         *ToolCallArgumentsStream
 }
 
 // parseAnthropicSSE is the body of stream()'s try block from the start event on (packages/ai/src/api/anthropic-messages.ts:596-826): it pushes start, consumes the SSE iterator until it completes, and publishes exactly one terminal event. Error-event data is surfaced verbatim.
@@ -1949,6 +1969,8 @@ func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, 
 	usage := &output.Usage
 	usageCost := builder.modelCost
 	var inputTransformations []any
+	// openBlocks is the stream state per Anthropic block index.
+	openBlocks := map[int]*anthropicOpenBlock{}
 
 	// fail is the catch block (anthropic-messages.ts:817-826).
 	fail := func(err error) {
@@ -2056,32 +2078,34 @@ func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, 
 				}
 				continue
 			}
-			index := scratchIndexFor(ev.Index)
 			switch ev.ContentBlock.Type {
 			case "text":
-				output.Content = append(output.Content, TextContent{Text: ev.ContentBlock.Text, scratch: index})
+				output.Content = append(output.Content, TextContent{Text: ev.ContentBlock.Text})
+				openBlocks[ev.Index] = &anthropicOpenBlock{contentIndex: len(output.Content) - 1}
 				builder.push(TextStartEvent{ContentIndex: len(output.Content) - 1, Partial: output})
 			case "thinking":
 				output.Content = append(output.Content, ThinkingContent{
 					Thinking: ev.ContentBlock.Thinking, ThinkingSignature: ev.ContentBlock.Signature,
-					thinkingSignatureEmpty: ev.ContentBlock.Signature == "", scratch: index,
+					thinkingSignatureEmpty: ev.ContentBlock.Signature == "",
 				})
+				openBlocks[ev.Index] = &anthropicOpenBlock{contentIndex: len(output.Content) - 1}
 				builder.push(ThinkingStartEvent{ContentIndex: len(output.Content) - 1, Partial: output})
 			case "redacted_thinking":
 				output.Content = append(output.Content, ThinkingContent{
 					Thinking: "[Reasoning redacted]", ThinkingSignature: ev.ContentBlock.Data, Redacted: true,
-					thinkingSignatureEmpty: ev.ContentBlock.Data == "", scratch: index,
+					thinkingSignatureEmpty: ev.ContentBlock.Data == "",
 				})
+				openBlocks[ev.Index] = &anthropicOpenBlock{contentIndex: len(output.Content) - 1}
 				builder.push(ThinkingStartEvent{ContentIndex: len(output.Content) - 1, Partial: output})
 			case "tool_use":
-				arguments, _ := ev.ContentBlock.Input.(map[string]any)
+				arguments, _ := ev.ContentBlock.Input.value.(map[string]any)
 				if arguments == nil {
 					arguments = JsonObject{}
 				}
 				output.Content = append(output.Content, ToolCall{
 					ID: ev.ContentBlock.ID, Name: names.toolName(ev.ContentBlock.Name), Arguments: arguments,
-					scratch: toolCallScratch{hasPartialJson: true, hasIndex: true, index: ev.Index},
 				})
+				openBlocks[ev.Index] = &anthropicOpenBlock{contentIndex: len(output.Content) - 1, args: NewToolCallArgumentsStream()}
 				builder.push(ToolCallStartEvent{ContentIndex: len(output.Content) - 1, Partial: output})
 			}
 
@@ -2098,13 +2122,14 @@ func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, 
 					return
 				}
 			}
-			index := -1
+			var open *anthropicOpenBlock
 			if ev.Index.present {
-				index = findAnthropicBlock(output.Content, ev.Index.value)
+				open = openBlocks[ev.Index.value]
 			}
-			if index < 0 {
+			if open == nil {
 				continue
 			}
+			index := open.contentIndex
 			switch ev.Delta.Type {
 			case "text_delta":
 				if block, ok := output.Content[index].(TextContent); ok {
@@ -2119,9 +2144,13 @@ func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, 
 					builder.push(ThinkingDeltaEvent{ContentIndex: index, Delta: ev.Delta.Thinking, Partial: output})
 				}
 			case "input_json_delta":
-				if block, ok := output.Content[index].(ToolCall); ok {
-					block.scratch.partialJson = builder.appendArguments(index, block.scratch.partialJson, ev.Delta.PartialJSON)
-					block.setParsedArguments(builder.streamingArguments(index, block.scratch.partialJson))
+				if block, ok := output.Content[index].(ToolCall); ok && open.args != nil {
+					if ev.Delta.NoPartialJSON != "" {
+						throw(fmt.Errorf("Cannot read properties of %s (reading 'length')", ev.Delta.NoPartialJSON))
+						return
+					}
+					arguments, order := open.args.Append(ev.Delta.PartialJSON)
+					builder.showStreamedArguments(index, &block, open.args, arguments, order)
 					output.Content[index] = block
 					builder.push(ToolCallDeltaEvent{ContentIndex: index, Delta: ev.Delta.PartialJSON, Partial: output})
 				}
@@ -2140,25 +2169,25 @@ func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, 
 				throw(err)
 				return
 			}
-			index := findAnthropicBlock(output.Content, ev.Index)
-			if index < 0 {
+			open := openBlocks[ev.Index]
+			delete(openBlocks, ev.Index)
+			if open == nil {
 				continue
 			}
+			index := open.contentIndex
 			switch block := output.Content[index].(type) {
 			case TextContent:
-				block.scratch = ""
 				output.Content[index] = block
 				builder.release(index)
 				builder.push(TextEndEvent{ContentIndex: index, Content: block.Text, Partial: output})
 			case ThinkingContent:
-				block.scratch = ""
 				output.Content[index] = block
 				builder.release(index)
 				builder.push(ThinkingEndEvent{ContentIndex: index, Content: block.Thinking, Partial: output})
 			case ToolCall:
-				// Finalize in place and strip the scratch buffer so replay only carries parsed arguments.
-				block.SetFinalArguments(block.scratch.partialJson)
-				block.scratch = toolCallScratch{}
+				if open.args != nil {
+					block.SetFinalArguments(open.args.Text())
+				}
 				output.Content[index] = block
 				builder.release(index)
 				builder.push(ToolCallEndEvent{ContentIndex: index, ToolCall: block, Partial: output})

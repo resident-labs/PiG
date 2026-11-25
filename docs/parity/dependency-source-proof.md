@@ -11,9 +11,9 @@ CI reads the reviewed snapshot offline. It does not trust an ambient node_module
 | Property | Proof |
 |---|---|
 | Upstream owner | `.upstream/current/packages/coding-agent/package.json` |
-| Exact dependency | `undici` 8.10.2 |
-| Source | `test/parity/dependency-sources/undici/8.10.2/lib/core/connect.js` |
-| License | `test/parity/dependency-sources/undici/8.10.2/LICENSE` |
+| Exact dependency | `undici` 8.12.3 |
+| Source | `test/parity/dependency-sources/undici/8.12.3/lib/core/connect.js` |
+| License | `test/parity/dependency-sources/undici/8.12.3/LICENSE` |
 | Symbol | `buildConnector` |
 | Rule | Default connection timeout is 10000ms; the connector clears the timer on `secureConnect` for TLS and `connect` for TCP |
 | Literal consumer | `ai/http_transport.go:defaultHTTPConnectTimeout` |
@@ -58,10 +58,24 @@ The capture follows the same steps as for undici, with `lib/credentials/types.mj
 | License | `test/parity/dependency-sources/@smithy/core/3.33.3/LICENSE` |
 | Symbols | `DEFAULT_RETRY_DELAY_BASE`, `THROTTLING_RETRY_DELAY_BASE`, `MAXIMUM_RETRY_DELAY`, `THROTTLING_ERROR_CODES`, `refreshRetryTokenForRetry` |
 | Rule | The SDK's standard retry waits floor(random() * min(base * 2^attempts, 20 * 1000)) ms, with base 500 for a throttling error and 100 otherwise, and raises it to a retry-after hint by at most 5_000 ms |
-| Literal consumer | `ai/bedrock_retry_backoff.go` |
-| Behavioral proof | `ai/bedrock_retry_backoff_test.go` |
+| Literal consumer | `ai/providers/bedrock/bedrock_retry_backoff.go` |
+| Behavioral proof | `ai/providers/bedrock/bedrock_retry_backoff_test.go` |
 
 A package that no workspace manifest declares is admitted through the root lockfile: the guard requires the record's version and archive integrity to equal the lockfile entry's.
+
+## Node's bundled minimatch
+
+| Property | Proof |
+|---|---|
+| Upstream owner | Node, not Pi: `fs.globSync` (Pi's `expandPackageGlob`, `package-manager.ts`) runs the minimatch that ships in Node's own `deps/minimatch`, not the `minimatch` that Pi's `package.json` pins |
+| Exact release | Node 24.22.1, the release `.node-version` pins and the parity oracle runs; the record cites `.node-version` as its manifest and the guard requires the record's version to equal it |
+| Source | `test/parity/dependency-sources/node/24.22.1/deps/minimatch/index.js`, cited as `upstream: node-deps/minimatch/index.js:<symbol>` (the `node-deps/` prefix cannot be mistaken for an npm pin) |
+| Integrity | `sha256-` of `node-v24.22.1.tar.gz` from nodejs.org `SHASUMS256.txt`; capture verifies the archive before extracting `deps/minimatch/index.js` |
+| Symbols | `maxExtglobRecursion` |
+| Rule | Node's matcher parses extglobs with the regular-expression AST of minimatch 10.2.6 and nests them two deep; Pi's own `minimatch()` calls run minimatch 11.0.3, which has no AST |
+| Literal consumer | `coding/packagecontent/glob_ast.go` (`globMaxExtglobRecursion`) |
+
+Advancing `.node-version` fails the guard until the snapshot is re-captured from the new release.
 
 ## Capture and review
 
@@ -73,25 +87,25 @@ A package that no workspace manifest declares is admitted through the root lockf
 6. Review the default, completion event and error/cancellation behavior in the new source.
 7. Run the guard tests, transport tests and provider scenario before accepting the update.
 
-The capture for 8.10.2 uses:
+The capture for 8.12.3 uses:
 
 ```sh
 work=$(mktemp -d)
 export work
-curl -fsS https://registry.npmjs.org/undici/8.10.2 -o "$work/package.json"
-curl -fsS https://registry.npmjs.org/undici/-/undici-8.10.2.tgz -o "$work/package.tgz"
+curl -fsS https://registry.npmjs.org/undici/8.12.3 -o "$work/package.json"
+curl -fsS https://registry.npmjs.org/undici/-/undici-8.12.3.tgz -o "$work/package.tgz"
 python3 - <<'PY'
 import base64, hashlib, json, os, pathlib, tarfile
 work = pathlib.Path(os.environ['work'])
 metadata = json.loads((work / 'package.json').read_text())
 archive = (work / 'package.tgz').read_bytes()
-assert metadata['version'] == '8.10.2'
+assert metadata['version'] == '8.12.3'
 integrity = 'sha512-' + base64.b64encode(hashlib.sha512(archive).digest()).decode()
 assert integrity == metadata['dist']['integrity']
 with tarfile.open(work / 'package.tgz') as package:
     for name in ['lib/core/connect.js', 'LICENSE']:
         source = package.extractfile('package/' + name).read()
-        target = pathlib.Path('test/parity/dependency-sources/undici/8.10.2') / name
+        target = pathlib.Path('test/parity/dependency-sources/undici/8.12.3') / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(source)
         print(name, hashlib.sha256(source).hexdigest())

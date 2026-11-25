@@ -23,7 +23,7 @@ func TestRemoteWatcherDoublesItsReconnectDelayAfterEachLostAttempt(t *testing.T)
 	delays := make(chan time.Duration, 16)
 	previous := reconnectTimer
 	reconnectTimer = func(delay time.Duration) *time.Timer {
-		// The loop keeps reconnecting until Close; extra delays past the buffer are dropped so the loop never blocks on the test.
+		// The loop keeps reconnecting until Stop; extra delays past the buffer are dropped so the loop never blocks on the test.
 		select {
 		case delays <- delay:
 		default:
@@ -34,22 +34,22 @@ func TestRemoteWatcherDoublesItsReconnectDelayAfterEachLostAttempt(t *testing.T)
 
 	targets := []durableenv.WatchTarget{{Path: "/watched"}}
 	logPath := filepath.Join(t.TempDir(), "launches")
-	hello := encodeFrame(frameRequest, 1, Json{"protocol": 1, "op": "hello"}, nil)
-	watch := encodeFrame(frameRequest, 2, Json{"targets": []any{Json{"path": "/watched", "recursive": false, "exclude": Json{"hidden": false, "names": []any{}}}}, "op": "watch"}, nil)
+	hello := mustFrame(frameRequest, 1, Json{"protocol": 1, "op": "hello"}, nil)
+	watch := mustFrame(frameRequest, 2, Json{"targets": []any{Json{"path": "/watched", "recursive": false, "exclude": Json{"hidden": false, "names": []any{}}}}, "op": "watch"}, nil)
 	var script strings.Builder
 	_, _ = fmt.Fprintf(&script, `echo >> %q; [ "$(wc -l < %q)" -gt 1 ] && exit 1; `, logPath, logPath)
 	script.WriteString(syncLine + helloResult)
 	// The daemon exits only after the test has seen the watcher ready and sent the stop frame: a daemon that exits right behind its ready event races the
 	// connection's reader, and an exit reaped before the event is dispatched loses the watch before it was ever established.
-	stop := encodeFrame(frameRequest, 3, Json{"op": "stop"}, nil)
-	_, _ = fmt.Fprintf(&script, `head -c %d >/dev/null; printf '%s'; head -c %d >/dev/null; exit 0`, len(hello)+len(watch), octal(encodeFrame(frameEvent, 2, Json{"kind": "ready", "mode": "native"}, nil)), len(stop))
+	stop := mustFrame(frameRequest, 3, Json{"op": "stop"}, nil)
+	_, _ = fmt.Fprintf(&script, `head -c %d >/dev/null; printf '%s'; head -c %d >/dev/null; exit 0`, len(hello)+len(watch), octal(mustFrame(frameEvent, 2, Json{"kind": "ready", "mode": "native"}, nil)), len(stop))
 	connection := scriptedConnection(t, script.String(), nil)
 
-	watcher, err := OpenRemoteWatcher(background, connection, targets, func(durableenv.WatchChange) {}, RemoteWatchOptions{})
+	watcher, err := OpenRemoteWatcher(background, connection, targets, func(durableenv.FileChange) {}, RemoteWatchOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { connection.Close(); _ = watcher.Close(background) }()
+	defer func() { connection.Close(); _ = watcher.Stop(background) }()
 	connection.Start(background, "stop", Json{}, RequestOptions{}) // the daemon exits on this frame, so the established watch is lost and reconnects
 
 	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second, 30 * time.Second}

@@ -5,6 +5,7 @@ package extension
 import (
 	"context"
 	"errors"
+	"maps"
 	"slices"
 	"sync"
 
@@ -21,6 +22,8 @@ type PendingNativeProviderRegistration struct {
 	Provider      *ai.ModelsProvider
 	ExtensionPath string
 	carrier       *NativeProvider
+	// Outcome is told the registry's verdict when the queue drains (see PendingProviderRegistration.Outcome).
+	Outcome func(error)
 }
 
 // AssertActive returns the stale message as an error once the runtime was invalidated, and nil before.
@@ -41,6 +44,20 @@ func (r *ExtensionRuntime) FlagValue(name string) (any, bool) {
 	defer r.mu.Unlock()
 	value, has := r.FlagValues[name]
 	return value, has
+}
+
+// FlagValuesSnapshot is a copy of the flag values, the Map a caller of Pi's `new Map(runtime.flagValues)` holds.
+func (r *ExtensionRuntime) FlagValuesSnapshot() map[string]any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return maps.Clone(r.FlagValues)
+}
+
+// SetFlagValue stores a flag's value, replacing the default or an earlier value (`runtime.flagValues.set`).
+func (r *ExtensionRuntime) SetFlagValue(name string, value any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.FlagValues[name] = value
 }
 
 // SetFlagDefault sets a flag's value unless the flag already has one.
@@ -83,36 +100,69 @@ func (r *ExtensionRuntime) Invalidate(message ...string) {
 	if len(message) != 0 && message[0] != "" {
 		r.staleMessage = message[0]
 	}
-	tracked := r.eventBusUnsubscribers
-	r.eventBusUnsubscribers = nil
+	var tracked []*eventBusSubscription
+	for entry := r.eventBusHead; entry != nil; entry = entry.next {
+		entry.linked = false
+		tracked = append(tracked, entry)
+	}
+	r.eventBusHead, r.eventBusTail, r.eventBusRetained = nil, nil, 0
 	r.mu.Unlock()
 	for _, entry := range tracked {
 		entry.run()
 	}
 }
 
-// eventBusSubscription is one retained event-bus subscription; run is idempotent.
+// eventBusSubscription is one retained event-bus subscription, a node of the runtime's insertion-ordered list (Pi's Set of trackedUnsubscribe closures: each
+// subscription is its own member, even for the same handler, and unsubscribing deletes it in constant time). run is idempotent. prev, next and linked are
+// guarded by runtime.mu.
 type eventBusSubscription struct {
 	once        sync.Once
 	unsubscribe func()
 	runtime     *ExtensionRuntime
+	prev, next  *eventBusSubscription
+	linked      bool
 }
 
 func (e *eventBusSubscription) run() {
 	e.once.Do(func() {
 		e.runtime.mu.Lock()
-		e.runtime.eventBusUnsubscribers = slices.DeleteFunc(e.runtime.eventBusUnsubscribers, func(other *eventBusSubscription) bool { return other == e })
+		e.runtime.unlinkEventBusLocked(e)
 		e.runtime.mu.Unlock()
 		e.unsubscribe()
 	})
 }
 
+func (r *ExtensionRuntime) unlinkEventBusLocked(e *eventBusSubscription) {
+	if !e.linked {
+		return
+	}
+	if e.prev != nil {
+		e.prev.next = e.next
+	} else {
+		r.eventBusHead = e.next
+	}
+	if e.next != nil {
+		e.next.prev = e.prev
+	} else {
+		r.eventBusTail = e.prev
+	}
+	e.prev, e.next, e.linked = nil, nil, false
+	r.eventBusRetained--
+}
+
 // TrackEventBusSubscription retains an event-bus subscription until the runtime is invalidated: Invalidate runs every retained unsubscribe, in subscription order. It returns the unsubscribe function that runs the original once and forgets it.
 // upstream: loader.ts:201-210 trackEventBusSubscription, :198-199 invalidate
 func (r *ExtensionRuntime) TrackEventBusSubscription(unsubscribe func()) func() {
-	entry := &eventBusSubscription{unsubscribe: unsubscribe, runtime: r}
+	entry := &eventBusSubscription{unsubscribe: unsubscribe, runtime: r, linked: true}
 	r.mu.Lock()
-	r.eventBusUnsubscribers = append(r.eventBusUnsubscribers, entry)
+	entry.prev = r.eventBusTail
+	if r.eventBusTail != nil {
+		r.eventBusTail.next = entry
+	} else {
+		r.eventBusHead = entry
+	}
+	r.eventBusTail = entry
+	r.eventBusRetained++
 	r.mu.Unlock()
 	return entry.run
 }
@@ -146,6 +196,15 @@ func (r *ExtensionRuntime) registerNativeProvider(ctx context.Context, provider 
 	return actions.registerNative(ctx, provider, carrier)
 }
 
+// QueueNativeProviderCarrier queues the Provider object an extension registers while it loads, whether or not a registry is bound, as QueueProviderRegistration does for a configuration: Pi's loader queues both in the runtime of the load, and the binding that drains them reports a rejection as the registering extension's diagnostic (loader.ts:220-222, runner.ts:488-504).
+//
+// upstream: loader.ts:220-222 (`runtime.registerNativeProvider` of the loading runtime)
+func (r *ExtensionRuntime) QueueNativeProviderCarrier(carrier *NativeProvider, extensionPath string, outcome func(error)) {
+	r.mu.Lock()
+	r.pendingNativeProviders = append(r.pendingNativeProviders, PendingNativeProviderRegistration{Provider: carrier.ProviderObject(), ExtensionPath: extensionPath, carrier: carrier, Outcome: outcome})
+	r.mu.Unlock()
+}
+
 // PendingNativeProviderRegistrations returns the queued native providers in registration order.
 func (r *ExtensionRuntime) PendingNativeProviderRegistrations() []PendingNativeProviderRegistration {
 	r.mu.Lock()
@@ -170,7 +229,11 @@ func (r *ExtensionRuntime) bindNativeProviders(actions ProviderActions, report f
 		}
 		entry := r.pendingNativeProviders[i]
 		r.mu.Unlock()
-		if err := actions.registerNative(context.Background(), entry.Provider, entry.carrier); err != nil && report != nil {
+		err := actions.registerNative(context.Background(), entry.Provider, entry.carrier)
+		if entry.Outcome != nil {
+			entry.Outcome(err)
+		}
+		if err != nil && report != nil {
 			report(&ExtensionError{ExtensionPath: entry.ExtensionPath, Event: "register_provider", Error: err.Error(), Stack: ErrorStack(err)})
 		}
 	}

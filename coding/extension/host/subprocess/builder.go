@@ -29,6 +29,7 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/extension/host/runtimecell"
 	extsource "github.com/MichaelKinsy/PiG/coding/extension/source"
 	"github.com/MichaelKinsy/PiG/internal/buildprogress"
+	"github.com/MichaelKinsy/PiG/internal/execfile"
 	"github.com/MichaelKinsy/PiG/internal/pigsdklock"
 	"github.com/MichaelKinsy/PiG/internal/toolchain"
 )
@@ -289,7 +290,10 @@ func detectBuildType(src string) (string, error) {
 	if hasNodeSource(src) {
 		return "node", nil
 	}
-	return "", fmt.Errorf("cannot detect build type in %s: need go.mod, Cargo.toml, package.json, or a .ts/.js entrypoint", src)
+	if lisp.hasSource != nil && lisp.hasSource(src) {
+		return "lisp", nil
+	}
+	return "", fmt.Errorf("cannot detect build type in %s: need go.mod, Cargo.toml, package.json, a .ts/.js entrypoint, or an ASDF .asd/.lisp factory", src)
 }
 
 // sourceUnchanged reports an error when the source files of srcDir no longer hash to the stamp read before the build. Nothing is
@@ -350,6 +354,8 @@ func hashSourceDirStamped(src, buildType string) (digest, stamp string, err erro
 		exts = []string{".rs", ".toml", ".lock"}
 	case "node":
 		exts = []string{".ts", ".js", ".mjs", ".cjs", ".json"}
+	case "lisp":
+		exts = []string{".lisp", ".asd"}
 	}
 
 	info, err := os.Stat(src)
@@ -400,8 +406,10 @@ func hashSourceDirStamped(src, buildType string) (digest, stamp string, err erro
 
 // hashDirSources walks root and mixes every source file whose name ends in one
 // of exts into h, keyed by its path relative to root, in deterministic
-// filepath.WalkDir order. Hidden, vendor, build-output, and dependency
-// directories are skipped to match what the compiler actually reads.
+// filepath.WalkDir order. Hidden, vendor, build-output (named target or dist,
+// or marked with CACHEDIR.TAG), and dependency directories are skipped to
+// match what the compiler actually reads, and a directory that vanishes while
+// the walk runs held no source.
 func hashDirSources(h hash.Hash, root string, exts []string) error {
 	return hashDirSourcesStamped(h, nil, root, exts)
 }
@@ -435,17 +443,38 @@ func walkDirSources(root string, exts []string, visit func(path, rel string) err
 	if err != nil {
 		return err
 	}
-	// WalkDir does not traverse a symlink used as its root. Resolve only the
-	// admitted root; nested symlink entries remain excluded by WalkDir.
+	// WalkDirShared, like filepath.WalkDir, does not traverse a symlink used as its root. Resolve only the
+	// admitted root; nested symlink entries remain excluded by the walk.
 	root = physicalRoot
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	vanish := runtimecell.NewVanishTracker()
+	if err := runtimecell.WalkDirShared(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			// A directory deleted after its parent listed it held no source of this build, as in runtimecell's hashGoModuleDir
+			// (on Windows one still being deleted fails to open instead of reporting not-exist; see VanishTracker). A directory
+			// or source file that is there and cannot be read is not that: the hash fails closed.
+			if path != root && d.IsDir() && vanish.Vanished(path, err) {
+				return filepath.SkipDir
+			}
 			return err
 		}
 		if d.IsDir() {
 			base := d.Name()
 			if path != root && (strings.HasPrefix(base, ".") || base == "target" || base == "vendor" || base == "node_modules" || base == "dist") {
 				return filepath.SkipDir
+			}
+			// A tree marked CACHEDIR.TAG (a Cargo target directory, whatever its name) is build output. Not opening
+			// any directory below it keeps the hash from failing on the temp directories the build removes mid-walk.
+			if path != root {
+				tagged, err := runtimecell.IsCacheDirectory(path)
+				if err != nil {
+					if vanish.Vanished(path, err) {
+						return filepath.SkipDir
+					}
+					return err
+				}
+				if tagged {
+					return filepath.SkipDir
+				}
 			}
 			return nil
 		}
@@ -467,7 +496,10 @@ func walkDirSources(root string, exts []string, visit func(path, rel string) err
 			}
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	return vanish.Verify()
 }
 
 // goLocalReplaceDirs returns physical existing directories that srcDir's go.mod
@@ -708,6 +740,8 @@ func sdkSourceExts(buildType string) []string {
 		return []string{".rs", ".toml", ".lock"}
 	case "python":
 		return []string{".py", ".toml", ".lock"}
+	case "lisp":
+		return []string{".lisp", ".asd"}
 	case "node":
 		return []string{".js", ".mjs", ".cjs", ".ts", ".json"}
 	}
@@ -980,14 +1014,20 @@ func buildRust(ctx context.Context, cacheRoot, srcDir, outPath, stagedSDK string
 
 	// Copy to temp, then rename (atomic).
 	tmpPath := outPath + ".tmp"
-	data, err := os.ReadFile(builtBin)
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(tmpPath, data, 0o755); err != nil {
+	if err := copyBuiltBinary(builtBin, tmpPath); err != nil {
 		return err
 	}
 	return os.Rename(tmpPath, outPath)
+}
+
+// copyBuiltBinary copies the binary cargo built to dst, the program the host executes once the build is published. execfile writes the copy: a concurrent fork must not leave a child that holds its write descriptor, which makes the exec fail with ETXTBSY.
+func copyBuiltBinary(src, dst string) error {
+	input, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = input.Close() }() // Read-only: close cannot lose data.
+	return execfile.Write(dst, os.O_CREATE|os.O_TRUNC, 0o755, input)
 }
 
 func cargoBuildTargetDirectory(workingDirectory string) string {
@@ -1188,4 +1228,22 @@ func (b *Builder) CurrentCacheEntry(name, srcDir string) (string, bool, error) {
 	entry := filepath.Join(b.cacheDir, fileNameComponent(name)+"-"+hash)
 	_, valid := runtimecell.ValidEntry(entry, runtimecell.EntryIdentity{InputDigest: hash, Artifact: extensionArtifactName(runtime.GOOS, buildType), Language: buildType})
 	return entry, valid, nil
+}
+
+// hasLispSource reports whether dir holds an ASDF system definition or a Lisp source file.
+func hasLispSource(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		switch strings.ToLower(filepath.Ext(entry.Name())) {
+		case ".lisp", ".asd":
+			return true
+		}
+	}
+	return false
 }

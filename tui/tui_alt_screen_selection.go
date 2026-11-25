@@ -1,5 +1,7 @@
 package tui
 
+// Ports packages/tui/src/tui-alt-screen.ts (text selection)
+
 import (
 	"encoding/base64"
 	"fmt"
@@ -71,7 +73,8 @@ func (t *TuiAltScreen) getScrollSelectionPoint(scrollView *ScrollView, x, y int)
 		return nil
 	}
 	visibleTop := max(0, box.Rect.Y, box.Clip.Y)
-	visibleBottom := min(t.height-1, box.Rect.Y+box.Rect.Height-1, box.Clip.Y+box.Clip.Height-1)
+	_, rows := t.size()
+	visibleBottom := min(rows-1, box.Rect.Y+box.Rect.Height-1, box.Clip.Y+box.Clip.Height-1)
 	if visibleBottom < visibleTop {
 		return nil
 	}
@@ -96,7 +99,8 @@ func (t *TuiAltScreen) getSelectionPoint(event sgrMouseEvent, scrollView *Scroll
 			return *p
 		}
 	}
-	return selectionPoint{row: max(0, min(t.height-1, event.y)), col: max(0, min(t.width-1, event.x))}
+	columns, rows := t.size()
+	return selectionPoint{row: max(0, min(rows-1, event.y)), col: max(0, min(columns-1, event.x))}
 }
 
 // getSelectionSourceLine returns the rendered line a point indexes. Caller
@@ -114,6 +118,16 @@ func (t *TuiAltScreen) getSelectionSourceLine(point selectionPoint) string {
 	return ""
 }
 
+// isTerminalWordSelectionJoiner reports whether segment is one of the characters iTerm2 considers part of a word by default (tui-alt-screen.ts
+// TERMINAL_WORD_SELECTION_JOINERS).
+func isTerminalWordSelectionJoiner(segment string) bool {
+	switch segment {
+	case "/", "-", "+", "\\", "~", "_", ".":
+		return true
+	}
+	return false
+}
+
 type wordSegment struct {
 	start, end int
 	selectable bool
@@ -127,9 +141,9 @@ func wordSegments(line string) []wordSegment {
 	for segment := range wordsegmenter.Segments(line) {
 		end := start + widthx.VisibleWidth(segment.Segment)
 		// Regular mode delegates double-click selection to the terminal
-		// emulator. Fullscreen owns mouse selection, so mirror common terminal
-		// word selection by keeping paths and kebab-case tokens whole.
-		joiner := segment.Segment == "/" || segment.Segment == "-"
+		// emulator. Fullscreen owns mouse selection, so it uses iTerm2's default
+		// "characters considered part of a word" set (Pi ff6896471, #10980).
+		joiner := isTerminalWordSelectionJoiner(segment.Segment)
 		segments = append(segments, wordSegment{start: start, end: end, selectable: segment.IsWordLike || joiner, joiner: joiner})
 		start = end
 	}
@@ -240,7 +254,8 @@ func (t *TuiAltScreen) updateSelectionAutoScroll(event sgrMouseEvent) {
 		return
 	}
 	visibleTop := max(0, box.Rect.Y, box.Clip.Y)
-	visibleBottom := min(t.height-1, box.Rect.Y+box.Rect.Height-1, box.Clip.Y+box.Clip.Height-1)
+	_, rows := t.size()
+	visibleBottom := min(rows-1, box.Rect.Y+box.Rect.Height-1, box.Clip.Y+box.Clip.Height-1)
 	t.selectionDragPointer = &pointerXY{x: event.x, y: event.y}
 	switch {
 	case event.y <= visibleTop:
@@ -386,9 +401,10 @@ func (t *TuiAltScreen) handleSelectionRelease(event sgrMouseEvent, point selecti
 		if t.lastClick != nil {
 			clickCount = t.lastClick.count
 		}
+		columns, rows := t.size()
 		eff.clickEvent = &TuiMouseEvent{
 			Type: MouseClick, Button: decodeMouseButton(event.button), X: event.x, Y: event.y, ScreenX: event.x, ScreenY: event.y,
-			Width: max(1, t.width), Height: max(1, t.height),
+			Width: max(1, columns), Height: max(1, rows),
 			Shift: event.button&4 != 0, Alt: event.button&8 != 0, Ctrl: event.button&16 != 0, ClickCount: clickCount,
 		}
 	}
@@ -434,11 +450,12 @@ func (t *TuiAltScreen) handleSelectionPress(event sgrMouseEvent, eff *mouseEffec
 	t.pressedURL = ""
 	t.pressedURLSet = false
 	if snapped == nil {
+		columns, rows := t.size()
 		line := ""
-		if row := max(0, min(t.height-1, event.y)); row < len(t.previousScreen) {
+		if row := max(0, min(rows-1, event.y)); row < len(t.previousScreen) {
 			line = t.previousScreen[row]
 		}
-		t.pressedURL, t.pressedURLSet = widthx.GetOsc8LinkAtColumn(line, max(0, min(t.width-1, event.x)))
+		t.pressedURL, t.pressedURLSet = widthx.GetOsc8LinkAtColumn(line, max(0, min(columns-1, event.x)))
 	}
 	eff.render = true
 }
@@ -522,7 +539,7 @@ func (t *TuiAltScreen) copyTextToClipboard(text string) bool {
 			return false
 		}
 	} else {
-		_, _ = fmt.Fprintf(t.out, "\x1b]52;c;%s\x07", base64.StdEncoding.EncodeToString([]byte(text)))
+		WriteToTerminal(t.out, fmt.Sprintf("\x1b]52;c;%s\x07", base64.StdEncoding.EncodeToString([]byte(text))))
 	}
 	t.flash("Copied!", altScreenFlashDefaultDurationMS)
 	return true
@@ -617,7 +634,8 @@ func (t *TuiAltScreen) applySelection(screen []string, layout *LayoutFrame) []st
 	}
 	screenStart, screenEnd := start, end
 	minRow, maxRow := 0, len(screen)-1
-	minColumn, maxColumn := 0, t.width
+	columns, _ := t.size()
+	minColumn, maxColumn := 0, columns
 	if start.scrollView != nil {
 		if layout == nil {
 			return screen
@@ -629,7 +647,7 @@ func (t *TuiAltScreen) applySelection(screen []string, layout *LayoutFrame) []st
 		minRow = max(0, box.Rect.Y, box.Clip.Y)
 		maxRow = min(len(screen)-1, box.Rect.Y+box.Rect.Height-1, box.Clip.Y+box.Clip.Height-1)
 		minColumn = max(0, box.Rect.X, box.Clip.X)
-		maxColumn = min(t.width, box.Rect.X+box.Rect.Width, box.Clip.X+box.Clip.Width)
+		maxColumn = min(columns, box.Rect.X+box.Rect.Width, box.Clip.X+box.Clip.Width)
 		scrollTop := start.scrollView.ScrollTop()
 		screenStart.row = box.Rect.Y + start.row - scrollTop
 		screenStart.col = box.Rect.X + start.col

@@ -110,9 +110,12 @@ func runRPCPipeline(b *testing.B, deltas int, meter *pipelineMeter) {
 	defer cancel()
 	out := newStdoutQueue(io.Discard, func(err error) { b.Error(err) })
 	defer out.Close()
+	write := func(v any) { writeJSONLine(out, v) }
+	// responses is runRPCMode's response turn, which forward hands to the loop chain (rpcLoopChain.observeCommands).
 	h := &rpcHost{
 		ctx: ctx, cancel: cancel,
-		writeRPC:        func(v any) { writeJSONLine(out, v) },
+		writeRPC:        write,
+		responses:       &rpcResponseTurn{write: write},
 		requestShutdown: func() {},
 		conversionErr:   make(chan error, 1),
 		stdoutWait:      func(ctx context.Context) { out.Wait(ctx) },

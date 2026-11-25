@@ -14,7 +14,7 @@ import (
 	"github.com/MichaelKinsy/PiG/durable/session/sessiontest"
 )
 
-// Pi types.ts:868-881 WatchHandle and session/observation.ts:155 CommittedWatch: value is the acquisition revision before start and the
+// Pi types.ts:868-881 WatchHandle and chord/src/watch.ts Watch: value is the acquisition revision before start and the
 // latest delivered revision afterward; start installs the sole asynchronous listener and never invokes it inline; stop idempotently stops
 // future callbacks and returns the watch's terminal result; closed settles with that result; a listener that fails ends only its own watch
 // with reason listener_error carrying the error. The watch is held as a durable.WatchHandle, the interface a caller sees.
@@ -91,7 +91,8 @@ func TestWatchHandleContract(t *testing.T) {
 		var mu sync.Mutex
 		var delivered []any
 		inline := true
-		handle.Start(func(_ context.Context, value durable.JsonObject, _ []durable.Op) error {
+		handle.Start(func(_ context.Context, change durable.WatchCall[durable.JsonObject]) error {
+			value := change.Value
 			mu.Lock()
 			defer mu.Unlock()
 			if inline {
@@ -113,10 +114,10 @@ func TestWatchHandleContract(t *testing.T) {
 		}
 		first, _ := handle.Stop()
 		second, _ := handle.Stop()
-		if first != second || first.Reason != durable.WatchStopped {
+		if first != second || first.Kind != durable.WatchStopped {
 			t.Fatalf("stop = %+v then %+v, want the same stopped result", first, second)
 		}
-		if end := waitClosed(handle); end.Reason != durable.WatchStopped {
+		if end := waitClosed(handle); end.Kind != durable.WatchStopped {
 			t.Fatalf("closed with %+v, want stopped", end)
 		}
 		set(harness, 2)
@@ -129,7 +130,7 @@ func TestWatchHandleContract(t *testing.T) {
 		}
 	})
 
-	// observation.ts:174-212: a frame committed before start stays pending (advance does not touch value), and start only schedules its drain
+	// chord watch.ts Watch: a frame committed before start stays pending (advance does not touch value), and start only schedules its drain
 	// (`if (this.#pending.length > 0) this.#schedule()`, a microtask), so the listener never runs inside start even when a frame is waiting.
 	t.Run("keeps a frame committed before start pending and delivers it after start returns", func(t *testing.T) {
 		harness := open()
@@ -142,7 +143,8 @@ func TestWatchHandleContract(t *testing.T) {
 		var mu sync.Mutex
 		var delivered []string
 		inStart := true
-		handle.Start(func(_ context.Context, value durable.JsonObject, _ []durable.Op) error {
+		handle.Start(func(_ context.Context, change durable.WatchCall[durable.JsonObject]) error {
+			value := change.Value
 			mu.Lock()
 			defer mu.Unlock()
 			if inStart {
@@ -166,7 +168,7 @@ func TestWatchHandleContract(t *testing.T) {
 
 	t.Run("accepts one start and none after stop", func(t *testing.T) {
 		harness := open()
-		listener := func(context.Context, durable.JsonObject, []durable.Op) error { return nil }
+		listener := func(_ context.Context, change durable.WatchCall[durable.JsonObject]) error { return nil }
 		started := watch(harness)
 		started.Start(listener)
 		panics("already started", func() { started.Start(listener) })
@@ -179,10 +181,12 @@ func TestWatchHandleContract(t *testing.T) {
 	t.Run("ends only the watch whose listener failed", func(t *testing.T) {
 		harness := open()
 		failed, healthy := watch(harness), watch(harness)
-		failed.Start(func(context.Context, durable.JsonObject, []durable.Op) error { return errors.New("listener failed") })
+		failed.Start(func(_ context.Context, change durable.WatchCall[durable.JsonObject]) error {
+			return errors.New("listener failed")
+		})
 		var mu sync.Mutex
 		calls := 0
-		healthy.Start(func(context.Context, durable.JsonObject, []durable.Op) error {
+		healthy.Start(func(_ context.Context, change durable.WatchCall[durable.JsonObject]) error {
 			mu.Lock()
 			calls++
 			mu.Unlock()
@@ -190,7 +194,7 @@ func TestWatchHandleContract(t *testing.T) {
 		})
 		set(harness, 1)
 		end := waitClosed(failed)
-		if end.Reason != durable.WatchListenerError || end.Error == nil || end.Error.Error() != "listener failed" {
+		if end.Kind != durable.WatchListenerError || end.Error == nil || end.Error.Error() != "listener failed" {
 			t.Fatalf("end = %+v, want listener_error carrying the listener's error", end)
 		}
 		harness.Session.WaitDeliveries()

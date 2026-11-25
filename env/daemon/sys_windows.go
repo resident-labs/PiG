@@ -28,6 +28,29 @@ func openReadOnly(path string, _ bool) (*os.File, error) { return openForRead(pa
 // isLinkRefusal is never true: Windows has no O_NOFOLLOW.
 func isLinkRefusal(error) bool { return false }
 
+// rustIOError reports false: Windows keeps the message Durable's exec gives.
+func rustIOError(error) (string, bool) { return "", false }
+
+// libuvName is the code itself: Windows has no table narrower than the codes the daemon derives.
+func libuvName(code string) string { return code }
+
+// openDirectory opens path as a directory; a file is ENOTDIR.
+func openDirectory(path string) (*os.File, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	stats, err := file.Stat()
+	if err == nil && !stats.IsDir() {
+		err = synthetic("ENOTDIR")
+	}
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
 // openForRead is Node's open(path, "r") through CreateFileW, as libuv's fs__open.
 func openForRead(path string) (*os.File, error) {
 	name, err := windows.UTF16PtrFromString(path)
@@ -96,3 +119,8 @@ func rawName(string) []int { return nil }
 
 // defaultChildSignals has nothing to do: Windows programs do not inherit signal dispositions.
 func defaultChildSignals() {}
+
+// notifyExitSignals delivers nothing: the daemon cannot catch TerminateProcess. When it ends, the job object kills each
+// command's own process; processes those start leave the job (silent breakaway, as in libuv) and keep running
+// (sys/windows.rs on_exit_signal).
+func notifyExitSignals() (<-chan int, func()) { return nil, func() {} }

@@ -17,17 +17,17 @@ import (
 
 type changes struct {
 	mu    sync.Mutex
-	items []durableenv.WatchChange
+	items []durableenv.FileChange
 }
 
-func (c *changes) add(change durableenv.WatchChange) {
+func (c *changes) add(change durableenv.FileChange) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.items = append(c.items, change)
 }
 
 // waitFor returns once an item satisfies match, scanning from index start; it reports the index after it.
-func (c *changes) waitFor(t *testing.T, start int, within time.Duration, match func(durableenv.WatchChange) bool) int {
+func (c *changes) waitFor(t *testing.T, start int, within time.Duration, match func(durableenv.FileChange) bool) int {
 	t.Helper()
 	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {
@@ -47,14 +47,14 @@ func (c *changes) waitFor(t *testing.T, start int, within time.Duration, match f
 	return 0
 }
 
-func isOverflow(change durableenv.WatchChange) bool {
-	_, ok := change.(durableenv.WatchChangeOverflow)
+func isOverflow(change durableenv.FileChange) bool {
+	_, ok := change.(durableenv.FileChangeOverflow)
 	return ok
 }
 
-func pathsInclude(path string) func(durableenv.WatchChange) bool {
-	return func(change durableenv.WatchChange) bool {
-		paths, ok := change.(durableenv.WatchChangePaths)
+func pathsInclude(path string) func(durableenv.FileChange) bool {
+	return func(change durableenv.FileChange) bool {
+		paths, ok := change.(durableenv.FileChangePaths)
 		if !ok {
 			return false
 		}
@@ -70,7 +70,7 @@ func TestRemoteWatcherOpensAgainAfterALostConnectionAndReportsOverflow(t *testin
 	var seen changes
 	// upstream: packages/env/src/remote-env.ts:809 watch opens a daemon watcher and opens it again after a lost connection.
 	watcher := must(env.Watch(ctx, []durableenv.WatchTarget{{Path: "."}}, seen.add))
-	defer func() { _ = watcher.Close(ctx) }()
+	defer func() { _ = watcher.Stop(ctx) }()
 	if watcher.Mode() != durableenv.WatchNative && watcher.Mode() != durableenv.WatchPolling {
 		t.Fatalf("mode %q", watcher.Mode())
 	}
@@ -88,17 +88,17 @@ func TestRemoteWatcherOpensAgainAfterALostConnectionAndReportsOverflow(t *testin
 	mustDo(env.WriteFile(ctx, "after.txt", "2"))
 	seen.waitFor(t, next, 20*time.Second, pathsInclude(filepath.Join(root, "after.txt")))
 
-	// A closed watcher reports nothing, whatever the connection does.
-	mustDo(watcher.Close(ctx))
+	// A stopped watcher reports nothing, whatever the connection does.
+	mustDo(watcher.Stop(ctx))
 	seen.mu.Lock()
 	count := len(seen.items)
 	seen.mu.Unlock()
-	mustDo(env.WriteFile(ctx, "closed.txt", "3"))
+	mustDo(env.WriteFile(ctx, "stopped.txt", "3"))
 	time.Sleep(500 * time.Millisecond)
 	seen.mu.Lock()
 	defer seen.mu.Unlock()
 	if len(seen.items) != count {
-		t.Fatalf("a closed watcher reported %v", seen.items[count:])
+		t.Fatalf("a stopped watcher reported %v", seen.items[count:])
 	}
 }
 
@@ -115,7 +115,7 @@ func TestRemoteWatcherFailsToOpenOverTheDirectoryBudgetLikeNodeFileWatcher(t *te
 	small := NewRemoteExecutionEnv(RemoteExecutionEnvOptions{Connection: env.Connection, ID: "pi-env:test", Cwd: env.Cwd(), Watch: RemoteWatchOptions{MaxDirectories: new(2)}})
 	mustDo(small.CreateDir(ctx, "tree/a/b", nil))
 	mustDo(small.CreateDir(ctx, "tree/c", nil))
-	_, err := small.Watch(ctx, []durableenv.WatchTarget{{Path: "tree", Recursive: true}}, func(durableenv.WatchChange) {})
+	_, err := small.Watch(ctx, []durableenv.WatchTarget{{Path: "tree", Recursive: true}}, func(durableenv.FileChange) {})
 	if code := errorCodeOf(err); code != "invalid" {
 		t.Fatalf("watch of a tree over the budget: code %s (%v), want invalid", code, err)
 	}
@@ -128,26 +128,26 @@ func TestRemoteWatcherSendsASetZeroDirectoryBudget(t *testing.T) {
 	ctx := context.Background()
 	zero := NewRemoteExecutionEnv(RemoteExecutionEnvOptions{Connection: env.Connection, ID: "pi-env:test", Cwd: env.Cwd(), Watch: RemoteWatchOptions{MaxDirectories: new(0)}})
 	mustDo(zero.CreateDir(ctx, "tree", nil))
-	_, err := zero.Watch(ctx, []durableenv.WatchTarget{{Path: "tree", Recursive: true}}, func(durableenv.WatchChange) {})
+	_, err := zero.Watch(ctx, []durableenv.WatchTarget{{Path: "tree", Recursive: true}}, func(durableenv.FileChange) {})
 	if code := errorCodeOf(err); code != "invalid" {
 		t.Fatalf("watch with a budget of 0 directories: code %s (%v), want invalid", code, err)
 	}
-	watcher, err := env.Watch(ctx, []durableenv.WatchTarget{{Path: "tree", Recursive: true}}, func(durableenv.WatchChange) {})
+	watcher, err := env.Watch(ctx, []durableenv.WatchTarget{{Path: "tree", Recursive: true}}, func(durableenv.FileChange) {})
 	if err != nil {
 		t.Fatalf("an unset budget is the daemon default: %v", err)
 	}
-	_ = watcher.Close(ctx)
+	_ = watcher.Stop(ctx)
 }
 
 // upstream: packages/env/src/watch.ts:62-68 close wakes the reconnect loop's pending delay (#wake, :133-142) and does not wait it out, and the
 // loop then stops before it opens the watcher again, so nothing is delivered after close.
-// mutation-checked: dropping the wake send in RemoteWatcher.Close fails it.
-func TestRemoteWatcherCloseWakesAPendingReconnect(t *testing.T) {
+// mutation-checked: dropping the wake send in RemoteWatcher.Stop fails it.
+func TestRemoteWatcherStopWakesAPendingReconnect(t *testing.T) {
 	env, connection := remoteEnvironment(t)
 	ctx := context.Background()
 	var seen changes
 	watcher := must(env.Watch(ctx, []durableenv.WatchTarget{{Path: "."}}, seen.add)).(*RemoteWatcher)
-	defer func() { _ = watcher.Close(ctx) }()
+	defer func() { _ = watcher.Stop(ctx) }()
 
 	info := must(connection.Info(ctx))
 	mustDo(must(os.FindProcess(info.Pid)).Kill())
@@ -165,23 +165,23 @@ func TestRemoteWatcherCloseWakesAPendingReconnect(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	started := time.Now()
-	mustDo(watcher.Close(ctx))
+	mustDo(watcher.Stop(ctx))
 	if took := time.Since(started); took >= reconnectFirst/2 {
 		t.Fatalf("Close took %s; it must wake the reconnect delay of %s, not wait it out", took, reconnectFirst)
 	}
 	time.Sleep(reconnectFirst + 200*time.Millisecond)
-	// The loop checks #closed after the delay (watch.ts:144), so no watch request is opened again on the daemon.
+	// The loop checks #stopped after the delay (watch.ts:144), so no watch request is opened again on the daemon.
 	watcher.mu.Lock()
 	request := watcher.request
 	watcher.mu.Unlock()
 	select {
 	case <-request:
 	default:
-		t.Fatal("a watcher closed while reconnecting opened a watch request again")
+		t.Fatal("a watcher stopped while reconnecting opened a watch request again")
 	}
 	seen.mu.Lock()
 	defer seen.mu.Unlock()
 	if len(seen.items) != 0 {
-		t.Fatalf("a watcher closed while reconnecting reported %v", seen.items)
+		t.Fatalf("a watcher stopped while reconnecting reported %v", seen.items)
 	}
 }

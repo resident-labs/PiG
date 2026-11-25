@@ -1,5 +1,7 @@
 package codingagent
 
+// pi: packages/coding-agent/src/modes/interactive/components/markdown-transform.ts
+
 import (
 	"context"
 	"encoding/json"
@@ -55,7 +57,7 @@ func TestMarkdownModeReplacementWaitsForCallbackBody(t *testing.T) {
 			*remote,
 			{MarkdownTransformer: func(text string, _ extension.MarkdownTransformContext) string { record("C " + text); return text }},
 		}, "")
-		block := m.newAssistantMessageBlock()
+		block := m.newAssistantMessageBlock(messageMeta{})
 		block.SetContent([]tui.AssistantSegment{{Text: "first"}})
 		block.Render(80)
 		<-started
@@ -105,7 +107,7 @@ func TestMarkdownModeCrossComponentAdmissionOrder(t *testing.T) {
 			}
 			return "transformed " + text
 		}}}, "")
-		a, b := m.newAssistantMessageBlock(), m.newUserMessageBlock("B1")
+		a, b := m.newAssistantMessageBlock(messageMeta{}), m.newUserMessageBlock("B1", messageMeta{})
 		a.SetContent([]tui.AssistantSegment{{Text: "A1"}})
 		a.Render(80)
 		<-started
@@ -170,7 +172,7 @@ func TestMarkdownAbandonedBodyKeepsCallbackOrder(t *testing.T) {
 		defer cancel()
 		m := &InteractiveMode{backgroundCtx: ctx, tuiInst: tui.NewWithOutput(io.Discard, 80, 24), uiTaskCh: make(chan func(), 8)}
 		m.newRunner = inproc.NewRunner([]extension.Extension{*remote}, "")
-		block := m.newAssistantMessageBlock()
+		block := m.newAssistantMessageBlock(messageMeta{})
 		block.SetContent([]tui.AssistantSegment{{Text: "first"}})
 		block.Render(80)
 		<-started
@@ -238,7 +240,7 @@ func TestMarkdownBodyOutlivingDisconnectOrShutdownPublishesNothing(t *testing.T)
 					*remote,
 					{MarkdownTransformer: func(text string, _ extension.MarkdownTransformContext) string { record("C " + text); return text }},
 				}, "")
-				block := m.newAssistantMessageBlock()
+				block := m.newAssistantMessageBlock(messageMeta{})
 				block.SetContent([]tui.AssistantSegment{{Text: "first"}})
 				block.Render(80)
 				<-started

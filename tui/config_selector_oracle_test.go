@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -151,18 +152,46 @@ func TestConfigSelectorMatchesPi(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The oracle renders in about 3 s and prints its stages on stderr; a run that has not finished in 5 minutes is stuck, and the
-	// failure shows the last stage it reached (a Windows run once waited 29 minutes for it with no output).
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	// The oracle runs with --single-threaded because Node can deadlock in its own shutdown. process.exit, called as soon as the 16.7 MB
+	// result is written, joins the V8 worker threads in DisposePlatform; a worker that is compiling baseline code can be parked in
+	// CollectionBarrier::AwaitCollectionBackground, waiting for a collection only the main thread can run, and the join never returns
+	// (nodejs/node#64274, nodejs/node#54918). Windows runs of this test hung that way after "oracle: written", exit event already fired.
+	// With no V8 background threads no job can park there.
+	//
+	// The oracle also prints a stage line on stderr at least every 32 probes. A run is stuck when no stage line arrives for 2 minutes,
+	// and the failure shows the last stage it reached.
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "node", "testdata/config_selector.mjs", pigversion.UpstreamPackageVersion)
+	cmd := exec.CommandContext(ctx, "node", "--single-threaded", "testdata/config_selector.mjs", pigversion.UpstreamPackageVersion)
 	cmd.WaitDelay = 10 * time.Second // after a kill, a descendant holding the pipes does not keep Output waiting
 	cmd.Stdin = bytes.NewReader(input)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	stderr := &oracleStages{progress: make(chan struct{}, 1)}
+	cmd.Stderr = stderr
+	stalled := make(chan struct{})
+	go func() {
+		timer := time.NewTimer(2 * time.Minute)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stderr.progress:
+				timer.Reset(2 * time.Minute)
+			case <-timer.C:
+				close(stalled)
+				cancel()
+				return
+			}
+		}
+	}()
 	output, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("Pi oracle: %v\n%s", err, &stderr)
+		select {
+		case <-stalled:
+			t.Fatalf("Pi oracle: no stage line for 2 minutes: %v\n%s", err, stderr)
+		default:
+			t.Fatalf("Pi oracle: %v\n%s", err, stderr)
+		}
 	}
 	var expected []configOracleResult
 	if err := json.Unmarshal(output, &expected); err != nil {
@@ -264,4 +293,27 @@ func joinFrame(frames [][]string, at int) string {
 		return "(none)"
 	}
 	return strings.Join(frames[at], "\n")
+}
+
+// oracleStages keeps the oracle's stderr for the failure message and signals each write as progress.
+type oracleStages struct {
+	mu       sync.Mutex
+	buf      bytes.Buffer
+	progress chan struct{}
+}
+
+func (s *oracleStages) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case s.progress <- struct{}{}:
+	default:
+	}
+	return s.buf.Write(p)
+}
+
+func (s *oracleStages) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
 }

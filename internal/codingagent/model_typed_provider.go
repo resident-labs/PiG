@@ -56,8 +56,10 @@ func builtinTypedBase(id string, fallback ai.ModelsStreamFunction) *ai.ModelsPro
 	}
 	auth, _ := ai.BuiltinProviderAuth(id)
 	chatModels := func() []*ai.Model {
-		models := make([]*ai.Model, 0, len(chat))
-		for _, generated := range chat {
+		// The models are read when the provider is listed, so OpenRouter's routing variants (D199) are derived then and not at startup.
+		listed := builtinChatCatalogListed(id)
+		models := make([]*ai.Model, 0, len(listed))
+		for _, generated := range listed {
 			model := generated.ToModel()
 			model.Capabilities = generated.ToCapabilities()
 			models = append(models, model)
@@ -119,11 +121,16 @@ func (r *ModelRegistry) GetTypedProvider(id string, fallback ai.ModelsStreamFunc
 		base = &ai.ModelsProvider{ID: id, Name: id, GetModels: func() ([]*ai.Model, error) { return nil, nil }, Stream: fallback, StreamSimple: fallback}
 	}
 	var input *ProviderConfigInput
+	compose := r.composeNativeProvider
 	if registered {
-		input = new(providerModelInput(id, dynamic))
+		if r.NativeProvider(id) != nil {
+			input, compose = new(carrierModelInput(id, dynamic)), r.composeCarrierProvider
+		} else {
+			input = new(providerModelInput(id, dynamic))
+		}
 	}
 	base = r.withNativeAuth(id, base)
-	provider, err := r.composeNativeProvider(base, input)
+	provider, err := compose(base, input)
 	if err != nil {
 		return nil
 	}

@@ -16,6 +16,7 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/handleryield"
 	"github.com/MichaelKinsy/PiG/internal/jsloop"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/jsstring/localecompare"
 
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
@@ -132,6 +133,8 @@ type Options struct {
 	//
 	// dyna patch P7 (PATCHES.md).
 	DeferredToolsSection bool
+	// RefuseConfigFiles, when set, is the refusal message of a host that does not accept `mcp.json`.
+	RefuseConfigFiles string
 	// AgentDir and ConfigDirName locate the configuration and the credentials.
 	AgentDir      string
 	ConfigDirName string
@@ -298,7 +301,7 @@ func RenderServersSection(servers []McpServerListing) (string, bool) {
 	if len(listed) == 0 {
 		return "", false
 	}
-	slices.SortStableFunc(listed, func(a, b McpServerListing) int { return jsstring.LocaleCompare(a.Entry.Name, b.Entry.Name) })
+	slices.SortStableFunc(listed, func(a, b McpServerListing) int { return localecompare.Compare(a.Entry.Name, b.Entry.Name) })
 	heads := make([]string, len(listed))
 	reaches := map[string]bool{}
 	for i, server := range listed {
@@ -1515,12 +1518,22 @@ func (e *Extension) loadConfig(ctx EventContext) LoadedMcpConfig {
 	return LoadMcpConfig(LoadOptions{AgentDir: e.options.AgentDir, Cwd: ctx.Cwd, ProjectTrusted: trusted, ConfigDirName: e.options.ConfigDirName})
 }
 
+// acceptedConfig is the configuration the session uses: [Extension.loadConfig]'s, except that a host that refuses `mcp.json` (D202, a closed
+// Piglet Binary) starts none of its servers and reports why when there were any.
+func (e *Extension) acceptedConfig(ctx EventContext) LoadedMcpConfig {
+	loaded := e.loadConfig(ctx)
+	if e.options.RefuseConfigFiles != "" && len(loaded.Servers) > 0 {
+		return LoadedMcpConfig{Errors: []string{e.options.RefuseConfigFiles}}
+	}
+	return loaded
+}
+
 // SessionStart is the `session_start` handler. It loads the configuration and
 // connects the enabled servers on a goroutine the extension owns and drains in
 // [Extension.SessionShutdown]; the first prompt waits for them in
 // [Extension.BeforeAgentStart].
 func (e *Extension) SessionStart(ctx EventContext) {
-	loaded := e.loadConfig(ctx)
+	loaded := e.acceptedConfig(ctx)
 	e.mu.Lock()
 	e.configErrors = loaded.Errors
 	e.projectConfig = loaded.ProjectConfig

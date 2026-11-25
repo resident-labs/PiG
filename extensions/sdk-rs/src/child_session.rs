@@ -18,7 +18,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::extension::ToolDefinition;
 use crate::protocol::Connection;
@@ -81,22 +81,45 @@ pub struct CreateAgentSessionOptions {
     pub model_runtime: Option<String>,
     /// Pi's `scopedModels`: a JSON list of `{"model": <model object>, "thinkingLevel"?: ...}` the session cycles through.
     pub scoped_models: Option<Value>,
+    /// Pi's `sessionStartEvent`: the session_start event the session's extensions receive when they bind. `None` is Pi's default, reason `"startup"`.
+    pub session_start_event: Option<SessionStartEvent>,
+}
+
+/// Pi's SessionStartEvent (types.ts) as the `sessionStartEvent` option takes it: why a session starts and, when it replaces another, that session's file. Its `type` is always `"session_start"`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionStartEvent {
+    /// `"startup"`, `"reload"`, `"new"`, `"resume"` or `"fork"`.
+    pub reason: String,
+    /// The file of the session this one replaces; `None` is Pi's undefined.
+    pub previous_session_file: Option<String>,
 }
 
 fn resources_wire(resources: &ResourceOptions) -> Value {
     let mut wire = serde_json::Map::new();
     for (flag, key) in [
-        (resources.no_extensions, "noExtensions"), (resources.no_skills, "noSkills"), (resources.no_prompt_templates, "noPromptTemplates"),
-        (resources.no_themes, "noThemes"), (resources.no_context_files, "noContextFiles"),
+        (resources.no_extensions, "noExtensions"),
+        (resources.no_skills, "noSkills"),
+        (resources.no_prompt_templates, "noPromptTemplates"),
+        (resources.no_themes, "noThemes"),
+        (resources.no_context_files, "noContextFiles"),
     ] {
         if flag {
             wire.insert(key.into(), Value::Bool(true));
         }
     }
     for (value, key) in [
-        (&resources.additional_extension_paths, "additionalExtensionPaths"), (&resources.additional_skill_paths, "additionalSkillPaths"),
-        (&resources.additional_prompt_template_paths, "additionalPromptTemplatePaths"), (&resources.extension_names, "extensionNames"),
-        (&resources.skill_names, "skillNames"), (&resources.append_system_prompt, "appendSystemPrompt"),
+        (
+            &resources.additional_extension_paths,
+            "additionalExtensionPaths",
+        ),
+        (&resources.additional_skill_paths, "additionalSkillPaths"),
+        (
+            &resources.additional_prompt_template_paths,
+            "additionalPromptTemplatePaths",
+        ),
+        (&resources.extension_names, "extensionNames"),
+        (&resources.skill_names, "skillNames"),
+        (&resources.append_system_prompt, "appendSystemPrompt"),
     ] {
         if let Some(list) = value {
             wire.insert(key.into(), json!(list));
@@ -155,7 +178,9 @@ impl ChildSessions {
 
     /// Queues one `childSession.event` notification on its session. The reader calls it, so it only queues.
     pub(crate) fn deliver(&self, args: &Value) {
-        let Some(id) = args["id"].as_str() else { return };
+        let Some(id) = args["id"].as_str() else {
+            return;
+        };
         if let Some(session) = self.lookup(id) {
             let seq = args["seq"].as_u64().unwrap_or(0);
             let event = match args.get("stream") {
@@ -207,8 +232,12 @@ impl SessionShared {
             _ => {
                 let base = stream["base"].as_u64().unwrap_or(0);
                 match replica.take() {
-                    Some((seq, mut root)) if seq == base => crate::event_stream::apply_ops(&mut root, &stream["ops"]).map(|()| root),
-                    _ => Err(format!("message_update delta applies to payload {base}, the replica holds a different one")),
+                    Some((seq, mut root)) if seq == base => {
+                        crate::event_stream::apply_ops(&mut root, &stream["ops"]).map(|()| root)
+                    }
+                    _ => Err(format!(
+                        "message_update delta applies to payload {base}, the replica holds a different one"
+                    )),
                 }
             }
         };
@@ -244,7 +273,15 @@ impl SessionShared {
             let (seq, event, listeners) = {
                 let mut delivery = self.queue.lock().unwrap();
                 match delivery.pending.pop_front() {
-                    Some((seq, event)) if !delivery.stopped => (seq, event, delivery.listeners.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>()),
+                    Some((seq, event)) if !delivery.stopped => (
+                        seq,
+                        event,
+                        delivery
+                            .listeners
+                            .iter()
+                            .map(|(_, l)| l.clone())
+                            .collect::<Vec<_>>(),
+                    ),
                     _ => {
                         delivery.running = false;
                         return;
@@ -272,6 +309,7 @@ impl SessionShared {
 /// A child agent session: Pi's `AgentSession` as an extension holds it. Create it with
 /// [`Context::create_agent_session`](crate::Context::create_agent_session).
 pub struct AgentSession {
+    context: crate::context::Context,
     conn: Arc<Connection>,
     shared: Arc<SessionShared>,
     /// `session.sessionId`.
@@ -305,16 +343,26 @@ pub struct PromptOptions {
 fn call(conn: &Connection, method: &str, args: Value) -> io::Result<Option<Value>> {
     let result = conn.call(method, Some(args))?;
     if let Some(err) = result.error {
-        return Err(io::Error::new(io::ErrorKind::Other, crate::context::host_error_message(err)));
+        return Err(io::Error::other(crate::context::host_error_message(err)));
     }
     Ok(result.result)
 }
 
-pub(crate) fn create(conn: &Arc<Connection>, call_host: impl Fn(&str, Option<Value>) -> io::Result<Option<Value>>, options: CreateAgentSessionOptions) -> io::Result<AgentSession> {
+pub(crate) fn create(
+    context: &crate::context::Context,
+    options: CreateAgentSessionOptions,
+) -> io::Result<AgentSession> {
+    let conn = &context.conn;
+    let call_host = |method: &str, args: Option<Value>| context.call_host(method, args);
     let id = format!("c{}", conn.children.next.fetch_add(1, Ordering::SeqCst) + 1);
     let mut args = serde_json::Map::new();
     args.insert("id".into(), json!(id));
-    for (value, key) in [(&options.cwd, "cwd"), (&options.agent_dir, "agentDir"), (&options.thinking_level, "thinkingLevel"), (&options.no_tools, "noTools")] {
+    for (value, key) in [
+        (&options.cwd, "cwd"),
+        (&options.agent_dir, "agentDir"),
+        (&options.thinking_level, "thinkingLevel"),
+        (&options.no_tools, "noTools"),
+    ] {
         if let Some(value) = value {
             args.insert(key.into(), json!(value));
         }
@@ -322,7 +370,10 @@ pub(crate) fn create(conn: &Arc<Connection>, call_host: impl Fn(&str, Option<Val
     if let Some(model) = &options.model {
         args.insert("model".into(), model.clone());
     }
-    for (value, key) in [(&options.tools, "tools"), (&options.exclude_tools, "excludeTools")] {
+    for (value, key) in [
+        (&options.tools, "tools"),
+        (&options.exclude_tools, "excludeTools"),
+    ] {
         if let Some(list) = value {
             args.insert(key.into(), json!(list));
         }
@@ -333,13 +384,26 @@ pub(crate) fn create(conn: &Arc<Connection>, call_host: impl Fn(&str, Option<Val
     if options.in_memory {
         args.insert("inMemory".into(), Value::Bool(true));
     }
-    for (value, key) in [(&options.session_manager, "sessionManager"), (&options.settings_manager, "settingsManager"), (&options.resource_loader, "resourceLoader"), (&options.model_runtime, "modelRuntime")] {
+    for (value, key) in [
+        (&options.session_manager, "sessionManager"),
+        (&options.settings_manager, "settingsManager"),
+        (&options.resource_loader, "resourceLoader"),
+        (&options.model_runtime, "modelRuntime"),
+    ] {
         if let Some(handle) = value {
             args.insert(key.into(), json!(handle));
         }
     }
     if let Some(scoped) = &options.scoped_models {
         args.insert("scopedModels".into(), scoped.clone());
+    }
+    if let Some(event) = &options.session_start_event {
+        let mut wire = serde_json::Map::new();
+        wire.insert("reason".into(), json!(event.reason));
+        if let Some(file) = &event.previous_session_file {
+            wire.insert("previousSessionFile".into(), json!(file));
+        }
+        args.insert("sessionStartEvent".into(), Value::Object(wire));
     }
     if let Some(resources) = &options.resources {
         let wire = resources_wire(resources);
@@ -356,10 +420,20 @@ pub(crate) fn create(conn: &Arc<Connection>, call_host: impl Fn(&str, Option<Val
     if !declarations.is_empty() {
         args.insert("customTools".into(), Value::Array(declarations));
     }
-    let shared = Arc::new(SessionShared { id: id.clone(), tools, queue: Mutex::new(Delivery::default()), replica: Mutex::new(None), changed: Condvar::new(), disposed: AtomicBool::new(false) });
+    let shared = Arc::new(SessionShared {
+        id: id.clone(),
+        tools,
+        queue: Mutex::new(Delivery::default()),
+        replica: Mutex::new(None),
+        changed: Condvar::new(),
+        disposed: AtomicBool::new(false),
+    });
     // The tools are served from the moment the host knows the session, which can be before the call returns.
     if !conn.children.add(&shared) {
-        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Extension connection is closed"));
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "Extension connection is closed",
+        ));
     }
     let info = match call_host("childSession.create", Some(Value::Object(args))) {
         Ok(info) => info.unwrap_or(Value::Null),
@@ -370,16 +444,39 @@ pub(crate) fn create(conn: &Arc<Connection>, call_host: impl Fn(&str, Option<Val
     };
     let text = |key: &str| info[key].as_str().unwrap_or("").to_string();
     Ok(AgentSession {
+        context: context.clone(),
         conn: conn.clone(),
         shared,
         session_id: text("sessionId"),
-        session_file: info["sessionFile"].as_str().filter(|file| !file.is_empty()).map(str::to_string),
+        session_file: info["sessionFile"]
+            .as_str()
+            .filter(|file| !file.is_empty())
+            .map(str::to_string),
         model: info["model"].clone(),
         thinking_level: text("thinkingLevel"),
-        active_tools: info["activeTools"].as_array().map(|tools| tools.iter().filter_map(|t| t.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+        active_tools: info["activeTools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|t| t.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
         system_prompt: text("systemPrompt"),
-        model_fallback_message: info["modelFallbackMessage"].as_str().filter(|m| !m.is_empty()).map(str::to_string),
-        extension_errors: info["extensionErrors"].as_array().map(|errors| errors.iter().filter_map(|e| e.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+        model_fallback_message: info["modelFallbackMessage"]
+            .as_str()
+            .filter(|m| !m.is_empty())
+            .map(str::to_string),
+        extension_errors: info["extensionErrors"]
+            .as_array()
+            .map(|errors| {
+                errors
+                    .iter()
+                    .filter_map(|e| e.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -410,19 +507,30 @@ impl AgentSession {
         if let Some(source) = options.source {
             args["source"] = json!(source);
         }
-        let result = self.call("childSession.prompt", args)?.unwrap_or(Value::Null);
-        self.shared.wait_delivered(result["events"].as_u64().unwrap_or(0));
+        let result = self
+            .call("childSession.prompt", args)?
+            .unwrap_or(Value::Null);
+        self.shared
+            .wait_delivered(result["events"].as_u64().unwrap_or(0));
         Ok(())
     }
 
     /// `AgentSession.steer`: queue `text` for the running session after the current turn's tool calls, before its next model call.
     pub fn steer(&self, text: &str) -> io::Result<()> {
-        self.call("childSession.queue", json!({"behavior": "steer", "text": text})).map(|_| ())
+        self.call(
+            "childSession.queue",
+            json!({"behavior": "steer", "text": text}),
+        )
+        .map(|_| ())
     }
 
     /// `AgentSession.followUp`: queue `text` for after the run's current work finishes.
     pub fn follow_up(&self, text: &str) -> io::Result<()> {
-        self.call("childSession.queue", json!({"behavior": "followUp", "text": text})).map(|_| ())
+        self.call(
+            "childSession.queue",
+            json!({"behavior": "followUp", "text": text}),
+        )
+        .map(|_| ())
     }
 
     /// `AgentSession.abort`: abort the run and return once the session is idle. An aborted run settles normally, so its `prompt` returns `Ok`.
@@ -432,28 +540,72 @@ impl AgentSession {
 
     /// `AgentSession.bindExtensions({})`: the extensions the session's resources loaded start, headless, and receive `session_start`.
     pub fn bind_extensions(&self) -> io::Result<()> {
-        self.call("childSession.bindExtensions", json!({})).map(|_| ())
+        self.call("childSession.bindExtensions", json!({}))
+            .map(|_| ())
+    }
+
+    /// `session.refreshContext()`: the session's finalized transcript is read again from its log, after the caller appended entries to the log [`AgentSession::session_manager`] returns.
+    pub fn refresh_context(&self) -> io::Result<()> {
+        self.call("childSession.refreshContext", json!({}))
+            .map(|_| ())
+    }
+
+    /// `session.sessionManager`: the log the session appends to, the very one a `SessionManager` passed in `CreateAgentSessionOptions` names.
+    pub fn session_manager(&self) -> io::Result<crate::SessionManager> {
+        let reply = self
+            .call("childSession.sessionManager", json!({}))?
+            .unwrap_or(Value::Null);
+        let handle = reply["handle"]
+            .as_str()
+            .filter(|handle| !handle.is_empty())
+            .ok_or_else(|| io::Error::other("host returned no session graph handle"))?;
+        Ok(crate::SessionManager::adopt(
+            &self.context,
+            handle.to_string(),
+        ))
+    }
+
+    /// `session.extensionRunner.hasHandlers(event.type)` and then `emit(event)`: the result (`Null` for nothing) and whether an extension had a handler for the type. It serves `AgentSessionRuntime`, which Pi gives these two calls on the runner of the session it replaces.
+    pub(crate) fn emit_extension_event(&self, event: Value) -> io::Result<(Value, bool)> {
+        let reply = self
+            .call("childSession.emit", json!({"event": event}))?
+            .unwrap_or(Value::Null);
+        Ok((
+            reply["result"].clone(),
+            reply["emitted"].as_bool().unwrap_or(false),
+        ))
     }
 
     /// The session's current state: `sessionId`, `sessionFile`, `model`, `isStreaming`, `isIdle`, `thinkingLevel`, `activeTools`, `systemPrompt`,
     /// `pendingMessageCount` and `lastAssistantText` (absent when there is none).
     pub fn state(&self) -> io::Result<Value> {
-        Ok(self.call("childSession.state", json!({}))?.unwrap_or(Value::Null))
+        Ok(self
+            .call("childSession.state", json!({}))?
+            .unwrap_or(Value::Null))
     }
 
     /// `session.messages`: the transcript the session holds, in Pi's message shape.
     pub fn messages(&self) -> io::Result<Vec<Value>> {
-        Ok(self.call("childSession.messages", json!({}))?.and_then(|messages| messages.as_array().cloned()).unwrap_or_default())
+        Ok(self
+            .call("childSession.messages", json!({}))?
+            .and_then(|messages| messages.as_array().cloned())
+            .unwrap_or_default())
     }
 
     /// `AgentSession.subscribe`: `listener` receives the session's events (Pi's `AgentSessionEvent` as JSON) in order until the returned
     /// [`SessionSubscription`] unsubscribes it, the session is disposed or the connection ends.
-    pub fn subscribe(&self, listener: impl Fn(&Value) + Send + Sync + 'static) -> SessionSubscription {
+    pub fn subscribe(
+        &self,
+        listener: impl Fn(&Value) + Send + Sync + 'static,
+    ) -> SessionSubscription {
         let mut delivery = self.shared.queue.lock().unwrap();
         delivery.next_listener += 1;
         let key = delivery.next_listener;
         delivery.listeners.push((key, Arc::new(listener)));
-        SessionSubscription { shared: self.shared.clone(), key }
+        SessionSubscription {
+            shared: self.shared.clone(),
+            key,
+        }
     }
 
     /// `AgentSession.dispose`: abort the run, release the session in the host and remove its listeners. Idempotent.
@@ -463,7 +615,10 @@ impl AgentSession {
         }
         self.shared.stop();
         if let Err(error) = self.call("childSession.dispose", json!({})) {
-            eprintln!("pig: dispose of child session {} failed: {error}", self.shared.id);
+            eprintln!(
+                "pig: dispose of child session {} failed: {error}",
+                self.shared.id
+            );
         }
     }
 }
@@ -477,6 +632,11 @@ pub struct SessionSubscription {
 impl SessionSubscription {
     /// Removes the listener; it takes effect before the next event.
     pub fn unsubscribe(&self) {
-        self.shared.queue.lock().unwrap().listeners.retain(|(key, _)| *key != self.key);
+        self.shared
+            .queue
+            .lock()
+            .unwrap()
+            .listeners
+            .retain(|(key, _)| *key != self.key);
     }
 }

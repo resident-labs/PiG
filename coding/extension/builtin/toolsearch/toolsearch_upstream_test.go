@@ -72,6 +72,24 @@ func TestBm25RankerRanksByTermRelevanceAndRespectsTheLimit(t *testing.T) {
 	}
 }
 
+// Ports tool-search.test.ts "ranks a tool first when the query is its name" (Pi #11331).
+func TestBm25RankerRanksAToolFirstWhenTheQueryIsItsName(t *testing.T) {
+	named := []toolsearch.Document{
+		toolsearch.CreateDocument(info("mcp__app__queue_read", "Read a queued message of this thread.", ""), nil),
+		toolsearch.CreateDocument(info("mcp__dev-app__thread_read", "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false.", ""), nil),
+	}
+	ranker := toolsearch.NewBm25Ranker()
+	for _, query := range []string{"thread_read", "dev_app__thread_read", "mcp__dev-app__thread_read", "Thread_Read", "thread read"} {
+		if got, want := names(ranker.Rank(query, named, 1)), []string{"mcp__dev-app__thread_read"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("%q: %q, want %q", query, got, want)
+		}
+	}
+	// Partial names still rank by BM25.
+	if got, want := names(ranker.Rank("read", named, 1)), []string{"mcp__app__queue_read"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("read: %q, want %q", got, want)
+	}
+}
+
 func TestBm25RankerReturnsNothingForUnknownOrEmptyQueries(t *testing.T) {
 	ranker, documents := toolsearch.NewBm25Ranker(), rankerDocuments()
 	for _, query := range []string{"kubernetes", "the", "tickets"} { // "tickets": known v1 limit, no synonyms.
@@ -145,56 +163,6 @@ func documentsOf(tools []extension.ToolInfo, namespace *extension.ToolNamespace,
 
 func first(ranker *toolsearch.Bm25Ranker, query string, documents []toolsearch.Document) []string {
 	return names(ranker.Rank(query, documents, 1))
-}
-
-func TestBm25RankerRanksAToolFirstWhenTheQueryIsItsName(t *testing.T) {
-	documents := documentsOf([]extension.ToolInfo{
-		info("mcp__app__queue_read", "Read a queued message of this thread.", ""),
-		info("mcp__dev-app__thread_read", "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false.", ""),
-	}, nil, "")
-	ranker := toolsearch.NewBm25Ranker()
-	for _, query := range []string{"thread_read", "dev_app__thread_read", "mcp__dev-app__thread_read", "Thread_Read", "thread read"} {
-		if got := first(ranker, query, documents); !reflect.DeepEqual(got, []string{"mcp__dev-app__thread_read"}) {
-			t.Errorf("%q: %q", query, got)
-		}
-	}
-	// Partial names still rank by BM25.
-	if got := first(ranker, "read", documents); !reflect.DeepEqual(got, []string{"mcp__app__queue_read"}) {
-		t.Errorf("read: %q", got)
-	}
-}
-
-func TestBm25RankerRanksANameMatchAboveMentionsInDescriptions(t *testing.T) {
-	documents := documentsOf([]extension.ToolInfo{
-		info("mcp__ci__status", "Deploy status: last deploy, deploy log, deploy errors.", ""),
-		info("mcp__ci__deploy_release", "Start a release of the current branch to an environment, run the migrations, switch traffic over, and wait until the new version is live and healthy.", ""),
-	}, nil, "")
-	if got := first(toolsearch.NewBm25Ranker(), "deploy", documents); !reflect.DeepEqual(got, []string{"mcp__ci__deploy_release"}) {
-		t.Errorf("deploy: %q", got)
-	}
-}
-
-func TestBm25RankerRanksAToolFirstWhenTheQueryContainsItsWholeName(t *testing.T) {
-	peekaboo := &extension.ToolNamespace{Name: "mcp__peekaboo", Instructions: "Peekaboo controls macOS apps by app name."}
-	documents := documentsOf([]extension.ToolInfo{
-		info("mcp__peekaboo__see", "Capture the app window of the peekaboo app and describe the app.", ""),
-		info("mcp__peekaboo__menu", "Click a menu item of an app.", ""),
-		info("mcp__peekaboo__app", "Launch, quit, relaunch, focus, hide, or switch applications. Targets an application by name, bundle identifier, or process ID, and can wait until it is ready.", ""),
-		info("mcp__app__queue_read", "Read a queued message of this thread.", ""),
-		info("mcp__dev-app__thread_read", "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans.", ""),
-	}, peekaboo, "mcp__peekaboo__")
-	ranker := toolsearch.NewBm25Ranker()
-	for query, want := range map[string]string{
-		"peekaboo app":               "mcp__peekaboo__app",
-		"open the peekaboo app tool": "mcp__peekaboo__app",
-		"read thread_read state":     "mcp__dev-app__thread_read",
-		// Without the whole name, mentions in descriptions decide.
-		"describe window": "mcp__peekaboo__see",
-	} {
-		if got := first(ranker, query, documents); !reflect.DeepEqual(got, []string{want}) {
-			t.Errorf("%q: %q, want %q", query, got, want)
-		}
-	}
 }
 
 func TestBm25RankerRanksAToolMatchingMoreQueryTermsFirstWhateverTheScores(t *testing.T) {

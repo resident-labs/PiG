@@ -8,6 +8,7 @@ type InstallOption func(*installOptions)
 type installOptions struct {
 	ignoreScripts bool
 	ctx           context.Context
+	progress      ProgressCallback
 }
 
 // WithIgnoreScripts runs the package manager with `--ignore-scripts`, so no lifecycle script of the installed Package or of its dependencies runs during the install. Npm, pnpm and bun accept the same flag.
@@ -22,6 +23,11 @@ func WithIgnoreScripts() InstallOption {
 // dyna patch P9
 func WithContext(ctx context.Context) InstallOption {
 	return func(options *installOptions) { options.ctx = ctx }
+}
+
+// WithProgressReporter receives the progress events a managed Git install raises while it runs, such as the warning for a failed `git clean`. Pi's package manager emits them through the callback set with setProgressCallback.
+func WithProgressReporter(progress ProgressCallback) InstallOption {
+	return func(options *installOptions) { options.progress = progress }
 }
 
 func resolveInstallOptions(opts []InstallOption) installOptions {

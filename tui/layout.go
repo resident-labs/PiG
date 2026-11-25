@@ -1,5 +1,7 @@
 package tui
 
+// Ports packages/tui/src/tui-main-screen.ts (OSC133_ZONE_PREFIX, shared by the regular-mode renderer)
+
 import (
 	"math"
 	"slices"
@@ -297,6 +299,7 @@ func layoutHStack(context *layoutContext, component Component, node StackLayoutN
 		childY := y
 		switch node.Align {
 		case "center":
+			//portlint:allow numbers layout.ts:224 Math.floor((allocatedHeight - childHeight) / 2): childHeight is min(allocatedHeight, natural) or allocatedHeight, so the difference is never negative and truncation is floor
 			childY += (allocatedHeight - childHeight) / 2
 		case "end":
 			childY += allocatedHeight - childHeight
@@ -382,6 +385,7 @@ func getScrollbarGeometry(box *LayoutBox, includeHiddenAuto bool) *ScrollbarGeom
 	minThumbHeight := min(2, trackHeight)
 	thumbCandidate := trackHeight
 	if contentHeight > 0 {
+		//portlint:allow numbers layout.ts:291 Math.round((trackHeight * trackHeight) / contentHeight): contentHeight > 0 is checked and the quotient is non-negative, where math.Round and Math.round agree
 		thumbCandidate = int(math.Round(float64(trackHeight*trackHeight) / float64(contentHeight)))
 	}
 	thumbHeight := max(minThumbHeight, min(trackHeight, thumbCandidate))
@@ -389,6 +393,7 @@ func getScrollbarGeometry(box *LayoutBox, includeHiddenAuto bool) *ScrollbarGeom
 	maxThumbTop := trackHeight - thumbHeight
 	thumbOffset := 0
 	if maxScrollTop != 0 {
+		//portlint:allow numbers layout.ts:295 Math.round((scrollTop / maxScrollTop) * maxThumbTop): maxScrollTop != 0 and the factors are non-negative, where math.Round and Math.round agree
 		thumbOffset = int(math.Round(float64(box.ScrollView.ScrollTop()) / float64(maxScrollTop) * float64(maxThumbTop)))
 	}
 	column := box.Rect.X + box.Rect.Width - 1
@@ -466,25 +471,30 @@ func paintBox(box *LayoutBox, screen []string, totalWidth int) {
 	if box.ScrollView != nil && box.ScrollContentLines != nil && box.Rect.Height > 0 {
 		scrollTop := box.ScrollView.ScrollTop()
 		if scrollTop > 0 {
-			for imageRow := scrollTop - 1; imageRow >= 0; imageRow-- {
+			// Find the nearest image line above the viewport. Placeholder rows below an image line may contain padding, borders, or
+			// side-by-side text, so the search is bounded by the tallest registered image instead of by row content.
+			minRow := max(0, scrollTop-GetMaxKittyImageRows())
+			for imageRow := scrollTop - 1; imageRow >= minRow; imageRow-- {
 				imageLine := ""
 				if imageRow < len(box.ScrollContentLines) {
 					imageLine = box.ScrollContentLines[imageRow]
 				}
-				if metadata := GetKittyImageMetadata(imageLine); metadata != nil {
-					hiddenRows := scrollTop - imageRow
-					if hiddenRows < metadata.Rows {
-						visibleRows := min(box.Rect.Height, metadata.Rows-hiddenRows)
-						cropped := CropKittyImageLine(imageLine, hiddenRows, visibleRows)
-						if box.Rect.X == 0 && box.Rect.Width >= totalWidth {
-							screen[box.Rect.Y] = cropped
-						}
+				if !IsImageLine(imageLine) {
+					continue
+				}
+				metadata := GetKittyImageMetadata(imageLine)
+				if metadata == nil {
+					continue
+				}
+				hiddenRows := scrollTop - imageRow
+				if hiddenRows < metadata.Rows {
+					visibleRows := min(box.Rect.Height, metadata.Rows-hiddenRows)
+					cropped := CropKittyImageLine(imageLine, hiddenRows, visibleRows)
+					if box.Rect.X == 0 && box.Rect.Width >= totalWidth {
+						screen[box.Rect.Y] = cropped
 					}
-					break
 				}
-				if imageLine != "" {
-					break
-				}
+				break
 			}
 		}
 	}

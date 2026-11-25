@@ -11,11 +11,10 @@ import (
 	"github.com/MichaelKinsy/PiG/durable"
 )
 
-// Upstream's #kick queues a microtask in the publishing turn, so the reservation pass takes its place on the Session
-// line before any other code runs: a commit that code starts after the publication, such as a handler's or a host's,
-// lines up behind the pass. Pi Durable 1.0.4 on a task created and then, from a subscriber of that publication, a
-// second task created, commits "x pending", "x running", "m pending", "m running"; if the second creation overtook the
-// pass, one reservation commit would start both tasks.
+// Upstream publishes a commit inside Storage's adopt: the dispatch to subscribeCommits() listeners is queued first, then the
+// Session's own observers queue the scheduler's #kick microtask. A commit that a host listener starts therefore lines up
+// ahead of the reservation pass, which then finds both tasks and starts them in one reservation commit ("x pending",
+// "m pending", "x running, m running").
 func TestReservationPassTakesItsLinePositionInThePublishingTurn(t *testing.T) {
 	for run := range 50 {
 		complete := func(ctx context.Context, _ stepRecord, runtime stepRuntime) error {
@@ -31,7 +30,7 @@ func TestReservationPassTakesItsLinePositionInThePublishingTurn(t *testing.T) {
 		var commits []string
 		var started atomic.Bool
 		secondErr := make(chan error, 1)
-		opened.harness.SubscribeCommits(func(_ context.Context, publication durable.CommitPublication) {
+		opened.harness.ObserveCommits(commitsObserver{advance: func(_ context.Context, publication durable.CommitPublication) {
 			var writes []string
 			for _, change := range publication.Changes {
 				if write, ok := change.(durable.TaskWrite); ok && write.Value.State.Status != durable.TaskTerminal {
@@ -47,21 +46,19 @@ func TestReservationPassTakesItsLinePositionInThePublishingTurn(t *testing.T) {
 			if len(writes) != 1 || writes[0] != "test.line-first:pending" || !started.CompareAndSwap(false, true) {
 				return
 			}
-			// Still in the publishing turn: hold the scheduler's own goroutine back, start the second creation, and
-			// return once it is queued. Whatever the scheduler took on the line before this point stays ahead of it.
-			impl.tasks.mu.Lock()
-			defer impl.tasks.mu.Unlock()
-			jobs := impl.LineJobs()
+			// The scheduler takes its line position once the host listeners ran: hold its own goroutine back, start the second
+			// creation, and return once it is queued, ahead of the pass.
+			entered := make(chan struct{})
 			go func() {
 				_, err := durable.Commit(testContext, opened.root, func(tx durable.Tx) (durable.TaskId, error) {
+					close(entered)
 					return tx.CreateTaskErased(second.Erased(), nil, durable.TaskOptions{Ownership: conversationOwned})
 				})
 				secondErr <- err
 			}()
-			for impl.LineJobs() <= jobs {
-				flush()
-			}
-		})
+			// Its callback runs on the line: the creation holds its position ahead of the pass.
+			<-entered
+		}})
 		opened.harness.Resume()
 		// Resume's own pass has ended, so the creation below starts a pass of its own.
 		eventually(t, func() bool {
@@ -82,7 +79,10 @@ func TestReservationPassTakesItsLinePositionInThePublishingTurn(t *testing.T) {
 		mu.Lock()
 		got := strings.Join(commits, " | ")
 		mu.Unlock()
-		want := "test.line-first:pending | test.line-first:running | test.line-second:pending | test.line-second:running"
+		// Either the pass saw both creations and reserves them in one commit, or it missed the second one and the pass its
+		// publication starts reserves it: both keep the order.
+		got = strings.Replace(got, "test.line-first:running | test.line-second:running", "test.line-first:running,test.line-second:running", 1)
+		want := "test.line-first:pending | test.line-second:pending | test.line-first:running,test.line-second:running"
 		if got != want {
 			t.Fatalf("run %d: task commits %s\nwant %s", run, got, want)
 		}

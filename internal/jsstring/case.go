@@ -11,7 +11,8 @@ func ToLower(s string) string {
 	if isASCIIOnly(s) {
 		return strings.ToLower(s)
 	}
-	runes := []rune(s)
+	var stack [32]rune // like []rune(s), text of up to 32 code points is decoded without a heap allocation
+	runes := appendCodePoints(stack[:0], s)
 	var b strings.Builder
 	b.Grow(len(s))
 	for i, r := range runes {
@@ -25,10 +26,68 @@ func ToLower(s string) string {
 				b.WriteRune('σ')
 			}
 		default:
-			b.WriteRune(unicode.ToLower(r))
+			writeCodePoint(&b, unicode.ToLower(r))
 		}
 	}
 	return b.String()
+}
+
+// appendCodePoints appends the JavaScript code points of the UTF-16 units of s to dst. A lone surrogate is kept as its own surrogate value, which has no case
+// and is neither cased nor case-ignorable, so toLowerCase and toUpperCase leave it alone; each other ill-formed byte is U+FFFD.
+func appendCodePoints(dst []rune, s string) []rune {
+	for i := 0; i < len(s); {
+		r, size := DecodeRuneInString(s[i:])
+		dst = append(dst, r)
+		i += size
+	}
+	return dst
+}
+
+// writeCodePoint writes r as UTF-8, or as WTF-8 when r is a surrogate, which WriteRune would turn into U+FFFD. The builder is the result's only buffer.
+func writeCodePoint(b *strings.Builder, r rune) {
+	if r >= 0xd800 && r <= 0xdfff {
+		b.WriteByte(byte(0xe0 | (r >> 12)))
+		b.WriteByte(byte(0x80 | ((r >> 6) & 0x3f)))
+		b.WriteByte(byte(0x80 | (r & 0x3f)))
+		return
+	}
+	b.WriteRune(r)
+}
+
+// LowerContains is strings.Contains(ToLower(s), lowerNeedle) for a lowerNeedle that is already lowercase. An ASCII-only s, the common case of a model
+// id or name, lowercases only A to Z, so it is searched without building its lowercase copy.
+func LowerContains(s, lowerNeedle string) bool {
+	if !isASCIIOnly(s) {
+		return strings.Contains(ToLower(s), lowerNeedle)
+	}
+	for i := 0; i+len(lowerNeedle) <= len(s); i++ {
+		if asciiLowerPrefix(s[i:], lowerNeedle) {
+			return true
+		}
+	}
+	return false
+}
+
+// LowerEquals is ToLower(s) == lowerText for a lowerText that is already lowercase, without the lowercase copy of an ASCII-only s.
+func LowerEquals(s, lowerText string) bool {
+	if !isASCIIOnly(s) {
+		return ToLower(s) == lowerText
+	}
+	return len(s) == len(lowerText) && asciiLowerPrefix(s, lowerText)
+}
+
+// asciiLowerPrefix reports whether the ASCII-lowercased start of s is lowerPrefix; s holds at least len(lowerPrefix) bytes.
+func asciiLowerPrefix(s, lowerPrefix string) bool {
+	for i := 0; i < len(lowerPrefix); i++ {
+		c := s[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != lowerPrefix[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func isASCIIOnly(s string) bool {

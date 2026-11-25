@@ -265,7 +265,7 @@ type packedPendingExt struct {
 	address string
 }
 
-// factoryAdmission is one control line on a packed process's stdin. Op "admit" (the default) starts a generation of the named member's factory on Socket. Entry, Cwd and ReloadPass let a Node runtime apply Pi's factory-cache rules, ReloadPass tells the Python runner when to re-import an edited extension, and the Go and Rust runners read only Name and Socket. ReloadPass is zero outside a reload and otherwise identifies one Host.Reload: Pi clears the factory cache once per reload and then caches every factory that reload loads, and the Python runner decides on the first admission of a reload which extensions to re-import. Op "park" holds the process open with no generation while a replacement Session builds its host: the runner sets the hold, then connects to Socket, so the host retires its last generation only after the hold took effect. Op "noop" changes nothing: writing it proves the process still reads its stdin. Fields are tab-separated so every runner, including Rust's without a JSON dependency, parses a line the same way. Name, Socket, Entry and Cwd are percent-encoded (encodeAdmissionField) because each may hold a tab or line break: a name derives from a source path and a socket path from the user's runtime directory. Every runner decodes the same four escapes.
+// factoryAdmission is one control line on a packed process's stdin. Op "admit" (the default) starts a generation of the named member's factory on Socket. Entry, Cwd and ReloadPass let a Node runtime apply Pi's factory-cache rules, ReloadPass tells the Python runner when to re-import an edited extension, and the Go and Rust runners read only Name and Socket. ReloadPass is zero outside a reload and otherwise identifies one Host.Reload: Pi clears the factory cache once per reload and then caches every factory that reload loads, and the Python runner decides on the first admission of a reload which extensions to re-import. Op "park" holds the process open with no generation while a replacement Session builds its host: the runner sets the hold, then connects to Socket, so the host retires its last generation only after the hold took effect. Op "noop" changes nothing: writing it proves the process still reads its stdin. Fields are tab-separated so every runner, including Rust's without a JSON dependency, parses a line the same way. Name, Socket, Entry and Cwd are percent-encoded (encodeAdmissionField) because each may hold a tab or line break: a name derives from a source path and a socket path from the user's runtime directory. Every runner decodes the same four escapes. The host writes the admission of a member only after the members before it have registered (startGoPackedCellOnce), because a runner starts each admitted factory on its own goroutine and takes them in whatever order the scheduler picks, while a factory that calls the host before it returns waits for the host to serve its connection.
 type factoryAdmission struct {
 	Op         string
 	Name       string
@@ -390,11 +390,10 @@ func (h *Host) startGoPackedCellOnce(ctx context.Context, cell *runtimecell.GoPa
 		if desc.Name == "" {
 			return nil, nil, newLoadError(cell.Key, "resolve", "missing_name", fmt.Errorf("packed extension name is required"))
 		}
-		sockPath, err := h.sockPathFor(desc.Name)
+		sockPath, err := h.newSocketPath()
 		if err != nil {
 			return nil, nil, newLoadError(desc.Name, "spawn", "socket_dir_failed", fmt.Errorf("create socket dir: %w", err))
 		}
-		_ = os.Remove(sockPath)
 		ln, address, err := ListenExtension(sockPath, nodeRuntime)
 		if err != nil {
 			closePendingListeners(pendingExts)
@@ -515,15 +514,6 @@ func (h *Host) startGoPackedCellOnce(ctx context.Context, cell *runtimecell.GoPa
 	}
 
 	var acceptErr *packedAcceptError
-	if retained != nil && !nodeRuntime {
-		// The runner starts every member's factory together, as a fresh runner does at spawn. The reload pass tells the Python runner when to re-import an edited extension.
-		for i := range pendingExts {
-			if err := processState.share.send(factoryAdmission{Name: pendingExts[i].me.config.Name, Socket: pendingExts[i].address, ReloadPass: reloadPass(ctx)}); err != nil {
-				processState.stop()
-				return nil, nil, newLoadError(cell.Key, "spawn", "admit_failed", fmt.Errorf("admit %s to the running packed process: %w", pendingExts[i].me.config.Name, err))
-			}
-		}
-	}
 	staged := make([]stagedManagedExt, 0, len(pendingExts))
 	registered := make([]extension.Extension, 0, len(pendingExts))
 	for i := range pendingExts {
@@ -553,6 +543,16 @@ func (h *Host) startGoPackedCellOnce(ctx context.Context, cell *runtimecell.GoPa
 				processState.factoryOwner.Store(&me.config.Name)
 				if sendErr := processState.share.send(factoryAdmission{Name: me.config.Name, Entry: me.nodeEntry, Socket: pendingExts[i].address, ReloadPass: reloadPass(ctx), Cwd: h.cwd}); sendErr != nil {
 					err = &admissionWriteError{err: sendErr}
+				}
+			}
+		} else if retained != nil {
+			// Pi runs one factory at a time, and a factory may call the host before it returns (a subscription on the event bus). The host serves that call only on the connection it is accepting, so the runner is told of a member once the members before it have registered: its factories run in separate goroutines and the one that takes the runner's factory turn first would otherwise be a later member, while the host waits for an earlier one. The reload pass tells the Python runner when to re-import an edited extension.
+			if sendErr := processState.share.send(factoryAdmission{Name: me.config.Name, Socket: pendingExts[i].address, ReloadPass: reloadPass(ctx)}); sendErr != nil {
+				err = newLoadError(cell.Key, "spawn", "admit_failed", fmt.Errorf("admit %s to the running packed process: %w", me.config.Name, sendErr))
+				if i == 0 {
+					// No member's factory has run: the cell fails whole.
+					processState.stop()
+					return nil, nil, err
 				}
 			}
 		}
@@ -860,6 +860,8 @@ func (h *Host) acceptPackedExt(ctx context.Context, me *managedExt, ln net.Liste
 
 	h.markExtension(me.config.Name, "handshake-start")
 	conn := NewConn(me.config.Name, rawConn)
+	// Every member of a packed process has its own socket, and the process's exit ends them all (peer_exit.go).
+	conn.watchPeerExit(me.packedProcess.startWait())
 	if turns := me.processFileMutations(); turns != nil {
 		conn.shareFileMutations(turns)
 	}
@@ -931,10 +933,10 @@ func (h *Host) acceptPackedExt(ctx context.Context, me *managedExt, ln net.Liste
 		loadErr.StderrLog = me.stderrLogPath
 		return nil, loadErr
 	}
-	go h.handleIncoming(me, conn)
+	h.goHandleIncoming(me, conn)
 	for _, provider := range reg.Providers {
 		if provider.Native != nil {
-			if err := h.registerNativeProvider(ctx, me, conn, provider.Native); err != nil {
+			if err := h.registerNativeProvider(ctx, me, conn, provider.Native, true); err != nil {
 				return nil, err
 			}
 			continue
@@ -945,21 +947,7 @@ func (h *Host) acceptPackedExt(ctx context.Context, me *managedExt, ln net.Liste
 			loadErr.StderrLog = me.stderrLogPath
 			return nil, loadErr
 		}
-		// Model-provider registration and OAuth registration are independent
-		// concerns: an extension may contribute an OAuth login with no
-		// model-provider callback wired, so gate only the model-provider hook.
-		h.attachProviderOperations(me, provider, &cfg)
-		if err := h.providerRuntime.RegisterProvider(provider.Name, cfg, extConfigOrigin(me.config)); err != nil {
-			return nil, err
-		}
-		if h.uiBridge != nil {
-			h.uiBridge.RecordProviderRegistration(provider.Name, provider.Config)
-		}
-		h.mu.Lock()
-		notifySuperseded := h.transferProviderOwnershipLocked(me, conn, provider.Name)
-		h.mu.Unlock()
-		notifySuperseded()
-		if err := h.registerOAuthProvider(me, provider.Name, provider.Config); err != nil {
+		if err := h.queueLoadedProvider(me, conn, provider, cfg); err != nil {
 			loadErr := newLoadError(me.config.Name, "register", "provider_config_invalid", err)
 			loadErr.StderrLog = me.stderrLogPath
 			return nil, loadErr

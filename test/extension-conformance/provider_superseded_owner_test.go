@@ -21,7 +21,7 @@ func TestSupersededOwnerKeepsACapturedProviderCallableAcrossSDKs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, language := range []string{"node", "go", "python", "rust"} {
+	for _, language := range []string{"node", "go", "python", "rust", "lisp"} {
 		t.Run(language, func(t *testing.T) {
 			dir := t.TempDir()
 			services, err := coding.CreateAgentSessionServices(coding.CreateAgentSessionServicesOptions{CWD: dir, AgentDir: filepath.Join(dir, "agent")})
@@ -42,9 +42,12 @@ func TestSupersededOwnerKeepsACapturedProviderCallableAcrossSDKs(t *testing.T) {
 				owner = subprocess.ExtConfig{Name: "provider-object-python", Source: filepath.Join(root, "test/extension-conformance/testdata/provider-object-python"), Enabled: true, Isolation: "strict", RuntimeKind: "subprocess", RuntimeLanguage: language, EntrypointKind: "factory", Factory: "new_extension", SDKName: "pig-sdk-py", Package: "provider_object"}
 			case "rust":
 				owner = subprocess.ExtConfig{Name: "provider-object-rust", Source: filepath.Join(root, "test/extension-conformance/testdata/provider-object-rust"), Enabled: true, Isolation: "strict", RuntimeKind: "subprocess", RuntimeLanguage: language, EntrypointKind: "factory", Factory: "new_extension", SDKName: "pig-sdk", Package: "provider-object-rust"}
+			case "lisp":
+				owner = subprocess.ExtConfig{Name: "provider-object-lisp", Source: filepath.Join(root, "test/extension-conformance/testdata/provider-object-lisp"), Enabled: true, Isolation: "strict", RuntimeKind: "subprocess", RuntimeLanguage: language, EntrypointKind: "factory", Factory: "new-extension", SDKName: "pig-sdk-lisp", Package: "provider-object"}
 			}
 			reader := subprocess.ExtConfig{Name: "extension-provider-carrier-remote", Source: filepath.Join(root, "test/parity/scenarios/testdata/extension-provider-carrier-remote.mjs"), Enabled: true, Isolation: "strict"}
 			loaded, errs := host.LoadAll(t.Context(), []subprocess.ExtConfig{owner, reader})
+			applyQueuedRegistrations(host)
 			if len(errs) > 0 {
 				t.Fatal(errs)
 			}
@@ -61,6 +64,7 @@ func TestSupersededOwnerKeepsACapturedProviderCallableAcrossSDKs(t *testing.T) {
 			if _, err := host.Load(t.Context(), subprocess.ExtConfig{Name: "carrier-replacement", Source: replacement, Enabled: true, Isolation: "strict"}); err != nil {
 				t.Fatal(err)
 			}
+			applyQueuedRegistrations(host)
 			retained := filepath.Join(dir, "retained.json")
 			if err := loaded[1].Commands["carrier-retained"].Handler(t.Context(), retained); err != nil {
 				t.Fatalf("the captured Provider failed after its owner was superseded: %v", err)

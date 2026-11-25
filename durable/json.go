@@ -1,8 +1,6 @@
 package durable
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -10,6 +8,9 @@ import (
 	"github.com/MichaelKinsy/PiG/chord"
 	"github.com/MichaelKinsy/PiG/chord/delta"
 	"github.com/MichaelKinsy/PiG/durable/internal/ordered"
+	"github.com/MichaelKinsy/PiG/durable/internal/strictjson"
+	"github.com/MichaelKinsy/PiG/internal/chord/chordjson"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
 // ToJsonValue returns a detached strict JSON copy of value: nil, bool, float64, string, []any, or *delta.JsonObject. It
@@ -21,7 +22,7 @@ func ToJsonValue(value any) (JsonValue, error) {
 	if copyErr == nil {
 		return copied, nil
 	}
-	encoded, err := marshalStrict(value)
+	encoded, err := strictjson.Marshal(value)
 	if err != nil {
 		if errors.Is(err, delta.ErrNotStrictJSON) {
 			return nil, err
@@ -29,21 +30,8 @@ func ToJsonValue(value any) (JsonValue, error) {
 		return nil, copyErr
 	}
 	// Objects decode in encoding order, so a struct's fields keep their declared order.
-	return delta.DecodeJson(encoded)
+	return decodeJsonText(encoded)
 }
-
-func isNonFinite(text string) bool {
-	return text == "NaN" || text == "+Inf" || text == "-Inf"
-}
-
-// nonFiniteError is chord's non-finite strict JSON error for a typed value that JSON encoding rejected.
-type nonFiniteError struct{}
-
-func (nonFiniteError) Error() string {
-	return "Value contains a non-finite number and is not strict JSON"
-}
-
-func (nonFiniteError) Is(target error) bool { return target == delta.ErrNotStrictJSON }
 
 // ToJsonObject returns the JSON object representation of value; it fails when value does not encode as an object.
 func ToJsonObject(value any) (JsonObject, error) {
@@ -73,12 +61,12 @@ func FromJsonValue[T any](value JsonValue) (T, error) {
 			return typed, nil
 		}
 	}
-	encoded, err := marshalStrict(value)
+	encoded, err := strictjson.Marshal(value)
 	if err != nil {
 		return decoded, err
 	}
 	if holdsDynamicJSON[T]() {
-		dynamic, err := delta.DecodeJson(encoded)
+		dynamic, err := decodeJsonText(encoded)
 		if err != nil {
 			return decoded, err
 		}
@@ -88,13 +76,12 @@ func FromJsonValue[T any](value JsonValue) (T, error) {
 		}
 		return typed, nil
 	}
-	decoder := json.NewDecoder(bytes.NewReader(encoded))
-	if err := decoder.Decode(&decoded); err != nil {
+	if err := jsstring.UnmarshalKeepingSurrogates(encoded, &decoded); err != nil {
 		return decoded, err
 	}
 	if ordered.HasDynamic(reflect.TypeFor[T]()) {
 		// A JsonValue member holds the text's objects in order, as JSON.parse gives Pi.
-		tree, err := delta.DecodeJson(encoded)
+		tree, err := decodeJsonText(encoded)
 		if err != nil {
 			return decoded, err
 		}
@@ -120,34 +107,25 @@ func holdsDynamicJSON[T any]() bool {
 	return false
 }
 
-// marshalStrict is json.Marshal with a non-finite number reported as chord's strict JSON error.
-func marshalStrict(value any) ([]byte, error) {
-	encoded, err := json.Marshal(value)
-	if unsupported, ok := errors.AsType[*json.UnsupportedValueError](err); ok && isNonFinite(unsupported.Str) {
-		return nil, nonFiniteError{}
-	}
-	return encoded, err
-}
-
 // CopyJson returns a detached copy of a JSON value.
 func CopyJson(value JsonValue) (JsonValue, error) {
 	return ToJsonValue(value)
 }
 
 // unmarshalOrdered decodes data into target, then gives target's JsonValue members the text's key order, as JSON.parse gives Pi.
-func unmarshalOrdered(data []byte, target any) error {
-	if dynamic, ok := target.(*JsonValue); ok {
-		value, err := delta.DecodeJson(data)
+func unmarshalOrdered[T any](data []byte, target *T) error {
+	if dynamic, ok := any(target).(*JsonValue); ok {
+		value, err := decodeJsonText(data)
 		if err == nil {
 			*dynamic = value
 		}
 		return err
 	}
-	if err := json.Unmarshal(data, target); err != nil {
+	if err := jsstring.UnmarshalKeepingSurrogates(data, target); err != nil {
 		return err
 	}
-	if ordered.HasDynamic(reflect.TypeOf(target).Elem()) {
-		tree, err := delta.DecodeJson(data)
+	if ordered.HasDynamic(reflect.TypeFor[T]()) {
+		tree, err := decodeJsonText(data)
 		if err != nil {
 			return err
 		}
@@ -155,3 +133,12 @@ func unmarshalOrdered(data []byte, target any) error {
 	}
 	return nil
 }
+
+// decodeJsonText parses JSON text into a strict JSON value whose objects keep the text's key order, as JSON.parse gives Pi,
+// and whose strings keep the unit of a lone surrogate escape (`\ud83d`), which a Go string holds as WTF-8. Chord's own
+// decoder reads that escape as U+FFFD, as every other Chord caller expects.
+func decodeJsonText(data []byte) (JsonValue, error) {
+	return chordjson.DecodeUnquoting(data, unquoteJS)
+}
+
+func unquoteJS(raw []byte, text *string) error { return jsstring.UnmarshalKeepingSurrogates(raw, text) }

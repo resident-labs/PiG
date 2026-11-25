@@ -3,12 +3,10 @@
 package subprocess
 
 import (
-	"context"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
-	"time"
 )
 
 // TestReload_MixedCellFailureIsolatesFailingExtension verifies that when one
@@ -24,7 +22,7 @@ func TestReload_MixedCellFailureIsolatesFailingExtension(t *testing.T) {
 	h := NewHostWithConfigRoot(t.TempDir(), t.TempDir())
 	h.SetConfigLoader(func() ([]ExtConfig, error) { return good, nil })
 	t.Cleanup(func() { h.Shutdown("test done") })
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := buildContext(t)
 	defer cancel()
 	if _, err := h.Reload(ctx); err != nil {
 		t.Fatalf("first reload: %v", err)
@@ -80,9 +78,8 @@ func TestReload_MixedCellFailureIsolatesFailingExtension(t *testing.T) {
 }
 
 func TestReloadReturnsConfiguredOrderForMixedPackedAndIsolatedCells(t *testing.T) {
-	keepGoBuildCaches(t)
 	root := t.TempDir()
-	t.Setenv("HOME", filepath.Join(root, "home"))
+	isolateHome(t, filepath.Join(root, "home"))
 	t.Setenv("PIG_HOME", filepath.Join(root, "pig-home"))
 	rootA := writePackedFactoryModule(t, "example.com/mixorder/a", "mix-order-a", "tool_a")
 	rootB := writePackedFactoryModule(t, "example.com/mixorder/b", "mix-order-b", "tool_b")
@@ -95,7 +92,7 @@ func TestReloadReturnsConfiguredOrderForMixedPackedAndIsolatedCells(t *testing.T
 	host := NewHostWithConfigRoot(root, filepath.Join(root, "config"))
 	host.SetConfigLoader(func() ([]ExtConfig, error) { return append([]ExtConfig(nil), configs...), nil })
 	t.Cleanup(func() { host.Shutdown("test done") })
-	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
+	ctx, cancel := buildContext(t)
 	defer cancel()
 
 	loaded, err := host.Reload(ctx)

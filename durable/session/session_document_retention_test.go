@@ -35,21 +35,6 @@ var (
 	retentionSessionCounterDoc = defineDoc("test.retention.session-counter", 1, sessionScope, func() obj { return delta.JsonObjectOf("count", 0) })
 )
 
-// retentionClock is a controllable wall clock.
-type retentionClock struct {
-	now  atomic.Int64
-	fail atomic.Bool
-}
-
-func (clock *retentionClock) read() float64 {
-	if clock.fail.Load() {
-		panic(errors.New("clock"))
-	}
-	return float64(clock.now.Load())
-}
-
-func (clock *retentionClock) advance(ms int64) { clock.now.Add(ms) }
-
 // retentionSession is a Session with a controllable clock and retention.
 type retentionSession struct {
 	storage   *sessiontest.ControlledStorage
@@ -73,7 +58,7 @@ func (opened *retentionSession) sizes() session.DocumentCacheSizes {
 // settleLine lets the line run what is queued on it: an eviction job, then returns.
 func (opened *retentionSession) settleLine(t *testing.T) {
 	t.Helper()
-	_, err := opened.session.ReadOnLine(func() (any, error) { return nil, nil })
+	_, err := opened.session.ReadOnLine(func(durable.Storage) (any, error) { return nil, nil })
 	must(t, err)
 }
 
@@ -161,9 +146,13 @@ func TestSessionDocumentCacheRetention(t *testing.T) {
 		opened.bump(t, conversationId, 1)
 		watch := watchOf(t, opened, retentionCounterDoc, conversationId)
 		kept := watchOf(t, opened, retentionCounterDoc, conversationId)
-		kept.Start(func(context.Context, obj, []durable.Op) error { return nil })
+		kept.Start(func(_ context.Context, change durable.WatchCall[obj]) error { return nil })
 		seen := &watchRecorder{}
-		watch.Start(func(_ context.Context, value obj, ops []durable.Op) error { seen.record(value, ops); return nil })
+		watch.Start(func(_ context.Context, change durable.WatchCall[obj]) error {
+			value, ops := change.Value, change.Ops
+			seen.record(value, ops)
+			return nil
+		})
 		opened.clock.advance(1_000_000)
 		opened.bump(t, conversationId, 1)
 		opened.settleLine(t)
@@ -440,14 +429,14 @@ func TestSessionDocumentCacheRetention(t *testing.T) {
 				return mustDoc(t, tx, retentionCounterDoc, conversationId).Set("count", 1)
 			}))
 			clock.advance(1e12)
-			_, err := kernel.ReadOnLine(func() (any, error) { return nil, nil })
+			_, err := kernel.ReadOnLine(func(durable.Storage) (any, error) { return nil, nil })
 			must(t, err)
 			want := 1
 			if name == "dropped" {
 				want = 0
 			}
 			eventuallyTrue(t, func() bool {
-				_, err := kernel.ReadOnLine(func() (any, error) { return nil, nil })
+				_, err := kernel.ReadOnLine(func(durable.Storage) (any, error) { return nil, nil })
 				must(t, err)
 				return kernel.DocumentCacheSizes().Cached == want
 			})
@@ -493,29 +482,26 @@ func TestSessionDocumentCacheRetention(t *testing.T) {
 		opened.close(t)
 	})
 
-	// Pi 1.2.0 packages/durable/test/session-document-retention.test.ts:347 "does not keep a replacement cached for an observer of the retired incarnation"
-	t.Run("does not keep a replacement cached for an observer of the retired incarnation", func(t *testing.T) {
+	// session-document-retention.test.ts "pins only what is at the address a watch follows: nothing while retired, then the new incarnation"
+	t.Run("pins only what is at the address a watch follows: nothing while retired, then the new incarnation", func(t *testing.T) {
 		opened := openRetention(0)
 		conversationId := opened.conversation(t)
 		opened.bump(t, conversationId, 1)
 		watch := watchOf(t, opened, retentionCounterDoc, conversationId)
-		watch.Start(func(context.Context, obj, []durable.Op) error { return nil })
+		watch.Start(func(_ context.Context, change durable.WatchCall[obj]) error { return nil })
 		commit(t, opened.session, func(tx durable.Tx) error { return tx.RetireDoc(retentionCounterDoc, conversationId) })
-		<-watch.Closed()
-		if end := watch.End(); end.Reason != durable.WatchRetired {
-			t.Fatalf("end %+v, want retired", end)
-		}
-		if watch.Value() != nil {
-			t.Fatalf("watch value %v, want retired", watch.Value())
-		}
-		// A retired incarnation never changes again: its observer pins nothing.
+		opened.untilCached(t, 0)
 		if attached := opened.sizes().Attached; attached != 0 {
 			t.Fatalf("attached %d, want 0", attached)
 		}
 		opened.bump(t, conversationId, 5)
-		opened.untilCached(t, 0)
-		expectEqual(t, opened.snapshot(t, retentionCounterDoc, conversationId), delta.JsonObjectOf("count", 5))
+		opened.settleLine(t)
+		if sizes := opened.sizes(); sizes.Cached != 1 || sizes.Attached != 1 {
+			t.Fatalf("sizes %+v, want one cached and one attached", sizes)
+		}
+		eventuallyTrue(t, func() bool { return num(watch.Value().Value("count")) == 5 })
 		_, _ = watch.Stop()
+		opened.untilCached(t, 0)
 		opened.close(t)
 	})
 
@@ -617,11 +603,6 @@ func TestSessionDocumentCacheRetention(t *testing.T) {
 			t.Fatalf("Infinity: cached %d, want 1", cached)
 		}
 		opened.close(t)
-	})
-
-	// Pi 1.2.0 packages/durable/test/session-document-retention.test.ts:451 "keeps no timer where timers cannot be unreferenced, and evicts on commits"
-	t.Run("keeps no timer where timers cannot be unreferenced, and evicts on commits", func(t *testing.T) {
-		t.Skip("JS mechanic: the case replaces globalThis.setTimeout with one returning plain numbers without unref (as in Cloudflare Workers); Go has no global timer function to replace and its timers have no unref, so they never keep the process alive")
 	})
 
 	// Pi 1.2.0 packages/durable/test/session-document-retention.test.ts:539 "keeps a reloaded newer version cached while an observer of the older one is attached"

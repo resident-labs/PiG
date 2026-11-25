@@ -2,6 +2,8 @@
 
 package tui
 
+// Ports packages/tui/src/terminal.ts (ProcessTerminal on Unix: raw-mode input and the terminal size).
+
 import (
 	"context"
 	"errors"
@@ -37,6 +39,30 @@ func terminalHungUp(file *os.File) bool {
 	}
 }
 
+// inForeground is tcgetpgrp on stdin compared with this process's group: whether the group may use the terminal without a SIGTTOU or SIGTTIN
+// stop. Job control applies only to the controlling terminal: ENOTTY means stdin is a terminal that is not this process's controlling terminal,
+// so nothing can stop the process there and it counts as foreground, as Pi's SIGCONT handler restarts the UI there. Any other error, EIO of a
+// hung-up terminal first, is returned for the caller to treat as a dead terminal.
+func (t *ProcessTerminal) inForeground() (bool, error) {
+	if t.stdin == nil {
+		return false, syscall.ENOTTY
+	}
+	fd := int(t.stdin.Fd())
+	for {
+		pgrp, err := unix.IoctlGetInt(fd, unix.TIOCGPGRP)
+		if isEINTR(err) {
+			continue
+		}
+		if errors.Is(err, unix.ENOTTY) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return pgrp == syscall.Getpgrp(), nil
+	}
+}
+
 // pollReadable waits up to ms milliseconds for fd to become readable. It
 // returns n>0 when readable, 0 on timeout. EINTR is retried internally so the
 // caller never observes it. Mirrors the original DrainInput poll loop.
@@ -62,7 +88,7 @@ type terminalInputWaiter struct {
 	callbackDone chan struct{}
 }
 
-func newTerminalInputWaiter(ctx context.Context) (*terminalInputWaiter, error) {
+func newTerminalInputWaiter(ctx context.Context, _ *os.File) (*terminalInputWaiter, error) {
 	cancelRead, cancelWrite, err := os.Pipe()
 	if err != nil {
 		return nil, err
@@ -103,6 +129,9 @@ func (w *terminalInputWaiter) wait(file *os.File, ms int) (bool, error) {
 	}
 }
 
+// readPipe reports no pipe: a pipe is waited on by wait like any other file, since poll answers for it.
+func (w *terminalInputWaiter) readPipe(*os.File, int) ([]byte, bool, error) { return nil, false, nil }
+
 func (w *terminalInputWaiter) close() {
 	if !w.stopCallback() {
 		<-w.callbackDone
@@ -111,7 +140,7 @@ func (w *terminalInputWaiter) close() {
 	_ = w.cancelWrite.Close()
 }
 
-// isEINTR reports whether a read error is an interrupted syscall worth retrying.
+// isEINTR reports whether a read, poll or termios ioctl error is an interrupted syscall worth retrying.
 func isEINTR(err error) bool { return errors.Is(err, unix.EINTR) }
 
 // startResizeWatcher installs a SIGWINCH handler that calls onResize on resize,

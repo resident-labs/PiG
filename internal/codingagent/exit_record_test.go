@@ -57,17 +57,11 @@ func TestExitRecordChild(t *testing.T) {
 		group.Go(func() { panic("boom without a handler") })
 		select {}
 	case "fatal-error":
-		// A real runtime fatal error, which no recover can intercept: concurrent map writes.
-		shared := map[int]int{}
-		var wg sync.WaitGroup
-		for range 8 {
-			wg.Go(func() {
-				for i := range 1 << 24 {
-					shared[i%64] = i
-				}
-			})
-		}
-		wg.Wait()
+		// A real runtime fatal error, which no recover can intercept, on every run. Concurrent map writes were one only
+		// when two threads happened to be inside the map's write at the same instant: a child that the host ran on one
+		// CPU at a time (a full-package run on a loaded machine) finished its 8 x 16M writes and exited 0.
+		var mu sync.Mutex
+		mu.Unlock()
 	case "wait":
 		fmt.Println("ready")
 		select {}
@@ -76,6 +70,52 @@ func TestExitRecordChild(t *testing.T) {
 	case "dead-terminal":
 		m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: "/work", AgentDir: agentDir, AppVersion: "9.9.9", TerminateExtensionProcesses: terminatedSentinel(agentDir)})
 		m.emergencyTerminalExit("terminal gone: read /dev/tty: input/output error")
+	case "dead-terminal-concurrent":
+		// The input reader, a failed terminal write and a crash on the dead terminal reach the emergency exit together.
+		m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: "/work", AgentDir: agentDir, AppVersion: "9.9.9"})
+		for i := range 8 {
+			go m.emergencyTerminalExit(fmt.Sprintf("terminal gone: path %d", i))
+		}
+		select {}
+	case "dead-terminal-after-signal":
+		// The signal goroutine already owns the line when the dead terminal's exit arrives.
+		m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: "/work", AgentDir: agentDir, AppVersion: "9.9.9"})
+		RecordEnding(agentDir, "received SIGHUP")
+		m.emergencyTerminalExit("terminal gone: EOF (hung up)")
+	case "dead-terminal-while-emergency":
+		// A goroutine fails on the dead terminal while the first emergency exit is held inside its write: the production
+		// uncaughtOffLoop handler reaches emergencyTerminalExit as a second caller, which must block behind the first.
+		m := emergencyChildMode(agentDir)
+		release := emergencyChildHolding(m)
+		SetUncaughtGoroutineHandler(m.uncaughtOffLoop)
+		m.backgroundTasks.Go(func() { panic(&os.PathError{Op: "write", Path: "/dev/tty", Err: syscall.EIO}) })
+		waitParked(1)
+		release()
+		select {}
+	case "second-emergency-never-returns":
+		// Pi's emergencyTerminalExit is `never`: a second caller that returned would end the process with status 3.
+		m := emergencyChildMode(agentDir)
+		release := emergencyChildHolding(m)
+		go func() {
+			m.emergencyTerminalExit("terminal gone: EOF (hung up)")
+			os.Exit(3)
+		}()
+		waitParked(1)
+		release()
+		select {}
+	case "crash-while-emergency":
+		// A crash that is not a dead terminal ends in os.Exit(1); with an emergency exit in flight it must wait behind it.
+		m := emergencyChildMode(agentDir)
+		release := emergencyChildHolding(m)
+		SetUncaughtGoroutineHandler(m.uncaughtOffLoop)
+		m.backgroundTasks.Go(func() { panic("boom while an emergency exit runs") })
+		waitParked(1)
+		release()
+		select {}
+	case "extension-shutdown-then-dead-terminal":
+		m := emergencyChildMode(agentDir)
+		m.requestExtensionShutdown()
+		m.emergencyTerminalExit("terminal gone: EOF (hung up)")
 	case "dead-terminal-off-loop":
 		// A goroutine fails because the terminal is gone: Pi's uncaughtCrash takes emergencyTerminalExit, which kills the
 		// detached children.
@@ -216,7 +256,7 @@ func TestUnrecoveredGoroutinePanicBecomesACrashRecordAtTheNextStart(t *testing.T
 func TestRuntimeFatalErrorBecomesAFatalCrashRecord(t *testing.T) {
 	agentDir := t.TempDir()
 	output, code := runExitRecordChild(t, "fatal-error", agentDir)
-	if code != 2 || !strings.Contains(output, "fatal error: concurrent map") {
+	if code != 2 || !strings.Contains(output, "fatal error: sync: unlock of unlocked mutex") {
 		t.Fatalf("the child did not die of a runtime fatal error (exit %d)\n%s", code, output)
 	}
 	ReconcileSessionMarkers(agentDir, time.Now())

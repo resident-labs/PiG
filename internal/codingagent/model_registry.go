@@ -1,5 +1,7 @@
 package codingagent
 
+// Ports packages/coding-agent/src/core/model-runtime.ts
+
 import (
 	"bytes"
 	"context"
@@ -152,7 +154,7 @@ type modelDefinition struct {
 	// registration is the definition as the registering extension wrote it (extension.ProviderModelConfig.Definition); nil for a
 	// models.json model. Pi's model object is that definition spread (provider-composer.ts extensionModelFromDefinition), not the
 	// member-by-member object modelFromJson builds, so the definition fixes its members and their order.
-	registration json.RawMessage
+	registration *registeredDefinition
 }
 
 type modelCostJSON struct {
@@ -945,7 +947,9 @@ func providerConfigFromRegistration(configMap extension.ProviderConfig) (provide
 		if err != nil {
 			return providerConfig{}, false
 		}
-		provider.Models[i].registration = definition
+		if definition != nil {
+			provider.Models[i].registration = &registeredDefinition{raw: definition}
+		}
 	}
 	if configMap.Headers != nil && provider.Headers == nil {
 		provider.Headers = map[string]*string{}
@@ -1347,15 +1351,15 @@ func (r *ModelRegistry) GetAvailable() []ModelEntry {
 // It reads every provider's catalog as GetAllModelData does, in the same order, but builds a model of a plain bundled catalog (plainGeneratedModels) only when the model is available: a catalog built for a provider without auth is discarded unseen.
 func (r *ModelRegistry) GetAvailableModelData() []*ai.Model {
 	type providerData struct {
+		id      string
 		models  []*ai.Model
-		plain   []ai.GeneratedModel
 		isPlain bool
 	}
 	ids := r.modelProviderIDs()
 	data := make([]providerData, len(ids))
 	for i, id := range ids {
-		if plain, ok := r.plainGeneratedModels(id); ok {
-			data[i] = providerData{plain: plain, isPlain: true}
+		if r.isPlainGenerated(id) {
+			data[i] = providerData{id: id, isPlain: true}
 			continue
 		}
 		data[i].models = r.GetProviderModelData(id)
@@ -1364,18 +1368,17 @@ func (r *ModelRegistry) GetAvailableModelData() []*ai.Model {
 	configured := make(map[string]bool)
 	filters := make(map[string]func(string) bool)
 	accept := func(providerID, modelID string) bool {
-		available, checked := configured[providerID]
-		if !checked {
-			available = r.HasConfiguredAuth(providerID)
-			configured[providerID] = available
-			filters[providerID] = r.accountModelFilter(providerID)
-		}
-		return available && filters[providerID](modelID)
+		return r.providerAvailable(configured, filters, providerID) && filters[providerID](modelID)
 	}
 	for _, provider := range data {
 		if provider.isPlain {
-			for i := range provider.plain {
-				generated := &provider.plain[i]
+			// A provider that has no catalog or no auth lists no model, so its list (OpenRouter's routing variants, D199, are derived with it) is not read.
+			if len(builtinChatCatalog(provider.id)) == 0 || !r.providerAvailable(configured, filters, provider.id) {
+				continue
+			}
+			plain := builtinChatCatalogListed(provider.id)
+			for i := range plain {
+				generated := &plain[i]
 				if accept(generated.Provider, generated.ID) {
 					out = append(out, generated.ToModel())
 				}
@@ -1389,6 +1392,17 @@ func (r *ModelRegistry) GetAvailableModelData() []*ai.Model {
 		}
 	}
 	return out
+}
+
+// providerAvailable reports whether providerID has configured auth, reading it and its account filter once into configured and filters.
+func (r *ModelRegistry) providerAvailable(configured map[string]bool, filters map[string]func(string) bool, providerID string) bool {
+	available, checked := configured[providerID]
+	if !checked {
+		available = r.HasConfiguredAuth(providerID)
+		configured[providerID] = available
+		filters[providerID] = r.accountModelFilter(providerID)
+	}
+	return available
 }
 
 // accountModelFilter retains native availability snapshots and Copilot's optional OAuth picker allowlist.

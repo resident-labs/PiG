@@ -13,7 +13,18 @@ import (
 //go:embed assets/clankolas.png
 var clankolasPNG []byte
 
-var loadAnnouncementImage = sync.OnceValue(func() string { return base64.StdEncoding.EncodeToString(clankolasPNG) })
+// announcementImage holds the base64 image, encoded on first use. It is not a sync.OnceValue package variable: that
+// initializer runs at program start and keeps the 539 KB image in every program that links this package, the
+// interactive mode or not. Here only the announcement component refers to the image.
+var announcementImage struct {
+	once  sync.Once
+	value string
+}
+
+func loadAnnouncementImage() string {
+	announcementImage.once.Do(func() { announcementImage.value = base64.StdEncoding.EncodeToString(clankolasPNG) })
+	return announcementImage.value
+}
 
 type earendilAnnouncementComponent struct {
 	*tui.Container
@@ -25,7 +36,7 @@ func newEarendilAnnouncementComponent() *earendilAnnouncementComponent {
 	image.Theme.FallbackColor = func(text string) string { return tui.ActiveTheme().Fg("muted", text) }
 	return &earendilAnnouncementComponent{Container: tui.NewContainer(
 		tui.NewDynamicBorderToken("accent"),
-		tui.NewPaddedText("\x1b[1m"+theme.Fg("accent", "pi has joined Earendil")+"\x1b[22m", 1, 0, nil),
+		tui.NewPaddedText(tui.ChalkBold(theme.Fg("accent", "pi has joined Earendil")), 1, 0, nil),
 		tui.NewSpacer(1),
 		tui.NewPaddedText(theme.Fg("muted", "Read the blog post:"), 1, 0, nil),
 		tui.NewPaddedText(theme.Fg("mdLink", "https://mariozechner.at/posts/2026-04-08-ive-sold-out/"), 1, 0, nil),

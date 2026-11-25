@@ -1,6 +1,6 @@
 # Slash commands
 
-PiG has the built-in slash commands of Pi 1.4.0 ([Pi's slash command reference](https://github.com/earendil-works/pi/blob/v1.2.0/packages/coding-agent/docs/slash-commands.md)). Rows marked `[pig]` are PiG additions. Extensions can register more slash commands.
+PiG has the built-in slash commands of Pi 1.5.0 ([Pi's slash command reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/slash-commands.md)). Rows marked `[pig]` are PiG additions. Extensions can register more slash commands.
 
 ## Core
 
@@ -13,7 +13,7 @@ PiG has the built-in slash commands of Pi 1.4.0 ([Pi's slash command reference](
 | `/login` | Configure provider authentication. |
 | `/logout` | Remove provider authentication. |
 | `/new` | Start a new session in the same cwd. |
-| `/resume` | Resume a different session. |
+| `/resume` | Resume another session. |
 | `/fork` | Fork from a previous user message. |
 | `/clone` | Duplicate session at the current position. |
 | `/tree` | Navigate session tree. |
@@ -52,7 +52,7 @@ PiG Standard and other Piglets can add commands through selected extension Resou
 
 ## Worked examples
 
-Each example shows what you type, what PiG prints and where the behaviour comes from. The screens are taken from a real PiG session (a test model answering `What is in notes.txt?` first), so the lines above and below the result are the session's own. Paths and IDs on your computer differ. Where PiG differs from Pi, the divergence number is given. File and line references point to Pi 1.4.0's `packages/coding-agent/src/modes/interactive/interactive-mode.ts` (written `Pi:`) and to PiG's source.
+Each example shows what you type, what PiG prints and where the behaviour comes from. The screens are taken from a real PiG session (a test model answering `What is in notes.txt?` first), so the lines above and below the result are the session's own. Paths and IDs on your computer differ. Where PiG differs from Pi, the divergence number is given. File and line references point to Pi 1.5.0's `packages/coding-agent/src/modes/interactive/interactive-mode.ts` (written `Pi:`) and to PiG's source.
 
 ### Look at the session
 
@@ -86,7 +86,7 @@ Each example shows what you type, what PiG prints and where the behaviour comes 
  Status: Inactive (cache lifetime unavailable)
 ```
 
-`File:` reads `In-memory` under `--no-session`. Pi 1.1.0 showed an identical screen, and Pi 1.4.0 did not change `/session`.
+`File:` reads `In-memory` under `--no-session`. Pi 1.1.0 showed an identical screen, and no later Pi release changed `/session`.
 
 **`/name <text>`** sets the session's display name, shown in the footer and in `/resume`:
 
@@ -431,7 +431,7 @@ Use `/export` instead when the session holds anything private. When the upload f
  Bug report exported to:
  /home/you/project/pig-bug-report-01a12bca-2b63-7109-98f6-d549300404d0.zip
  Report ID: 01a12bca-2b63-7109-98f6-d549300404d0
-To report it, open a PiG issue and attach pig-bug-report-01a12bca-2b63-7109-98f6-d549300404d0.zip:
+To report it, open this link, drag pig-bug-report-01a12bca-2b63-7109-98f6-d549300404d0.zip into the issue and submit. The link fills in your versions and report ID, and "What happened" is the only field you need:
 https://github.com/MichaelKinsy/PiG/issues/new?template=bug.yml&title=bug%3A+the+footer+shows+the+wrong+model&version=...
 ```
 

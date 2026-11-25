@@ -5,6 +5,7 @@ import (
 	"weak"
 )
 
+// Ports packages/ai/src/utils/event-stream.ts (the partial and final message references EventStream.push and end publish).
 type assistantMessagePublication struct {
 	cell    weak.Pointer[assistantMessageCell]
 	cleanup runtime.Cleanup
@@ -38,7 +39,7 @@ func (stream *AssistantMessageEventStream) publishPartialLocked(message *Assista
 			walk := plainWalk{knownValid: stream.validated}
 			copied, ok := clonePlainJSON(value, &walk)
 			if !ok {
-				return cloneJSONValue(value)
+				return cloneArgumentsValue(value)
 			}
 			if len(walk.longest) > len(validated) {
 				validated = walk.longest

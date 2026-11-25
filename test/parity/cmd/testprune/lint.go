@@ -14,11 +14,13 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/MichaelKinsy/PiG/automation/ci/preflight/reviewed"
 )
 
 // provenanceFile declares where every golden or snapshot file's expected
 // values come from.
-const provenanceFile = "test/testdata-provenance.toml"
+const provenanceFile = reviewed.ProvenanceFile
 
 type goldenEntry struct {
 	Paths []string `toml:"paths"`
@@ -37,12 +39,34 @@ type inputEntry struct {
 	Paths []string `toml:"paths"`
 }
 
+// The tooling list ([[tooling]] of the provenance file) is reviewed.Tooling: the pre-flight's test-expectation rule reads
+// it through the same package, so both gates leave the same directories out of the expected-value rule.
+
+// checkTooling returns every violation of the tooling list's rules.
+func checkTooling(tooling []reviewed.Tooling, tracked []string) []string {
+	var problems []string
+	for i, e := range tooling {
+		where := fmt.Sprintf("%s: tooling entry %d (%s)", provenanceFile, i+1, e.Prefix)
+		switch {
+		case !strings.HasPrefix(e.Prefix, "automation/") || !strings.HasSuffix(e.Prefix, "/") || strings.Count(e.Prefix, "/") < 3 || strings.Contains(e.Prefix, ".."):
+			problems = append(problems, where+": a tooling prefix is a directory below automation/<area>/ and ends with a slash; product code stays under the rule")
+		case strings.TrimSpace(e.Reason) == "":
+			problems = append(problems, where+": has no reason")
+		case !slices.ContainsFunc(tracked, func(f string) bool { return strings.HasPrefix(f, e.Prefix) }):
+			problems = append(problems, where+": matches no tracked file")
+		}
+	}
+	return problems
+}
+
 type provenance struct {
 	// ExpectationsFrom exempts commits authored before this RFC 3339 time from the
 	// expected-value rule, so history from before the ratchet is not reviewed again.
 	ExpectationsFrom string        `toml:"expectations_from"`
 	Golden           []goldenEntry `toml:"golden"`
 	Input            []inputEntry  `toml:"input"`
+	// Tooling lists the PiG-owned CI tooling directories the expected-value rule does not guard.
+	Tooling []reviewed.Tooling `toml:"tooling"`
 }
 
 // goldenWriterRE matches the switch a test uses to rewrite its own expected files.
@@ -84,6 +108,7 @@ func isGoldenFile(p string) bool {
 }
 
 func gitFiles(root string, args ...string) ([]string, error) {
+	//nolint:gosec // G204 (class a): program is literal git; args are fixed per caller (ls-files -z).
 	cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
 	out, err := cmd.Output()
 	if err != nil {
@@ -160,6 +185,7 @@ func checkProvenance(root string, tracked []string, prov provenance, hasTest fun
 			problems = append(problems, f+": golden or snapshot file without provenance in "+provenanceFile)
 		}
 	}
+	problems = append(problems, checkTooling(prov.Tooling, tracked)...)
 	sort.Strings(problems)
 	return problems
 }
@@ -219,8 +245,10 @@ func piSourceNames(root string) (map[string]bool, error) {
 // checkCoEdits returns each commit that edits an expectation value in a test
 // file while changing production code of the same directory, unless the commit
 // message or a line the commit adds to the test file cites a Pi source line
-// (a file piNames holds) whose behavior changed.
-func checkCoEdits(root string, rangeSpec string, from time.Time, piNames map[string]bool, ledger []reviewEntry) ([]string, error) {
+// (a file piNames holds) whose behavior changed, unless the test file lies in a tooling directory (reviewed.InTooling), or the reviewed ledger holds an entry for the commit and path. An entry
+// is read first: it can record that a commit's own citation names a Pi line that did not change, which history cannot
+// rewrite.
+func checkCoEdits(root string, rangeSpec string, from time.Time, piNames map[string]bool, ledger []reviewed.Entry, tooling []reviewed.Tooling) ([]string, error) {
 	edits, err := scanCoEdits(root, []string{rangeSpec, "--", "*.go"})
 	if err != nil {
 		return nil, err
@@ -232,33 +260,37 @@ func checkCoEdits(root string, rangeSpec string, from time.Time, piNames map[str
 		if e.ValueEdits == 0 || seen[e.Commit+e.Path] {
 			continue
 		}
+		if _, ok := reviewed.InTooling(tooling, e.Path); ok {
+			continue
+		}
 		if authored, err := time.Parse(time.RFC3339, e.Authored); err == nil && authored.Before(from) {
 			continue
 		}
 		seen[e.Commit+e.Path] = true
+		//nolint:gosec // G204 (class a): program is literal git; e.Commit is a hash parsed from git log output.
 		msg, err := exec.Command("git", "-C", root, "show", "-s", "--format=%B", e.Commit).Output()
 		if err != nil {
 			return nil, err
+		}
+		admitted := false
+		for i, r := range ledger {
+			if !r.Matches(e.Commit, e.Path) {
+				continue
+			}
+			used[i] = true
+			if err := r.Validate(piNames, divergenceRecorded(root)); err != nil {
+				problems = append(problems, fmt.Sprintf("%s %s: ledger entry %s", shortSHA(e.Commit), e.Path, err))
+			}
+			admitted = true
+		}
+		if admitted {
+			continue
 		}
 		cited := slices.ContainsFunc(e.Cited, func(name string) bool { return piNames[name] })
 		for _, m := range piCiteRE.FindAllSubmatch(msg, -1) {
 			cited = cited || piNames[path.Base(string(m[1]))]
 		}
 		if cited {
-			continue
-		}
-		reviewed := false
-		for i, r := range ledger {
-			if len(r.Commit) < 10 || !strings.HasPrefix(e.Commit, r.Commit) || r.Path != e.Path {
-				continue
-			}
-			used[i] = true
-			if err := r.validate(root, piNames); err != nil {
-				problems = append(problems, fmt.Sprintf("%s %s: ledger entry %s", shortSHA(e.Commit), e.Path, err))
-			}
-			reviewed = true
-		}
-		if reviewed {
 			continue
 		}
 		problems = append(problems, fmt.Sprintf("%s %s: changes %d expected value(s) in %s together with %s; cite the Pi behavior that changed (a `Pi-Behavior-Change: <pi file.ts:line>` trailer, or a `name.ts:line` comment on a changed test line, naming a Pi file of %s), or leave the expectation alone",
@@ -269,8 +301,8 @@ func checkCoEdits(root string, rangeSpec string, from time.Time, piNames map[str
 		return nil, err
 	}
 	for i, r := range ledger {
-		if !used[i] && (len(r.Commit) < 10 || entryInRange(r, inRange)) {
-			problems = append(problems, fmt.Sprintf("%s: stale ledger entry %s %s matches no finding", reviewedFile, shortSHA(r.Commit), r.Path))
+		if !used[i] && (!r.Pinned() || entryInRange(r, inRange)) {
+			problems = append(problems, fmt.Sprintf("%s: stale ledger entry %s %s matches no finding", reviewed.File, shortSHA(r.Commit), r.Path))
 		}
 	}
 	return problems, nil
@@ -278,6 +310,7 @@ func checkCoEdits(root string, rangeSpec string, from time.Time, piNames map[str
 
 // commitsInRange returns the full SHA of every commit rangeSpec selects.
 func commitsInRange(root, rangeSpec string) ([]string, error) {
+	//nolint:gosec // G204 (class a): program is literal git; rangeSpec is the operator -base/-head value concatenated as "base..head" and passed to rev-list without `--`.
 	out, err := exec.Command("git", "-C", root, "rev-list", rangeSpec).Output()
 	if err != nil {
 		return nil, fmt.Errorf("git rev-list %s: %w", rangeSpec, err)
@@ -285,62 +318,33 @@ func commitsInRange(root, rangeSpec string) ([]string, error) {
 	return strings.Fields(string(out)), nil
 }
 
-func entryInRange(r reviewEntry, inRange []string) bool {
-	return len(r.Commit) >= 10 && slices.ContainsFunc(inRange, func(c string) bool { return strings.HasPrefix(c, r.Commit) })
+func entryInRange(r reviewed.Entry, inRange []string) bool {
+	return slices.ContainsFunc(inRange, r.NamesCommit)
 }
 
 // prunableEntries lists the ledger entries whose commit is not in rangeSpec. A squash merge replaces the reviewed
 // commit with a new one, so on main and on every later branch such an entry can never match a finding again; it
 // does not fail the lint, a maintainer deletes it.
-func prunableEntries(root, rangeSpec string, ledger []reviewEntry) ([]string, error) {
+func prunableEntries(root, rangeSpec string, ledger []reviewed.Entry) ([]string, error) {
 	inRange, err := commitsInRange(root, rangeSpec)
 	if err != nil {
 		return nil, err
 	}
 	var out []string
 	for _, r := range ledger {
-		if len(r.Commit) >= 10 && !entryInRange(r, inRange) {
+		if r.Pinned() && !entryInRange(r, inRange) {
 			out = append(out, fmt.Sprintf("%s %s", shortSHA(r.Commit), r.Path))
 		}
 	}
 	return out, nil
 }
 
-const reviewedFile = "test/parity/testprune-reviewed.toml"
-
-// reviewEntry is one reviewed finding: it satisfies the expected-value finding of exactly its commit and path.
-type reviewEntry struct {
-	Path   string `toml:"path"`
-	Commit string `toml:"commit"`
-	Class  string `toml:"class"`
-	Cite   string `toml:"cite"`
-	Reason string `toml:"reason"`
-}
-
-var divergenceIDRE = regexp.MustCompile(`^D\d+$`)
-
-func (r reviewEntry) validate(root string, piNames map[string]bool) error {
-	if strings.TrimSpace(r.Reason) == "" {
-		return fmt.Errorf("has no reason")
+// divergenceRecorded tells whether the tree at root holds the record of divergence id.
+func divergenceRecorded(root string) func(string) bool {
+	return func(id string) bool {
+		_, err := os.Stat(filepath.Join(root, reviewed.DivergenceFile(id)))
+		return err == nil
 	}
-	switch r.Class {
-	case "CITE":
-		m := piCiteRE.FindStringSubmatch("Pi-Behavior-Change: " + r.Cite)
-		if m == nil || !piNames[path.Base(m[1])] {
-			return fmt.Errorf("cite %q does not name a Pi file:line of %s", r.Cite, piInventories[0])
-		}
-	case "DIVERGENCE":
-		if !divergenceIDRE.MatchString(r.Cite) {
-			return fmt.Errorf("cite %q is not a divergence id", r.Cite)
-		}
-		if _, err := os.Stat(filepath.Join(root, "docs/parity/divergences", r.Cite+".md")); err != nil {
-			return fmt.Errorf("divergence %s has no docs/parity/divergences/%s.md", r.Cite, r.Cite)
-		}
-	case "NOBEHAVIOR", "message-only":
-	default:
-		return fmt.Errorf("unknown class %q", r.Class)
-	}
-	return nil
 }
 
 func shortSHA(s string) string {
@@ -393,23 +397,25 @@ func runLint(root string, args []string) error {
 		if err != nil {
 			return err
 		}
-		var reviewed struct {
-			Entry []reviewEntry `toml:"entry"`
-		}
-		if _, err := toml.DecodeFile(filepath.Join(root, reviewedFile), &reviewed); err != nil {
-			return err
-		}
-		rangeSpec := *base + ".." + *head
-		p, err := checkCoEdits(root, rangeSpec, from, piNames, reviewed.Entry)
+		raw, err := os.ReadFile(filepath.Join(root, reviewed.File))
 		if err != nil {
 			return err
 		}
-		prunable, err := prunableEntries(root, rangeSpec, reviewed.Entry)
+		ledger, err := reviewed.Parse(string(raw))
+		if err != nil {
+			return err
+		}
+		rangeSpec := *base + ".." + *head
+		p, err := checkCoEdits(root, rangeSpec, from, piNames, ledger, prov.Tooling)
+		if err != nil {
+			return err
+		}
+		prunable, err := prunableEntries(root, rangeSpec, ledger)
 		if err != nil {
 			return err
 		}
 		for _, e := range prunable {
-			fmt.Fprintf(os.Stderr, "note: %s: prunable ledger entry %s: its commit is not in %s (squash-merged or rewritten); delete it\n", reviewedFile, e, rangeSpec)
+			fmt.Fprintf(os.Stderr, "note: %s: prunable ledger entry %s: its commit is not in %s (squash-merged or rewritten); delete it\n", reviewed.File, e, rangeSpec)
 		}
 		problems = append(problems, p...)
 	}

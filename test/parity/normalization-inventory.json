@@ -6,29 +6,34 @@
       "reason": "Normalized/layout comparators are explicit plain-terminal contracts: ANSI, CR, trailing spaces and outer blank rows are not compared. They are not full wire proof. Exact comparators apply only scenario-declared, justified replacements."
     },
     {
+      "source": "test/parity/runner/capture_stable.go",
+      "sha256": "b1cc3c4c0d146cb6330865b6afd6c5d60eb4a26c58721cd38f04ecadfc67ffad",
+      "reason": "The final terminal capture is the plain screen, the escaped screen and the plain screen again; it is accepted only when both plain captures are equal and hold the scenario's capture_start, and it is retaken every poll within the last step budget until then. Only the capture kinds a comparator reads are cropped to capture_start/capture_end: a capture_start absent from one of those fails the run (the whole captures are kept in the artifacts, with the failure joined to any step failure), and a capture no comparator reads is kept whole under a not-asserted-uncropped artifact name. No comparison is loosened: this is synchronization with the screen and a stricter crop, not a normalization."
+    },
+    {
       "source": "test/parity/runner/changelog_assert.go",
       "sha256": "ce703c70d410d59e79c6f0e1df29268350b47148169f43ac809385659f1a3b4a",
       "reason": "D22: the products ship different changelog documents. Compare every rendered release header, in order, against that binary's independent source document; this does not claim cross-product equality of body text or styling."
     },
     {
       "source": "test/parity/runner/default_cwd.go",
-      "sha256": "87f96d163240967c16b07d885ae32e092d5bd23d6a9955b0500903b6c33c6e6d",
+      "sha256": "1d4a37c55271b632bbde9cc75d90b451b6dc2ea760d760c73f68cbe2e0ceba97",
       "reason": "D2/D22 fixture control balances prompt paths. Only terminal captures use length-preserving cwd digit substitution; process records retain raw paths unless an explicit JSON alias selects them."
     },
     {
       "source": "test/parity/runner/driver_ht.go",
-      "sha256": "824387e750c2c0b0ee97d3b49255a9b42655b2003a1e31b0681e23b08ff86c69",
-      "reason": "Headless terminal state capture compares the declared visible surface, not transient bytes. Tool stderr is diagnostic transport noise, not product stderr."
+      "sha256": "8b4b59fd3b8faf1a1048769f3650a72297beabfdd63b4af4fc68dc768162813a",
+      "reason": "Headless terminal state capture compares the declared visible surface, not transient bytes. Tool stderr is diagnostic transport noise, not product stderr. A capture_start absent from a capture a comparator reads fails the run instead of comparing the whole screen."
     },
     {
       "source": "test/parity/runner/driver_rpc.go",
-      "sha256": "7970de354d9b59f85ed5a00c4179dccc53cd05c108d7aaed0acb144e5a4a668d",
+      "sha256": "9e1aec0393b4e3185b23766f31cd4ad623a5770684b79c4cd46b3b997e9f481a",
       "reason": "canonical_json sorts JSON object keys only and preserves terminal framing. Raw stdout and stderr are retained. wait_contains/wait_event are new-output barriers, not acceptance assertions. A poll_until step resends one read-only query until its response holds the awaited state and then leaves every response to that query out of the compared and raw output, because their count follows timing; every other record, including the commands that prove the settled state, is compared."
     },
     {
       "source": "test/parity/runner/driver_tmux.go",
-      "sha256": "4589a75c48e5103aadb9fcc9acbc08f84ab88fb282a0ddad24e2850e06a7a8d3",
-      "reason": "Terminal state capture is not a byte-stream assertion. A scenario explicitly selects viewport or retained history and its crop. History capture uses session-local maximum retention without changing pane size or shared defaults; required anchors and source-derived assertions reject incomplete history. Readiness and new-output barriers are synchronization, not behavioral coverage."
+      "sha256": "404f1fb90381f12f1a45fe3bd248ad25305f25af661a3d369f74d217c2642a4d",
+      "reason": "Terminal state capture is not a byte-stream assertion. A scenario explicitly selects viewport or retained history and its crop. History capture uses session-local maximum retention without changing pane size or shared defaults; required anchors and source-derived assertions reject incomplete history. Readiness and new-output barriers are synchronization, not behavioral coverage. The final capture is taken only from a still screen (the plain captures around the escaped one are equal, within the last step budget), and a capture_start absent from a capture a comparator reads, still absent when that budget ends, fails the run instead of comparing the whole screen. A capture no comparator reads is kept whole, not cropped."
     },
     {
       "source": "test/parity/runner/footer_crop.go",
@@ -62,7 +67,7 @@
     },
     {
       "source": "test/parity/testdata/provider-wire-pig/main.go",
-      "sha256": "655543c20ca024ef74ec392531c1472e99fc928e216ad114e0a1b2c85ad3a798",
+      "sha256": "048e77319ec5758485dc9110a354596b5bd4c9fe5ac5e7951ef25461726289ef",
       "reason": "Legacy role/key/auth summaries are diagnostic only: wireBody now compares the entire captured HTTP request body alongside them. Aggregated provider response summaries do not prove mode events; real-provider RPC/JSON scenarios compare those separately."
     },
     {
@@ -117,7 +122,7 @@
           "kind": "terminal_crop",
           "configuration": {
             "capture_start": "/mo\n────────────────────────────────────────────────────────────────────────────────────────────────────",
-            "capture_end": "  import         Import and resume a session from a JSONL file"
+            "capture_end": "  import         Import a JSONL session, preserving its ID and working directory"
           },
           "reason": "Owned visible surface: Typing '/mo' narrows the slash popup to the exact model-related subset.",
           "limitations": "No claim about output outside this crop or transient terminal bytes."
@@ -516,6 +521,56 @@
       ]
     },
     {
+      "scenario": "test/parity/scenarios/cli-utils/33-mcp-add-oauth-client-registration.toml",
+      "transforms": [
+        {
+          "kind": "normalize_replace",
+          "pattern": "\\bpig\\b",
+          "with": "pi",
+          "reason": "D2: PiG uses the pig executable name instead of pi."
+        },
+        {
+          "kind": "normalize_replace",
+          "pattern": " in \\S+mcp\\.json",
+          "with": " in AGENT/mcp.json",
+          "reason": "The isolated agent directory differs by its random suffix; the file name and message stay compared."
+        }
+      ]
+    },
+    {
+      "scenario": "test/parity/scenarios/cli-utils/34-mcp-add-oauth-client-registration-invalid.toml",
+      "transforms": [
+        {
+          "kind": "normalize_replace",
+          "pattern": "\\bpig\\b",
+          "with": "pi",
+          "reason": "D2: PiG uses the pig executable name instead of pi."
+        }
+      ]
+    },
+    {
+      "scenario": "test/parity/scenarios/cli-utils/35-mcp-add-oauth-client-registration-cimd-conflict.toml",
+      "transforms": [
+        {
+          "kind": "normalize_replace",
+          "pattern": "\\bpig\\b",
+          "with": "pi",
+          "reason": "D2: PiG uses the pig executable name instead of pi."
+        }
+      ]
+    },
+    {
+      "scenario": "test/parity/scenarios/cli-utils/36-mcp-add-oauth-client-registration-stdio.toml",
+      "transforms": [
+        {
+          "kind": "normalize_replace",
+          "pattern": "\\bpig\\b",
+          "with": "pi",
+          "reason": "D2: PiG uses the pig executable name instead of pi."
+        }
+      ]
+    },
+    {
       "scenario": "test/parity/scenarios/clipboard-images/01-clipboard-read-deferred.toml",
       "transforms": [
         {
@@ -806,30 +861,6 @@
           "pattern": "(?m)^(Exported to: )/[^\\r\\n]*/parity-cli-01-export-cli-plain-(pig|pi)-[0-9]+",
           "with": "${1}<TEMP>",
           "reason": "D2: replace only this scenario's allocated temporary root, preserving the entire destination suffix and status line."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "cacheWrite: 0, total: 0 \\}",
-          "with": "cacheWrite: 0 }",
-          "reason": "D124: the cost totals object has no total field in Pi 1.1.0's template.js."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "(?s)\\n *const componentTotal =.*?\\(msg\\.usage\\.cost\\.cacheWrite \\|\\| 0\\);",
-          "with": "",
-          "reason": "D124: the component-sum fallback is absent in Pi 1.1.0's template.js."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "(?s)\\n *// Provider-reported totals.*?: componentTotal;",
-          "with": "",
-          "reason": "D124: the recorded cost.total accumulation is absent in Pi 1.1.0's template.js."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "const totalCost = globalStats\\.cost\\.total;",
-          "with": "const totalCost = globalStats.cost.input + globalStats.cost.output + globalStats.cost.cacheRead + globalStats.cost.cacheWrite;",
-          "reason": "D124: the header cost is the component sum in Pi 1.1.0's template.js."
         }
       ]
     },
@@ -841,30 +872,6 @@
           "pattern": "(?m)^(Exported to: )/[^\\r\\n]*/parity-cli-02-export-cli-ansi-(pig|pi)-[0-9]+",
           "with": "${1}<TEMP>",
           "reason": "D2: replace only this scenario's allocated temporary root, preserving the entire destination suffix and status line."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "cacheWrite: 0, total: 0 \\}",
-          "with": "cacheWrite: 0 }",
-          "reason": "D124: the cost totals object has no total field in Pi 1.1.0's template.js."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "(?s)\\n *const componentTotal =.*?\\(msg\\.usage\\.cost\\.cacheWrite \\|\\| 0\\);",
-          "with": "",
-          "reason": "D124: the component-sum fallback is absent in Pi 1.1.0's template.js."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "(?s)\\n *// Provider-reported totals.*?: componentTotal;",
-          "with": "",
-          "reason": "D124: the recorded cost.total accumulation is absent in Pi 1.1.0's template.js."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "const totalCost = globalStats\\.cost\\.total;",
-          "with": "const totalCost = globalStats.cost.input + globalStats.cost.output + globalStats.cost.cacheRead + globalStats.cost.cacheWrite;",
-          "reason": "D124: the header cost is the component sum in Pi 1.1.0's template.js."
         }
       ]
     },
@@ -876,30 +883,6 @@
           "pattern": "(?m)^(Exported to: )/[^\\r\\n]*/parity-cli-03-export-cli-tools-(pig|pi)-[0-9]+",
           "with": "${1}<TEMP>",
           "reason": "D2: replace only this scenario's allocated temporary root, preserving the destination suffix and the full HTML artifact."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "cacheWrite: 0, total: 0 \\}",
-          "with": "cacheWrite: 0 }",
-          "reason": "D124: the cost totals object has no total field in Pi 1.1.0's template.js."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "(?s)\\n *const componentTotal =.*?\\(msg\\.usage\\.cost\\.cacheWrite \\|\\| 0\\);",
-          "with": "",
-          "reason": "D124: the component-sum fallback is absent in Pi 1.1.0's template.js."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "(?s)\\n *// Provider-reported totals.*?: componentTotal;",
-          "with": "",
-          "reason": "D124: the recorded cost.total accumulation is absent in Pi 1.1.0's template.js."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "const totalCost = globalStats\\.cost\\.total;",
-          "with": "const totalCost = globalStats.cost.input + globalStats.cost.output + globalStats.cost.cacheRead + globalStats.cost.cacheWrite;",
-          "reason": "D124: the header cost is the component sum in Pi 1.1.0's template.js."
         }
       ]
     },
@@ -911,30 +894,6 @@
           "pattern": "(?m)^(Exported to: )/[^\\r\\n]*/parity-cli-04-export-cli-full-mix-(pig|pi)-[0-9]+",
           "with": "${1}<TEMP>",
           "reason": "D2: replace only this scenario's allocated temporary root, preserving the destination suffix and the full HTML artifact."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "cacheWrite: 0, total: 0 \\}",
-          "with": "cacheWrite: 0 }",
-          "reason": "D124: the cost totals object has no total field in Pi 1.1.0's template.js."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "(?s)\\n *const componentTotal =.*?\\(msg\\.usage\\.cost\\.cacheWrite \\|\\| 0\\);",
-          "with": "",
-          "reason": "D124: the component-sum fallback is absent in Pi 1.1.0's template.js."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "(?s)\\n *// Provider-reported totals.*?: componentTotal;",
-          "with": "",
-          "reason": "D124: the recorded cost.total accumulation is absent in Pi 1.1.0's template.js."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "const totalCost = globalStats\\.cost\\.total;",
-          "with": "const totalCost = globalStats.cost.input + globalStats.cost.output + globalStats.cost.cacheRead + globalStats.cost.cacheWrite;",
-          "reason": "D124: the header cost is the component sum in Pi 1.1.0's template.js."
         }
       ]
     },
@@ -975,30 +934,6 @@
           "pattern": "(?m)^(Exported to: )/[^\\r\\n]*/parity-cli-06-export-cli-skills-(pig|pi)-[0-9]+",
           "with": "${1}<TEMP>",
           "reason": "D2: replace only this scenario's allocated temporary root, preserving the destination suffix and the full HTML artifact."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "cacheWrite: 0, total: 0 \\}",
-          "with": "cacheWrite: 0 }",
-          "reason": "D124: the cost totals object has no total field in Pi 1.1.0's template.js."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "(?s)\\n *const componentTotal =.*?\\(msg\\.usage\\.cost\\.cacheWrite \\|\\| 0\\);",
-          "with": "",
-          "reason": "D124: the component-sum fallback is absent in Pi 1.1.0's template.js."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "(?s)\\n *// Provider-reported totals.*?: componentTotal;",
-          "with": "",
-          "reason": "D124: the recorded cost.total accumulation is absent in Pi 1.1.0's template.js."
-        },
-        {
-          "kind": "normalize_replace",
-          "pattern": "const totalCost = globalStats\\.cost\\.total;",
-          "with": "const totalCost = globalStats.cost.input + globalStats.cost.output + globalStats.cost.cacheRead + globalStats.cost.cacheWrite;",
-          "reason": "D124: the header cost is the component sum in Pi 1.1.0's template.js."
         }
       ]
     },
@@ -2535,6 +2470,25 @@
       ]
     },
     {
+      "scenario": "test/parity/scenarios/extensions-runtime/88-startup-provider-registration-failure.toml",
+      "transforms": [
+        {
+          "kind": "output_normalized_equal",
+          "reason": "Declared plain-text/layout surface: A rejected provider registration is the services diagnostic, not a failed extension load",
+          "limitations": "ANSI, CR, trailing spaces and outer blank rows are not equality evidence."
+        }
+      ]
+    },
+    {
+      "scenario": "test/parity/scenarios/extensions-runtime/89-reload-provider-registration-failure.toml",
+      "transforms": [
+        {
+          "kind": "cwd_snapshot_digits",
+          "reason": "D2: per-run cwd digits vary; preserve digit count so path width, truncation and surrounding cells remain compared."
+        }
+      ]
+    },
+    {
       "scenario": "test/parity/scenarios/footer/01-footer-default.toml",
       "transforms": [
         {
@@ -2712,6 +2666,24 @@
             "capture_start_last": true
           },
           "reason": "Owned visible surface: Forking before the source name refreshes the footer from the unnamed destination.",
+          "limitations": "No claim about output outside this crop or transient terminal bytes."
+        },
+        {
+          "kind": "cwd_snapshot_digits",
+          "reason": "D2: per-run cwd digits vary; preserve digit count so path width, truncation and surrounding cells remain compared."
+        }
+      ]
+    },
+    {
+      "scenario": "test/parity/scenarios/footer/12-footer-provider-prefix.toml",
+      "transforms": [
+        {
+          "kind": "terminal_crop",
+          "configuration": {
+            "capture_start": "parity-snap-cwd-",
+            "capture_start_last": true
+          },
+          "reason": "Owned visible surface: The footer prefixes the model with its provider when two providers are available",
           "limitations": "No claim about output outside this crop or transient terminal bytes."
         },
         {
@@ -3042,6 +3014,24 @@
             "capture_end_regex": "└────"
           },
           "reason": "Owned visible surface: Fullscreen transcript search: Ctrl+Shift+F opens the search box and typed text edits the query, with the match counter, identically in pig and pi.",
+          "limitations": "No claim about output outside this crop or transient terminal bytes."
+        },
+        {
+          "kind": "cwd_snapshot_digits",
+          "reason": "D2: per-run cwd digits vary; preserve digit count so path width, truncation and surrounding cells remain compared."
+        }
+      ]
+    },
+    {
+      "scenario": "test/parity/scenarios/fullscreen/14-fullscreen-model-scope-notice.toml",
+      "transforms": [
+        {
+          "kind": "terminal_crop",
+          "configuration": {
+            "capture_start": "Model scope:",
+            "capture_end": "to cycle)"
+          },
+          "reason": "Owned visible surface: Fullscreen header shows the model scope notice in the same cells as pi.",
           "limitations": "No claim about output outside this crop or transient terminal bytes."
         },
         {
@@ -4275,6 +4265,106 @@
       ]
     },
     {
+      "scenario": "test/parity/scenarios/interactive-rendering/58-alt-up-dequeues-queued-message.toml",
+      "transforms": [
+        {
+          "kind": "normalize_replace",
+          "pattern": "(?m)^(── )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]( Working ─*)$",
+          "with": "${1}<SPINNER>${2}",
+          "reason": "Capture timing selects the spinner phase; preserve the Working label and every border cell."
+        },
+        {
+          "kind": "output_normalized_equal",
+          "reason": "Declared plain-text/layout surface: Alt+Up restores a queued steering message to the editor and the turn ends without sending it",
+          "limitations": "ANSI, CR, trailing spaces and outer blank rows are not equality evidence."
+        },
+        {
+          "kind": "terminal_crop",
+          "configuration": {
+            "capture_start": "LIVE-STREAM-24",
+            "capture_end": "queued steer text"
+          },
+          "reason": "Owned visible surface: Alt+Up restores a queued steering message to the editor and the turn ends without sending it",
+          "limitations": "No claim about output outside this crop or transient terminal bytes."
+        },
+        {
+          "kind": "cwd_snapshot_digits",
+          "reason": "D2: per-run cwd digits vary; preserve digit count so path width, truncation and surrounding cells remain compared."
+        }
+      ]
+    },
+    {
+      "scenario": "test/parity/scenarios/interactive-rendering/59-up-recalls-queued-message-copy-tip.toml",
+      "transforms": [
+        {
+          "kind": "normalize_replace",
+          "pattern": "(?m)^(── )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]( Working ─*)$",
+          "with": "${1}<SPINNER>${2}",
+          "reason": "Capture timing selects the spinner phase; preserve the Working label and every border cell."
+        },
+        {
+          "kind": "normalize_replace",
+          "pattern": "(?m)^ ↳ That.s a copy\\. The queued message still sends\\. .*\\n(?: .*\\n)*? ?.*Profiles > Keyboard\\.[ \\t]*\\n",
+          "with": "",
+          "reason": "D228 adds the one-time copy tip, wrapped over two rows because it ends with the Terminal.app mapping hint under TERM_PROGRAM=tmux."
+        },
+        {
+          "kind": "output_normalized_equal",
+          "reason": "Declared plain-text/layout surface: Plain Up with an empty editor and a queued steering message recalls history as in Pi; PiG adds one copy tip under the editor",
+          "limitations": "ANSI, CR, trailing spaces and outer blank rows are not equality evidence."
+        },
+        {
+          "kind": "terminal_crop",
+          "configuration": {
+            "capture_start": "Steering: queued steer text",
+            "capture_end": "(auto)"
+          },
+          "reason": "Owned visible surface: Plain Up with an empty editor and a queued steering message recalls history as in Pi; PiG adds one copy tip under the editor",
+          "limitations": "No claim about output outside this crop or transient terminal bytes."
+        },
+        {
+          "kind": "cwd_snapshot_digits",
+          "reason": "D2: per-run cwd digits vary; preserve digit count so path width, truncation and surrounding cells remain compared."
+        }
+      ]
+    },
+    {
+      "scenario": "test/parity/scenarios/interactive-rendering/60-terminal-app-up-dequeues-queued-message.toml",
+      "transforms": [
+        {
+          "kind": "terminal_crop",
+          "configuration": {
+            "capture_start": "LIVE-TOOL-24",
+            "capture_end": "(auto)"
+          },
+          "reason": "Owned visible surface: In Terminal.app plain Up restores the queued steering message to the editor in PiG; Pi recalls history and still sends it",
+          "limitations": "No claim about output outside this crop or transient terminal bytes."
+        },
+        {
+          "kind": "cwd_snapshot_digits",
+          "reason": "D2: per-run cwd digits vary; preserve digit count so path width, truncation and surrounding cells remain compared."
+        }
+      ]
+    },
+    {
+      "scenario": "test/parity/scenarios/interactive-rendering/62-chalk-level-zero-modifiers.toml",
+      "transforms": [
+        {
+          "kind": "terminal_crop",
+          "configuration": {
+            "capture_start": "Chalk level zero",
+            "capture_end": "Chalk answer end"
+          },
+          "reason": "Owned visible surface: With CI=1 (chalk level 0) Markdown headings, quotes, table headers and links draw no bold, italic or underline.",
+          "limitations": "No claim about output outside this crop or transient terminal bytes."
+        },
+        {
+          "kind": "cwd_snapshot_digits",
+          "reason": "D2: per-run cwd digits vary; preserve digit count so path width, truncation and surrounding cells remain compared."
+        }
+      ]
+    },
+    {
       "scenario": "test/parity/scenarios/json/01-json-mode-streams-events.toml",
       "transforms": [
         {
@@ -5124,15 +5214,15 @@
       ]
     },
     {
-      "scenario": "test/parity/scenarios/model-resolver-selector/24-fullscreen-model-picker-page-down-scrolls-viewport.toml",
+      "scenario": "test/parity/scenarios/model-resolver-selector/24-fullscreen-model-picker-page-keys-reach-selector.toml",
       "transforms": [
         {
           "kind": "terminal_crop",
           "configuration": {
             "capture_start": "Only showing models",
-            "capture_end": "Model Name: Model One"
+            "capture_end": "Model Name: Model Two"
           },
-          "reason": "Owned visible surface: Fullscreen PageDown scrolls the viewport and leaves the model picker selection alone.",
+          "reason": "Owned visible surface: Fullscreen PageUp moves the model picker selection by a page instead of scrolling the viewport.",
           "limitations": "No claim about output outside this crop or transient terminal bytes."
         },
         {
@@ -5471,7 +5561,7 @@
           "kind": "terminal_crop",
           "configuration": {
             "capture_start": "post-login-state:",
-            "capture_end": "post-login-state: current=openai/gpt-5.5 default=openai/gpt-5.5"
+            "capture_end": "post-login-state: current=openai/gpt-6.1-sol default=openai/gpt-6.1-sol"
           },
           "reason": "Owned visible surface: API key login from unknown selects and persists the provider default",
           "limitations": "No claim about output outside this crop or transient terminal bytes."
@@ -6533,8 +6623,8 @@
           "paths": [
             "/**/sections/preamble"
           ],
-          "pig": "operating inside pig,",
-          "pi": "operating inside pi,",
+          "pig": "running inside pig,",
+          "pi": "running inside pi,",
           "reason": "D2: only the host command identity differs in the preamble; retain the rest of the complete sentence."
         },
         {
@@ -6551,45 +6641,9 @@
           "paths": [
             "/**/sections/docs"
           ],
-          "pig": "asks about pig itself,",
-          "pi": "asks about pi itself,",
-          "reason": "D2: this exact heading clause names the host command; no other words in the read-only condition are aliased."
-        },
-        {
-          "kind": "literal",
-          "paths": [
-            "/**/sections/docs"
-          ],
           "pig": "When reading pig docs or examples,",
           "pi": "When reading pi docs or examples,",
           "reason": "D2/D22: the path-resolution instruction names its product; retain its complete resolution rule and relative paths."
-        },
-        {
-          "kind": "literal",
-          "paths": [
-            "/**/sections/docs"
-          ],
-          "pig": "pig packages (docs/packages.md)",
-          "pi": "pi packages (docs/packages.md)",
-          "reason": "D2: only the product name in the Package topic differs; the packages.md destination and every other topic remain literal."
-        },
-        {
-          "kind": "literal",
-          "paths": [
-            "/**/sections/docs"
-          ],
-          "pig": "When working on pig topics,",
-          "pi": "When working on pi topics,",
-          "reason": "D2: this exact instruction prefix names the host product; retain its complete-read and cross-reference requirements."
-        },
-        {
-          "kind": "literal",
-          "paths": [
-            "/**/sections/docs"
-          ],
-          "pig": "Always read pig .md files",
-          "pi": "Always read pi .md files",
-          "reason": "D2/D22: this exact instruction prefix names the product documentation; retain completely, link-following instructions, and the TUI example."
         },
         {
           "kind": "duration_ms",
@@ -7694,8 +7748,8 @@
           "paths": [
             "/**/sections/preamble"
           ],
-          "pig": "operating inside pig,",
-          "pi": "operating inside pi,",
+          "pig": "running inside pig,",
+          "pi": "running inside pi,",
           "reason": "D2: only the host command identity differs in the preamble; retain the rest of the complete sentence."
         },
         {
@@ -7712,45 +7766,9 @@
           "paths": [
             "/**/sections/docs"
           ],
-          "pig": "asks about pig itself,",
-          "pi": "asks about pi itself,",
-          "reason": "D2: this exact heading clause names the host command; no other words in the read-only condition are aliased."
-        },
-        {
-          "kind": "literal",
-          "paths": [
-            "/**/sections/docs"
-          ],
           "pig": "When reading pig docs or examples,",
           "pi": "When reading pi docs or examples,",
           "reason": "D2/D22: the path-resolution instruction names its product; retain its complete resolution rule and relative paths."
-        },
-        {
-          "kind": "literal",
-          "paths": [
-            "/**/sections/docs"
-          ],
-          "pig": "pig packages (docs/packages.md)",
-          "pi": "pi packages (docs/packages.md)",
-          "reason": "D2: only the product name in the Package topic differs; the packages.md destination and every other topic remain literal."
-        },
-        {
-          "kind": "literal",
-          "paths": [
-            "/**/sections/docs"
-          ],
-          "pig": "When working on pig topics,",
-          "pi": "When working on pi topics,",
-          "reason": "D2: this exact instruction prefix names the host product; retain its complete-read and cross-reference requirements."
-        },
-        {
-          "kind": "literal",
-          "paths": [
-            "/**/sections/docs"
-          ],
-          "pig": "Always read pig .md files",
-          "pi": "Always read pi .md files",
-          "reason": "D2/D22: this exact instruction prefix names the product documentation; retain completely, link-following instructions, and the TUI example."
         },
         {
           "kind": "duration_ms",
@@ -7933,8 +7951,8 @@
           "paths": [
             "/**/sections/preamble"
           ],
-          "pig": "operating inside pig,",
-          "pi": "operating inside pi,",
+          "pig": "running inside pig,",
+          "pi": "running inside pi,",
           "reason": "D2: only the host command identity differs in the preamble; retain the rest of the complete sentence."
         },
         {
@@ -7951,45 +7969,9 @@
           "paths": [
             "/**/sections/docs"
           ],
-          "pig": "asks about pig itself,",
-          "pi": "asks about pi itself,",
-          "reason": "D2: this exact heading clause names the host command; no other words in the read-only condition are aliased."
-        },
-        {
-          "kind": "literal",
-          "paths": [
-            "/**/sections/docs"
-          ],
           "pig": "When reading pig docs or examples,",
           "pi": "When reading pi docs or examples,",
           "reason": "D2/D22: the path-resolution instruction names its product; retain its complete resolution rule and relative paths."
-        },
-        {
-          "kind": "literal",
-          "paths": [
-            "/**/sections/docs"
-          ],
-          "pig": "pig packages (docs/packages.md)",
-          "pi": "pi packages (docs/packages.md)",
-          "reason": "D2: only the product name in the Package topic differs; the packages.md destination and every other topic remain literal."
-        },
-        {
-          "kind": "literal",
-          "paths": [
-            "/**/sections/docs"
-          ],
-          "pig": "When working on pig topics,",
-          "pi": "When working on pi topics,",
-          "reason": "D2: this exact instruction prefix names the host product; retain its complete-read and cross-reference requirements."
-        },
-        {
-          "kind": "literal",
-          "paths": [
-            "/**/sections/docs"
-          ],
-          "pig": "Always read pig .md files",
-          "pi": "Always read pi .md files",
-          "reason": "D2/D22: this exact instruction prefix names the product documentation; retain completely, link-following instructions, and the TUI example."
         }
       ]
     },
@@ -9863,6 +9845,24 @@
       ]
     },
     {
+      "scenario": "test/parity/scenarios/slash-commands/26-hotkeys-extension-shortcuts.toml",
+      "transforms": [
+        {
+          "kind": "terminal_crop",
+          "configuration": {
+            "capture_start": "Session name set: hotkeys-ext-anchor",
+            "capture_end": "Session name set: hotkeys-ext-end"
+          },
+          "reason": "Owned visible surface: Hotkeys lists extension-registered shortcuts in an Extensions table",
+          "limitations": "No claim about output outside this crop or transient terminal bytes."
+        },
+        {
+          "kind": "cwd_snapshot_digits",
+          "reason": "D2: per-run cwd digits vary; preserve digit count so path width, truncation and surrounding cells remain compared."
+        }
+      ]
+    },
+    {
       "scenario": "test/parity/scenarios/startup/00-startup-banner.toml",
       "transforms": [
         {
@@ -10627,10 +10627,10 @@
         {
           "kind": "terminal_crop",
           "configuration": {
-            "capture_start": "select-list:render=true:pageIgnored=true:wrap=a:select=a:cancel=true",
-            "capture_end": "select-list:render=true:pageIgnored=true:wrap=a:select=a:cancel=true"
+            "capture_start": "select-list:render=true:pageClamped=true:wrap=a:select=a:cancel=true",
+            "capture_end": "select-list:render=true:pageClamped=true:wrap=a:select=a:cancel=true"
           },
-          "reason": "Owned visible surface: SelectList wraps arrows, confirms/cancels, and ignores non-contract page input",
+          "reason": "Owned visible surface: SelectList wraps arrows, confirms/cancels, and clamps page input at the last item",
           "limitations": "No claim about output outside this crop or transient terminal bytes."
         },
         {

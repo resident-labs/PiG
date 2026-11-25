@@ -14,7 +14,7 @@ The Skill checks only the tools required for the selected task. It asks before i
 
 The qualified verification toolchain is:
 
-- Go 1.27.3;
+- Go 1.27.4;
 - macOS 13 or later for native macOS builds;
 - Git;
 - Node.js 24.22.1;
@@ -48,7 +48,7 @@ See [`docs/project/RELEASING.md`](https://github.com/MichaelKinsy/PiG/blob/main/
 
 ## Mirror upstream
 
-PiG compares against one Pi build. The upstream pin is one setting, `.upstream/pin`: a release tag or a pinned pi-mono commit. PiG 0.5.0 pins Pi 1.4.0.
+PiG compares against one Pi build. The upstream pin is one setting, `.upstream/pin`: a release tag or a pinned pi-mono commit. PiG 0.5.0 pinned the Pi release of its own `.upstream/pin`.
 
 ```bash
 make upstream-mirror

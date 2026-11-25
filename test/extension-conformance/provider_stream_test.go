@@ -27,6 +27,7 @@ func TestProviderProducersAcrossSDKs(t *testing.T) {
 		{"go-isolated", "testdata/provider-go", false, false}, {"go-packed", "testdata/provider-go", false, true},
 		{"python-isolated", "testdata/provider-python", false, false}, {"python-packed", "testdata/provider-python", false, true},
 		{"rust-isolated", "testdata/provider-rust", false, false}, {"rust-packed", "testdata/provider-rust", false, true},
+		{"lisp-isolated", "testdata/provider-lisp", false, false}, {"lisp-packed", "testdata/provider-lisp", false, true},
 		{"node-isolated", "../../coding/testdata/provider-stream-producer.mjs", false, false}, {"node-packed", "../../coding/testdata/provider-stream-producer.mjs", false, true},
 		{"fused-go", "", true, false},
 	}
@@ -58,47 +59,11 @@ func TestProviderProducersAcrossSDKs(t *testing.T) {
 			detach := icodingagent.WireModelOperations(bridge, icodingagent.ModelOperationBindings{CurrentModel: session.Model, ModelLookup: services.ModelRuntime().GetModel, ModelCatalog: func(...string) []*ai.Model { return services.ModelRuntime().GetModels() }, Registry: services.Registry().ModelRegistry, ModelBuilder: func(spec string) (*ai.Model, error) { return coding.BuildModel(spec, services) }, SessionHandle: session})
 			defer detach()
 			host.SetUIBridge(bridge)
-			if tc.fused {
-				_, err = host.LoadInProcess(t.Context(), subprocess.ExtConfig{Name: "provider-producer", Enabled: true}, func(conn net.Conn) error { return testfixture.ProviderProducer().RunWithConn(conn) })
-			} else {
-				name := "provider-producer"
-				if strings.HasPrefix(tc.name, "node-") {
-					name = "provider-stream-producer"
-				}
-				source, resolveErr := filepath.Abs(tc.source)
-				if resolveErr != nil {
-					t.Fatal(resolveErr)
-				}
-				cfg, _, resolveErr := subprocess.ResolveExtConfigWithIdentity(source, name)
-				if resolveErr != nil {
-					t.Fatal(resolveErr)
-				}
-				cfgs := []subprocess.ExtConfig{cfg}
-				if tc.packed {
-					siblingPath := tc.source + "-sibling"
-					if strings.HasPrefix(tc.name, "node-") {
-						siblingPath = "testdata/provider-sibling.mjs"
-					}
-					absoluteSibling, pathErr := filepath.Abs(siblingPath)
-					if pathErr != nil {
-						t.Fatal(pathErr)
-					}
-					sibling, _, siblingErr := subprocess.ResolveExtConfigWithIdentity(absoluteSibling, "provider-sibling")
-					if siblingErr != nil {
-						t.Fatal(siblingErr)
-					}
-					cfgs = append(cfgs, sibling)
-				} else {
-					cfgs[0].Isolation = "isolated"
-				}
-				_, loadErrors := host.LoadAll(t.Context(), cfgs)
-				if len(loadErrors) > 0 {
-					err = loadErrors[0]
-				}
-			}
+			err = loadProviderFixture(t, host, tc.name, tc.source, tc.fused, tc.packed)
 			if err != nil {
 				t.Fatal(err)
 			}
+			applyQueuedRegistrations(host)
 			// Pi model-runtime.ts:753-787 publishes a configured registration in the available snapshot before registerProvider returns; the selector, cycling and SDK snapshot readers need no reload.
 			if !availableModel(services.ModelRuntime().GetAvailableSnapshot(), "extension-provider", "faux") || !availableModel(services.Registry().GetAvailableModelData(), "extension-provider", "faux") {
 				t.Fatalf("registered provider missing from availability: snapshot=%v registry=%v", services.ModelRuntime().GetAvailableSnapshot(), services.Registry().GetAvailableModelData())
@@ -155,4 +120,48 @@ func availableModel(models []*ai.Model, providerID, modelID string) bool {
 		}
 	}
 	return false
+}
+
+// loadProviderFixture loads the provider producer of a conformance case into host: in process (fused), alone in its own process, or packed with a sibling. A case name that starts with "node-" names a Node source.
+func loadProviderFixture(t *testing.T, host *subprocess.Host, caseName, source string, fused, packed bool) error {
+	t.Helper()
+	if fused {
+		_, err := host.LoadInProcess(t.Context(), subprocess.ExtConfig{Name: "provider-producer", Enabled: true}, func(conn net.Conn) error { return testfixture.ProviderProducer().RunWithConn(conn) })
+		return err
+	}
+	node := strings.HasPrefix(caseName, "node-")
+	name := "provider-producer"
+	if node {
+		name = "provider-stream-producer"
+	}
+	absoluteSource, err := filepath.Abs(source)
+	if err != nil {
+		return err
+	}
+	cfg, _, err := subprocess.ResolveExtConfigWithIdentity(absoluteSource, name)
+	if err != nil {
+		return err
+	}
+	cfgs := []subprocess.ExtConfig{cfg}
+	if packed {
+		siblingPath := source + "-sibling"
+		if node {
+			siblingPath = "testdata/provider-sibling.mjs"
+		}
+		absoluteSibling, err := filepath.Abs(siblingPath)
+		if err != nil {
+			return err
+		}
+		sibling, _, err := subprocess.ResolveExtConfigWithIdentity(absoluteSibling, "provider-sibling")
+		if err != nil {
+			return err
+		}
+		cfgs = append(cfgs, sibling)
+	} else {
+		cfgs[0].Isolation = "isolated"
+	}
+	if _, loadErrors := host.LoadAll(t.Context(), cfgs); len(loadErrors) > 0 {
+		return loadErrors[0]
+	}
+	return nil
 }

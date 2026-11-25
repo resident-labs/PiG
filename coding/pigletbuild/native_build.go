@@ -81,6 +81,8 @@ func buildNativeArtifact(ctx context.Context, source pigSource, p *piglet.Piglet
 			sc, err = buildGoCell(cellCtx, cell, cacheRoot, host)
 		case subprocess.CellStrategyPackedRust:
 			sc, err = buildRustCell(cellCtx, cell, cacheRoot, host)
+		case subprocess.CellStrategyPackedLisp:
+			sc, err = buildLispCell(cellCtx, cell, cacheRoot, host)
 		case subprocess.CellStrategyPackedNode:
 			sc, err = buildNodeCell(cell, cacheRoot, host)
 		case subprocess.CellStrategyIsolated:
@@ -172,6 +174,8 @@ func buildNativeArtifact(ctx context.Context, source pigSource, p *piglet.Piglet
 	}
 	buildArgs := buildprogress.ToolArgs(ctx, "go", pigletBinaryBuildArgs(abary, opts.Version, overlayPath, stripTags))
 	cmd := source.goCommand(ctx, goToolchain, buildArgs...)
+	// A Piglet Binary links statically unless the user chose CGO_ENABLED or the build has cgo sources.
+	cmd.Env = staticPigletBuildEnv(ctx, source, goToolchain, cmd, overlayPath, stripTags, host)
 	if err := buildprogress.Run(buildprogress.Member(ctx, p.Name), cmd); err != nil {
 		return nil, fmt.Errorf("build Piglet Binary: %w", err)
 	}
@@ -335,6 +339,31 @@ func buildRustCell(ctx context.Context, cell subprocess.CellSpec, cacheRoot stri
 	return stagedCell{
 		entry: cellpack.CellEntry{
 			Language: "rust", Key: cell.Key, Strategy: string(cell.Strategy), OS: host.OS, Arch: host.Arch,
+			Binary: rel, Extensions: exts,
+		},
+		binaryPath: packed.BinaryPath,
+	}, nil
+}
+
+// buildLispCell builds the SBCL runner image of a packed-lisp cell through the cache the runtime uses, so the Binary
+// starts the image it embeds without SBCL or the extension's source.
+func buildLispCell(ctx context.Context, cell subprocess.CellSpec, cacheRoot string, host Target) (stagedCell, error) {
+	lispExts, err := cell.LispExtensions()
+	if err != nil {
+		return stagedCell{}, err
+	}
+	packed, err := runtimecell.BuildLispPackedCell(ctx, cacheRoot, cell.Key, lispExts)
+	if err != nil {
+		return stagedCell{}, fmt.Errorf("build cell %q: %w", cell.Key, err)
+	}
+	exts := make([]cellpack.ExtEntry, len(lispExts))
+	for i, e := range lispExts {
+		exts[i] = cellpack.ExtEntry{Name: e.Name, Hash: e.Hash}
+	}
+	rel := "lisp/" + shortHash(packed.Hash) + "/runner"
+	return stagedCell{
+		entry: cellpack.CellEntry{
+			Language: "lisp", Key: cell.Key, Strategy: string(cell.Strategy), OS: host.OS, Arch: host.Arch,
 			Binary: rel, Extensions: exts,
 		},
 		binaryPath: packed.BinaryPath,

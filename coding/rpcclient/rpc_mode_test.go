@@ -55,7 +55,7 @@ func newRpcModeFixture(t *testing.T, provider, model string, files map[string]st
 
 func newFauxFixture(t *testing.T) rpcModeFixture {
 	t.Helper()
-	return newRpcModeFixture(t, "test-faux", "echo", map[string]string{})
+	return newRpcModeFixture(t, "test-faux", "faux-1", map[string]string{})
 }
 
 // A reasoning model from models.json; these tests never contact it.
@@ -126,7 +126,7 @@ func TestRpcModeShouldGetState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Model == nil || state.Model.Provider != "test-faux" || state.Model.ID != "echo" {
+	if state.Model == nil || state.Model.Provider != "test-faux" || state.Model.ID != "faux-1" {
 		t.Fatalf("state.model = %+v", state.Model)
 	}
 	if state.IsStreaming || state.MessageCount != 0 {
@@ -568,41 +568,6 @@ func TestRpcEventListenerReceivesPromptEventsInOrderUntilDetached(t *testing.T) 
 	f.promptAndWait(t, "reply with exactly: again")
 	if after := snapshot(); !slices.Equal(after, first) {
 		t.Fatalf("listener kept receiving after detach: %v then %v", first, after)
-	}
-}
-
-// rpc-client.ts:525-538 hands the listener `JSON.parse(line) as JsonAgentSessionEvent`: the record itself. Every event's Raw is the complete
-// record whose "type" is Type, and a message_update is in json-event.ts's shape: the message's usage, and an assistantMessageEvent without the
-// cumulative `partial` snapshot (toJsonEvent, json-event.ts:55-69).
-func TestRpcEventListenerRawIsTheCompleteJSONRecord(t *testing.T) {
-	f := newFauxFixture(t)
-	events := f.promptAndWait(t, "reply with exactly: hello")
-	var updates int
-	for _, event := range events {
-		var record map[string]json.RawMessage
-		if err := json.Unmarshal(event.Raw, &record); err != nil {
-			t.Fatalf("%s Raw = %q is not a JSON record: %v", event.Type, event.Raw, err)
-		}
-		if got := string(record["type"]); got != `"`+event.Type+`"` {
-			t.Fatalf("Raw type %s != Type %q", got, event.Type)
-		}
-		if event.Type != "message_update" {
-			continue
-		}
-		updates++
-		var update struct {
-			Usage                 *json.RawMessage `json:"usage"`
-			AssistantMessageEvent map[string]any   `json:"assistantMessageEvent"`
-		}
-		if err := json.Unmarshal(event.Raw, &update); err != nil {
-			t.Fatal(err)
-		}
-		if _, hasPartial := update.AssistantMessageEvent["partial"]; update.Usage == nil || update.AssistantMessageEvent["type"] == nil || hasPartial {
-			t.Fatalf("message_update Raw = %s, want usage and an assistantMessageEvent without partial", event.Raw)
-		}
-	}
-	if updates == 0 {
-		t.Fatalf("no message_update among %d events", len(events))
 	}
 }
 

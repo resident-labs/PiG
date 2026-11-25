@@ -2,8 +2,9 @@ import {
   AssistantMessageEventStream,
   DEFAULT_MAX_AGENT_RETRY_DELAY_MS,
   EventStream,
+  StreamingJsonParser,
   StringEnum,
-  Type,
+  ToolCallArgumentsStream,
   cleanupSessionResources,
   createAssistantMessageEventStream,
   createFauxCore,
@@ -28,7 +29,7 @@ import {
   uuidv7,
   validateToolArguments,
   validateToolCall
-} from "./chunk-IHYSFH2N.js";
+} from "./chunk-LM2GRTGA.js";
 import {
   envApiKeyAuth,
   lazyOAuth
@@ -80,7 +81,7 @@ import {
   toToolDeclaration,
   withClientIdentity,
   withoutInitialSystemMessage
-} from "./chunk-SS4XPEIJ.js";
+} from "./chunk-YGHTO7GP.js";
 import "./chunk-SHUYVCID.js";
 export {
   AI_TELEMETRY_SCHEMA,
@@ -92,8 +93,9 @@ export {
   ModelsError,
   PI_AI_VERSION,
   PI_ATTRIBUTION,
+  StreamingJsonParser,
   StringEnum,
-  Type,
+  ToolCallArgumentsStream,
   appendAssistantMessageDiagnostic,
   calculateCost,
   clampThinkingLevel,

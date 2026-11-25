@@ -11,50 +11,63 @@ import { homedir } from "os";
 import { basename, dirname, join } from "path";
 
 // pi-dist/pi-tui/fuzzy.js
+function scorePositions(textLower, positions) {
+  let score = 0;
+  let lastMatchIndex = -1;
+  let consecutiveMatches = 0;
+  for (const i of positions) {
+    if (lastMatchIndex === i - 1) {
+      consecutiveMatches++;
+      score -= consecutiveMatches * 5;
+    } else {
+      consecutiveMatches = 0;
+      if (lastMatchIndex >= 0) {
+        score += (i - lastMatchIndex - 1) * 2;
+      }
+    }
+    if (i === 0 || /[\s\-_./:]/.test(textLower[i - 1])) {
+      score -= 10;
+    }
+    score += i * 0.1;
+    lastMatchIndex = i;
+  }
+  return score;
+}
+__name(scorePositions, "scorePositions");
+function matchQuery(normalizedQuery, textLower) {
+  if (normalizedQuery.length === 0) {
+    return { matches: true, score: 0 };
+  }
+  if (normalizedQuery.length > textLower.length) {
+    return { matches: false, score: 0 };
+  }
+  const positions = [];
+  let lastMatchIndex = -1;
+  for (let queryIndex = 0; queryIndex < normalizedQuery.length; queryIndex++) {
+    const i = textLower.indexOf(normalizedQuery[queryIndex], lastMatchIndex + 1);
+    if (i === -1) {
+      return { matches: false, score: 0 };
+    }
+    positions.push(i);
+    lastMatchIndex = i;
+  }
+  let score = scorePositions(textLower, positions);
+  for (let start = textLower.indexOf(normalizedQuery); start !== -1; start = textLower.indexOf(normalizedQuery, start + 1)) {
+    for (let k = 0; k < positions.length; k++) {
+      positions[k] = start + k;
+    }
+    score = Math.min(score, scorePositions(textLower, positions));
+  }
+  if (normalizedQuery === textLower) {
+    score -= 100;
+  }
+  return { matches: true, score };
+}
+__name(matchQuery, "matchQuery");
 function fuzzyMatch(query, text) {
   const queryLower = query.toLowerCase();
   const textLower = text.toLowerCase();
-  const matchQuery = /* @__PURE__ */ __name((normalizedQuery) => {
-    if (normalizedQuery.length === 0) {
-      return { matches: true, score: 0 };
-    }
-    if (normalizedQuery.length > textLower.length) {
-      return { matches: false, score: 0 };
-    }
-    let queryIndex = 0;
-    let score = 0;
-    let lastMatchIndex = -1;
-    let consecutiveMatches = 0;
-    while (queryIndex < normalizedQuery.length) {
-      const i = textLower.indexOf(normalizedQuery[queryIndex], lastMatchIndex + 1);
-      if (i === -1)
-        break;
-      const isWordBoundary = i === 0 || /[\s\-_./:]/.test(textLower[i - 1]);
-      if (lastMatchIndex === i - 1) {
-        consecutiveMatches++;
-        score -= consecutiveMatches * 5;
-      } else {
-        consecutiveMatches = 0;
-        if (lastMatchIndex >= 0) {
-          score += (i - lastMatchIndex - 1) * 2;
-        }
-      }
-      if (isWordBoundary) {
-        score -= 10;
-      }
-      score += i * 0.1;
-      lastMatchIndex = i;
-      queryIndex++;
-    }
-    if (queryIndex < normalizedQuery.length) {
-      return { matches: false, score: 0 };
-    }
-    if (normalizedQuery === textLower) {
-      score -= 100;
-    }
-    return { matches: true, score };
-  }, "matchQuery");
-  const primaryMatch = matchQuery(queryLower);
+  const primaryMatch = matchQuery(queryLower, textLower);
   if (primaryMatch.matches) {
     return primaryMatch;
   }
@@ -64,7 +77,7 @@ function fuzzyMatch(query, text) {
   if (!swappedQuery) {
     return primaryMatch;
   }
-  const swappedMatch = matchQuery(swappedQuery);
+  const swappedMatch = matchQuery(swappedQuery, textLower);
   if (!swappedMatch.matches) {
     return primaryMatch;
   }
@@ -1317,6 +1330,8 @@ var Text = class {
     this.customBgFn = customBgFn;
   }
   setText(text) {
+    if (text === this.text)
+      return;
     this.text = text;
     this.cachedText = void 0;
     this.cachedWidth = void 0;
@@ -1624,7 +1639,7 @@ function findWordForward(text, cursor, options) {
 __name(findWordForward, "findWordForward");
 
 // pi-dist/pi-tui/components/select-list.js
-import { getKeybindings as getKeybindings2 } from "../keybindings.js";
+import { getKeybindings as getKeybindings2, getSelectPageIndex } from "../keybindings.js";
 import { truncateToWidth, visibleWidth as visibleWidth3 } from "../utils.js";
 var DEFAULT_PRIMARY_COLUMN_WIDTH = 32;
 var PRIMARY_COLUMN_GAP = 2;
@@ -1635,6 +1650,7 @@ var SelectList = class {
   static {
     __name(this, "SelectList");
   }
+  capturesViewportInput = true;
   items = [];
   filteredItems = [];
   selectedIndex = 0;
@@ -1724,11 +1740,17 @@ var SelectList = class {
   }
   handleInput(keyData) {
     const kb = getKeybindings2();
+    const pageIndex = getSelectPageIndex(kb, keyData, this.selectedIndex, this.filteredItems.length, this.maxVisible);
     if (kb.matches(keyData, "tui.select.up")) {
       this.selectedIndex = this.selectedIndex === 0 ? this.filteredItems.length - 1 : this.selectedIndex - 1;
       this.notifySelectionChange();
     } else if (kb.matches(keyData, "tui.select.down")) {
       this.selectedIndex = this.selectedIndex === this.filteredItems.length - 1 ? 0 : this.selectedIndex + 1;
+      this.notifySelectionChange();
+    } else if (pageIndex !== void 0) {
+      if (this.filteredItems.length === 0 || pageIndex === this.selectedIndex)
+        return;
+      this.selectedIndex = pageIndex;
       this.notifySelectionChange();
     } else if (kb.matches(keyData, "tui.select.confirm")) {
       const selectedItem = this.filteredItems[this.selectedIndex];
@@ -1974,6 +1996,10 @@ var Editor = class {
   };
   /** Focusable interface - set by TUI when focus changes */
   focused = false;
+  /** The open autocomplete menu receives fullscreen viewport keys, such as PageUp/PageDown. */
+  get capturesViewportInput() {
+    return this.autocompleteState !== null;
+  }
   tui;
   theme;
   paddingX = 0;
@@ -2323,7 +2349,7 @@ var Editor = class {
         this.cancelAutocomplete();
         return;
       }
-      if (kb.matches(data, "tui.select.up") || kb.matches(data, "tui.select.down")) {
+      if (kb.matches(data, "tui.select.up") || kb.matches(data, "tui.select.down") || kb.matches(data, "tui.select.pageUp") || kb.matches(data, "tui.select.pageDown")) {
         this.autocompleteList.handleInput(data);
         return;
       }
@@ -5540,11 +5566,18 @@ __name(renderLatex, "renderLatex");
 
 // pi-dist/pi-tui/components/markdown.js
 import { getCapabilities as getCapabilities2, hyperlink, isImageLine } from "../terminal-image.js";
-import { applyBackgroundToLine as applyBackgroundToLine2, flattenLines as flattenLines3, visibleWidth as visibleWidth8, wrapTextWithAnsi as wrapTextWithAnsi2 } from "../utils.js";
+import { applyBackgroundToLine as applyBackgroundToLine2, cjkPunctuationRegex, flattenLines as flattenLines3, visibleWidth as visibleWidth8, wrapTextWithAnsi as wrapTextWithAnsi2 } from "../utils.js";
 var STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
-var StrictStrikethroughTokenizer = class extends Tokenizer {
+var MarkdownTokenizer = class extends Tokenizer {
   static {
-    __name(this, "StrictStrikethroughTokenizer");
+    __name(this, "MarkdownTokenizer");
+  }
+  url(src) {
+    const token = super.url(src);
+    if (!token)
+      return void 0;
+    const punctuationIndex = token.raw.search(cjkPunctuationRegex);
+    return punctuationIndex < 0 ? token : super.url(token.raw.slice(0, punctuationIndex));
   }
   del(src) {
     const match = STRICT_STRIKETHROUGH_REGEX.exec(src);
@@ -5692,7 +5725,7 @@ function trimPartialClosingFences(tokens) {
 __name(trimPartialClosingFences, "trimPartialClosingFences");
 var markdownParser = new Marked();
 markdownParser.setOptions({
-  tokenizer: new StrictStrikethroughTokenizer()
+  tokenizer: new MarkdownTokenizer()
 });
 markdownParser.use({
   tokenizer: { emStrong: markedCjkFriendly().tokenizer?.emStrong },
@@ -5719,6 +5752,13 @@ var Markdown = class {
   // about ten times the size of its source, and every message of a long transcript keeps a Markdown component. The
   // tokens survive a burst of re-renders, such as a theme preview, and are collected afterwards.
   cachedTokens;
+  // The last render's top-level blocks. While a message streams only its last block changes, so a render styles and
+  // wraps only that block. Each render keeps only the blocks it used, which drops a streamed block's earlier versions.
+  // Held weakly like the tokens: the blocks repeat the source in their keys and the code in their highlighting, and
+  // only a burst of renders, such as streaming or a resize, needs them.
+  blocks;
+  // Highlighted code of the block being rendered, only set while renderBlock runs.
+  blockHighlightedCode;
   constructor(text, paddingX, paddingY, theme, defaultTextStyle, options) {
     this.text = text;
     this.paddingX = paddingX;
@@ -5729,9 +5769,14 @@ var Markdown = class {
   }
   setText(text) {
     this.text = text;
-    this.invalidate();
+    this.clearRenderCache();
   }
   invalidate() {
+    this.clearRenderCache();
+    this.blocks = void 0;
+    this.defaultStylePrefix = void 0;
+  }
+  clearRenderCache() {
     this.cachedText = void 0;
     this.cachedWidth = void 0;
     this.cachedLines = void 0;
@@ -5743,6 +5788,7 @@ var Markdown = class {
     const contentWidth = Math.max(1, width - this.paddingX * 2);
     const text = this.options.transform?.(this.text, contentWidth) ?? this.text;
     if (!text || text.trim() === "") {
+      this.blocks = void 0;
       const result2 = [];
       this.cachedText = this.text;
       this.cachedWidth = width;
@@ -5757,55 +5803,66 @@ var Markdown = class {
       trimPartialClosingFences(tokens);
       this.cachedTokens = new WeakRef({ source: normalizedText, tokens });
     }
-    const renderedLines = [];
+    const reuseBlocks = Object.keys(tokens.links).length === 0;
+    const previousBlocks = this.blocks?.deref();
+    const blocks = /* @__PURE__ */ new Map();
+    this.blocks = new WeakRef(blocks);
+    const contentLines = [];
     for (let i = 0; i < tokens.length; i++) {
       const token = tokens[i];
-      const nextToken = tokens[i + 1];
-      const tokenLines = this.renderToken(token, contentWidth, nextToken?.type);
-      for (const tokenLine of tokenLines) {
-        renderedLines.push(tokenLine);
+      const nextTokenType = tokens[i + 1]?.type;
+      const reused = reuseBlocks ? blocks.get(token.raw) ?? previousBlocks?.get(token.raw) : void 0;
+      const block = reused ?? { width: -1, nextTokenType, lines: [], highlightedCode: /* @__PURE__ */ new Map() };
+      if (block.width !== width || block.nextTokenType !== nextTokenType) {
+        this.renderBlock(block, token, nextTokenType, width, contentWidth);
       }
-    }
-    const wrappedLines = [];
-    for (const line of renderedLines) {
-      if (isImageLine(line)) {
-        wrappedLines.push(line);
-      } else {
-        for (const wrappedLine of wrapTextWithAnsi2(line, contentWidth)) {
-          wrappedLines.push(wrappedLine);
-        }
-      }
-    }
-    const leftMargin = " ".repeat(this.paddingX);
-    const rightMargin = " ".repeat(this.paddingX);
-    const bgFn = this.defaultTextStyle?.bgColor;
-    const contentLines = [];
-    for (const line of wrappedLines) {
-      if (isImageLine(line)) {
+      if (reuseBlocks)
+        blocks.set(token.raw, block);
+      for (const line of block.lines) {
         contentLines.push(line);
-        continue;
-      }
-      const lineWithMargins = leftMargin + line + rightMargin;
-      if (bgFn) {
-        contentLines.push(applyBackgroundToLine2(lineWithMargins, width, bgFn));
-      } else {
-        const visibleLen = visibleWidth8(lineWithMargins);
-        const paddingNeeded = Math.max(0, width - visibleLen);
-        contentLines.push(lineWithMargins + " ".repeat(paddingNeeded));
       }
     }
+    const bgFn = this.defaultTextStyle?.bgColor;
     const emptyLine = " ".repeat(width);
     const emptyLines = [];
     for (let i = 0; i < this.paddingY; i++) {
       const line = bgFn ? applyBackgroundToLine2(emptyLine, width, bgFn) : emptyLine;
       emptyLines.push(line);
     }
+    flattenLines3(emptyLines);
     const result = emptyLines.concat(contentLines, emptyLines);
-    flattenLines3(result);
     this.cachedText = this.text;
     this.cachedWidth = width;
     this.cachedLines = result;
     return result.length > 0 ? result : [""];
+  }
+  /** Render one top-level block to output lines: wrapped, with margins, and padded or backgrounded to the width. */
+  renderBlock(block, token, nextTokenType, width, contentWidth) {
+    this.blockHighlightedCode = block.highlightedCode;
+    const leftMargin = " ".repeat(this.paddingX);
+    const rightMargin = " ".repeat(this.paddingX);
+    const bgFn = this.defaultTextStyle?.bgColor;
+    const lines = [];
+    for (const line of this.renderToken(token, contentWidth, nextTokenType)) {
+      if (isImageLine(line)) {
+        lines.push(line);
+        continue;
+      }
+      for (const wrappedLine of wrapTextWithAnsi2(line, contentWidth)) {
+        const lineWithMargins = leftMargin + wrappedLine + rightMargin;
+        if (bgFn) {
+          lines.push(applyBackgroundToLine2(lineWithMargins, width, bgFn));
+        } else {
+          const paddingNeeded = Math.max(0, width - visibleWidth8(lineWithMargins));
+          lines.push(lineWithMargins + " ".repeat(paddingNeeded));
+        }
+      }
+    }
+    this.blockHighlightedCode = void 0;
+    flattenLines3(lines);
+    block.lines = lines;
+    block.width = width;
+    block.nextTokenType = nextTokenType;
   }
   /**
    * Apply default text style to a string.
@@ -5912,7 +5969,10 @@ var Markdown = class {
         break;
       case "latexBlock": {
         const latexToken = token;
-        const rendered = !latexToken.pending && this.options.renderLatex !== false ? renderLatex(latexToken.text, { display: true }) ?? latexToken.raw.trim() : latexToken.raw.trim();
+        let rendered = !latexToken.pending && this.options.renderLatex !== false ? renderLatex(latexToken.text, { display: true }) : void 0;
+        if (rendered === void 0 || rendered.split("\n").some((line) => visibleWidth8(line) > width)) {
+          rendered = latexToken.raw.trim();
+        }
         for (const line of rendered.split("\n")) {
           lines.push(this.applyDefaultStyle(line));
         }
@@ -5925,8 +5985,13 @@ var Markdown = class {
         const indent = this.theme.codeBlockIndent ?? "  ";
         lines.push(this.theme.codeBlockBorder(`\`\`\`${token.lang || ""}`));
         if (this.theme.highlightCode) {
-          const highlightedLines = this.theme.highlightCode(token.text, token.lang);
-          for (const hlLine of highlightedLines) {
+          const key = `${token.lang ?? ""}\0${token.text}`;
+          let highlighted = this.blockHighlightedCode?.get(key);
+          if (!highlighted) {
+            highlighted = this.theme.highlightCode(token.text, token.lang);
+            this.blockHighlightedCode?.set(key, highlighted);
+          }
+          for (const hlLine of highlighted) {
             lines.push(`${indent}${hlLine}`);
           }
         } else {
@@ -5961,7 +6026,16 @@ var Markdown = class {
           const lineWithReappliedStyle = line.replace(/\x1b\[0m/g, `\x1B[0m${quoteStylePrefix}`);
           return quoteStyle(lineWithReappliedStyle);
         }, "applyQuoteStyle");
-        const quoteContentWidth = Math.max(1, width - 2);
+        if (width < 3) {
+          const quoteTokens2 = token.tokens || [];
+          for (let i = 0; i < quoteTokens2.length; i++) {
+            for (const line of this.renderToken(quoteTokens2[i], width, quoteTokens2[i + 1]?.type, styleContext)) {
+              lines.push(line);
+            }
+          }
+          break;
+        }
+        const quoteContentWidth = width - 2;
         const quoteInlineStyleContext = {
           applyText: /* @__PURE__ */ __name((text) => text, "applyText"),
           stylePrefix: quoteStylePrefix
@@ -5971,7 +6045,9 @@ var Markdown = class {
         for (let i = 0; i < quoteTokens.length; i++) {
           const quoteToken = quoteTokens[i];
           const nextQuoteToken = quoteTokens[i + 1];
-          renderedQuoteLines.push(...this.renderToken(quoteToken, quoteContentWidth, nextQuoteToken?.type, quoteInlineStyleContext));
+          for (const line of this.renderToken(quoteToken, quoteContentWidth, nextQuoteToken?.type, quoteInlineStyleContext)) {
+            renderedQuoteLines.push(line);
+          }
         }
         while (renderedQuoteLines.length > 0 && renderedQuoteLines[renderedQuoteLines.length - 1] === "") {
           renderedQuoteLines.pop();
@@ -6522,12 +6598,13 @@ var ScrollView = class extends Container2 {
 };
 
 // pi-dist/pi-tui/components/settings-list.js
-import { getKeybindings as getKeybindings5 } from "../keybindings.js";
+import { getKeybindings as getKeybindings5, getSelectPageIndex as getSelectPageIndex2 } from "../keybindings.js";
 import { truncateToWidth as truncateToWidth4, visibleWidth as visibleWidth9, wrapTextWithAnsi as wrapTextWithAnsi3 } from "../utils.js";
 var SettingsList = class {
   static {
     __name(this, "SettingsList");
   }
+  capturesViewportInput = true;
   items;
   filteredItems;
   theme;
@@ -6678,6 +6755,7 @@ var SettingsList = class {
     }
     const kb = getKeybindings5();
     const displayItems = this.getDisplayItems();
+    const pageIndex = getSelectPageIndex2(kb, data, this.selectedIndex, displayItems.length, this.maxVisible);
     if (kb.matches(data, "tui.select.up")) {
       if (displayItems.length === 0)
         return;
@@ -6686,6 +6764,10 @@ var SettingsList = class {
       if (displayItems.length === 0)
         return;
       this.selectedIndex = this.selectedIndex === displayItems.length - 1 ? 0 : this.selectedIndex + 1;
+    } else if (pageIndex !== void 0) {
+      if (displayItems.length === 0)
+        return;
+      this.selectedIndex = pageIndex;
     } else if (kb.matches(data, "tui.select.confirm") || data === " " && (!this.searchEnabled || this.searchInput?.getValue().length === 0)) {
       this.activateItem();
     } else if (kb.matches(data, "tui.select.cancel")) {
@@ -6845,18 +6927,18 @@ var VStack = class extends Stack {
 };
 
 // pi-dist/pi-tui/index.js
-import { getKeybindings as getKeybindings8, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "../keybindings.js";
+import { getKeybindings as getKeybindings8, getSelectPageIndex as getSelectPageIndex3, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "../keybindings.js";
 import { decodeKittyPrintable as decodeKittyPrintable2, isKeyRelease as isKeyRelease2, isKeyRepeat, isKittyProtocolActive, Key, matchesKey as matchesKey2, parseKey, setKittyProtocolActive as setKittyProtocolActive2 } from "../keys.js";
 import { getNativeClipboard } from "../native-platform.js";
 
 // pi-dist/pi-tui/program-status.js
+import { replaceControlCharacters } from "../utils.js";
 var PROGRAM_STATUS_QUERY = "\x1B]7501;?\x1B\\";
 function isProgramStatusReply(sequence) {
   return /^\x1b\]7501;\?[^\x07\x1b]*(?:\x07|\x1b\\)$/.test(sequence);
 }
 __name(isProgramStatusReply, "isProgramStatusReply");
 var APP_PATTERN = /^[A-Za-z0-9_.+-]{1,32}$/;
-var CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]+/g;
 var MAX_MESSAGE_BYTES = 2048;
 function truncateUtf8(text, maxBytes) {
   if (Buffer.byteLength(text, "utf8") <= maxBytes)
@@ -6879,7 +6961,7 @@ function formatProgramStatus(status) {
     pairs.push(`app=${status.app}`);
   if (status.state === "blocked" && status.kind)
     pairs.push(`kind=${status.kind}`);
-  const message = truncateUtf8((status.message ?? "").replace(CONTROL_CHARACTERS, " ").trim(), MAX_MESSAGE_BYTES);
+  const message = truncateUtf8(replaceControlCharacters(status.message ?? "").trim(), MAX_MESSAGE_BYTES);
   if (message)
     pairs.push(`msg=${Buffer.from(message, "utf8").toString("base64")}`);
   return `\x1B]7501;${pairs.join(":")}\x1B\\`;
@@ -7219,6 +7301,7 @@ __name(isNativeModifierPressed, "isNativeModifierPressed");
 
 // pi-dist/pi-tui/terminal.js
 import { getNativePlatformHelper as getNativePlatformHelper2 } from "../native-platform.js";
+import { replaceControlCharacters as replaceControlCharacters2 } from "../utils.js";
 var TERMINAL_PROGRESS_KEEPALIVE_MS = 1e3;
 var TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1B]9;4;3\x07";
 var TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1B]9;4;0\x07";
@@ -7255,9 +7338,14 @@ function refreshTerminalDimensions() {
   }
 }
 __name(refreshTerminalDimensions, "refreshTerminalDimensions");
+function isNativeShiftEnterCandidate(data) {
+  return data === "\r" || data === "\x1B\r";
+}
+__name(isNativeShiftEnterCandidate, "isNativeShiftEnterCandidate");
 function normalizeNativeShiftEnterInput(data, shouldDetectNativeShiftEnter, isShiftPressed) {
-  if (shouldDetectNativeShiftEnter && data === "\r" && isShiftPressed)
+  if (shouldDetectNativeShiftEnter && isNativeShiftEnterCandidate(data) && isShiftPressed) {
     return NATIVE_SHIFT_ENTER_SEQUENCE;
+  }
   return data;
 }
 __name(normalizeNativeShiftEnterInput, "normalizeNativeShiftEnterInput");
@@ -7481,7 +7569,7 @@ var ProcessTerminal = class {
   forwardInputSequence(sequence) {
     if (!this.inputHandler)
       return;
-    const shouldDetectNativeShiftEnter = sequence === "\r" && (isAppleTerminalSession() || process.platform === "win32");
+    const shouldDetectNativeShiftEnter = isNativeShiftEnterCandidate(sequence) && (isAppleTerminalSession() || process.platform === "win32");
     const input = normalizeNativeShiftEnterInput(sequence, shouldDetectNativeShiftEnter, shouldDetectNativeShiftEnter && isNativeModifierPressed("shift"));
     this.inputHandler(input);
   }
@@ -7634,7 +7722,7 @@ var ProcessTerminal = class {
     process.stdout.write("\x1B[2J\x1B[H");
   }
   setTitle(title) {
-    process.stdout.write(`\x1B]0;${title}\x07`);
+    process.stdout.write(`\x1B]0;${replaceControlCharacters2(title)}\x07`);
   }
   setProgramStatus(status) {
     this.programStatus = status.state === "clear" ? void 0 : status;
@@ -7998,7 +8086,7 @@ import { getKeybindings as getKeybindings7 } from "../keybindings.js";
 import { isKeyRelease } from "../keys.js";
 
 // pi-dist/pi-tui/layout.js
-import { cropKittyImageLine, getKittyImageMetadata, isImageLine as isImageLine2 } from "../terminal-image.js";
+import { cropKittyImageLine, getKittyImageMetadata, getMaxKittyImageRows, isImageLine as isImageLine2 } from "../terminal-image.js";
 import { CURSOR_MARKER as CURSOR_MARKER3, compositeTuiLine as compositeTuiLine2 } from "../tui.js";
 import { extractAnsiCode, getActiveBackgroundAnsi, getGraphemeCellRange, sliceByColumn as sliceByColumn3, visibleWidth as visibleWidth12 } from "../utils.js";
 var OSC133_ZONE_PREFIX = /^(?:\x1b\]133;[ABC](?:\x07|\x1b\\))+/;
@@ -8251,21 +8339,23 @@ function paintBox(box, screen, totalWidth) {
   for (const child of box.children)
     paintBox(child, screen, totalWidth);
   if (box.scrollView && box.scrollContentLines && box.scrollView.scrollTop > 0 && box.rect.height > 0) {
-    for (let imageRow = box.scrollView.scrollTop - 1; imageRow >= 0; imageRow--) {
+    const scrollTop = box.scrollView.scrollTop;
+    const minRow = Math.max(0, scrollTop - getMaxKittyImageRows());
+    for (let imageRow = scrollTop - 1; imageRow >= minRow; imageRow--) {
       const imageLine = box.scrollContentLines[imageRow] ?? "";
+      if (!isImageLine2(imageLine))
+        continue;
       const metadata = getKittyImageMetadata(imageLine);
-      if (metadata) {
-        const hiddenRows = box.scrollView.scrollTop - imageRow;
-        if (hiddenRows < metadata.rows) {
-          const visibleRows = Math.min(box.rect.height, metadata.rows - hiddenRows);
-          const cropped = cropKittyImageLine(imageLine, hiddenRows, visibleRows);
-          if (box.rect.x === 0 && box.rect.width >= totalWidth)
-            screen[box.rect.y] = cropped;
-        }
-        break;
+      if (!metadata)
+        continue;
+      const hiddenRows = scrollTop - imageRow;
+      if (hiddenRows < metadata.rows) {
+        const visibleRows = Math.min(box.rect.height, metadata.rows - hiddenRows);
+        const cropped = cropKittyImageLine(imageLine, hiddenRows, visibleRows);
+        if (box.rect.x === 0 && box.rect.width >= totalWidth)
+          screen[box.rect.y] = cropped;
       }
-      if (imageLine !== "")
-        break;
+      break;
     }
   }
   paintScrollbar(box, screen, totalWidth);
@@ -8431,7 +8521,7 @@ var MAX_CACHED_OFFSCREEN_KITTY_TRANSMISSION_BYTES = 32 * 1024 * 1024;
 var MAX_CACHED_OFFSCREEN_KITTY_DECODED_BYTES = 64 * 1024 * 1024;
 var DOUBLE_CLICK_INTERVAL_MS = 500;
 var COPY_ERROR_FLASH_DURATION_MS = 5e3;
-var TERMINAL_WORD_SELECTION_JOINERS = /* @__PURE__ */ new Set(["/", "-"]);
+var TERMINAL_WORD_SELECTION_JOINERS = /* @__PURE__ */ new Set(["/", "-", "+", "\\", "~", "_", "."]);
 var TuiAltScreen = class extends TuiBase {
   static {
     __name(this, "TuiAltScreen");
@@ -8853,7 +8943,10 @@ var TuiAltScreen = class extends TuiBase {
   flash(message, durationMs) {
     this.flashes.flash(message, durationMs);
   }
-  shouldDeferViewportInputToOverlay() {
+  /** Focused overlays and components that capture viewport input receive viewport keys instead of the transcript. */
+  shouldDeferViewportInput() {
+    if (this.getFocusedComponent()?.capturesViewportInput)
+      return true;
     return this.isOverlayFocused() && this.activeSearch?.overlay?.isFocused() !== true;
   }
   clearComponentMouseGesture() {
@@ -8935,7 +9028,7 @@ var TuiAltScreen = class extends TuiBase {
         return { consume: true };
       }
     }
-    if (this.shouldDeferViewportInputToOverlay())
+    if (this.shouldDeferViewportInput())
       return void 0;
     if (keybindings.matches(data, "tui.altScreen.pageUp")) {
       if (!isRelease) {
@@ -9865,6 +9958,7 @@ import * as path2 from "node:path";
 import { deleteKittyImage as deleteKittyImage2, isImageLine as isImageLine4 } from "../terminal-image.js";
 import { TuiBase as TuiBase2 } from "../tui.js";
 import { visibleWidth as visibleWidth14 } from "../utils.js";
+var OSC133_ZONE_PREFIX3 = /^(?:\x1b\]133;[ABC](?:\x07|\x1b\\))+/;
 var KITTY_SEQUENCE_PREFIX = "\x1B_G";
 var MAX_RENDER_WRITE_CHARS = 1024 * 1024;
 var BoundedTerminalWriter = class {
@@ -10084,7 +10178,7 @@ var TuiMainScreen = class extends TuiBase2 {
       const targetScreenRow = targetRow - viewportTop;
       return targetScreenRow - currentScreenRow;
     }, "computeLineDiff");
-    let newLines = this.resolveFakeCursors(this.render(width));
+    let newLines = this.resolveFakeCursors(this.render(width).map((line) => line.replace(OSC133_ZONE_PREFIX3, "")));
     if (this.hasOverlayEntries) {
       newLines = this.compositeOverlays(newLines, width, height);
     }
@@ -10410,7 +10504,7 @@ var TuiMainScreen = class extends TuiBase2 {
 };
 
 // pi-dist/pi-tui/index.js
-import { getOsc8LinkAtColumn as getOsc8LinkAtColumn2, sliceByColumn as sliceByColumn5, stripTerminalSequences as stripTerminalSequences3, truncateToWidth as truncateToWidth9, visibleWidth as visibleWidth15, wrapTextWithAnsi as wrapTextWithAnsi4 } from "../utils.js";
+import { getOsc8LinkAtColumn as getOsc8LinkAtColumn2, replaceControlCharacters as replaceControlCharacters3, sliceByColumn as sliceByColumn5, stripTerminalSequences as stripTerminalSequences3, truncateToWidth as truncateToWidth9, visibleWidth as visibleWidth15, wrapTextWithAnsi as wrapTextWithAnsi4 } from "../utils.js";
 export {
   Box,
   CURSOR_MARKER5 as CURSOR_MARKER,
@@ -10466,6 +10560,7 @@ export {
   getNativeClipboard,
   getOsc8LinkAtColumn2 as getOsc8LinkAtColumn,
   getPngDimensions2 as getPngDimensions,
+  getSelectPageIndex3 as getSelectPageIndex,
   getTerminalColorMode,
   getWebpDimensions,
   hyperlink2 as hyperlink,
@@ -10488,6 +10583,7 @@ export {
   renderFakeCursor3 as renderFakeCursor,
   renderImage2 as renderImage,
   renderLatex,
+  replaceControlCharacters3 as replaceControlCharacters,
   resetCapabilitiesCache,
   rgbColor,
   setCapabilities2 as setCapabilities,

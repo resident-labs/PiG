@@ -13,6 +13,12 @@ import (
 // runHostWiringMode runs the real binary in mode with the given extensions and no prompt, and returns the lines the extensions wrote to their report. Print and JSON mode read an empty stdin; RPC mode reads a closed one, which disposes the runtime as rpc-mode.ts does at input end.
 func runHostWiringMode(t *testing.T, mode string, extraArgs []string, extensions ...string) []string {
 	t.Helper()
+	return runHostWiringModeEnv(t, mode, nil, extraArgs, extensions...)
+}
+
+// runHostWiringModeEnv is runHostWiringMode with extra environment variables.
+func runHostWiringModeEnv(t *testing.T, mode string, env []string, extraArgs []string, extensions ...string) []string {
+	t.Helper()
 	binary := buildPigBinaryForSignalTest(t)
 	home, cwd := t.TempDir(), t.TempDir()
 	report := filepath.Join(t.TempDir(), "report.jsonl")
@@ -35,7 +41,7 @@ func runHostWiringMode(t *testing.T, mode string, extraArgs []string, extensions
 	}
 	cmd := exec.CommandContext(t.Context(), binary, args...)
 	cmd.Dir = cwd
-	cmd.Env = append(os.Environ(), "HOME="+home, "PIG_HOME="+filepath.Join(home, ".pig"), "PIG_CODING_AGENT_DIR="+filepath.Join(home, "pig"), "WIRING_REPORT="+report)
+	cmd.Env = append(append(os.Environ(), env...), "HOME="+home, "PIG_HOME="+filepath.Join(home, ".pig"), "PIG_CODING_AGENT_DIR="+filepath.Join(home, "pig"), "WIRING_REPORT="+report)
 	cmd.Stdin = strings.NewReader("")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -126,6 +132,55 @@ func TestExtensionVirtualModelFlushFailureStopsStartup(t *testing.T) {
 			}
 			if stderr.String() != want || stdout.String() != "" {
 				t.Fatalf("%s mode stderr %q, stdout %q; want stderr %q and no stdout", mode, stderr.String(), stdout.String(), want)
+			}
+		})
+	}
+}
+
+// Pi binds a mode's extensions with that mode: print-mode.ts bindExtensions passes "json" for --mode json and "print" otherwise, and rpc-mode.ts passes "rpc"; the interactive mode passes "tui" (interactive-mode.ts), which the parity scenario 90-extension-run-mode drives on a PTY. An extension reads it as ctx.mode. Pig's host sends the mode in the ready payload, and every SDK that never receives one reports "print" (issue 360), so only json and rpc tell a host that sends the mode from one that does not.
+func TestExtensionContextModeIsTheRunMode(t *testing.T) {
+	t.Parallel()
+	for _, fixture := range []string{"host-wiring-run-mode.mjs", "host-wiring-run-mode.py"} {
+		for _, mode := range []string{"print", "json", "rpc"} {
+			t.Run(fixture+"/"+mode, func(t *testing.T) {
+				got := runHostWiringMode(t, mode, nil, fixture)
+				if want := []string{`{"event":"mode","value":"` + mode + `"}`}; !slices.Equal(got, want) {
+					t.Fatalf("records:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+				}
+			})
+		}
+	}
+}
+
+// An SDK extension that computes a schema with a member of Type the host's type engine runs (Pick) loads in every mode of the stock pig binary: the Go, Rust and
+// Python SDKs send the call to the host (type.engine), and the engine is registered by coding/extension/pigsdk, which every pig program that embeds an SDK links, so no
+// host the command builds can meet the call without an engine. The subprocess package's own test binary links no pigsdk, so it registers the engine for its fixtures
+// (coding/extension/host/subprocess/type_engine_testmain_test.go); this test is the production path.
+func TestStockPigHostsTheTypeEngineForSDKExtensionsInEveryMode(t *testing.T) {
+	t.Parallel()
+	want := []string{`{"event":"type_engine","keys":["id","n"]}`}
+	for _, mode := range []string{"print", "json", "rpc"} {
+		t.Run(mode, func(t *testing.T) {
+			got := runHostWiringMode(t, mode, nil, "host-wiring-type-engine.py")
+			if !slices.Equal(got, want) {
+				t.Fatalf("records:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+			}
+		})
+	}
+}
+
+// Pi's pi.sendMessage with triggerTurn marks the Session busy before it returns (agent-session.ts:2404, 1895) and its one event loop runs nothing else until the
+// handler awaits, so a read in the handler's synchronous part is busy however long that part takes: a Pi handler that blocks for a second after the send still
+// reads busy. The run the faux model answers ends within that second, so a host that answers isIdle from the Session at the read reports idle. A Python handler
+// that sleeps is not at an await (time.sleep makes no call whose Pi API returns a Promise), so the read right after is busy in print, JSON and RPC mode alike.
+func TestSDKExtensionIsBusyThroughTheSynchronousPartAfterATriggeringSend(t *testing.T) {
+	t.Parallel()
+	want := []string{`{"event":"idle","sync":false}`}
+	for _, mode := range []string{"print", "json", "rpc"} {
+		t.Run(mode, func(t *testing.T) {
+			got := runHostWiringModeEnv(t, mode, []string{"PIG_TEST_FAUX=1"}, []string{"--offline", "--model", "test-faux/faux-1"}, "host-wiring-send-idle.py")
+			if !slices.Equal(got, want) {
+				t.Fatalf("records:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 			}
 		})
 	}

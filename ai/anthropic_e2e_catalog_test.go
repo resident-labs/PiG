@@ -30,14 +30,17 @@ func assertAnthropicCatalogDenominator(t *testing.T, cases anthropicAcceptanceCa
 	t.Helper()
 	var expected []string
 	for _, provider := range ListProviders() {
-		for _, model := range ListModels(provider) {
+		// OpenRouter's :nitro and :floor variants are PiG's addition (D199); the Pi fixture has none.
+		for _, model := range piListedModels(ListModels(provider)) {
 			if model.API == APIAnthropicMessages {
 				expected = append(expected, provider+"/"+model.ID)
 			}
 		}
 	}
 	slices.Sort(expected)
-	if !slices.Equal(cases.All, expected) {
+	all := slices.Clone(cases.All)
+	slices.Sort(all)
+	if !slices.Equal(all, expected) {
 		t.Fatal("Anthropic model denominator differs from the Pi 1.2.0 fixture; see testdata/port-wave-13/README.md")
 	}
 }

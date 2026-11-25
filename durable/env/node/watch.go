@@ -191,14 +191,14 @@ func compareUTF16(a, b string) int {
 // watchers before they are scanned again, so nothing written into them before the watcher existed is missed.
 type nodeFileWatcher struct {
 	targets        []resolvedTarget
-	onChange       func(durableenv.WatchChange)
+	onChange       func(durableenv.FileChange)
 	pollInterval   time.Duration
 	maxDirectories int
 
 	// snapshot is owned by the opener, then by the running flush.
 	snapshot snapshot
 
-	// deliverMu is held while a change is delivered, so a delivery never starts after Close has set closed.
+	// deliverMu is held while a change is delivered, so a delivery never starts after Stop has set stopped.
 	deliverMu sync.Mutex
 
 	mu   sync.Mutex
@@ -213,14 +213,14 @@ type nodeFileWatcher struct {
 	timer       *time.Timer
 	running     chan struct{}
 	dirty       bool
-	closed      bool
+	stopped     bool
 }
 
 var _ durableenv.FileWatcher = (*nodeFileWatcher)(nil)
 
 // Watch reports changes to the targets; see FileSystem.Watch. Coverage is established when it returns: the watchers
 // come first, then the snapshot later changes are compared with.
-func (env *NodeExecutionEnv) Watch(ctx context.Context, targets []durableenv.WatchTarget, onChange func(durableenv.WatchChange)) (durableenv.FileWatcher, error) {
+func (env *NodeExecutionEnv) Watch(ctx context.Context, targets []durableenv.WatchTarget, onChange func(durableenv.FileChange)) (durableenv.FileWatcher, error) {
 	if err := abortedFileError(ctx, ""); err != nil {
 		return nil, err
 	}
@@ -230,13 +230,13 @@ func (env *NodeExecutionEnv) Watch(ctx context.Context, targets []durableenv.Wat
 		return nil, toFileError(err, fsCall{})
 	}
 	if abortErr := abortedFileError(ctx, ""); abortErr != nil {
-		_ = watcher.Close(ctx)
+		_ = watcher.Stop(ctx)
 		return nil, abortErr
 	}
 	return watcher, nil
 }
 
-func openFileWatcher(targets []durableenv.WatchTarget, resolve func(string) string, onChange func(durableenv.WatchChange), options NodeWatchOptions) (*nodeFileWatcher, error) {
+func openFileWatcher(targets []durableenv.WatchTarget, resolve func(string) string, onChange func(durableenv.FileChange), options NodeWatchOptions) (*nodeFileWatcher, error) {
 	resolved := make([]resolvedTarget, len(targets))
 	paths := make([]string, len(targets))
 	for index, target := range targets {
@@ -304,11 +304,11 @@ func (watcher *nodeFileWatcher) Mode() durableenv.WatchMode {
 	return watcher.mode
 }
 
-// Close stops watching; no onChange call starts after it returns. It waits for a rescan in progress, except while a
-// change is being delivered, so Close may be called from onChange.
-func (watcher *nodeFileWatcher) Close(context.Context) error {
+// Stop stops watching; no onChange call starts after it returns. It waits for a rescan in progress, except while a
+// change is being delivered, so Stop may be called from onChange.
+func (watcher *nodeFileWatcher) Stop(context.Context) error {
 	watcher.mu.Lock()
-	if watcher.closed {
+	if watcher.stopped {
 		watcher.mu.Unlock()
 		return nil
 	}
@@ -329,7 +329,7 @@ func (watcher *nodeFileWatcher) Close(context.Context) error {
 
 func (watcher *nodeFileWatcher) stop() {
 	watcher.mu.Lock()
-	watcher.closed = true
+	watcher.stopped = true
 	if watcher.timer != nil {
 		watcher.timer.Stop()
 		watcher.timer = nil
@@ -344,14 +344,14 @@ func (watcher *nodeFileWatcher) stop() {
 	}
 }
 
-// deliver calls onChange unless the watcher is closed; a panic in the callback must not stop watching.
-func (watcher *nodeFileWatcher) deliver(change durableenv.WatchChange) {
+// deliver calls onChange unless the watcher is stopped; a panic in the callback must not stop watching.
+func (watcher *nodeFileWatcher) deliver(change durableenv.FileChange) {
 	watcher.deliverMu.Lock()
 	defer watcher.deliverMu.Unlock()
 	watcher.mu.Lock()
-	closed := watcher.closed
+	stopped := watcher.stopped
 	watcher.mu.Unlock()
-	if closed {
+	if stopped {
 		return
 	}
 	defer func() { _ = recover() }() // upstream: durable/src/env/node-watch.ts:deliver
@@ -361,7 +361,7 @@ func (watcher *nodeFileWatcher) deliver(change durableenv.WatchChange) {
 func (watcher *nodeFileWatcher) schedulePoll() {
 	watcher.mu.Lock()
 	defer watcher.mu.Unlock()
-	if watcher.closed || watcher.mode != durableenv.WatchPolling || watcher.timer != nil {
+	if watcher.stopped || watcher.mode != durableenv.WatchPolling || watcher.timer != nil {
 		return
 	}
 	watcher.timer = time.AfterFunc(watcher.pollInterval, func() {
@@ -375,7 +375,7 @@ func (watcher *nodeFileWatcher) schedulePoll() {
 
 // scheduleFlushLocked arms the debounce timer; the caller holds mu.
 func (watcher *nodeFileWatcher) scheduleFlushLocked() {
-	if watcher.closed || watcher.timer != nil {
+	if watcher.stopped || watcher.timer != nil {
 		return
 	}
 	watcher.timer = time.AfterFunc(debounce, func() {
@@ -437,7 +437,7 @@ func (watcher *nodeFileWatcher) runFlush() {
 			if _, ok := errors.AsType[budgetExceeded](err); ok {
 				fileError = durableenv.NewFileError(durableenv.FileErrorInvalid, err.Error(), "", nil)
 			}
-			watcher.deliver(durableenv.WatchChangeError{Error: fileError})
+			watcher.deliver(durableenv.FileChangeFailed{Error: fileError})
 			watcher.stop()
 			return
 		}
@@ -450,10 +450,10 @@ func (watcher *nodeFileWatcher) runFlush() {
 				paths = append(paths, path)
 			}
 			slices.SortFunc(paths, compareUTF16)
-			watcher.deliver(durableenv.WatchChangePaths{Paths: paths})
+			watcher.deliver(durableenv.FileChangePaths{Paths: paths})
 		}
 		watcher.mu.Lock()
-		again := watcher.dirty && !watcher.closed
+		again := watcher.dirty && !watcher.stopped
 		watcher.mu.Unlock()
 		if !again {
 			return
@@ -466,20 +466,20 @@ func (watcher *nodeFileWatcher) sync(report bool) (map[string]bool, error) {
 	changed := map[string]bool{}
 	for range syncRounds {
 		watcher.mu.Lock()
-		closed, mode := watcher.closed, watcher.mode
+		stopped, mode := watcher.stopped, watcher.mode
 		watcher.mu.Unlock()
-		if closed {
+		if stopped {
 			break
 		}
 		scan, err := watcher.scan(mode)
 		if err != nil {
 			return nil, err
 		}
-		// Closed during the scan: installing watchers now would leak them.
+		// Stopped during the scan: installing watchers now would leak them.
 		watcher.mu.Lock()
-		closed, mode = watcher.closed, watcher.mode
+		stopped, mode = watcher.stopped, watcher.mode
 		watcher.mu.Unlock()
-		if closed {
+		if stopped {
 			break
 		}
 		next := scan.snapshot
@@ -715,7 +715,7 @@ func (watcher *nodeFileWatcher) reconcileWatchers(scan scanResult) bool {
 			return false
 		}
 		watcher.mu.Lock()
-		if watcher.closed || watcher.mode != durableenv.WatchNative {
+		if watcher.stopped || watcher.mode != durableenv.WatchNative {
 			watcher.mu.Unlock()
 			_ = created.Close()
 			return false
@@ -752,7 +752,7 @@ func (watcher *nodeFileWatcher) reconcileWatchers(scan scanResult) bool {
 			}
 		}
 		watcher.mu.Lock()
-		if !watcher.closed {
+		if !watcher.stopped {
 			entry := snap[path]
 			watcher.watched[path] = installedWatch{dev: entry.dev, ino: entry.ino, alias: alias}
 			if alias != "" {
@@ -784,7 +784,7 @@ func (watcher *nodeFileWatcher) switchToPolling() {
 	if fsw != nil {
 		_ = fsw.Close()
 	}
-	watcher.deliver(durableenv.WatchChangeOverflow{})
+	watcher.deliver(durableenv.FileChangeOverflow{})
 	watcher.schedulePoll()
 }
 
@@ -811,7 +811,14 @@ func (watcher *nodeFileWatcher) pumpEvents(fsw *fsnotify.Watcher) {
 func (watcher *nodeFileWatcher) onEvent(path string) {
 	watcher.mu.Lock()
 	defer watcher.mu.Unlock()
-	if watcher.closed {
+	if watcher.stopped {
+		return
+	}
+	// fsnotify's kqueue backend names an event for a descriptor whose watch it already removed (a directory deleted under a recursive
+	// watch) with an empty path, and "." once cleaned. Every target is within such a path, so it would report the target itself, which
+	// Pi's FSEvents-backed daemon does not. It names no entry: only a rescan follows, which finds what changed.
+	if !filepath.IsAbs(path) {
+		watcher.scheduleFlushLocked()
 		return
 	}
 	// The file a linked target points to changed: report the target.

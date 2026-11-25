@@ -31,6 +31,7 @@ type ConfiguredPackage struct {
 }
 
 // GetGitDependencyInstallArgs selects the install arguments of a Git package's dependencies from the package manager the npmCommand names, without auto-installing peer dependencies.
+// Ports packages/coding-agent/src/core/package-manager.ts (getGitDependencyInstallArgs).
 // Ports .upstream/v0.99.1/packages/coding-agent/src/core/package-manager.ts:1821-1838 (getGitDependencyInstallArgs).
 func GetGitDependencyInstallArgs(sm *codingagent.SettingsManager, opts ...InstallOption) ([]string, error) {
 	manager, err := PackageManagerName(DefaultNpmCommand(sm))
@@ -44,7 +45,7 @@ func GetGitDependencyInstallArgs(sm *codingagent.SettingsManager, opts ...Instal
 	case "pnpm":
 		args = []string{"install", "--prod", "--config.auto-install-peers=false", "--config.strict-peer-dependencies=false", "--config.strict-dep-builds=false"}
 	case "npm":
-		args = []string{"install", "--omit=dev", "--legacy-peer-deps"}
+		args = []string{"install", "--omit=dev", "--legacy-peer-deps", "--no-audit", "--no-fund"}
 	default:
 		args = []string{"install"}
 	}
@@ -77,7 +78,8 @@ func InstallPackageArtifacts(cwd, agentDir string, sm *codingagent.SettingsManag
 		case "npm":
 			return InstallManagedNPM(cwd, agentDir, sm, pkg.Source, local, opts...)
 		case "git":
-			return InstallManagedGit(cwd, agentDir, sm, pkg.Source, local, opts...)
+			gitOpts := append([]InstallOption{WithProgressReporter(progress)}, opts...)
+			return InstallManagedGit(cwd, agentDir, sm, pkg.Source, local, gitOpts...)
 		default:
 			return fmt.Errorf("unsupported package source: %s", pkg.Source)
 		}
@@ -341,6 +343,9 @@ func PackageSourceIdentityChecked(baseDir, raw string) (string, error) {
 		}
 		return "unsupported:" + strings.TrimSpace(raw), nil
 	}
+	if path, local := strings.CutPrefix(identity, "local:"); local && ref.Kind == sourceref.KindLocal && resolvepath.FoldsCase() {
+		identity = "local:" + resolvepath.ComparisonKey(path)
+	}
 	return identity, nil
 }
 
@@ -380,8 +385,22 @@ func InstallManagedNPM(cwd, agentDir string, sm *codingagent.SettingsManager, so
 	if err != nil {
 		return err
 	}
-	args = append(args, NpmInstallArgs(manager, ref.Locator, installRoot, ref.NPMRegistry, opts...)...)
+	realRoot, err := RealInstallRoot(installRoot)
+	if err != nil {
+		return err
+	}
+	args = append(args, NpmInstallArgs(manager, ref.Locator, realRoot, ref.NPMRegistry, opts...)...)
 	return RunPackageProcessContext(resolveInstallOptions(opts).ctx, "", command[0], args...)
+}
+
+// RealInstallRoot is the install root npm gets as --prefix: its real path when it exists, itself otherwise (package-manager.ts
+// getNpmInstallArgs, realpathSync: on Windows the spelling of a component that is not a link, 8.3 short names included, is kept). npm writes broken nested package-lock.json paths when --prefix goes through a symlink, such as a ~/.pi linked
+// into a dotfiles repository; every later install would nest one level deeper.
+func RealInstallRoot(root string) (string, error) {
+	if _, err := os.Stat(root); err != nil {
+		return root, nil
+	}
+	return codingagent.RealPathSync(root)
 }
 
 func NpmInstallArgs(manager, spec, installRoot, registry string, opts ...InstallOption) []string {
@@ -397,7 +416,8 @@ func NpmInstallArgs(manager, spec, installRoot, registry string, opts ...Install
 			"--config.strict-dep-builds=false",
 		}
 	default:
-		args = []string{"install", spec, "--prefix", installRoot, "--legacy-peer-deps"}
+		// npm audit fix would run without --legacy-peer-deps and install pi peers, so skip audit advice.
+		args = []string{"install", spec, "--prefix", installRoot, "--legacy-peer-deps", "--no-audit", "--no-fund"}
 	}
 	if registry != "" {
 		args = append(args, "--registry", registry)
@@ -582,9 +602,11 @@ func fileCheckoutSegments(repoPath string) []string {
 // localhost file URL with a drive becomes the equivalent file:///C:/....
 func GitCloneRepo(goos, repo string) string {
 	const localhost = "file://localhost/"
+	//portlint:allow utf16units PiG-only Windows clone fix with no Pi counterpart; the prefix is ASCII, and EqualFold can only accept the first 17 bytes when they are ASCII (the only non-ASCII fold to a prefix letter is U+017F for s, which takes 2 bytes for one letter and so cannot fill 17 bytes with 17 letters), so the slice ends on a character boundary
 	if goos != "windows" || len(repo) < len(localhost) || !strings.EqualFold(repo[:len(localhost)], localhost) {
 		return repo
 	}
+	//portlint:allow utf16units the first len(localhost) bytes matched the ASCII prefix above, so this offset is a character boundary
 	rest := repo[len(localhost):]
 	drive, _, _ := strings.Cut(rest, "/")
 	if !IsDriveSegment(drive) {
@@ -595,6 +617,7 @@ func GitCloneRepo(goos, repo string) string {
 
 // IsDriveSegment reports whether segment is a Windows drive such as C:.
 func IsDriveSegment(segment string) bool {
+	//portlint:allow utf16units PiG-only drive check: a segment of 2 bytes whose bytes are an ASCII letter and a colon is exactly a 2-unit string of those characters, and any non-ASCII segment fails the byte tests and has more than 2 bytes or a non-letter first byte
 	return len(segment) == 2 && segment[1] == ':' && ('A' <= segment[0] && segment[0] <= 'Z' || 'a' <= segment[0] && segment[0] <= 'z')
 }
 

@@ -8,6 +8,7 @@ import (
 
 	"github.com/MichaelKinsy/PiG/durable/core/jv"
 	"github.com/MichaelKinsy/PiG/durable/core/session"
+	"github.com/MichaelKinsy/PiG/durable/core/session/hopcost"
 	"github.com/MichaelKinsy/PiG/durable/core/session/sessiontest"
 )
 
@@ -58,19 +59,40 @@ func TestSchedulerMatchesPiDurable(t *testing.T) {
 	}
 }
 
+// logStore logs each commit one tick after Storage received it, as the oracle's wrapper does (`queueMicrotask` in the receipt of each stored
+// batch): the entry is queued in the tick the writer's call stores the batch, and the Harness clock advances with it.
+//
+// A scenario's "storage" shapes the Storage as the oracle does (testdata/sched_oracle.mjs): the batch at refuseAt (counted from the start) is
+// refused, the one at rejectAt fails its call.
 type logStore struct {
 	*sessiontest.MemStore
-	log *[]any
+	log    *[]any
+	logged *int
+	loop   *session.Loop
+	// stored counts the batches stored so far; refuse and reject name the batch that is refused or fails the call (-1: none).
+	stored         int
+	refuse, reject int
 }
 
-func (l logStore) Commit(writes []session.Write, next session.ID) (session.Seq, error) {
+func (l *logStore) Commit(writes []session.Write, next session.ID) (session.Seq, error) {
+	if l.stored == l.refuse {
+		return 0, &session.RefusedError{Err: errors.New("refused")}
+	}
+	if l.stored == l.reject {
+		return 0, errors.New("rejected")
+	}
+	l.stored++
 	seq, err := l.MemStore.Commit(writes, next)
 	if err == nil {
 		ws := make([]any, len(writes))
 		for i, w := range writes {
 			ws[i] = writeValue(w)
 		}
-		*l.log = append(*l.log, obj("t", "commit", "seq", float64(seq), "writes", ws))
+		entry := obj("t", "commit", "seq", float64(seq), "writes", ws)
+		l.loop.Defer(func() {
+			*l.logged++
+			*l.log = append(*l.log, entry)
+		})
 	}
 	return seq, err
 }
@@ -95,10 +117,48 @@ func runSched(t *testing.T, file string) []any {
 	var events []any
 	logf := func(kv ...any) { events = append(events, obj(kv...)) }
 	mem := sessiontest.New()
-	store := logStore{mem, &events}
-	now := func() float64 { return 1000 + float64(len(mem.Commits)) }
-	sess := session.New(store, mem.NextID(), now)
 	loop := &session.Loop{}
+	logged := 0
+	shape, _ := get(sc, "storage").(*jv.Object)
+	storageTicks, refuseAt, rejectAt := 0, -1, -1
+	if shape != nil {
+		storageTicks = int(gint(shape, "ticks"))
+		if shape.Has("refuseAt") {
+			refuseAt = int(gint(shape, "refuseAt"))
+		}
+		if shape.Has("rejectAt") {
+			rejectAt = int(gint(shape, "rejectAt"))
+		}
+	}
+	store := &logStore{MemStore: mem, log: &events, logged: &logged, loop: loop, refuse: refuseAt, reject: rejectAt}
+	loop.Elapsed = sessiontest.Elapsed(hopcost.Memory)
+	// The oracle's Storage is an async function around MemoryStorage that waits storageTicks passes first (testdata/sched_oracle.mjs): MemoryStorage
+	// stores in the tick it is called, one tick after the wait when there is one, and the wrapper's own promise settles when it returns
+	// MemoryStorage's (two passes later), or at once after awaiting a call whose batch was cut off by a refusal or a rejection.
+	loop.StoreTicks = func(batches [][]session.Write) (int, int, int) {
+		receive := 0
+		if storageTicks > 0 {
+			receive = storageTicks + 1
+		}
+		cut := len(batches)
+		for i := range batches {
+			if store.stored+i == refuseAt || store.stored+i == rejectAt {
+				cut = i
+				break
+			}
+		}
+		if cut < len(batches) {
+			return 0, receive, hopcost.StoreCallResume(receive + 1)
+		}
+		return 0, receive, hopcost.StoreCallResume(receive + 2)
+	}
+	now := func() float64 { return 1000 + float64(logged) }
+	if gstr(sc, "clock") == "fixed" {
+		now = func() float64 { return 1000 }
+	}
+	sess := session.New(store, mem.NextID(), now)
+	sess.SetHopProfile(hopcost.Memory)
+	loop.Bind(sess)
 
 	gates := map[string][]func(){}
 	released := map[string]bool{}
@@ -186,13 +246,17 @@ func runSched(t *testing.T, file string) []any {
 			case get(step, "waitForTask") != nil:
 				on := get(step, "waitForTask")
 				rt.WaitForTask(session.ID(on.(float64)), func(rec *jv.Object, err error, _ bool) {
-					if err != nil {
-						logf("t", "waited", "task", float64(tid), "on", on, "error", err.Error())
-					} else {
-						st, _ := getStrField(rec)
-						logf("t", "waited", "task", float64(tid), "on", on, "status", st)
-					}
-					next()
+					// The task's call goes through the scheduler's `#read`, an async function that returns the read's promise: the task resumes two
+					// ticks after the promise settles.
+					loop.Wait(2, markResumer(func() {
+						if err != nil {
+							logf("t", "waited", "task", float64(tid), "on", on, "error", err.Error())
+						} else {
+							st, _ := getStrField(rec)
+							logf("t", "waited", "task", float64(tid), "on", on, "status", st)
+						}
+						next()
+					}))
 				})
 			case get(step, "throw") != nil:
 				done(errors.New(gstr(step, "throw")))
@@ -257,17 +321,25 @@ func runSched(t *testing.T, file string) []any {
 		Snapshot: func() session.Snapshot { return reg },
 		Report:   func(err error, _ *jv.Object) { logf("t", "report", "message", err.Error()) },
 		Now:      now,
+		// The callbacks of a job run at the tick of the job's duration their Pi awaits reach: the log entry follows the ticks the transaction spent.
 		SettleOutcome: func(tx *session.Tx, rec *jv.Object, outcome *jv.Object) error {
-			logf("t", "settleOutcome", "task", get(rec, "id"), "status", get(outcome, "status"))
+			task, status := get(rec, "id"), get(outcome, "status")
+			loop.Wait(tx.Ticks()-loop.Consumed(), markResumer(func() { logf("t", "settleOutcome", "task", task, "status", status) }))
 			return nil
 		},
 		WithdrawInputs: func(tx *session.Tx, id session.ID) error {
-			logf("t", "withdraw", "conversation", float64(id))
+			loop.Wait(tx.Ticks()-loop.Consumed(), markResumer(func() { logf("t", "withdraw", "conversation", float64(id)) }))
 			return nil
 		},
 		Timer: func(at float64, fire func()) func() { return func() {} },
 	})
 	_ = byName
+	// The oracle's Session is a plain one, which drops the failure's report: the Scheduler's report of it is the Harness's.
+	sess.OnFail = nil
+	if get(sc, "membership") != true {
+		// Nor does the oracle's plain Session add the scheduler's membership keys (`membership: true` does).
+		sess.MembershipKeys = nil
+	}
 
 	watch := func(name string, f func(done func(rec *jv.Object, err error))) {
 		f(func(rec *jv.Object, err error) {
@@ -283,45 +355,60 @@ func runSched(t *testing.T, file string) []any {
 		})
 	}
 
+	queueCommit := func(ops []any, done func(error)) {
+		loop.Line(func() error {
+			_, err := sess.Commit(func(tx *session.Tx) error {
+				for _, o := range ops {
+					op := o.(*jv.Object)
+					var err error
+					switch gstr(op, "op") {
+					case "rootConversation":
+						_, err = tx.CreateRootConversation()
+					case "createConversation":
+						_, err = tx.CreateConversation(session.Ownership{Task: gint(op, "ownerTask")})
+					case "createTask":
+						opts := session.TaskOptions{}
+						if oo, ok := get(op, "opts").(*jv.Object); ok {
+							opts = session.TaskOptions{OwnerTask: gint(oo, "ownerTask"), ConversationID: gint(oo, "conversationId"), Background: get(oo, "background") == true}
+						}
+						input := get(op, "input")
+						_, err = tx.CreateTask(&impls[gstr(op, "task")].Def, input, opts)
+					case "appendEntry":
+						_, err = tx.AppendEntry(gint(op, "conversationId"), jv.Clone(get(op, "draft")).(*jv.Object))
+					case "createSubmission":
+						_, err = tx.CreateSubmission(jv.Clone(get(op, "create")).(*jv.Object))
+					}
+					if err != nil {
+						return err
+					}
+				}
+				return nil
+			}, session.TxScope{})
+			return err
+		}, done)
+	}
+
 	for i, cv := range get(sc, "cmds").([]any) {
 		cmd := cv.(*jv.Object)
 		logf("t", "cmd", "i", float64(i), "cmd", gstr(cmd, "cmd"))
 		switch gstr(cmd, "cmd") {
 		case "commit":
-			loop.Line(func() error {
-				_, err := sess.Commit(func(tx *session.Tx) error {
-					for _, o := range get(cmd, "ops").([]any) {
-						op := o.(*jv.Object)
-						var err error
-						switch gstr(op, "op") {
-						case "rootConversation":
-							_, err = tx.CreateRootConversation()
-						case "createConversation":
-							_, err = tx.CreateConversation(session.Ownership{Task: gint(op, "ownerTask")})
-						case "createTask":
-							opts := session.TaskOptions{}
-							if oo, ok := get(op, "opts").(*jv.Object); ok {
-								opts = session.TaskOptions{OwnerTask: gint(oo, "ownerTask"), ConversationID: gint(oo, "conversationId"), Background: get(oo, "background") == true}
-							}
-							input := get(op, "input")
-							_, err = tx.CreateTask(&impls[gstr(op, "task")].Def, input, opts)
-						case "appendEntry":
-							_, err = tx.AppendEntry(gint(op, "conversationId"), jv.Clone(get(op, "draft")).(*jv.Object))
-						case "createSubmission":
-							_, err = tx.CreateSubmission(jv.Clone(get(op, "create")).(*jv.Object))
-						}
-						if err != nil {
-							return err
-						}
-					}
-					return nil
-				}, session.TxScope{})
-				return err
-			}, func(err error) {
+			queueCommit(get(cmd, "ops").([]any), func(err error) {
 				if err != nil {
 					logf("t", "cmdError", "i", float64(i), "message", err.Error())
 				}
 			})
+		// commits queues several on the line in one tick: they overlap in the Storage.
+		case "commits":
+			for j, ops := range get(cmd, "each").([]any) {
+				queueCommit(ops.([]any), func(err error) {
+					if err != nil {
+						logf("t", "cmdError", "i", float64(i), "j", float64(j), "message", err.Error())
+						return
+					}
+					logf("t", "committed", "i", float64(i), "j", float64(j))
+				})
+			}
 		case "open":
 			sched.Open(func(err error) {
 				if err != nil {

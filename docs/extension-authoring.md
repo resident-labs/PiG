@@ -7,7 +7,7 @@ Read these files before adding or changing extension behavior:
 1. `docs/extension-api-parity.md`: parity boundary and SDK coverage matrix.
 2. `docs/parity/DIVERGENCES.md`: numbered intentional differences from upstream pi.
 3. `coding/extension/host/subprocess/protocol.go`: canonical wire protocol.
-4. `extensions/sdk/`, `extensions/sdk-rs/`, `extensions/sdk-py/`: SDK bridges.
+4. `extensions/sdk/`, `extensions/sdk-rs/`, `extensions/sdk-py/`, `extensions/sdk-lisp/`: SDK bridges.
 5. `extensions/sdk-ts/`: declarations for Pi-compatible TypeScript extensions and PiG-only additions.
 6. `test/extension-conformance/conformance_test.go`: cross-SDK behavior gate.
 7. `test/extension-conformance/sdkscenarios/`: the scenario table. A scenario is data: the extension every SDK's scenario driver (`testdata/scenario-driver*`) registers, the host steps `TestSDKScenarios` runs against the real host, and the observation every SDK must produce. Add a capability as a scenario here, not as a copy per SDK. A row an SDK fails today goes in the scenario's `Red` map with the owner of the fix and the observation the SDK produces today (`Got`). `make test-sdk-conformance` runs the table. A red row must produce exactly its `Got`, and the entry must be deleted when the row passes.
@@ -68,9 +68,23 @@ ext.Command("refresh", "Refresh models.", func(ctx sdk.Context, _ string) error 
 
 The Go subprocess SDK already runs each inbound handler on its own goroutine. Blocking inside the handler preserves upstream `await`: the host receives the response only when the callback completes. Wrapping the body in another `go func()` and returning `nil` early changes ordering, drops the returned error, and cancels the handler-scoped `sdk.Context` as soon as the handler returns.
 
+After a triggering `pi.sendMessage(..., { triggerTurn: true })`, `ctx.isIdle()` reads busy in every extension until the code that sent the message awaits or returns (Pi's one event loop runs nothing else before that). A thread-based SDK has no `await`, so blocking is not the same here: a handler that blocks on a raw sleep keeps `isIdle` busy for everyone until it returns, and only a call Pi awaits (`waitForIdle`, `exec`, the dialogs, ...) or the SDK's yield helper stands for `await`. A handler that waits for the run it started polls with the helper:
+
+```go
+trigger := true
+ctx.SendCustomMessage(msg, sdk.SendMessageOptions{TriggerTurn: &trigger})
+for idle, _ := ctx.IsIdle(); !idle; idle, _ = ctx.IsIdle() {
+    if err := ctx.Sleep(10 * time.Millisecond); err != nil { // yields first, then sleeps; not time.Sleep
+        return err
+    }
+}
+```
+
+The helpers are `ctx.Yield()` and `ctx.Sleep(d)` (Go), `ctx.yield_now()` and `ctx.sleep(duration)` (Rust, with a `Duration`), `ctx.yield_now()` and `ctx.sleep(seconds)` (Python), and `pig:ctx-yield` and `pig:ctx-sleep` (Lisp). Like Pi's `setTimeout`, the sleep helpers do not return early when the request is cancelled; use `Done()` (`is_cancelled()`, `ctx-wait-cancelled`) to stop earlier. A Node extension awaits as in Pi and needs nothing. The remaining difference is D225: a raw sleep keeps the hold, and a send from a thread the handler started holds nothing. `chord.DeliveryEntered` (D224) is the same pattern for a watch listener's wait in Chord's Go packages.
+
 ### Per-run prompt sections
 
-`before_agent_start` handlers receive `event.messageType`: `"user"` with `event.prompt` and `event.images` for a run that a user message starts, and `"custom"` with `event.message` for a run that `sendMessage` with `triggerTurn` starts while the agent is idle. A custom run also checks compaction first, applies the handlers' result and delivers pending `nextTurn` messages, as a user run does. Either run counts as busy while its handlers run, so messages sent meanwhile join it and a prompt or `sendUserMessage` must name its delivery. Handlers that should act only on user prompts check `event.messageType === "user"`, as `examples/extensions/plan-mode` does. This is Pi 1.4.0's behavior (Pi #5581, Pi PR #10739).
+`before_agent_start` handlers receive `event.messageType`: `"user"` with `event.prompt` and `event.images` for a run that a user message starts, and `"custom"` with `event.message` for a run that `sendMessage` with `triggerTurn` starts while the agent is idle. A custom run also checks compaction first, applies the handlers' result and delivers pending `nextTurn` messages, as a user run does. Either run counts as busy while its handlers run, so messages sent meanwhile join it and a prompt or `sendUserMessage` must name its delivery. Handlers that should act only on user prompts check `event.messageType === "user"`, as `examples/extensions/plan-mode` does. This is Pi 1.5.0's behavior (Pi #5581, Pi PR #10739).
 
 `before_agent_start` handlers can edit `event.systemPromptOptions.sections`. PiG preserves authored section order, validates XML tag names, records section deltas in the Session, and removes a per-run section when the next unmodified run starts. The host awaits the handler and retains section mutations before it reports an error. These mutations do not change the Session's base options.
 
@@ -215,7 +229,7 @@ To draw Pi's own components (container, box, text, truncated text, markdown, spa
 
 The host owns the state of a view's lists: keys the focused list binds move it, and its callbacks arrive as `kit.Event`s (`select`, `cancel`, `selectionChange`, `change`) on the overlay's input queue, after the input sent before them; every other key reaches the input handler. `View.theme` overrides theme tokens for one surface. An image's bytes cross the wire once per connection. The `lines` node's `image`, `progress` and `list` annotations are frontend-only: the SDKs send them only while a frontend draws.
 
-The conversation kinds (§2.1) follow Pi 1.4.0's components. A tool card and
+The conversation kinds (§2.1) follow Pi 1.5.0's components. A tool card and
 a `!` command take Pi's `outputPad` (default 1; Pi's `ToolExecutionOptions`
 and `BashExecutionComponent` argument) and `setOutputPad`, and a tool result
 carries the final result's `durationMs`, which a shell card draws as
@@ -224,6 +238,10 @@ carries the final result's `durationMs`, which a shell card draws as
 `set_output_pad`, `ToolResult::duration_ms`; Python `output_pad=`,
 `set_output_pad`, `ToolResult(duration_ms=)`. Node uses Pi's components
 directly.
+
+### Keybinding hints in renderers
+
+A renderer formats the user's configured keybindings with `keyText(id)` and `keyHint(id, description)` on the tool render context and on the message and entry renderer options, as Pi's `KeybindingHints` does (Pi 9376c8d1, #4748). `keyText` returns the keys of the id, joined by `/`, or an empty string when it has none; `keyHint` returns the keys in the host theme's dim color followed by the description in its muted color. Use these in renderers instead of the module-level function: Go `render.KeyHint("app.tools.expand", "to expand")` and `options.KeyText(...)`, Rust `render.key_hint(...)` and `options.key_text(...)`, Python `render.key_hint(...)` and `options.key_text(...)` (the options are the host's mapping and carry the two methods), Lisp `(pig:tool-render-context-key-hint render id description)` and `(pig:message-render-options-key-text options id)`, Node `context.keyHint(...)` and `options.keyText(...)`.
 
 ### Mouse in custom components
 
@@ -332,6 +350,7 @@ Pig accepts exactly one conventional factory or exact standalone form.
 | Go | importable `func Extension() *sdk.Extension` package | exact module with executable `package main` |
 | Rust | `src/lib.rs` with `pub fn new_extension() -> Extension` | exact crate with `src/main.rs` only |
 | Python | one module with `def new_extension() -> Extension` | executable `main.py` with a shebang |
+| Lisp | one ASDF system (`<name>.asd`) or one `<name>.lisp` file that defines `(defun new-extension ())`, usually through `(pig:define-extension ...)` | executable `main.lisp` with a shebang |
 | Node | Pi-compatible default export | exact executable script with a shebang |
 | Native | n/a | exact executable file |
 
@@ -366,6 +385,7 @@ The Go SDK changes that the upgrade reports since 0.4.1:
 - `ProviderStreamOptions` has `OnProviderStreamEvent` and no longer has `TransformHeaders`.
 - `Context.SetEditorComponent` takes an `sdk.EditorFactory` instead of `any`.
 - `Context.ConfigHome` returns `(string, error)`.
+- `HostHelpers.HighlightCode` has no `markdown` parameter: `getMarkdownTheme().highlightCode` is `highlightCode`.
 
 `make sdk-apidiff` fails an incompatible change to an extension SDK package that has no upgrade rule or release note.
 
@@ -421,6 +441,30 @@ def new_extension() -> pig_sdk.Extension:
 
 One selected root can contain only one module with this factory.
 
+### Lisp
+
+```lisp
+(defpackage "my-lisp-ext" (:use "COMMON-LISP"))
+(in-package "my-lisp-ext")
+
+(pig:define-extension "my-lisp-ext"
+  (:tool "hello" "Say hello" (pig:obj "type" "object")
+         (lambda (ctx params) (declare (ignore ctx params)) "hello"))
+  (:command "greet" "Greet the user"
+            (lambda (ctx args) (pig:ctx-notify ctx (format nil "hello ~A" args) "info")))
+  (:on :session-start (lambda (ctx data) (declare (ignore data)) (pig:ctx-set-status ctx "my-lisp-ext" "loaded"))))
+```
+
+`pig:define-extension` expands to exactly `(defun new-extension () ...)` in the current package, so the declarative form and a hand-written factory are the same factory. Each clause is the call of the same name on the extension (`pig:tool`, `pig:command`, `pig:shortcut`, `pig:flag`, `pig:on`, `pig:on-loaded`) and runs in clause order. Pig finds the factory in the system's package, or in the one file, and fails the build when it finds none or several. A directory holds either one `.asd` (system name = file name) or one factory `.lisp` file.
+
+Pig builds the system, with the staged `pig-sdk` system, into a cached SBCL image keyed by the SDK, the SBCL version and the source, then starts the image. The pinned toolchain is SBCL 2.6.9 (the official binary on Linux and Windows, built from the checksummed source on macOS) (`pig setup` shows what is missing; `PIG_SBCL` names another executable). Build once per source change, start in milliseconds after that. An extension runs in its own image, or shares one with other Lisp extensions whose packages and system names differ.
+
+Third-party libraries come from Quicklisp: list them in the system's `:depends-on` and Pig resolves them at build time from the pinned dist 2026-01-01 (`https://beta.quicklisp.org/dist/quicklisp/2026-01-01/`), together with the systems they need. The dist's `releases.txt` and `systems.txt` are checked against recorded SHA-256 digests, every archive against the size and MD5 the dist lists and against a SHA-256 recorded when it was first fetched, and nothing outside that dist is fetched. A system the dist does not list, a digest mismatch or an archive entry that leaves its release directory stops the build with the reason. Sources are cached under the Pig cache root (`quicklisp/2026-01-01`), and `PIG_OFFLINE` builds only from that cache. A single-file extension has no `.asd` and no dependencies.
+
+Conventions: kebab-case names, `ctx-` prefix for the per-request context. Payloads, event data and results are the wire JSON (`pig:obj` builds an object; objects read as `equal` hash-tables in member order, arrays as vectors, `t`, `:false` and `:null` for true, false and null, `nil` writes null; write an empty array as `#()`). Awaited host calls block the handler's thread and return the value or signal `pig:host-call-error`; `ctx-cancelled-p` and `ctx-wait-cancelled` report the request's cancellation; a member the SDK does not serve signals `pig:unsupported-capability` naming its gap lane and never returns a default. See `extensions/sdk-lisp/README.md` for the feature files and `docs/extension-api-parity.md` for the Lisp-specific limits.
+
+An exact standalone is an executable `main.lisp` that builds an extension with `pig:make-extension` and calls `(pig:run-extension ext)`; Pig runs it in the cached SDK image.
+
 ### Node
 
 Export one Pi-compatible default extension function. Pig packs Node factories into one shared Node process unless an extension is isolated. Import the canonical API from `@earendil-works/pi-coding-agent`. Pig supplies the compatible runtime module.
@@ -455,6 +499,8 @@ ext.RegisterProvider("example-provider", sdk.ProviderConfig{
 Rust: `ext.register_oauth_provider("example-provider", json!({"name": "Example Provider"}), OAuthProvider { login: Box::new(|cb| ...), .. })`.
 
 Python: `ext.register_oauth_provider("example-provider", {"name": "Example Provider"}, OAuthProvider(login=..., ...))`.
+
+Press Enter (`tui.select.confirm`) to open the device-login URL and copy the code, or log in manually. A provider can disable either action with `OpenBrowserOnConfirm` or `CopyCodeOnConfirm` set to a pointer to `false` (Go; `openBrowserOnConfirm` or `copyCodeOnConfirm` set to `false` in Node, Rust and Python) in the `OnDeviceCode` payload, and a native `AuthEvent` device-code notification takes the same fields.
 
 Value-returning callbacks (`OnPrompt`/`OnSelect`/`OnManualCodeInput`) return the user's input or, on dismissal, an error with Pi's message `Login cancelled` (Go `ErrOAuthCancelled`, Rust `OAUTH_CANCELLED`, Python `OAuthCancelled`; Node `onPrompt`, `onSelect` and `onManualCodeInput` reject with it). A login that returns that error ends as cancelled, and `/login` returns to the menu it was started from, as in Pi. Any other host failure is returned as that error. `OnManualCodeInput` asks with Pi's message "Paste the authorization code".
 
@@ -492,6 +538,27 @@ Prefer the context branch (what the model will see, trimmed at the last compacti
 
 Compute incrementally: keep running totals and update them from each new entry instead of rescanning the branch. Stream or peek (read only the fields you need, skip entries you do not care about) rather than materializing every entry. Before shipping, measure the handler on a large synthetic session (hundreds of MB, tens of thousands of entries, many compactions) and check both latency and peak memory.
 
+## Pricing what compaction would drop
+
+An extension that needs Pi's own answer to "where would compaction cut, and how many tokens lie before the cut" imports Pi's three helpers from its SDK. The helpers take the entries `getBranch()` returns, so no host call and no copy of Pi's logic is needed. Node re-exports Pi's `findCutPoint`, `sessionEntryToContextMessages` and `estimateTokens`. Go has `sdk.FindCutPoint`, `sdk.SessionEntryToContextMessages` and `sdk.EstimateTokens` in `github.com/MichaelKinsy/PiG/extensions/sdk` (a separate module: importing it does not pull in the host). Rust has `find_cut_point`, `session_entry_to_context_messages` and `estimate_tokens`. Python has the same snake_case names in `pig_sdk`.
+
+```go
+branch, _ := ctx.SessionManager().GetBranch(nil)
+cut := sdk.FindCutPoint(branch, 0, len(branch), keepRecentTokens) // Pi's findCutPoint
+dropped := 0
+for _, entry := range branch[:cut.FirstKeptEntryIndex] {
+	messages, err := sdk.SessionEntryToContextMessages(entry) // []any of map[string]any
+	if err != nil {
+		return err
+	}
+	for _, message := range messages {
+		dropped += sdk.EstimateTokens(message.(map[string]any))
+	}
+}
+```
+
+The helpers answer for the entries as stored. Pi's own `prepareCompaction` runs a cut over the session projection (context edits applied, a previous compaction's retained tail selected), and Pi does not export that projected cut, so over a branch with context edits the answer can differ from what native compaction does. Pass a `startIndex` after the last compaction entry to leave out what an earlier compaction already summarized. Each call costs time linear in the entries between `startIndex` and `endIndex`, as in Pi; a handler that runs per turn still follows the guidance above and keeps a running total instead of repricing the branch.
+
 ## Child agent sessions (`createAgentSession`)
 
 Pi's `createAgentSession` builds an independent `AgentSession` an extension can prompt, observe and abort without touching the session that runs it. Node extensions call Pi's own implementation. Go, Python and Rust extensions call `ctx.CreateAgentSession(sdk.CreateAgentSessionOptions{...})`, `ctx.create_agent_session(CreateAgentSessionOptions(...))` and `ctx.create_agent_session(CreateAgentSessionOptions { .. })`; the host builds the child `coding.Session` over the parent's model runtime, so every provider the extensions registered is available to it (`modelRuntime: ctx.modelRegistry.runtime` in Pi).
@@ -516,12 +583,16 @@ The session belongs to the extension's connection: closing the connection aborts
 
 Differences from Pi, each tested: a `model` the host's registry does not hold raises `Model <provider>/<id> not found` (Pi uses the object as given; a wire object carries no stream function), and Pi's `sessionManager`, `settingsManager`, `resourceLoader` and `modelRuntime` objects are in-process handles that do not cross the wire (`settings` and `resources` select what they would). `Dispose` is Pi's: the session is disconnected and its listeners dropped, a later prompt still runs the agent, and the host releases the session when the connection closes. The expected observations (event order, the leading system message, error messages) come from running Pi's own `createAgentSession` (`test/extension-conformance/testdata/child-session-want.json`).
 
+## Thinking runs
+
+An extension that draws the model's thinking itself, for example in an activity tree, calls `pi.ownThinkingRuns()` (Go `ext.OwnThinkingRuns(true)`, Rust `ext.own_thinking_runs(true)`, Python `ext.own_thinking_runs()`, Lisp `(own-thinking-runs ext)`) while it loads, and rewrites the visible run to an empty string with a Markdown transformer for `assistant-thinking`. The built-in message then draws no blank rows for a run that is hidden or empty (D214). Call it again with `false` through the runtime entry point (`ctx.OwnThinkingRuns(false)`, `ctx.own_thinking_runs(False)`, `ctx-own-thinking-runs`, Node `pi.ownThinkingRuns(false)`) to give the rows back; the flag is yours alone, the host ORs it with other extensions', and it leaves with your extension. In Node the call is a void setter ordered after your earlier UI calls; elsewhere it returns once the host applied it. `ownThinkingRuns` removes the spacing only; to also hide the thinking text, pair it with a Markdown transformer that rewrites the `assistant-thinking` text to empty (`pi.registerMarkdownTransformer` in Node, `MarkdownTransformer` in Go, `markdown_transformer` in Rust and Python).
+
 ## Adding a new extension API surface
 
 1. Read upstream Pi behavior in Pi's `packages/coding-agent/docs/extensions.md` and the upstream source under `.upstream/current/`.
 2. Add/confirm protocol shape in `coding/extension/host/subprocess/protocol.go`.
 3. Wire host behavior in `coding/extension/host/subprocess/`.
-4. Add matching Go, Rust, and Python SDK behavior (`extensions/sdk`, `extensions/sdk-rs`, `extensions/sdk-py`).
+4. Add matching Go, Rust, Python, and Lisp SDK behavior (`extensions/sdk`, `extensions/sdk-rs`, `extensions/sdk-py`, `extensions/sdk-lisp`), with a conformance row (the scenario table, the SDK harness or the family fixture under `test/extension-conformance/testdata/*-lisp`), or name the Lisp gap in `test/parity/sdk-exports.toml`.
 5. Update the Node compatibility runtime and `extensions/sdk-ts` declarations when the surface is available to Node extensions.
 6. Add or extend `test/extension-conformance` so every runtime matches the in-process reference.
 7. Update `docs/extension-api-parity.md`.

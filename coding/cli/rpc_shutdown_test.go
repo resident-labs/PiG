@@ -503,7 +503,12 @@ func TestRPCExtensionShutdownRequestExits(t *testing.T) {
 			records := drainRPCOutput(p)
 			p.waitForExit("after ctx.shutdown()")
 			response := handledPromptResponse("quit")
-			if want := []rpcRecord{rpcShutdownStartedNotify, response}; !reflect.DeepEqual(records, want) {
+			want := []rpcRecord{rpcShutdownStartedNotify, response}
+			if impl.name == "pig" {
+				// pig divergence (D231): follows Pi main 1708b4788, where the shutdown waits for the command's prompt response.
+				want = []rpcRecord{response, rpcShutdownStartedNotify}
+			}
+			if !reflect.DeepEqual(records, want) {
 				t.Fatalf("stdout = %v, want the prompt response and the session_shutdown notification", records)
 			}
 			if events := readRPCShutdownReport(t, report); !slices.Equal(events, []string{"quit", "session_shutdown"}) {
@@ -690,7 +695,7 @@ func TestRPCInputEndWindowClosesBeforeNextPollComparedWithPi(t *testing.T) {
 					var p *rpcProcess
 					if impl == "pig" {
 						env = append(env, "PIG_HOME="+filepath.Join(home, ".pig"), "PIG_CODING_AGENT_DIR="+filepath.Join(home, "agent"), "PIG_TEST_FAUX=1")
-						p = startRPCProcessAt(t, t.TempDir(), env, "--no-session", "--offline", "--model", "test-faux/echo", "-e", fixture)
+						p = startRPCProcessAt(t, t.TempDir(), env, "--no-session", "--offline", "--model", "test-faux/faux-1", "-e", fixture)
 					} else {
 						root, err := filepath.Abs("../..")
 						if err != nil {

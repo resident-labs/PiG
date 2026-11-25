@@ -33,9 +33,11 @@ func (g *GraphResourceLoader) Release() { g.loader.Close() }
 
 // graphLoaderOptions is Pi's DefaultResourceLoaderOptions as it crosses the wire: an object option is the handle of the object, a function option is the name of the function the extension holds.
 type graphLoaderOptions struct {
-	Cwd                           string    `json:"cwd"`
-	AgentDir                      string    `json:"agentDir"`
-	SettingsManager               string    `json:"settingsManager"`
+	Cwd             string `json:"cwd"`
+	AgentDir        string `json:"agentDir"`
+	SettingsManager string `json:"settingsManager"`
+	// Runtime is the handle of an ExtensionRuntime (createExtensionRuntime) the loader loads its extensions against.
+	Runtime                       string    `json:"runtime"`
 	AdditionalExtensionPaths      []string  `json:"additionalExtensionPaths"`
 	AdditionalSkillPaths          []string  `json:"additionalSkillPaths"`
 	AdditionalPromptTemplatePaths []string  `json:"additionalPromptTemplatePaths"`
@@ -54,6 +56,8 @@ type graphLoaderOptions struct {
 	AgentsFilesOverride           string    `json:"agentsFilesOverride"`
 	SystemPromptOverride          string    `json:"systemPromptOverride"`
 	AppendSystemPromptOverride    string    `json:"appendSystemPromptOverride"`
+	// ExtensionFactories are the compiled-in extensions the extension asked for by name (createCodemodeExtension, createToolSearchExtension, createMcpExtension); an inline function of the extension's own is not served.
+	ExtensionFactories []graphExtensionFactory `json:"extensionFactories"`
 }
 
 func newGraphResourceLoader(scope subprocess.SessionGraphScope, op string, raw json.RawMessage) (*GraphResourceLoader, error) {
@@ -150,6 +154,21 @@ func newGraphResourceLoader(scope subprocess.SessionGraphScope, op string, raw j
 			}
 			return base
 		}
+	}
+	if options.Runtime != "" {
+		object, ok := scope.Object(options.Runtime)
+		runtime, isRuntime := object.(*GraphExtensionRuntime)
+		if !ok || !isRuntime {
+			return nil, errors.New(subprocess.SessionGraphUnknownMessage)
+		}
+		loaderOptions.Runtime = runtime.runtime
+	}
+	for _, entry := range options.ExtensionFactories {
+		factory, err := entry.factory(scope, loaderOptions.AgentDir)
+		if err != nil {
+			return nil, err
+		}
+		loaderOptions.ExtensionFactories = append(loaderOptions.ExtensionFactories, factory)
 	}
 	g.loader = NewDefaultResourceLoader(loaderOptions)
 	return g, nil
@@ -405,7 +424,7 @@ func (g *GraphResourceLoader) extendResources(args icodingagent.GraphArgs) error
 	convert := func(list []graphResourcePath) []ExtensionResourcePath {
 		out := make([]ExtensionResourcePath, len(list))
 		for i, item := range list {
-			out[i] = ExtensionResourcePath{Path: item.Path, Metadata: icodingagent.PathMetadata{Source: item.Metadata.Source, Scope: item.Metadata.Scope, Origin: item.Metadata.Origin, BaseDir: item.Metadata.BaseDir}}
+			out[i] = ExtensionResourcePath{Path: item.Path, Metadata: icodingagent.PathMetadata{Source: item.Metadata.Source, Scope: item.Metadata.Scope, Origin: item.Metadata.Origin, BaseDir: item.Metadata.BaseDir, ChangelogPath: item.Metadata.ChangelogPath}}
 		}
 		return out
 	}
@@ -419,10 +438,11 @@ func (g *GraphResourceLoader) extendResources(args icodingagent.GraphArgs) error
 type graphResourcePath struct {
 	Path     string `json:"path"`
 	Metadata struct {
-		Source  string `json:"source"`
-		Scope   string `json:"scope"`
-		Origin  string `json:"origin"`
-		BaseDir string `json:"baseDir"`
+		Source        string `json:"source"`
+		Scope         string `json:"scope"`
+		Origin        string `json:"origin"`
+		BaseDir       string `json:"baseDir"`
+		ChangelogPath string `json:"changelogPath"`
 	} `json:"metadata"`
 }
 

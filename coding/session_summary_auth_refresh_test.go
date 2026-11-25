@@ -568,7 +568,7 @@ func TestAutoCompactionSurfacesRefreshFailureOnce(t *testing.T) {
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			if len(ends) != 1 || !strings.HasPrefix(ends[0].ErrorMessage, "Auto-compaction failed: ") || !strings.Contains(ends[0].ErrorMessage, "summarization failed: OAuth refresh failed for "+shape.credentialProvider) {
+			if len(ends) != 1 || !strings.HasPrefix(ends[0].ErrorMessage, "Auto-compaction failed: ") || !strings.Contains(ends[0].ErrorMessage, "Summarization failed: OAuth refresh failed for "+shape.credentialProvider) {
 				t.Fatalf("end events = %+v", ends)
 			}
 			if bearers := world.bearers(); len(bearers) != 0 {

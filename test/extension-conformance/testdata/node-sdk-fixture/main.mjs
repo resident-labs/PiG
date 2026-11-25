@@ -7,16 +7,56 @@ import * as piTui from "@earendil-works/pi-tui";
 import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 const { Container } = piTui;
 import {
-  createBashToolDefinition, createGrepToolDefinition, createLsToolDefinition, createReadToolDefinition, CONFIG_DIR_NAME, isToolCallEventType, CustomEditor, getAgentDir, getPackageDir, getShellConfig, generateDiffString, generateUnifiedPatch, sessionEntryToContextMessages, convertToPng, resizeImage, readStoredCredential, VERSION, formatSize, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES, truncateHead, truncateLine, truncateTail, withFileMutationQueue, isBashToolResult, isEditToolResult, isFindToolResult, isGrepToolResult, isLsToolResult, isPowerShellToolResult, isReadToolResult, isWriteToolResult,
+  createBashToolDefinition, createGrepToolDefinition, createLsToolDefinition, createReadToolDefinition, CONFIG_DIR_NAME, isToolCallEventType, CustomEditor, getAgentDir, getPackageDir, getShellConfig, generateDiffString, generateUnifiedPatch, sessionEntryToContextMessages, buildSessionContext, convertToPng, resizeImage, readStoredCredential, VERSION, formatSize, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES, truncateHead, truncateLine, truncateTail, withFileMutationQueue, isBashToolResult, isEditToolResult, isFindToolResult, isGrepToolResult, isLsToolResult, isPowerShellToolResult, isReadToolResult, isWriteToolResult,
   getMarkdownTheme, getSelectListTheme, getSettingsListTheme, renderDiff,
 } from "@earendil-works/pi-coding-agent";
 
 export default function (pi) {
+  pi.ownThinkingRuns(true);
   // factoryAgentDir is getAgentDir() while the factory runs, where Pi's extensions call it (TestConformance_HostConfigurationAgreesAcrossSDKs).
   const factoryAgentDir = getAgentDir();
   let schemaRejected = false;
   try { pi.registerTool({ name: "schema-invalid", description: "Must not register", parameters: null, execute: async () => ({ content: [] }) }); }
   catch (error) { schemaRejected = error.message.endsWith('must define an object parameter schema.'); }
+  { const Type = piAi.Type;
+    pi.registerTool({ name: "type-schema-tool", description: "Parameters built with Type", parameters: Type.Object({
+      query: Type.String({ description: "What to look up" }),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+      mode: Type.Union([Type.Literal("fast"), Type.Literal("deep")]),
+      tags: Type.Optional(Type.Array(Type.String())),
+      filter: Type.Optional(Type.Record(Type.String(), Type.Number())),
+    }, { additionalProperties: false }), execute: async () => ({ content: [{ type: "text", text: "ok" }] }) }); }
+  { // type-engine-tool (TestConformance_TypeEngineMembersAgreeAcrossSDKs): one property per member of Type that the host's type engine serves, built with Pi's own Type.
+    const Type = piAi.Type, S = Type.String(), N = Type.Number(), I = Type.Integer(), B = Type.Boolean(), L = (v) => Type.Literal(v), U = (...a) => Type.Union(a);
+    const base = Type.Object({ id: S, name: Type.Optional(S), n: I, tags: Type.Array(S) }), same = Type.Object({ a: S }), key = Type.Identifier("K");
+    pi.registerTool({ name: "type-engine-tool", description: "Parameters built with the engine members of Type", parameters: Type.Object({
+      picked: Type.Pick(base, ["id", "name"]), omitted: Type.Omit(base, ["tags"]), partial: Type.Partial(base), required: Type.Required(Type.Object({ a: Type.Optional(S), b: Type.Optional(N) })),
+      keys: Type.KeyOf(base), indexed: Type.Index(base, L("n")), readonlyObject: Type.ReadonlyObject(base), readonlyType: Type.ReadonlyType(Type.Array(S)),
+      evaluated: Type.Evaluate(Type.Intersect([same, Type.Object({ b: N })])), excluded: Type.Exclude(U(S, N, B), S), extracted: Type.Extract(U(S, N, B), U(S, N)),
+      nonNullable: Type.NonNullable(U(S, Type.Null())), uppercase: Type.Uppercase(L("abc")), lowercase: Type.Lowercase(L("ABC")), capitalize: Type.Capitalize(L("abc")),
+      uncapitalize: Type.Uncapitalize(L("ABC")), parameters: Type.Parameters(Type.Function([S, N], B)), constructorParameters: Type.ConstructorParameters(Type.Constructor([S], Type.Object({}))),
+      returnType: Type.ReturnType(Type.Function([S], N)), instanceType: Type.InstanceType(Type.Constructor([S], same)), fn: Type.Function([S], N), constructorType: Type.Constructor([S], same),
+      tuple: Type.Tuple([S, N]), template: Type.TemplateLiteral("a${string}"), conditional: Type.Conditional(S, S, L("yes"), L("no")),
+      mapped: Type.Mapped(key, U(L("a"), L("b")), Type.Ref("K"), S), cyclic: Type.Cyclic({ A: Type.Object({ next: Type.Optional(Type.Ref("A")) }) }, "A"),
+      module: Type.Module({ A: S, B: Type.Array(Type.Ref("A")) }), interface: Type.Interface([same], { b: N }), dependent: Type.Dependent(S, N, B), extends: Type.Extends({}, S, S),
+      instantiate: Type.Instantiate({ A: S }, Type.Ref("A")), call: Type.Instantiate({ Id: Type.Generic([Type.Parameter("T")], Type.Ref("T")) }, Type.Call(Type.Ref("Id"), [S])),
+      script: Type.Script("{ a: string; b?: number[] }"), rest: Type.Rest(Type.Tuple([S])), this: Type.This(), infer: Type.Infer("U", S), identifier: key,
+      generic: Type.Generic([Type.Parameter("T", S, S)], Type.Array(Type.Ref("T"))), recordKey: Type.RecordKey(Type.Record(S, N)), recordValue: Type.RecordValue(Type.Record(S, N)),
+      recordPattern: Type.String({ description: Type.RecordPattern(Type.Record(S, N)) }), enumKeyRecord: Type.Record(Type.Enum(["x", "y"]), N),
+    }, { additionalProperties: false }), execute: async () => ({ content: [{ type: "text", text: "ok" }] }) }); }
+  { // refine-probe (TestConformance_RefinedToolArgumentsAreNotRefined): Pi's own Type.Refine; every predicate and message function logs its call, and the test asserts the log stays empty (Pi 1.4.0+b556cfe5 never runs a refinement).
+    const Type = piAi.Type, log = [];
+    const checked = (tag, check) => (value) => { log.push(`check:${tag}`); return check(value); };
+    const worded = (tag, message) => (value) => { log.push(`error:${tag}`); return message(value); };
+    const equals = (tag, want) => Type.Refine(Type.String(), checked(tag, (v) => v === want), worded(`${tag}m`, () => `not ${want}`));
+    pi.registerTool({ name: "refine-probe", description: "Arguments checked by refinements", parameters: Type.Refine(Type.Object({
+      name: Type.Refine(Type.String(), checked("len", (v) => v.length >= 3), worded("lenmsg", () => "name is too short")),
+      qty: Type.Optional(Type.Refine(Type.Integer(), checked("even", (v) => v % 2 === 0), worded("evenmsg", (v) => `qty must be even, got ${v}`))),
+      pick: Type.Union([equals("u1", "a"), equals("u2", "b")]),
+      boom: Type.Optional(Type.Refine(Type.String(), checked("boom", () => { throw new Error("kaboom"); }))),
+    }), checked("root", () => true), worded("rootmsg", () => "root refused")), execute: async () => ({ content: [{ type: "text", text: "ok" }] }) });
+    pi.registerCommand("refine_log", { description: "Report and clear the refinement call log", handler: async (_args, ctx) => { const calls = log.splice(0); ctx.ui.notify(`refine_log:${JSON.stringify(calls)}:end`, "info"); } });
+  }
   pi.registerCommand("schema-probe", { description: "Report schema rejection", handler: async (_args, ctx) => ctx.ui.notify(`schema-rejected:${schemaRejected}`, "info") });
   for (const [name, type, value] of [["flag-true", "boolean", true], ["flag-false", "boolean", false], ["flag-string", "string", "default"], ["flag-empty", "string", ""], ["flag-unset", "string", undefined]]) {
     pi.registerFlag(name, { type, default: value });
@@ -53,6 +93,20 @@ export default function (pi) {
     try {
       const result = await pi.exec(probe.command, probe.args, { signal: controller.signal });
       ctx.ui.notify(`exec-abort:killed=${result.killed};code=${result.code};stdout=${result.stdout.trim()}`, "info");
+    } catch (error) {
+      ctx.ui.notify(`rejected:${error.message}`, "info");
+    }
+  }});
+  pi.registerCommand("select-page-probe", { description: "Answer getSelectPageIndex", handler: async (args, ctx) => {
+    const probe = JSON.parse(args);
+    const index = piTui.getSelectPageIndex(piTui.getKeybindings(), probe.data, probe.selected, probe.count, probe.page);
+    ctx.ui.notify(`select-page=${index === undefined ? "none" : index}`, "info");
+  }});
+  pi.registerCommand("exec-limits-probe", { description: "Exec with a maxBuffer", handler: async (args, ctx) => {
+    const probe = JSON.parse(args);
+    try {
+      const result = await pi.exec(probe.command, probe.args, probe.maxBuffer === undefined ? undefined : { maxBuffer: probe.maxBuffer });
+      ctx.ui.notify(`exec-limits:truncated=${result.truncated};killed=${result.killed};code=${result.code};stdout=${result.stdout.trim()};stderr=${result.stderr.trim()}`, "info");
     } catch (error) {
       ctx.ui.notify(`rejected:${error.message}`, "info");
     }
@@ -156,12 +210,17 @@ export default function (pi) {
     render(width) { return [`entryrenderer:${entry.data}:expanded=${Boolean(options.expanded)}:width=${width}`]; },
     invalidate() {},
   }));
+  // Test fixture, Pi 9376c8d1 (#4748): keyText and keyHint on the message and entry options and the tool render context. The content, data and q are the keybinding id.
+  const hintsOf = (hints, id) => `${hints.keyText(id)} | ${hints.keyHint(id, "to expand")}`;
+  pi.registerMessageRenderer("keyhints-message", (message, options) => ({ render: () => [hintsOf(options, message.content)], invalidate() {} }));
+  pi.registerEntryRenderer("keyhints-entry", (entry, options) => ({ render: () => [hintsOf(options, entry.data)], invalidate() {} }));
   pi.registerMarkdownTransformer((markdown, context) =>
     `md:${markdown}:${context.messageType}:streaming=${context.isStreaming}:width=${context.availableWidth}`);
   const resolvedLine = (prefix, toolName) => (args) => ({ render: () => [`${prefix}:${toolName}:${args?.q}`], invalidate: () => {} });
   pi.registerToolRenderer((toolName, next) => {
     switch (toolName) {
       case "conformance_tool_renderer": return { renderCall: resolvedLine("resolved", toolName) };
+      case "conformance_keyhints": return { renderCall: (args, _theme, context) => ({ render: () => [hintsOf(context, args.q)], invalidate() {} }) };
       case "conformance_no_renderer": return undefined;
       case "conformance_fill": return next() ?? { renderCall: resolvedLine("filled", toolName) };
       case "conformance_wrap": return { ...next(), renderCall: resolvedLine("wrapped", toolName) };
@@ -434,6 +493,8 @@ export default function (pi) {
     handler: async () => {},
   });
   pi.registerCommand("ping", { description: "Respond with pong", handler: async (_args, ctx) => ctx.ui.notify("pong", "info") });
+  pi.registerCommand("thinking_runs_off", { description: "Release thinking-run ownership", handler: async () => pi.ownThinkingRuns(false) });
+  pi.registerCommand("thinking_runs_on", { description: "Claim thinking-run ownership", handler: async () => pi.ownThinkingRuns(true) });
   pi.registerCommand("model-stream-probe", {
     description: "Exercise model streaming",
     handler: async (_args, ctx) => {
@@ -554,6 +615,134 @@ export default function (pi) {
         invalidate() {},
       }), { overlay: true, onHandle: (value) => { handle = value; } });
       ctx.ui.notify("overlay-focus=ok", "info");
+    },
+  });
+  // Pi's TuiAltScreen is served as Pi's own class; the Go, Rust and Python SDKs reach the host's port of it, and every SDK must report this text.
+  pi.registerCommand("tui-alt-screen-probe", {
+    description: "Drive a TuiAltScreen over a recording terminal",
+    handler: async (_args, ctx) => {
+      const { TuiAltScreen } = piTui;
+      const log=[]; let onInput, onResize, started=false;
+      const term={columns:20,rows:6,kittyProtocolActive:false,
+       start(i,r){onInput=i;onResize=r;started=true;log.push("start")},stop(){started=false;log.push("stop")},
+       async drainInput(){},write(d){log.push(d)},moveBy(){},hideCursor(){},showCursor(){},clearLine(){},clearFromCursor(){},clearScreen(){},setTitle(){},setProgress(){},setProgramStatus(){}};
+      const vis=s=>s.replace(/\x1b\[[0-9;?]*[A-Za-z]|\x1b\]8;;[^\x07\x1b]*(?:\x07|\x1b\\)?/g,"");
+      const lines=(name,fn)=>({name,render:fn,invalidate(){}});
+      const screen=new TuiAltScreen(term,false,undefined,{mouse:false,wheelScrollLines:3,copyOnSelect:true});
+      const doc=lines("doc",w=>Array.from({length:12},(_,i)=>`row ${i+1} w=${w}`));
+      screen.addChild(doc);
+      const f=[];
+      f.push(`mode=${screen.mode}`,`children=${screen.children.length}`,`terminal=${screen.terminal===term}`);
+      screen.start(); screen.renderNow();
+      const sl=()=>screen.getScreenLines().map(s=>vis(s).trimEnd());
+      f.push(`viewport=${screen.viewportTop}/${screen.isFollowingOutput}`,`first=${sl()[0]}`,`last=${sl()[5]}`,`redraws=${screen.fullRedraws>0}`,`entered=${log.some(l=>l.includes("\x1b[?1049h"))}`);
+      screen.scrollBy(-2);screen.renderNow();f.push(`up=${screen.viewportTop}/${screen.isFollowingOutput}`);
+      screen.scrollToTop();screen.renderNow();f.push(`top=${screen.viewportTop}/${screen.isFollowingOutput}`,`topfirst=${sl()[0]}`);
+      screen.scrollToBottom();screen.renderNow();f.push(`bottom=${screen.viewportTop}/${screen.isFollowingOutput}`);
+      screen.flash("hello",500);screen.renderNow();f.push(`flash=${sl().some(l=>l.includes("hello"))}`);
+      const ov=lines("ov",w=>["OVER"]);
+      const h=screen.showOverlay(ov,{width:8,anchor:"center"});screen.renderNow();
+      f.push(`overlay=${screen.hasOverlay()}/${screen.hasOverlayEntries}/${h.isFocused()}/${h.getBounds()?.width}`);
+      h.setHidden(true);f.push(`hidden=${h.isHidden()}`);h.setHidden(false);
+      screen.hideOverlay();f.push(`afterHide=${screen.hasOverlay()}/${screen.hasOverlayEntries}`);
+      const inputs=[];const foc={focused:false,render:()=>["foc"],invalidate(){},handleInput(d){inputs.push(d)}};
+      screen.setFocus(foc);f.push(`focus=${screen.getFocusedComponent()===foc}/${foc.focused}`);
+      onInput("k");
+      const lst=d=>d==="c"?{consume:true}:undefined;
+      const rm=screen.addInputListener(lst);onInput("c");rm();onInput("c");
+      screen.addInputListener(lst);screen.removeInputListener(lst);
+      f.push(`inputs=${inputs.join(",")}`);
+      let dbg=0;screen.onDebug=()=>{dbg++};onInput("\x1b[100;6u");f.push(`debug=${dbg}`);
+      screen.setShowHardwareCursor(true);screen.setClearOnShrink(true);
+      f.push(`flags=${screen.getShowHardwareCursor()}/${screen.getClearOnShrink()}`);
+      screen.setWheelScrollLines(2);screen.setCopyOnSelect(false);
+      f.push(`copy=${screen.getCopyOnSelect()}/${screen.hasActiveSelection()}/${await screen.copyActiveSelectionToClipboard()}`);screen.resetTextSelection();
+      const schemes=[];screen.onTerminalColorSchemeChange(s=>schemes.push(s));
+      screen.setTerminalColorSchemeNotifications(true);onInput("\x1b[?997;1n");onInput("\x1b[?997;2n");
+      f.push(`schemes=${schemes.join(",")}`);
+      const colors=await screen.queryTerminalColors({timeoutMs:20});f.push(`colors=${JSON.stringify(colors)}`);
+      const mr=screen.handleMouse?.({type:"wheel",button:"none",x:0,y:0,screenX:0,screenY:0,width:20,height:6,shift:false,alt:false,ctrl:false,wheelDelta:1});
+      f.push(`mouse=${JSON.stringify(mr??null)}`);
+      f.push(`render=${screen.render(10).slice(0,2).join("|")}`);
+      screen.invalidate();screen.requestRender();
+      const root=lines("root",w=>["ROOT"]);screen.setLayoutRoot(root);screen.renderNow();f.push(`root=${sl()[0].startsWith("ROOT")}`);screen.setLayoutRoot(undefined);
+      screen.removeChild(doc);f.push(`removed=${screen.children.length}`);screen.addChild(doc);screen.clear();f.push(`cleared=${screen.children.length}`);
+      screen.stop();f.push(`stopped=${!started}`);
+      ctx.ui.notify("tui-alt: "+f.join("; "), "info");
+      
+    },
+  });
+  // A component's render reads the screen, an overlay's visible callback decides its visibility, invalidate reaches the overlays, and a render that changes the screen reads its own changes back: Pi runs each call at once (Pi's own class here).
+  pi.registerCommand("tui-alt-frame-probe", {
+    description: "Read a TuiAltScreen from a component's render and exercise overlay visibility",
+    handler: async (_args, ctx) => {
+      const { TuiAltScreen } = piTui;
+      const term={columns:20,rows:6,kittyProtocolActive:false,start(){},stop(){},async drainInput(){},write(){},moveBy(){},hideCursor(){},showCursor(){},clearLine(){},clearFromCursor(){},clearScreen(){},setTitle(){},setProgress(){},setProgramStatus(){}};
+      const screen=new TuiAltScreen(term,false,undefined,{mouse:false});
+      const seen=[];let docInv=0,ovInv=0;
+      const doc={render(w){seen.push(`${screen.viewportTop}/${screen.isFollowingOutput}/${screen.getScreenLines().length}/${screen.hasActiveSelection()}/${screen.hasOverlay()}/${screen.getShowHardwareCursor()}`);return Array.from({length:12},(_,i)=>`row ${i+1}`)},invalidate(){docInv++}};
+      screen.addChild(doc);screen.start();screen.renderNow();screen.renderNow();
+      const f=[`frame1=${seen[0]}`,`frame2=${seen[seen.length-1]}`];
+      const widths=[];
+      const ov={render:()=>["OVER"],invalidate(){ovInv++}};
+      const hOn=screen.showOverlay(ov,{width:8,visible:(w,h)=>{widths.push(`${w}x${h}`);return w>=20}});
+      screen.renderNow();
+      f.push(`visibleOn=${screen.hasOverlay()}/${screen.hasOverlayEntries}/${widths.includes("20x6")}`);
+      hOn.hide();
+      const hOff=screen.showOverlay({render:()=>["X"],invalidate(){}},{visible:()=>false});
+      f.push(`visibleOff=${screen.hasOverlay()}/${screen.hasOverlayEntries}`);hOff.hide();
+      const ov2=screen.showOverlay(ov,{width:8});
+      docInv=0;ovInv=0;screen.invalidate();
+      f.push(`invalidate=${docInv>0}/${ovInv>0}`);
+      ov2.hide();
+      const mutLog=[];let armed=false,mutInv=0;
+      const extra={render:()=>["EXTRA"],invalidate(){}},target={render:()=>["TARGET"],invalidate(){}},popup={render:()=>["POP"],invalidate(){}};
+      const mut={render(w){
+        if(!armed)return ["MUT"];
+        armed=false;
+        const flags=()=>`${screen.getShowHardwareCursor()}/${screen.getClearOnShrink()}/${screen.getCopyOnSelect()}`;
+        const r=[`flags=${flags()}`];
+        screen.setShowHardwareCursor(true);screen.setClearOnShrink(true);screen.setCopyOnSelect(false);r.push(`set=${flags()}`);
+        screen.addChild(extra);r.push(`add=${screen.children.length}`);screen.removeChild(extra);r.push(`remove=${screen.children.length}`);
+        screen.setFocus(target);r.push(`focus=${screen.getFocusedComponent()===target}`);
+        let first;const h=screen.showOverlay(popup,{width:8,visible:()=>{first??=String(screen.getShowHardwareCursor());return true}});
+        r.push(`overlay=${screen.hasOverlay()}/${screen.hasOverlayEntries}/${h.isFocused()}/${first}`);
+        h.hide();r.push(`hidden=${screen.hasOverlayEntries}`);
+        screen.scrollBy(-2);r.push(`scroll=${screen.viewportTop}/${screen.isFollowingOutput}`);
+        mutInv=0;screen.invalidate();r.push(`invalidate=${mutInv>0}`);
+        r.push(`lines=${screen.getScreenLines().length}`);
+        mutLog.push(r.join(","));
+        return ["MUT"];
+      },invalidate(){mutInv++}};
+      screen.addChild(mut);screen.renderNow();armed=true;screen.renderNow();
+      f.push(`mutate=${mutLog.join("|")}`,`after=${screen.getShowHardwareCursor()}/${screen.getClearOnShrink()}/${screen.getCopyOnSelect()}/${screen.children.length}`);
+      screen.stop();
+      ctx.ui.notify("tui-alt-frame: "+f.join("; "), "info");
+      
+    },
+  });
+  // TuiAltScreen.children after addChild, removeChild and clear, with components of equal content (D207: the Go, Rust and Python SDKs return a copy of Pi's live array, so each read follows the call that changed the list).
+  pi.registerCommand("tui-alt-children-probe", {
+    description: "Read TuiAltScreen children after addChild, removeChild and clear, with components of equal content",
+    handler: async (_args, ctx) => {
+      const { TuiAltScreen } = piTui;
+      const term={columns:20,rows:6,kittyProtocolActive:false,start(){},stop(){},async drainInput(){},write(){},moveBy(){},hideCursor(){},showCursor(){},clearLine(){},clearFromCursor(){},clearScreen(){},setTitle(){},setProgress(){},setProgramStatus(){}};
+      const screen=new TuiAltScreen(term,false,undefined,{mouse:false});
+      const mk=()=>({render:()=>["same"],invalidate(){}});
+      const a=mk(),b=mk(),c=mk();
+      const name=k=>k===a?"a":k===b?"b":k===c?"c":"?";
+      const order=()=>screen.children.map(name).join("")||"-";
+      const f=[`empty=${order()}`];
+      screen.addChild(a);screen.addChild(b);screen.addChild(c);f.push(`added=${order()}`);
+      screen.removeChild(b);f.push(`removeB=${order()}`);
+      screen.removeChild(b);f.push(`removeAbsent=${order()}`);
+      screen.addChild(a);f.push(`duplicate=${order()}`);
+      screen.removeChild(a);f.push(`removeFirst=${order()}`);
+      screen.addChild(b);f.push(`readd=${order()}`);
+      f.push(`render=${screen.render(10).join("|")}`);
+      screen.setFocus(b);f.push(`focus=${name(screen.getFocusedComponent())}`);
+      screen.clear();f.push(`cleared=${order()}`);
+      ctx.ui.notify("tui-alt-children: "+f.join("; "), "info");
     },
   });
   // Pi hands a ui.custom factory its TUI: tui.showOverlay shows a raw panel whose handle works inside the factory (tui.ts:729-826).
@@ -688,6 +877,60 @@ export default function (pi) {
       ctx.ui.notify(`rw_idle_after_trigger=${ctx.isIdle()}`, "info");
     },
   });
+  pi.registerCommand("rw_idle_busy_until_yield", {
+    description: "Read isIdle after a message that starts a run, before and after a wait for the run",
+    handler: async (_args, ctx) => {
+      pi.sendMessage({ customType: "rw-trigger", content: "rw-trigger", display: true }, { triggerTurn: true });
+      const sync = [ctx.isIdle(), ctx.isIdle()];
+      await ctx.waitForIdle();
+      ctx.ui.notify(`rw_idle_busy_until_yield=sync:${sync.join(",")};later:${ctx.isIdle()}`, "info");
+    },
+  });
+  pi.registerCommand("rw_idle_send_then_await", {
+    description: "Await the run a message starts with no read in between, then read; again for a second message",
+    handler: async (_args, ctx) => {
+      pi.sendMessage({ customType: "rw-trigger", content: "rw-trigger", display: true }, { triggerTurn: true });
+      await ctx.waitForIdle();
+      const awaited = ctx.isIdle();
+      pi.sendMessage({ customType: "rw-trigger", content: "rw-trigger", display: true }, { triggerTurn: true });
+      const second = ctx.isIdle();
+      await ctx.waitForIdle();
+      ctx.ui.notify(`rw_idle_send_then_await=awaited:${awaited};second:${second};awaited-again:${ctx.isIdle()}`, "info");
+    },
+  });
+  pi.registerCommand("rw_idle_blocking", {
+    description: "Read isIdle after a message that starts a run and a wait that is no call",
+    handler: async (_args, ctx) => {
+      const before = ctx.isIdle();
+      pi.sendMessage({ customType: "rw-trigger", content: "rw-trigger", display: true }, { triggerTurn: true });
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+      ctx.ui.notify(`rw_idle_blocking=before:${before};after:${ctx.isIdle()}`, "info");
+    },
+  });
+  pi.registerCommand("rw_idle_yield_poll", {
+    description: "Poll isIdle with a sleep after a message that starts a run, until the Session is idle",
+    handler: async (_args, ctx) => {
+      pi.sendMessage({ customType: "rw-trigger", content: "rw-trigger", display: true }, { triggerTurn: true });
+      const first = ctx.isIdle();
+      for (const deadline = Date.now() + 5000; !ctx.isIdle() && Date.now() < deadline;) await new Promise((resolve) => setTimeout(resolve, 10));
+      ctx.ui.notify(`rw_idle_yield_poll=first:${first};final:${ctx.isIdle()}`, "info");
+    },
+  });
+  pi.registerCommand("rw_idle_callback", {
+    description: "Read isIdle after a message that starts a run, sent from a timer's callback while the handler awaits it",
+    handler: async (_args, ctx) => {
+      const before = ctx.isIdle();
+      await new Promise((resolve) => {
+        setTimeout(async () => {
+          pi.sendMessage({ customType: "rw-trigger", content: "rw-trigger", display: true }, { triggerTurn: true });
+          const sync = [ctx.isIdle(), ctx.isIdle()];
+          await ctx.waitForIdle();
+          ctx.ui.notify(`rw_idle_callback=before:${before};sync:${sync.join(",")};later:${ctx.isIdle()}`, "info");
+          resolve();
+        }, 10);
+      });
+    },
+  });
   let rwSettledOnce = false;
   pi.registerCommand("rw_idle_in_settled", {
     description: "Read isIdle after a message that starts a run, sent from an agent_settled handler",
@@ -698,6 +941,37 @@ export default function (pi) {
         pi.sendMessage({ customType: "rw-trigger", content: "rw-trigger", display: true }, { triggerTurn: true });
         ctx.ui.notify(`rw_idle_in_settled=${ctx.isIdle()}`, "info");
       });
+    },
+  });
+  pi.registerCommand("rw_idle_background", {
+    description: "Poll isIdle from a background callback after agent_end",
+    handler: async () => {
+      pi.on("agent_end", async (_event, ctx) => {
+        let idle = false;
+        const deadline = Date.now() + 3000;
+        const poll = () => {
+          idle = ctx.isIdle();
+          if (idle || Date.now() >= deadline) ctx.ui.notify(`rw_idle_background=${idle}`, "info");
+          else setTimeout(poll, 10);
+        };
+        setTimeout(poll, 10);
+      });
+    },
+  });
+  pi.registerCommand("rw_idle_live", {
+    description: "Poll isIdle live and report the sequence of answers",
+    handler: async (_args, ctx) => {
+      const seen = [];
+      const deadline = Date.now() + 10000;
+      const poll = () => {
+        const answer = String(ctx.isIdle());
+        if (seen.at(-1) !== answer) {
+          seen.push(answer);
+          ctx.ui.notify(`rw_idle_live=${seen.join(",")}`, "info");
+        }
+        if (seen.length < 3 && Date.now() < deadline) setTimeout(poll, 10);
+      };
+      poll();
     },
   });
   pi.registerCommand("set_model", {
@@ -838,6 +1112,17 @@ export default function (pi) {
       pi.registerTool({ ...bash, async execute(...a) { const r = await bash.execute(...a); r.content = r.content.map((b, i) => i === 0 ? { ...b, text: `«${b.text}»` } : b); return r; } });
       return emit({ registered: [read.name, bash.name] });
     }
+    if (c.kind === "registerEdit") {
+      const edit = piCodingAgent.createEditToolDefinition(c.factoryCwd);
+      pi.registerTool({ ...edit, async execute(...a) { const r = await edit.execute(...a); r.content = r.content.map((b, i) => i === 0 ? { ...b, text: `«edited:${b.text}»` } : b); return r; } });
+      return emit({ registered: [edit.name] });
+    }
+    if (c.kind === "prepare") {
+      const def = builtinFactories[c.tool][0](c.factoryCwd);
+      const report = { has: typeof def.prepareArguments === "function" };
+      if (report.has) { try { report.prepared = def.prepareArguments(c.params ?? {}); } catch (error) { report.error = error.message; } }
+      return emit(report);
+    }
     if (c.kind === "sets") return emit({ coding: piCodingAgent.createCodingTools(c.factoryCwd).map((t) => t.name), readOnly: piCodingAgent.createReadOnlyTools(c.factoryCwd).map((t) => t.name) });
     if (c.kind === "local") {
       const operations = c.shell === "powershell" ? piCodingAgent.createLocalPowerShellOperations() : piCodingAgent.createLocalBashOperations();
@@ -935,6 +1220,10 @@ export default function (pi) {
       return report;
     });
     const entries = golden.entries.map((c) => sessionEntryToContextMessages(c.entry));
+    const contexts = golden.contexts.map((c) => {
+      const [entries, leafId, pairs] = c.args;
+      try { return { result: JSON.parse(JSON.stringify(buildSessionContext(entries, leafId, pairs === undefined ? undefined : new Map(pairs)))) }; } catch (error) { return { throws: error.message }; }
+    });
     const meta = (image) => (image ? { mimeType: image.mimeType, ...(image.originalWidth === undefined ? {} : { originalWidth: image.originalWidth, originalHeight: image.originalHeight, width: image.width, height: image.height, wasResized: image.wasResized }), decodes: image.data.length > 0 } : null);
     const images = [];
     for (const c of golden.images) {
@@ -943,7 +1232,7 @@ export default function (pi) {
     }
     const read = (provider, path) => readStoredCredential(provider, path) ?? null;
     const creds = { explicit: read("anthropic", authPath), default: read("anthropic"), absentProvider: read("nobody", authPath), missingFile: read("anthropic", `${authPath}.missing`), notJSON: read("anthropic", `${authPath}.bad`) };
-    ctx.ui.notify(`host_helpers:${JSON.stringify({ diffs, entries, images, creds })}:end`, "info");
+    ctx.ui.notify(`host_helpers:${JSON.stringify({ diffs, entries, contexts, images, creds })}:end`, "info");
   } });
   // pi_ai_helpers_probe runs every call of the vector calls (test/parity/sdk-vectors, Pi's own answers at the pin, listed in one file by the test) through the runtime's pi-ai and
   // reports each answer as JSON (TestConformance_PiAiHelpersAgreeAcrossSDKs).
@@ -1073,6 +1362,16 @@ export default function (pi) {
     const missing = ctx.ui.getTheme("missing");
     const result = ctx.ui.setTheme("missing");
     ctx.ui.notify(`selected=${selected} expanded=${ctx.ui.getToolsExpanded()} named=${named?.name} missing=${missing === undefined} success=${result.success} error=${result.error}`, "info");
+  }});
+  pi.registerCommand("autocomplete-settle-register", {handler: async (_,ctx) => {
+    ctx.ui.addAutocompleteProvider(current => ({
+      async getSuggestions(lines,line,col,options) {
+        await current.getSuggestions(lines,line,col,options);
+        if(lines[0]==="slow")await new Promise(resolve=>setTimeout(resolve,400));
+        return {items:[{value:lines[0],label:"settled:"+lines[0]}],prefix:lines[0]};
+      },
+      applyCompletion(...args){return current.applyCompletion(...args);},
+    }));
   }});
   pi.registerCommand("autocomplete-register", {handler: async (_,ctx) => {
     for(const tag of ["A","B"]) {
@@ -1608,6 +1907,25 @@ export default function (pi) {
       ctx.ui.notify(`mouse=${result ?? ""}`, "info");
     },
   });
+  // viewport-probe's component: Component.capturesViewportInput is true until it gets "t", and it closes on "q".
+  class ViewportProbe {
+    constructor(done) {
+      this.done = done;
+      this.capturesViewportInput = true;
+    }
+    render() { return ["viewport probe"]; }
+    handleInput(data) {
+      if (data === "t") this.capturesViewportInput = false;
+      if (data === "q") this.done("viewport=done");
+    }
+  }
+  pi.registerCommand("viewport-probe", {
+    description: "Exercise capturesViewportInput",
+    handler: async (_args, ctx) => {
+      const result = await ctx.ui.custom((_tui, _theme, _keys, done) => new ViewportProbe(done), { overlay: true });
+      ctx.ui.notify(`${result ?? ""}`, "info");
+    },
+  });
   pi.registerMessageRenderer("kit-message", (_message, _options, theme) => new KitProbe(theme));
   pi.registerEntryRenderer("kit-entry", (_entry, _options, theme) => new KitProbe(theme));
   pi.registerCommand("kit-surfaces", {
@@ -1837,6 +2155,15 @@ export default function (pi) {
       const defaultWidth = await ctx.ui.custom(probe, { overlay: true });
       const percentWidth = await ctx.ui.custom(probe, { overlay: true, overlayOptions: { width: "50%" } });
       ctx.ui.notify(`overlay-width default=${defaultWidth} percent=${percentWidth}`, "info");
+    },
+  });
+  pi.registerCommand("blocked-custom-probe", {
+    description: "Open inline custom components with and without the blocked option",
+    handler: async (_args, ctx) => {
+      const probe = (_tui, _theme, _keys, done) => ({ render() { return ["blocked probe"]; }, invalidate() {}, handleInput(data) { if (data === "\r") done(1); } });
+      await ctx.ui.custom(probe, { blocked: { kind: "permission", message: "Approve?" } });
+      await ctx.ui.custom(probe);
+      ctx.ui.notify("blocked-custom done", "info");
     },
   });
   pi.registerCommand("timer-focused-probe", {

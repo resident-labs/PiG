@@ -1,7 +1,9 @@
 package delta
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"sort"
 	"strconv"
@@ -170,6 +172,44 @@ func (object *Object) Set(key string, value any) error {
 	if n.attached() {
 		n.objectSet(key, stored)
 	}
+	return nil
+}
+
+// AppendText appends text to the string at key. The change is recorded as one append op (several appends to a key in one change join
+// into one op) without comparing the old and new strings, which a plain Set of the longer string makes the tracker do when it prepares
+// the change. The new revision's string shares the bytes of the old one, so a text that grows one append per change costs the appended bytes, as it does with V8's ropes. A Set or Delete of the key in the same change falls back to that comparison. A
+// key that holds no string is an error and leaves the draft unchanged (tracker.ts appendText).
+func AppendText(object *Object, key, text string) error {
+	n, mu := object.ref.lock()
+	defer mu.Unlock()
+	if !n.attached() {
+		return nil
+	}
+	current, present := n.objectLookup(key)
+	value, isString := current.(string)
+	if !present || !isString {
+		quoted, _ := json.Marshal(key)
+		return fmt.Errorf("appendText() needs a string at %s", quoted)
+	}
+	if text == "" {
+		return nil
+	}
+	text = strings.Clone(text)
+	concat := n.ctx.owner.texts.concat
+	appended, tracked := n.appends[key]
+	if !tracked {
+		if _, written := n.writes[key]; written {
+			n.objectWrite(key, concat(value, text))
+			n.markChanged()
+			return nil
+		}
+		if n.appends == nil {
+			n.appends = map[string]string{}
+		}
+	}
+	n.objectWrite(key, concat(value, text))
+	n.appends[key] = concat(appended, text)
+	n.markChanged()
 	return nil
 }
 

@@ -29,7 +29,7 @@ def _load_golden():
     cases = []
     for path in sorted((VECTORS / "pi-ai").glob("*.json")):
         export = path.stem
-        if export in ("envApiKeyAuth", "createAssistantMessageEventStream"):
+        if export in ("envApiKeyAuth", "createAssistantMessageEventStream", "Type", "validateToolArguments"):  # Type has its own vectors (test_pi_ai_type_vectors.py); validateToolArguments is the host's (the Type.Refine conformance rows read its vectors)
             continue
         for case in _read_vectors("pi-ai", export):
             entry = {"fn": export, "args": [None if _is_undefined(arg) else arg for arg in case["args"]]}
@@ -90,6 +90,24 @@ CALLS = {
 
 def test_the_default_retry_delay_cap_is_pis():
     assert helpers.DEFAULT_MAX_AGENT_RETRY_DELAY_MS == 60_000
+
+
+def test_litellm_context_window_exceeded_is_overflow():
+    # Pi d3398f82 (#11492): the pattern is pinned by hand.
+    litellm = "400: litellm.ContextWindowExceededError: litellm.BadRequestError: litellm._pre_call_checks: Context Window exceeded for given call."
+    assert helpers.is_context_overflow({"role": "assistant", "stopReason": "error", "errorMessage": litellm})
+    assert not helpers.is_context_overflow({"role": "assistant", "stopReason": "stop", "errorMessage": litellm})
+    assert not helpers.is_context_overflow({"role": "assistant", "stopReason": "error", "errorMessage": "Throttling error: Context Window exceeded for given call"})
+
+
+def test_zhipu_usage_limit_1308_is_not_retryable():
+    # Pi c719d5b0 (#11572, #11537): the pattern is pinned by hand.
+    for text, want in (
+        ('429 {"error":{"code":"1308","message":"Usage limit reached for 5 hour."}}', False),
+        ('429 {"error":{"code":1308,"message":"Usage limit reached"}}', False),
+        ('429 {"error":{"code":"13081","message":"Too many requests"}}', True),
+    ):
+        assert helpers.is_retryable_assistant_error({"role": "assistant", "stopReason": "error", "errorMessage": text}) is want, text
 
 
 def test_the_golden_file_covers_every_helper():

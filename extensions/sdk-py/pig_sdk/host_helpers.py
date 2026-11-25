@@ -3,12 +3,14 @@ and Date.parse (the host's port of V8's). They read no session state, so the hos
 factory runs (before ``run``) dials the host itself: the first call opens the connection and ``run`` later reuses it. A call from a handler uses the
 handler's own connection (``ctx.parse_frontmatter``, ``ctx.parse_date``)."""
 import base64
+import contextlib
 import json
 import os
+import re
 import struct
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from .image_dimension_note import ResizedImage
 
@@ -36,8 +38,13 @@ class ParsedFrontmatter:
 
 
 class _State:
-    # Re-entrant: a listener the host dispatches while a factory-time call waits makes bus calls of its own on the same thread (``loading_call``).
+    # Guards the tables below for the moment each is read or changed, never across a read from the host: a factory-time call that waits for the host's answer holds
+    # only the lock of its own socket path (``_path_lock``), because every member's ``run`` takes this one.
     lock = threading.RLock()
+    # The lock of each socket path a factory-time call is using, by path: ``[lock, users]``, held for the length of one call on that connection. Re-entrant: a listener
+    # the host dispatches while a factory-time call waits makes bus calls of its own on the same thread (``loading_call``). ``users`` counts the threads that hold or
+    # wait for the lock (``_path_lock``); the entry is dropped when it reaches zero, so a path has one lock for as long as anyone holds or awaits it.
+    path_locks: dict = {}
     # The extension whose factory-time bus calls dialled each socket, by path: the owner of the listeners the host dispatches on that connection before ``run``.
     owners: dict = {}
     # The call results a ``loading_call`` read for an outer call that is still waiting, by call id.
@@ -45,6 +52,8 @@ class _State:
     call_seq: int = 0
     # The connections helpers opened before ``run``, by socket path; ``run`` takes its own.
     dialled: dict = {}
+    # The paths whose connection read the host's shutdown frame while a factory-time call waited; ``run`` ends on it once it has registered (``take_shutdown``).
+    shutdown: set = set()
     # The extensions that are running (a packed cell runs several), each with the socket it serves in ``_served_socket``: the first that is still running
     # answers a helper that has no Context and no socket of its own.
     running: list = []
@@ -71,11 +80,40 @@ def strip_frontmatter(content: str) -> str:
 
 
 def parse_date(text: str) -> Optional[float]:
-    """``Date.parse(text)`` (``new Date(text).getTime()`` for a string), V8's parser answered by the host: the time value in milliseconds, None when it is NaN."""
+    """``Date.parse(text)`` (``new Date(text).getTime()`` for a string), V8's parser answered by the host: the time value in milliseconds, None when it is NaN. Text in the
+    form ``toISOString`` writes for a four-digit year (``2026-01-02T03:04:05.678Z``) is answered without the host."""
+    ms = _parse_iso_date(text)
+    if ms is not None:
+        return ms
     hook = _State.hook
     if hook is not None and hook[1] is not None:
         return hook[1](text)
     return _decode_date(_helper_call(_CALL_PARSE_DATE, {"text": text}))
+
+
+_ISO_DATE = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.(\d{3})Z", re.ASCII)
+
+
+def _parse_iso_date(text: str) -> Optional[float]:
+    """``Date.parse`` for the text ``Date.prototype.toISOString`` writes for a year of four digits, ``YYYY-MM-DDTHH:mm:ss.sssZ`` with every field in range, which is how Pi
+    writes the timestamp of each session entry. ECMA-262 21.4.1.32 defines that form, so the answer is the same in every engine and needs no host. Text in any other form (a
+    missing Z, an offset, a year of six digits, a lowercase t or z, a field out of range such as February 30 or hour 24) is not decided here: the host's parser answers it, as V8
+    does. None means the host must answer."""
+    match = _ISO_DATE.fullmatch(text)
+    if match is None:
+        return None
+    year, month, day, hour, minute, second, millisecond = (int(group) for group in match.groups())
+    leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+    days_in_month = 29 if month == 2 and leap else 28 if month == 2 else 30 if month in (4, 6, 9, 11) else 31
+    if not 1 <= month <= 12 or not 1 <= day <= days_in_month or hour > 23 or minute > 59 or second > 59:
+        return None
+    # The days from 1970-01-01 in the proleptic Gregorian calendar, which is what ECMA-262 time values count.
+    shifted = year - 1 if month <= 2 else year
+    era = shifted // 400
+    year_of_era = shifted - era * 400
+    day_of_year = (153 * ((month + 9) % 12) + 2) // 5 + day - 1
+    days = era * 146097 + year_of_era * 365 + year_of_era // 4 - year_of_era // 100 + day_of_year - 719468
+    return float(((days * 24 + hour) * 60 + minute) * 60000 + second * 1000 + millisecond)
 
 
 @dataclass(frozen=True)
@@ -173,12 +211,10 @@ def resize_image(input_bytes: bytes, mime_type: str, options: Optional[ImageResi
     ``options`` say otherwise), as the host's image code does it. None, as Pi's null, when the image cannot be made to fit. An image already within every limit comes back
     as it was. It may be called before ``run``."""
     return _decode_resized(_helper_call(_CALL_RESIZE_IMAGE, _resize_args(input_bytes, mime_type, options)))
-def highlight_code_lines(code: str, lang: str, markdown: bool, theme: Optional[dict]) -> list:
+def highlight_code_lines(code: str, lang: str, theme: Optional[dict]) -> list:
     """The lines the host's highlight.js port makes of ``code`` in ``lang``, drawn with ``theme`` (the palette of the theme ``init_theme`` installed) or, when
     None, with the host's active theme."""
     args: dict = {"code": code, "lang": lang}
-    if markdown:
-        args["markdown"] = True
     if theme is not None:
         args["theme"] = theme
     lines = _helper_call(_CALL_HIGHLIGHT_CODE, args).get("lines")
@@ -212,26 +248,53 @@ def _helper_call(method: str, args: Any) -> Any:
     return loading_call(method, args)
 
 
+@contextlib.contextmanager
+def _path_lock(path: str) -> Iterator[None]:
+    """Hold the lock that serialises the factory-time calls on the connection dialled to ``path``. The host accepts a packed cell's members in order and serves a
+    connection only after the members before it have registered, so a call waits for the host's answer while an earlier member's ``run`` still has to take its own
+    connection: the wait holds the lock of its own path and never ``_State.lock``.
+
+    The caller counts itself among the path's users before it waits for the lock and leaves the count after it has released it, and the lock leaves the table only
+    when the count reaches zero: while any thread holds or waits for a path's lock, every other caller on that path finds the same one."""
+    with _State.lock:
+        entry = _State.path_locks.get(path)
+        if entry is None:
+            entry = _State.path_locks[path] = [threading.RLock(), 0]
+        entry[1] += 1
+    try:
+        with entry[0]:
+            yield
+    finally:
+        with _State.lock:
+            entry[1] -= 1
+            if entry[1] == 0:
+                del _State.path_locks[path]
+
+
 def loading_call(method: str, args: Any, owner: Any = None) -> Any:
     """A host call made while a factory runs, over the connection this extension's first such call dials and ``run`` later takes. It never rides a running
     extension's connection: the host attributes what a call carries (a ``pi.events`` listener) to the extension of the connection it arrives on.
 
     While it waits for the result it answers what the host sends the connection: pings, and the ``events.dispatch`` requests of ``owner``'s listeners (the
     extension that made a bus call on this connection), as a Node runtime serves a dispatch during its factory. The wait is re-entrant: a listener that makes a
-    bus call of its own waits for its result on the same thread, and the result of an outer call that arrives meanwhile is kept for it."""
-    with _State.lock:
-        path = _socket_path()
-        if not path:
-            raise RuntimeError("not connected to the host: PIG_EXT_SOCKET is not set, so this extension was not launched by pig")
+    bus call of its own waits for its result on the same thread, and the result of an outer call that arrives meanwhile is kept for it. The wait holds the lock of this
+    path's connection and ``_State.lock`` only for the moment each table is read or changed."""
+    path = _socket_path()
+    if not path:
+        raise RuntimeError("not connected to the host: PIG_EXT_SOCKET is not set, so this extension was not launched by pig")
+    with _path_lock(path):
         sock = _State.dialled.get(path)
         if sock is None:
             from . import _connect_unix
 
-            sock = _State.dialled[path] = _connect_unix(path)
-        if owner is not None:
-            _State.owners[path] = owner
-        _State.call_seq += 1
-        call_id = f"h{_State.call_seq}"
+            sock = _connect_unix(path)
+            with _State.lock:
+                _State.dialled[path] = sock
+        with _State.lock:
+            if owner is not None:
+                _State.owners[path] = owner
+            _State.call_seq += 1
+            call_id = f"h{_State.call_seq}"
         _send_frame(sock, {"type": "call", "id": call_id, "call": {"method": method, "args": args}})
         while call_id not in _State.results:
             env = _read_frame(sock)
@@ -240,6 +303,8 @@ def loading_call(method: str, args: Any, owner: Any = None) -> Any:
                 _State.results[env.get("id")] = env.get("call_result") or {}
             elif kind == "ping":
                 _send_frame(sock, {"type": "pong", "pong": {"nonce": (env.get("ping") or {}).get("nonce", "")}})
+            elif kind == "shutdown":
+                _State.shutdown.add(path)
             elif kind == "request":
                 _answer_loading_request(sock, _State.owners.get(path), env)
             elif kind == "notify" and (env.get("notify") or {}).get("method") == "events.release" and _State.owners.get(path) is not None:
@@ -318,8 +383,18 @@ def _read_exact(sock: Any, count: int) -> bytes:
     return bytes(buffer)
 
 
-def take_helper_socket(path: str) -> Any:
-    """The connection a helper opened to ``path``, for ``run`` to serve on; None when there is none."""
+def take_shutdown(path: str) -> bool:
+    """Whether the connection a factory opened to ``path`` read the host's shutdown frame; ``run`` then ends on it once it has registered."""
     with _State.lock:
-        _State.owners.pop(path, None)
-        return _State.dialled.pop(path, None)
+        if path in _State.shutdown:
+            _State.shutdown.discard(path)
+            return True
+        return False
+
+
+def take_helper_socket(path: str) -> Any:
+    """The connection a helper opened to ``path``, for ``run`` to serve on; None when there is none. A call still running on that connection finishes first."""
+    with _path_lock(path):
+        with _State.lock:
+            _State.owners.pop(path, None)
+            return _State.dialled.pop(path, None)

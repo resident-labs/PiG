@@ -34,7 +34,7 @@ const (
 // loadingBusCall reports whether a call may arrive while its factory is still loading, before the register handshake: the shared event bus, and the registry reads and checks of a Node factory's `pi` object, which Pi answers synchronously when the factory calls them, its exec, which Pi spawns directly, and the model stream (and its cancellation) of the pi-ai functions a module calls at load, which Pi runs in its own process with no registration gate.
 func loadingBusCall(method string) bool {
 	switch method {
-	case callXrefHello, callXrefOp, callEventsOn, callEventsOff, callEventsEmit, callEventsSettle, CallGetMcpServers, CallCheckMcpServer, "exec", CallLoadingExec, CallExecCancel, CallFileMutationEnter, CallFileMutationExit, CallParseFrontmatter, CallParseDate, CallGenerateDiffString, CallGenerateUnifiedPatch, CallCopyToClipboard, CallConvertToPng, CallResizeImage, CallBuiltinToolDefinition, CallHighlightCode, CallLoadTheme, "modelStream", "cancelModelStream":
+	case callXrefHello, callXrefOp, callEventsOn, callEventsOff, callEventsEmit, callEventsSettle, CallGetMcpServers, CallCheckMcpServer, "exec", CallLoadingExec, CallExecCancel, CallFileMutationEnter, CallFileMutationExit, CallParseFrontmatter, CallParseDate, CallGenerateDiffString, CallGenerateUnifiedPatch, CallCopyToClipboard, CallConvertToPng, CallResizeImage, CallBuiltinToolDefinition, CallHighlightCode, CallTypeEngine, CallLoadTheme, "modelStream", "cancelModelStream":
 		return true
 	}
 	return false
@@ -68,6 +68,7 @@ func (h *Host) observeXref(conn *Conn) {
 		h.forgetLocalRealm(conn)
 		h.xref.closed(conn)
 		h.loopTurns.closed(conn)
+		h.syncRuns.closed(conn)
 	}
 }
 
@@ -92,10 +93,12 @@ type busEmission struct {
 	pending map[*Conn]int
 	done    chan struct{}
 	closed  bool
+	// dispatching is set from the emission's creation until its dispatch loop ends. The loop registers each foreign listener realm as pending just before it writes the realm's request, so while it runs an empty pending map means only that the realms reached so far have reported (a realm already inside its own wait quiesces before it answers), not that the emission settled: done stays open for the realms the loop has yet to reach.
+	dispatching bool
 }
 
 func (e *busEmission) settleLocked() {
-	if !e.closed && len(e.pending) == 0 {
+	if !e.closed && !e.dispatching && len(e.pending) == 0 {
 		e.closed = true
 		close(e.done)
 	}
@@ -126,9 +129,17 @@ func (b *hostEventBus) newEmission(emitter *Conn) (string, *busEmission) {
 	b.initLocked()
 	b.nextEmission++
 	id := fmt.Sprint(b.nextEmission)
-	emission := &busEmission{emitter: emitter, pending: make(map[*Conn]int), done: make(chan struct{})}
+	emission := &busEmission{emitter: emitter, pending: make(map[*Conn]int), done: make(chan struct{}), dispatching: true}
 	b.emissions[id] = emission
 	return id, emission
+}
+
+// endDispatch ends the emission's dispatch phase: every foreign listener realm of the emit is registered as pending or has reported, so the emission settles once none is pending.
+func (b *hostEventBus) endDispatch(emission *busEmission) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	emission.dispatching = false
+	emission.settleLocked()
 }
 
 func (b *hostEventBus) addPending(emission *busEmission, conn *Conn, delta int) {
@@ -559,6 +570,10 @@ func (h *Host) handleEventBusCall(ctx context.Context, me *managedExt, conn *Con
 
 // dispatchEvent calls a snapshot of channel's listeners in order and reports whether the snapshot had any.
 func (h *Host) dispatchEvent(ctx context.Context, channel string, payload *busPayload, refs []xrefRef, emitter, emissionID string, emission *busEmission) bool {
+	if emission != nil {
+		// Every exit of the loop, including a listener that fails or whose connection closes, ends the dispatch phase.
+		defer h.eventBus.endDispatch(emission)
+	}
 	listeners := h.eventBus.snapshot(channel)
 	defer h.eventBus.finish(listeners)
 	for i := 0; i < len(listeners); {

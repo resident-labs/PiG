@@ -35,9 +35,6 @@ import (
 	"github.com/MichaelKinsy/PiG/durable/core/contracttest/guard"
 )
 
-// maxPayload bounds one request's payload: a corrupt length must not allocate before the read fails.
-const maxPayload = 1 << 30
-
 type server struct {
 	in       *bufio.Reader
 	out      *bufio.Writer
@@ -45,7 +42,16 @@ type server struct {
 	next     uint32
 	// perThread is the heap bytes one more runtime thread holds, measured by the first heap_threads request; 0 before.
 	perThread uint64
+	// rhead and whead are the frame headers read and written (arrays of the server, so no header escapes to the heap per frame); step is
+	// the buffer a step's answer is encoded in, kept while it is small: the response is written before the next request is read.
+	rhead [22]byte
+	whead [5]byte
+	step  []byte
 }
+
+// maxKeptStep is the capacity of the answer buffer the server keeps between requests; a larger step (a model request is the whole
+// transcript) is encoded in a buffer of its own.
+const maxKeptStep = 4 << 10
 
 type request struct {
 	op      uint8
@@ -57,13 +63,13 @@ type request struct {
 }
 
 func (s *server) read() (request, error) {
-	var head [22]byte
+	head := &s.rhead
 	if _, err := io.ReadFull(s.in, head[:]); err != nil {
 		return request{}, err
 	}
 	n := binary.LittleEndian.Uint32(head[18:])
-	if n > maxPayload {
-		return request{}, fmt.Errorf("request payload of %d bytes is over the %d byte bound", n, maxPayload)
+	if n > abi.MaxEventPayload {
+		return request{}, fmt.Errorf("request payload of %d bytes is over the %d byte bound", n, abi.MaxEventPayload)
 	}
 	r := request{op: head[0], handle: binary.LittleEndian.Uint32(head[1:]), kind: head[5],
 		now: math.Float64frombits(binary.LittleEndian.Uint64(head[6:])), origin: binary.LittleEndian.Uint32(head[14:]), payload: make([]byte, n)}
@@ -72,7 +78,7 @@ func (s *server) read() (request, error) {
 }
 
 func (s *server) write(typ uint8, body []byte) error {
-	var head [5]byte
+	head := &s.whead
 	head[0] = typ
 	binary.LittleEndian.PutUint32(head[1:], uint32(len(body)))
 	if _, err := s.out.Write(head[:]); err != nil {
@@ -133,7 +139,14 @@ func (s *server) serve(r request) []byte {
 			return abi.AppendStep(nil, &abi.Step{Status: abi.StatusRejected, Err: abi.ErrorJSON("InvalidEvent", err.Error())})
 		}
 		ev.Origin = r.origin
-		return abi.AppendStep(nil, sess.Step(ev))
+		step := sess.Step(ev)
+		if need := abi.StepSize(step); need > maxKeptStep {
+			return abi.AppendStep(make([]byte, 0, need), step)
+		}
+		if s.step == nil {
+			s.step = make([]byte, 0, maxKeptStep)
+		}
+		return abi.AppendStep(s.step[:0], step)
 	case 5:
 		delete(s.sessions, r.handle)
 		return nil
@@ -175,7 +188,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "corenative:", err)
 			os.Exit(1)
 		}
-		g.Begin(fmt.Sprintf("op %d handle %d kind %d (%d payload bytes)", r.op, r.handle, r.kind, len(r.payload)))
+		g.BeginRequest(r.op, r.handle, r.kind, len(r.payload))
 		answer := s.serve(r)
 		g.End()
 		if err := s.write(0, answer); err != nil {

@@ -123,6 +123,7 @@ func (o *LocalShellOperations) Exec(ctx context.Context, command, cwd string, op
 	if !commandFromStdin {
 		args = append(args, command)
 	}
+	//nolint:gosec // G204 (class d): the bash tool sink: the resolved shell with its -c (or stdin) transport on the command the model proposes, exactly like Pi's bash.ts; the user's shellPath setting picks the shell.
 	cmd := exec.Command(shell.Path, args...)
 	cmd.Dir = cwd
 	// Upstream passes env as the spawn's env option.
@@ -214,7 +215,7 @@ func (o *LocalShellOperations) Exec(ctx context.Context, command, cwd string, op
 		if opts.OnData != nil {
 			opts.OnData(chunk)
 		}
-	}, childwait.Hooks{BeforeRead: testHookBeforeStdioRead, GraceExpired: testHookStdioGraceExpired})
+	}, testStdioHooks())
 
 	waitErr := cmd.Wait()
 	input.Wait()
@@ -245,24 +246,7 @@ type shellSpawnError struct {
 	cause error
 }
 
-func (e *shellSpawnError) Error() string {
-	if spawnErr, ok := errors.AsType[*nodespawn.Error](e.cause); ok {
-		return spawnErr.Error()
-	}
-	code := nodeErrorCode(e.cause)
-	if e.notFound() {
-		code = "ENOENT"
-	}
-	if code != "" {
-		// child_process.spawn emits these errors with the file in the syscall and throws every other errno, such as ENOTDIR for a working directory that is a file, with the bare syscall "spawn" (internal/child_process.js ChildProcess.spawn).
-		switch code {
-		case "EACCES", "EAGAIN", "EMFILE", "ENFILE", "ENOENT":
-			return "spawn " + e.path + " " + code
-		}
-		return "spawn " + code
-	}
-	return e.cause.Error()
-}
+func (e *shellSpawnError) Error() string { return nodespawn.SpawnMessage(e.path, e.cause) }
 func (e *shellSpawnError) Unwrap() error { return e.cause }
 
 // Is reports a shell that os/exec could not find as fs.ErrNotExist.
@@ -299,6 +283,14 @@ var (
 	testHookStdioGraceExpired func()
 	testHookAfterShellStart   func()
 )
+
+// testStdioHooks is nil outside tests, so a command's pipes carry no hooks.
+func testStdioHooks() *childwait.Hooks {
+	if testHookBeforeStdioRead == nil && testHookStdioGraceExpired == nil {
+		return nil
+	}
+	return &childwait.Hooks{BeforeRead: testHookBeforeStdioRead, GraceExpired: testHookStdioGraceExpired}
+}
 
 // testHookTimeoutTimer replaces the wall-clock timer that arms a command's timeout, so a test can fire the timeout once the command has done
 // what the test needs: Pi arms its timeout as a delay after the spawn, which a machine too loaded to start the shell in time overruns before

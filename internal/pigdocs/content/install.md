@@ -9,7 +9,7 @@ On macOS, Linux or Android with Termux (arm64 only), install the latest release 
 `curl -fsSL https://pi-in-go.dev/install.sh | sh`; in Termux it installs the
 `android-arm64` release into `$PREFIX/bin`. Or download an archive from
 [GitHub Releases](https://github.com/MichaelKinsy/PiG/releases). Windows
-support is a preview. From a source checkout, build it with Go 1.27.3. Go 1.27 release binaries for macOS require macOS 13 or later:
+support is a preview. From a source checkout, build it with Go 1.27.4. Go 1.27 release binaries for macOS require macOS 13 or later:
 
 ```bash
 go build -o bin/pig ./cmd/pig
@@ -62,11 +62,24 @@ matching installation receipt.
 Each release tags the root module (`v0.2.0`) and the nested Go extension SDK
 module (`extensions/sdk/v0.2.0`) on the same commit; `go install` needs both.
 
+Install or run the command with Nix:
+
+```bash
+nix run github:MichaelKinsy/PiG -- --version
+nix profile add github:MichaelKinsy/PiG
+```
+
+Nix before 2.30 and Lix spell the second command `nix profile install`.
+
+The Nix package wraps the command with `fd`, `ripgrep` and the clipboard
+commands. Extensions build and run with the toolchains on `PATH`, as in any
+other installation. Update the flake input to update it.
+
 After the project publishes a release, you can also download an artifact from
 its release page. Verify the published checksum before you place `pig` on
 `PATH`.
 
-PiG stores user state under `~/.pig`. Set `PIG_HOME` only for an isolated config
+PiG stores user state under `~/.pig`, or under `$XDG_CONFIG_HOME/pig` when `XDG_CONFIG_HOME` is set. Set `PIG_HOME` only for an isolated config
 root, tests, or CI.
 
 ### Change what the install script does
@@ -77,7 +90,7 @@ root, tests, or CI.
 |---|---|
 | `PIG_VERSION` | Install this release (for example `0.5.0`) instead of the latest. |
 | `PIG_INSTALL_DIR` | Directory that receives `pig`. The default is `$HOME/.local/bin`, or `$PREFIX/bin` in Termux. |
-| `PIG_HOME` | PiG's settings directory, where the install receipt goes. The default is `~/.pig`. |
+| `PIG_HOME` | PiG's settings directory, where the install receipt goes. The default is `$XDG_CONFIG_HOME/pig` when `XDG_CONFIG_HOME` is set, else `~/.pig`. |
 | `PIG_API_BASE` | The API that names the latest release. The default is `https://pi-in-go.dev/api`. |
 | `PIG_LATEST_RELEASE_URL` | The page that redirects to the latest release, used when the API does not answer. |
 | `PIG_DOWNLOAD_BASE` | The release download root. The default is the GitHub Releases download URL of this repository. |
@@ -187,8 +200,8 @@ Piglet release records where each component comes from: binary, release
 closure, required `agentEnv`, or external mapping. Subprocess use does not create
 a different binary kind.
 
-Piglet Image is the OCI carrier when the Piglet needs an environment-complete
-runtime. Artifact startup never silently installs, pulls, logs in, or substitutes
+Piglet Image is the planned OCI carrier for a Piglet that needs an environment-complete
+runtime. It is not in this release; no command produces one. Artifact startup never silently installs, pulls, logs in, or substitutes
 an origin.
 
 ## 7. Set up an extension toolchain only when authoring/building

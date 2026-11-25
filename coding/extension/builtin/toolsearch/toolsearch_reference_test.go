@@ -10,10 +10,9 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/extension/builtin/toolsearch"
 )
 
-// Scores and ties measured on upstream 0.99.1's own Bm25Ranker (dist/extensions/tool-search/tool.js) for the same
-// documents; the upstream tests assert order only, so these pin the numbers, the schema walk and the tie order.
-// dyna patch P6 (PATCHES.md): the scores are now those of the ranker with the name as its own field (weight 3), measured on
-// an independent JavaScript port of earendil-works/pi#11625 and #11632, since the 0.99.1 ranker scores the name as text.
+// Scores and ties measured on Pi's own Bm25Ranker for the same documents; the upstream tests assert order only, so these pin the numbers, the schema walk and
+// the tie order. The numbers are from Pi cc44fa21 (tool-search/tool.ts, #11331), which scores the name apart from the description; the 0.99.1 numbers
+// they replace came from a ranker that folded the name into the text.
 
 func referenceDocuments() []toolsearch.Document {
 	return []toolsearch.Document{
@@ -36,6 +35,8 @@ func TestBm25ScoresMatchUpstream(t *testing.T) {
 		{"zebra", []toolsearch.Match{{Name: "gamma_tool", Score: 0.915681922553383}}},
 		{"yak", []toolsearch.Match{{Name: "gamma_tool", Score: 0.915681922553383}}},
 		{"fetch", []toolsearch.Match{{Name: "alpha_tool", Score: 0.13845673087706645}, {Name: "beta_tool", Score: 0.13845673087706645}, {Name: "gamma_tool", Score: 0.12466214883396388}}},
+		{"tool", []toolsearch.Match{{Name: "alpha_tool", Score: 0.4005941778735677}, {Name: "beta_tool", Score: 0.4005941778735677}, {Name: "gamma_tool", Score: 0.4005941778735677}}},
+		{"alpha tool", []toolsearch.Match{{Name: "alpha_tool", Score: 4.457442582544996}, {Name: "beta_tool", Score: 0.4005941778735677}, {Name: "gamma_tool", Score: 0.4005941778735677}}},
 	} {
 		got := toolsearch.NewBm25Ranker().Rank(c.query, documents, 8)
 		if len(got) != len(c.want) {

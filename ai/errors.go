@@ -12,6 +12,7 @@ import (
 	"unicode"
 
 	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
 const MaxProviderErrorBodyChars = 4000
@@ -57,8 +58,8 @@ func NormalizeProviderError(value any) NormalizedProviderError {
 		return NormalizedProviderError{Message: SafeJsonStringify(value)}
 	}
 	result := NormalizedProviderError{Message: err.Error(), MessageCarriesBody: true}
-	// pig additive (D92): only the Bedrock provider (the AWS SDK) produces a status-carrying response error; a build without it has none.
-	if status, ok := awsResponseErrorStatus(err); ok {
+	// pig additive (D92): only a provider package that links an SDK (ai/providers/bedrock, the AWS SDK) produces a status-carrying response error; a program without it has none.
+	if status, ok := responseErrorStatus(err); ok {
 		result.Status = new(status)
 	}
 	return result
@@ -160,6 +161,10 @@ var safeJSONEncoders = sync.Pool{New: func() any {
 func (state *safeJSONEncoder) stringify(value any) []byte {
 	state.buffer.Reset()
 	if err := state.encoder.Encode(value); err != nil {
+		// encoding/json refuses a NaN or an infinity, which JSON.stringify writes as null: only a value with no JSON form is written as String(value).
+		if stringified, stringifyErr := jsstring.MarshalJSON(value); stringifyErr == nil {
+			return append(state.canonical[:0], stringified...)
+		}
 		return append(state.canonical[:0], fmt.Sprint(value)...)
 	}
 	encoded := bytes.TrimSuffix(state.buffer.Bytes(), []byte("\n"))

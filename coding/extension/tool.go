@@ -38,7 +38,11 @@ type ToolRenderContext struct {
 	// Card identifies the tool card being rendered. Go mechanic (not a
 	// divergence): a renderer that runs in an extension process keeps State
 	// and its last component there, so the host names the card they belong
-	// to; upstream passes the card's objects themselves.
+	// to; upstream passes the card's objects themselves. The host frees the
+	// extension-side state of a card once no component its renderers returned
+	// is reachable, so a caller that goes on rendering a card keeps those
+	// components, as upstream's card keeps callRendererComponent and
+	// resultRendererComponent (tool-execution.ts).
 	Card string `json:"-"`
 }
 
@@ -204,8 +208,6 @@ type ToolDefinition struct {
 	// sets it for a tool built from Pi's create<Tool>ToolDefinition, whose
 	// renderers are that built-in tool's (D73).
 	BuiltInRenderers string `json:"-"`
-	// ValidationParameters is the host-only representation of non-enumerable TypeBox metadata.
-	ValidationParameters json.RawMessage `json:"-"`
 	// OutputSchema is the schema of the structured result. upstream: types.ts:585
 	OutputSchema json.RawMessage `json:"outputSchema,omitempty"`
 	// Exposure is how the model reaches the tool. Default: direct. upstream: types.ts:590

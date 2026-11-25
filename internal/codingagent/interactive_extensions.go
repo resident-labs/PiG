@@ -1,5 +1,7 @@
 package codingagent
 
+// Ports packages/coding-agent/src/modes/interactive/interactive-mode.ts (bindCurrentSessionExtensions and the extension action wiring).
+
 import (
 	"cmp"
 	"context"
@@ -7,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"os"
 	"slices"
 	"strings"
@@ -68,6 +71,10 @@ func (m *InteractiveMode) deliverUserMessage(content any, deliverAs extension.De
 	}
 	return m.postToMain(m.runCtx, func() {
 		if m.agent == nil {
+			return
+		}
+		// A start posted before a quit key set requestExit must not begin a turn the quit settle would wait for (D247).
+		if m.requestExit.Load() {
 			return
 		}
 		// Upstream sendUserMessage is prompt() with source "extension" and
@@ -475,6 +482,10 @@ func (m *InteractiveMode) renderWidgetsLocked() {
 			above = append(above, entry.component)
 		}
 	}
+	// pig divergence (D228): the one-time copy tip sits under the editor, after the below-editor widgets.
+	if m.queueCopyTip != nil {
+		below = append(below, m.queueCopyTip)
+	}
 	m.widgetContainer.SetChildren(above...)
 	if m.widgetContainerBelow != nil {
 		m.widgetContainerBelow.SetChildren(below...)
@@ -491,6 +502,32 @@ func (m *InteractiveMode) sessionToolActions() (extension.ToolActions, bool) {
 		return extension.ToolActions{}, false
 	}
 	return session.ToolActions(), true
+}
+
+// extensionAbort is the extension host's abort action: ctx.abort() of a subprocess extension in interactive mode. Pi's abort handler is `void this.session.abort()` (interactive-mode.ts:2077-2078, :4840-4857), and everything before abort()'s first await has run when the call returns: the flag for agent_settled is set, the retry, compaction and branch summary are cancelled and agent.abort() has aborted the run's AbortController (agent-session.ts:2519-2530, agent.ts:350-352). So a handler that holds ctx.signal sees it aborted once its call returns, and nothing waits for the end of the run: the run waits for the handler that made the call.
+//
+// The call arrives on a goroutine of the extension host. The owner loop may be busy with an earlier task, or waiting for the handler that made this call, so the cancellation is made here and not queued behind the loop: the host replies to the extension with the state of the run's signal, which must already be aborted. A Session cancels from any goroutine (RequestAbort). A mode that owns its agent aborts the run's signal here and leaves the loop only what it owns: renewing the abort context the next run starts with, which applies to the run this call aborted and not to one that began since.
+func (m *InteractiveMode) extensionAbort() {
+	if session, ok := m.opts.SessionHandle.(interface{ RequestAbort() }); ok {
+		session.RequestAbort()
+		return
+	}
+	if session := m.opts.SessionHandle; session != nil {
+		session.AbortRetry()
+		session.AbortCompaction()
+		session.AbortBranchSummary()
+	}
+	current := m.extensionAgent.Load()
+	var run context.Context
+	if current != nil {
+		run = current.Signal()
+		current.Abort()
+	}
+	_ = m.postToMain(m.runCtx, func() {
+		if current == nil || current.Signal() == run {
+			m.abortRun(m.runCtx)
+		}
+	})
 }
 
 func (m *InteractiveMode) wireSubprocessHostCallbacks() func() {
@@ -516,7 +553,11 @@ func (m *InteractiveMode) wireSubprocessHostCallbacks() func() {
 		if m.newRunner != nil {
 			runner = m.newRunner
 		}
-		return ExtensionToolInfos(runner, m.opts.ToolRegistryAllowed, m.opts.ExcludedTools)
+		var scope *extension.ToolScope
+		if session, ok := m.opts.SessionHandle.(interface{ ToolScope() *extension.ToolScope }); ok {
+			scope = session.ToolScope()
+		}
+		return ExtensionToolInfosScoped(runner, m.opts.ToolRegistryAllowed, m.opts.ExcludedTools, scope)
 	})
 	// upstream: agent-session.ts:3339, 3382-3383 bind getSettings, executeTool and getCallableTools to the session in every mode.
 	b.SetHostAction("getSettings", func() extension.Settings {
@@ -563,21 +604,7 @@ func (m *InteractiveMode) wireSubprocessHostCallbacks() func() {
 		b.SetHostAction("getExtensionStatuses", func() map[string]string { return m.statusLine.GetExtensionStatuses() })
 		b.SetHostAction("getAvailableProviderCount", func() int { return m.statusLine.ProviderCount() })
 	}
-	// Upstream abort() cancels the retry delay, compaction, branch summary
-	// and run, then awaits waitForIdle.
-	b.SetHostAction("abort", func() {
-		if err := m.postToMain(m.runCtx, func() {
-			if m.opts.SessionHandle != nil {
-				m.opts.SessionHandle.AbortRetry()
-				m.opts.SessionHandle.AbortCompaction()
-				m.opts.SessionHandle.AbortBranchSummary()
-			}
-			m.abortRun(m.runCtx)
-		}); err != nil {
-			return
-		}
-		_ = m.waitForIdle(m.runCtx)
-	})
+	b.SetHostAction("abort", m.extensionAbort)
 	b.SetHostAction("getScopedModels", m.extensionScopedModels)
 	b.SetHostAction("hasPendingMessages", m.extensionHasPendingMessages)
 	b.SetHostAction("shutdown", m.requestExtensionShutdown)
@@ -826,9 +853,10 @@ func subprocessOptionalInt64(object map[string]any, key, path string) (int64, er
 	}
 	switch number := value.(type) {
 	case float64:
-		if number != float64(int64(number)) {
+		if number < -(1<<63) || number >= 1<<63 || number != math.Trunc(number) {
 			return 0, fmt.Errorf("%s.%s must be an integer", path, key)
 		}
+		//portlint:allow numbers the range and integrality checks above make the conversion exact
 		return int64(number), nil
 	case int:
 		return int64(number), nil
@@ -1574,12 +1602,6 @@ func WireModelOperations(bridge ModelOperationBridge, bindings ModelOperationBin
 		extension.CallInitiated(ctx)
 		if bindings.Registry == nil {
 			return map[string]any{"ok": false, "error": "model registry not available"}
-		}
-		if providerID == "test-faux" && os.Getenv("PIG_TEST_FAUX") == "1" {
-			// The scripted test provider authenticates as the upstream side of
-			// the parity harness registers it (test/parity/testdata/test-faux-provider.ts:
-			// apiKey "unused"), so extensions take the same authenticated path.
-			return map[string]any{"ok": true, "apiKey": "unused", "baseUrl": "http://localhost:0"}
 		}
 		if bindings.Registry.NativeProvider(providerID) != nil {
 			auth, err := bindings.Registry.NativeProviderAuth(ctx, providerID, ai.AuthResolutionOverrides{})

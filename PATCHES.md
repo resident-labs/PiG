@@ -5,7 +5,7 @@ This is resident-labs/PiG, Dyna's fork of PiG. The branch `dyna` is the pinned P
 every existing behaviour as it was, so it can be offered upstream as it stands. A patch's code names it as
 `dyna patch P<n>`.
 
-Base: PiG v0.5.3 (526c86df8).
+Base: PiG v0.7.0 + main (40b509fbdf).
 
 ## P1 Members on a user message
 
@@ -114,7 +114,7 @@ Locked by: `TestHostSectionsChangeThroughContextUpdates`, `TestAContextUpdateArr
 `TestAToolActiveAgainChangesNoSection`, `TestHostSectionsReachASessionWithAPlainPrompt`, `TestASkillEditReachesTheNextRequest`
 (coding).
 
-## P6 Tool search ranking
+## P6 Tool search ranking (upstreamed in v0.7.0)
 
 What: `toolsearch.Bm25Ranker` ranks with the name and the namespace as fields of their own. `Document` has `Name`,
 `Text` (description, schema descriptions, property names) and `NamespaceText`. A query term in the name counts 3
@@ -122,6 +122,8 @@ times its IDF, one in the namespace 0.5 times, and BM25 length normalization app
 tool whose whole local name (the last `__` segment) is in the query gets a bonus of the sum of the query terms'
 IDF. A query that is exactly a tool's name (normalized, or a suffix after `__`) ranks that tool first. Among the
 rest, a tool that matches more query terms ranks above one that matches fewer, then the score decides.
+
+Status: upstream `MichaelKinsy/PiG` `main` (`40b509fbdf`) now carries Pi's equivalent BM25 name/namespace/exact/coverage ranker; the fork uses upstream's `toolsearch.go` directly (keeping only P7's `DeferredToolsDescription`).
 
 Why: the upstream fixes (earendil-works/pi #11625 name ranking and #11632 query coverage ranking) came after PiG's
 pin, and Dyna's Node fork carries them. Without them a model that searches for a tool by its name gets tools that
@@ -168,7 +170,7 @@ Upstream: not offered (owner's decision pending).
 ## P8 Active effort at the top level
 
 What: `ai.StreamOptions.ActiveEffortAtTopLevel` makes an Anthropic request that carries mid-conversation effort markers
-send the active effort as its top-level `output_config.effort`, where Pi sends `"high"`. A request without markers
+send the active effort as its top-level `output_config.effort`, where Pi sends `"low"` (previously `"high"`). A request without markers
 already sends the active effort there, so the option changes nothing for it. `SessionOptions.ActiveEffortAtTopLevel`
 (and `CreateAgentSessionFromServicesOptions.ActiveEffortAtTopLevel`) sets it on every request of a Session through
 `buildRequestOptions`, compaction and branch summaries included. Without it nothing changes.
@@ -248,13 +250,9 @@ Locked by: native request-phase, retry/backoff/limit, progress and cleanup tests
 
 Upstream: not offered (owner's decision, 2026-11-04).
 
-## P14 gpt-6.1-terra in the generated openai catalog
+## P14 gpt-6.1-terra in the generated openai catalog (dropped — upstreamed)
 
-What: `ai/models_generated.go` gains the openai `gpt-6.1-terra` entry, copied from pi-in-go.dev's `/api/models/providers/openai` (Responses, reasoning, 272,000 window, text and image).
-
-Why: a box whose remote-catalog cache is empty resolved terra from an older chat model's defaults (Completions, reasoning off, a small window) and compacted every ~50k tokens. Remove when the generated catalog includes terra.
-
-Files: `ai/models_generated.go`.
+Dropped on merge of `MichaelKinsy/PiG` `main` (`40b509fbdf`): upstream's `ai/models_generated.go` now includes `gpt-6.1-terra` across `openai`, `openai-codex`, `azure`, `amazon-bedrock`, and `cloudflare-ai-gateway`.
 
 ## P15 Compaction chunks are sized with the reserve's summary budget (superseded by P16)
 
@@ -280,11 +278,9 @@ Locked by: `TestCompactLiveExtendsTheLiveRequest`, `TestCompactLiveDropsTheOldes
 
 Upstream: not offered (owner's decision, 2026-11-04).
 
-## P18 Select only system-message bodies when restoring the tool loadout
+## P18 Select only system-message bodies when restoring the tool loadout (upstreamed in main)
 
-What: the constructor uses GetSystemMessages, filtering branch slot metadata before decoding. It keeps every ancestor system message, including before compaction, in the same order. Other history payloads remain lazy. Tool replay validation is unchanged.
-
-Why: restoring a compacted session decoded all historical tool-result bodies just to select system messages. Synthetic 100 MiB compacted histories spent seconds in this constructor traversal.
+What: upstream `main` (`40b509fbdf`) added `Session.GetBranchSystemMessages()` in `internal/codingagent/session.go`, which filters branch slot metadata before decoding in the same way. `coding/session.go` uses `inner.GetBranchSystemMessages()`; `GetSystemMessages` and the lock tests remain in place.
 
 Locked by: TestSystemMessagesMatchWholeBranchAcrossCompactionAndForks and TestP18ReplayMatchesWholeBranchIncludingPreCompactionToolErrors.
 

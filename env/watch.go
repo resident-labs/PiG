@@ -35,12 +35,12 @@ var reconnectTimer = time.NewTimer
 type RemoteWatcher struct {
 	connection *Connection
 	targets    []durableenv.WatchTarget
-	onChange   func(durableenv.WatchChange)
+	onChange   func(durableenv.FileChange)
 	options    RemoteWatchOptions
 
 	mu      sync.Mutex
 	mode    durableenv.WatchMode
-	closed  bool
+	stopped bool
 	cancel  context.CancelFunc
 	request chan struct{}
 	wake    chan struct{}
@@ -55,7 +55,7 @@ var _ durableenv.FileWatcher = (*RemoteWatcher)(nil)
 // OpenRemoteWatcher is upstream's RemoteWatcher.open: the constructor is private upstream, and Go has no static methods.
 // It watches targets (resolved paths); it fails like NodeFileWatcher.open if coverage cannot be
 // established.
-func OpenRemoteWatcher(ctx context.Context, connection *Connection, targets []durableenv.WatchTarget, onChange func(durableenv.WatchChange), options RemoteWatchOptions) (*RemoteWatcher, error) {
+func OpenRemoteWatcher(ctx context.Context, connection *Connection, targets []durableenv.WatchTarget, onChange func(durableenv.FileChange), options RemoteWatchOptions) (*RemoteWatcher, error) {
 	watcher := &RemoteWatcher{connection: connection, targets: targets, onChange: onChange, options: options, mode: durableenv.WatchNative}
 	if err := watcher.start(ctx); err != nil {
 		return nil, err
@@ -70,14 +70,14 @@ func (w *RemoteWatcher) Mode() durableenv.WatchMode {
 	return w.mode
 }
 
-// Close stops watching; no onChange call starts after it returns. It is idempotent.
-func (w *RemoteWatcher) Close(context.Context) error {
+// Stop stops watching; no onChange call starts after it returns. It is idempotent.
+func (w *RemoteWatcher) Stop(context.Context) error {
 	w.mu.Lock()
-	if w.closed {
+	if w.stopped {
 		w.mu.Unlock()
 		return nil
 	}
-	w.closed = true
+	w.stopped = true
 	wake, cancel, request := w.wake, w.cancel, w.request
 	w.mu.Unlock()
 	if wake != nil {
@@ -96,21 +96,21 @@ func (w *RemoteWatcher) Close(context.Context) error {
 	return nil
 }
 
-func (w *RemoteWatcher) isClosed() bool {
+func (w *RemoteWatcher) isStopped() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.closed
+	return w.stopped
 }
 
 func (w *RemoteWatcher) stop() {
 	w.mu.Lock()
-	w.closed = true
+	w.stopped = true
 	w.mu.Unlock()
 }
 
-// deliver calls onChange unless closed; a throwing callback must not stop watching.
-func (w *RemoteWatcher) deliver(change durableenv.WatchChange) {
-	if w.isClosed() {
+// deliver calls onChange unless stopped; a throwing callback must not stop watching.
+func (w *RemoteWatcher) deliver(change durableenv.FileChange) {
+	if w.isStopped() {
 		return
 	}
 	defer func() { _ = recover() }() // upstream: env/src/watch.ts:deliver
@@ -141,7 +141,7 @@ func (w *RemoteWatcher) start(ctx context.Context) error {
 	if w.options.MaxDirectories != nil {
 		request["maxDirectories"] = *w.options.MaxDirectories
 	}
-	//portlint:allow ctxmapping the watch request outlives open's ctx and ends at Close, as RemoteWatcher.open takes no signal (watch.ts:47-56)
+	//portlint:allow ctxmapping the watch request outlives open's ctx and ends at Stop, as RemoteWatcher.open takes no signal (watch.ts:47-56)
 	requestContext, cancel := context.WithCancel(context.Background())
 	stopForwarding := context.AfterFunc(ctx, cancel)
 	ready := make(chan struct{})
@@ -152,9 +152,9 @@ func (w *RemoteWatcher) start(ctx context.Context) error {
 	w.mu.Lock()
 	w.cancel = cancel
 	w.request = done
-	closedMeanwhile := w.closed
+	stoppedMeanwhile := w.stopped
 	w.mu.Unlock()
-	if closedMeanwhile {
+	if stoppedMeanwhile {
 		cancel()
 	}
 	call := w.connection.Start(requestContext, "watch", request, RequestOptions{OnEvent: func(event Json, _ []byte) {
@@ -177,7 +177,7 @@ func (w *RemoteWatcher) start(ctx context.Context) error {
 				w.mu.Unlock()
 			}
 			if event["overflow"] == true {
-				w.deliver(durableenv.WatchChangeOverflow{})
+				w.deliver(durableenv.FileChangeOverflow{})
 				return
 			}
 			var paths []string
@@ -187,13 +187,13 @@ func (w *RemoteWatcher) start(ctx context.Context) error {
 					paths = append(paths, path)
 				}
 			}
-			w.deliver(durableenv.WatchChangePaths{Paths: paths})
+			w.deliver(durableenv.FileChangePaths{Paths: paths})
 		case "error":
 			code := durableenv.FileErrorInvalid
 			if event["code"] == "permission_denied" {
 				code = durableenv.FileErrorPermissionDenied
 			}
-			w.deliver(durableenv.WatchChangeError{Error: durableenv.NewFileError(code, templateString(event, "message"), "", nil)})
+			w.deliver(durableenv.FileChangeFailed{Error: durableenv.NewFileError(code, templateString(event, "message"), "", nil)})
 			w.stop()
 		}
 	}})
@@ -212,19 +212,19 @@ func (w *RemoteWatcher) start(ctx context.Context) error {
 			failed <- err
 			return
 		}
-		if w.isClosed() {
+		if w.isStopped() {
 			return
 		}
 		if IsConnectionLost(err) {
 			w.reconnecting.Go(w.reconnect)
 			return
 		}
-		w.deliver(durableenv.WatchChangeError{Error: toFileError(err, "")})
+		w.deliver(durableenv.FileChangeFailed{Error: toFileError(err, "")})
 		w.stop()
 	}()
 	select {
 	case <-ready:
-		// The context only aborts the opening; the watcher lives until Close, as upstream's open takes no signal.
+		// The context only aborts the opening; the watcher lives until Stop, as upstream's open takes no signal.
 		stopForwarding()
 		return nil
 	case err := <-failed:
@@ -234,17 +234,17 @@ func (w *RemoteWatcher) start(ctx context.Context) error {
 }
 
 func (w *RemoteWatcher) reconnect() {
-	for delay := reconnectFirst; !w.isClosed(); delay = min(delay*2, reconnectMax) {
+	for delay := reconnectFirst; !w.isStopped(); delay = min(delay*2, reconnectMax) {
 		wake := make(chan struct{}, 1)
 		w.mu.Lock()
 		w.wake = wake
-		closed := w.closed
+		stopped := w.stopped
 		w.mu.Unlock()
-		if closed {
+		if stopped {
 			return
 		}
 		timer := reconnectTimer(delay)
-		//portlint:allow golifetime Close sends on w.wake, ending the wait, and the loop rechecks closed (watch.ts:133-140 #wake clears the timer)
+		//portlint:allow golifetime Stop sends on w.wake, ending the wait, and the loop rechecks stopped (watch.ts:133-140 #wake clears the timer)
 		select {
 		case <-timer.C:
 		case <-wake:
@@ -253,19 +253,19 @@ func (w *RemoteWatcher) reconnect() {
 		w.mu.Lock()
 		w.wake = nil
 		w.mu.Unlock()
-		if w.isClosed() {
+		if w.isStopped() {
 			return
 		}
 		err := w.start(context.Background())
 		if err == nil {
 			// Changes while disconnected were not seen.
-			w.deliver(durableenv.WatchChangeOverflow{})
+			w.deliver(durableenv.FileChangeOverflow{})
 			return
 		}
 		if IsConnectionLost(err) {
 			continue
 		}
-		w.deliver(durableenv.WatchChangeError{Error: toFileError(err, "")})
+		w.deliver(durableenv.FileChangeFailed{Error: toFileError(err, "")})
 		w.stop()
 		return
 	}

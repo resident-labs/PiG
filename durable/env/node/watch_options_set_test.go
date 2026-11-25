@@ -15,18 +15,18 @@ import (
 func TestNodeWatchMaxDirectoriesZeroRefusesEveryDirectory(t *testing.T) {
 	env := NewNodeExecutionEnv(NodeExecutionEnvOptions{Cwd: t.TempDir(), Watch: NodeWatchOptions{MaxDirectories: new(0)}})
 	mustDo(t, env.CreateDir(background, "tree", nil))
-	_, err := env.Watch(background, []durableenv.WatchTarget{{Path: "tree", Recursive: true}}, func(durableenv.WatchChange) {})
+	_, err := env.Watch(background, []durableenv.WatchTarget{{Path: "tree", Recursive: true}}, func(durableenv.FileChange) {})
 	fileErr, ok := errors.AsType[*durableenv.FileError](err)
 	if !ok || fileErr.Code != durableenv.FileErrorInvalid || !strings.Contains(fileErr.Message, "Watched paths exceed 0 directories") {
 		t.Fatalf("Watch error = %v, want the invalid budget error for 0 directories", err)
 	}
 	unset := NewNodeExecutionEnv(NodeExecutionEnvOptions{Cwd: t.TempDir()})
 	mustDo(t, unset.CreateDir(background, "tree", nil))
-	watcher, err := unset.Watch(background, []durableenv.WatchTarget{{Path: "tree", Recursive: true}}, func(durableenv.WatchChange) {})
+	watcher, err := unset.Watch(background, []durableenv.WatchTarget{{Path: "tree", Recursive: true}}, func(durableenv.FileChange) {})
 	if err != nil {
 		t.Fatalf("an unset limit is the default 10,000 directories: %v", err)
 	}
-	_ = watcher.Close(background)
+	_ = watcher.Stop(background)
 }
 
 // Pi node-watch.ts:163 takes `options.pollIntervalMs ?? DEFAULT_POLL_MS` and passes it to setTimeout (:230-233). Node runs a
@@ -51,13 +51,13 @@ func TestNodeTimerDelayFollowsSetTimeout(t *testing.T) {
 		{NodeWatchOptions{Mode: durableenv.WatchPolling, PollIntervalMs: new(0)}, time.Millisecond},
 		{NodeWatchOptions{Mode: durableenv.WatchPolling, PollIntervalMs: new(250)}, 250 * time.Millisecond},
 	} {
-		watcher, err := openFileWatcher([]durableenv.WatchTarget{{Path: t.TempDir()}}, func(path string) string { return path }, func(durableenv.WatchChange) {}, c.options)
+		watcher, err := openFileWatcher([]durableenv.WatchTarget{{Path: t.TempDir()}}, func(path string) string { return path }, func(durableenv.FileChange) {}, c.options)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if watcher.pollInterval != c.want {
 			t.Errorf("poll interval for %+v = %v, want %v", c.options, watcher.pollInterval, c.want)
 		}
-		_ = watcher.Close(background)
+		_ = watcher.Stop(background)
 	}
 }

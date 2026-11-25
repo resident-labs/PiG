@@ -70,9 +70,9 @@ func TestNpmCommandClassificationAtInstallAndRemove(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Pi's getNpmInstallRoot is path.join(agentDir, "npm"), in the platform's spelling.
-	root := filepath.Join(agent, "npm")
-	want := "install @scope/pkg --prefix " + root + " --legacy-peer-deps\n" +
-		"uninstall @scope/pkg --prefix " + root + " --legacy-peer-deps\n"
+	root := realPathSync(t, filepath.Join(agent, "npm"))
+	want := "install @scope/pkg --prefix " + root + " --legacy-peer-deps --no-audit --no-fund\n" +
+		"uninstall @scope/pkg --prefix " + root + " --legacy-peer-deps --no-audit --no-fund\n"
 	if string(calls) != want {
 		t.Fatalf("commands = %q, want %q", calls, want)
 	}

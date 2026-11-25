@@ -2,12 +2,17 @@
 
 package tui
 
+// Ports packages/tui/src/terminal.ts (ProcessTerminal on Windows: console input and the terminal size).
+
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"os"
+	"runtime"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -32,24 +37,35 @@ const resizePollInterval = 120 * time.Millisecond
 func pollReadable(_ uintptr, _ int) (int, error) { return 0, nil }
 
 type terminalInputWaiter struct {
-	ctx          context.Context
-	cancelEvent  windows.Handle
+	ctx         context.Context
+	cancelEvent windows.Handle
+	// pipe: the input is a pipe, whose handle signals whether or not input is queued, so it is read in a cancellable ReadFile instead of waited on (readPipe). Any other input signals its handle when it has input.
+	pipe         bool
 	stopCallback func() bool
 	callbackDone chan struct{}
+
+	// mu orders a pipe wait's start and end against abortPipeWait, so an abort reaches only the zero-byte read it was made for.
+	mu       sync.Mutex
+	handle   windows.Handle // the pipe the wait numbered waitID blocks on
+	waitID   uint64
+	blocking bool // a pipe wait is between setting up its zero-byte read and leaving it
 }
 
-func newTerminalInputWaiter(ctx context.Context) (*terminalInputWaiter, error) {
+func newTerminalInputWaiter(ctx context.Context, file *os.File) (*terminalInputWaiter, error) {
 	cancelEvent, err := windows.CreateEvent(nil, 1, 0, nil)
 	if err != nil {
 		return nil, err
 	}
+	fileType, _ := windows.GetFileType(windows.Handle(file.Fd()))
 	w := &terminalInputWaiter{
 		ctx:          ctx,
 		cancelEvent:  cancelEvent,
+		pipe:         fileType == windows.FILE_TYPE_PIPE,
 		callbackDone: make(chan struct{}),
 	}
 	w.stopCallback = context.AfterFunc(ctx, func() {
 		_ = windows.SetEvent(cancelEvent)
+		w.abortPipeWait(0)
 		//portlint:allow doubleclose context.AfterFunc runs this function at most once, and only it closes callbackDone
 		close(w.callbackDone)
 	})
@@ -58,14 +74,15 @@ func newTerminalInputWaiter(ctx context.Context) (*terminalInputWaiter, error) {
 
 // wait waits for either console input or cancellation before issuing ReadFile.
 // Stop therefore cannot leave an old reader blocked inside the read that
-// belongs to the next terminal owner.
+// belongs to the next terminal owner. A pipe is not waited on but read (readPipe).
 func (w *terminalInputWaiter) wait(file *os.File, ms int) (bool, error) {
+	handle := windows.Handle(file.Fd())
 	timeout := uint32(windows.INFINITE)
 	if ms >= 0 {
 		timeout = uint32(min(int64(ms), int64(windows.INFINITE)-1))
 	}
 	event, err := windows.WaitForMultipleObjects(
-		[]windows.Handle{windows.Handle(file.Fd()), w.cancelEvent},
+		[]windows.Handle{handle, w.cancelEvent},
 		false,
 		timeout,
 	)
@@ -76,6 +93,58 @@ func (w *terminalInputWaiter) wait(file *os.File, ms int) (bool, error) {
 		return false, err
 	}
 	return event == windows.WAIT_OBJECT_0, nil
+}
+
+// readPipe reads a pipe in one cancellable system call and reports whether file is a pipe at all; any other input is waited on by wait and read by the caller. A pipe handle is signalled from the moment the pipe exists and again after every read, so waiting on it cannot tell an empty pipe from one with input, and a reader sent into ReadFile on an empty pipe could not be stopped. So the read is the wait: CancelIoEx aborts a ReadFile blocked on an empty pipe with ERROR_OPERATION_ABORTED and no byte taken, and a read that completes as the cancel lands returns its bytes to the caller (libuv's uv_pipe_zero_readfile_thread_proc and uv__pipe_interrupt_read cancel their blocking read the same way). ms bounds the read as the framing deadline does (without limit when negative; zero only takes what is queued); a read that is cancelled or runs out of time returns no data, with the context's error if it was cancelled. A bounded read looks at the pipe first, so queued input arms no timer.
+func (w *terminalInputWaiter) readPipe(file *os.File, ms int) (data []byte, isPipe bool, err error) {
+	if !w.pipe {
+		return nil, false, nil
+	}
+	handle := windows.Handle(file.Fd())
+	queued := ms >= 0 && pipeReadable(handle)
+	if ms == 0 && !queued {
+		return nil, true, nil
+	}
+	w.mu.Lock()
+	if err := w.ctx.Err(); err != nil {
+		w.mu.Unlock()
+		return nil, true, err
+	}
+	w.waitID++
+	id := w.waitID
+	w.handle, w.blocking = handle, true
+	w.mu.Unlock()
+	if ms > 0 && !queued {
+		timer := time.AfterFunc(time.Duration(ms)*time.Millisecond, func() { w.abortPipeWait(id) })
+		defer timer.Stop()
+	}
+	buf := make([]byte, 256)
+	var n uint32
+	err = windows.ReadFile(handle, buf, &n, nil)
+	w.mu.Lock()
+	w.blocking = false
+	w.mu.Unlock()
+	switch {
+	case errors.Is(err, windows.ERROR_OPERATION_ABORTED):
+		return nil, true, w.ctx.Err()
+	case errors.Is(err, windows.ERROR_BROKEN_PIPE):
+		return buf[:n], true, io.EOF
+	}
+	return buf[:n], true, err
+}
+
+// abortPipeWait ends the pipe wait numbered id, or the current one when id is zero. CancelIoEx finds nothing while the wait has yet to enter ReadFile, so it repeats until the wait has left, which takes a few turns of the scheduler.
+func (w *terminalInputWaiter) abortPipeWait(id uint64) {
+	for {
+		w.mu.Lock()
+		if !w.blocking || id != 0 && w.waitID != id {
+			w.mu.Unlock()
+			return
+		}
+		_ = windows.CancelIoEx(w.handle, nil)
+		w.mu.Unlock()
+		runtime.Gosched()
+	}
 }
 
 func (w *terminalInputWaiter) close() {
@@ -237,7 +306,15 @@ var (
 	kernel32              = windows.NewLazySystemDLL("kernel32.dll")
 	procPeekConsoleInputW = kernel32.NewProc("PeekConsoleInputW")
 	procReadConsoleInputW = kernel32.NewProc("ReadConsoleInputW")
+	procPeekNamedPipe     = kernel32.NewProc("PeekNamedPipe")
 )
+
+// pipeReadable reports whether a read of the pipe returns without blocking: input is queued, or the pipe has ended and the read reports the end of input. A pipe that cannot be peeked is readable too, so the read reports its failure.
+func pipeReadable(handle windows.Handle) bool {
+	var available uint32
+	r1, _, _ := syscall.SyscallN(procPeekNamedPipe.Addr(), uintptr(handle), 0, 0, 0, uintptr(unsafe.Pointer(&available)), 0) //nolint:gosec // G103: PeekNamedPipe writes the count of bytes queued, and x/sys has no wrapper for it. SyscallN, unlike LazyProc.Call, keeps the count and the argument list on the stack.
+	return r1 == 0 || available != 0
+}
 
 // peekConsoleInput copies the console's queued input records into records
 // without removing them and returns how many it copied.
@@ -281,6 +358,9 @@ func (c *consoleInput) appendUTF8(buf []byte, units []uint16) []byte {
 	}
 	return buf
 }
+
+// inForeground is always true: a Windows console has no foreground process group that stops a background writer.
+func (*ProcessTerminal) inForeground() (bool, error) { return true, nil }
 
 // isEINTR reports whether a read error is an interrupted syscall. Windows has
 // no EINTR, so this is always false.

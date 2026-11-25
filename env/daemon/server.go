@@ -5,12 +5,14 @@ package daemon
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	durableenv "github.com/MichaelKinsy/PiG/durable/env"
@@ -39,6 +41,12 @@ type Options struct {
 	// OnSilence runs when the client went silent for the limit, after everything it started was killed; it defaults to
 	// exiting the process, as the daemon does.
 	OnSilence func()
+	// OnExitSignal runs with the signal number when the daemon receives SIGTERM, SIGINT or SIGHUP, after everything it
+	// started was killed; it defaults to exiting the process with status 128 + the signal, as the daemon does.
+	OnExitSignal func(signal int)
+	// exit ends the process when the daemon receives a signal and OnExitSignal is nil; it defaults to os.Exit, and only a test
+	// replaces it.
+	exit func(code int)
 }
 
 type fileHandle struct {
@@ -248,9 +256,12 @@ func (s *server) dispatch(id uint32, request any, payload []byte, ctl *control) 
 		if handle.failed.Load() {
 			return nil, nil, newFailure("EBADF", "an earlier write failed")
 		}
-		if _, err := handle.file.Write(payload); err != nil {
-			handle.failed.Store(true)
-			return nil, nil, ioFailure(err, "write", handle.path)
+		// write_all of nothing makes no system call, which a full device would fail.
+		if len(payload) > 0 {
+			if _, err := handle.file.Write(payload); err != nil {
+				handle.failed.Store(true)
+				return nil, nil, ioFailure(err, "write", handle.path)
+			}
 		}
 		return plain(Object{}, nil)
 	case "truncate":
@@ -474,16 +485,7 @@ func (s *server) opPread(request Object) (Object, []byte, *Failure) {
 }
 
 func (s *server) opOpendir(p string) (Object, []byte, *Failure) {
-	file, err := os.Open(p)
-	if err == nil {
-		var stats os.FileInfo
-		if stats, err = file.Stat(); err == nil && !stats.IsDir() {
-			err = synthetic("ENOTDIR")
-		}
-		if err != nil {
-			_ = file.Close()
-		}
-	}
+	file, err := openDirectory(p)
 	if err != nil {
 		return nil, nil, ioFailure(err, "opendir", p)
 	}
@@ -683,6 +685,23 @@ func runInOrder(queue *jobQueue, handle *fileHandle, job func()) {
 	})
 }
 
+// writeStderr writes message to stderr, waiting while it is full. Stderr shares stdout's open file description when the
+// daemon runs with 2>&1, and Serve has that description non-blocking: Go treats the inherited stderr as blocking, so a full
+// pipe would otherwise answer EAGAIN and lose the message. Pi's blocking eprintln waits.
+func writeStderr(stderr *os.File, message string) {
+	deadline := time.Now().Add(5 * time.Second)
+	for text := []byte(message); len(text) > 0; {
+		written, err := stderr.Write(text)
+		text = text[written:]
+		if err != nil && (!errors.Is(err, syscall.EAGAIN) || time.Now().After(deadline)) {
+			return
+		}
+		if err != nil {
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
 // respondHook, nil outside tests, runs before a request is answered; a test panics in it to reach recoverThreadPanic.
 var respondHook atomic.Pointer[func(op string)]
 
@@ -692,7 +711,7 @@ var respondHook atomic.Pointer[func(op string)]
 // jobs, and Rust's default hook reports the panic on stderr.
 func recoverThreadPanic() {
 	if failure := recover(); failure != nil {
-		fmt.Fprintf(os.Stderr, "thread panicked: %v\n", failure)
+		writeStderr(os.Stderr, fmt.Sprintf("thread panicked: %v\n", failure))
 	}
 }
 
@@ -801,8 +820,30 @@ func (s seen) Read(buffer []byte) (int, error) {
 
 // Serve runs one connection: it writes the sync line `PI-ENV <token>`, then answers frames from input on output until
 // input ends. Everything the client started is killed when it returns.
+//
+// pig divergence (D197): the Go runtime raised this process's soft limit of open files (RLIMIT_NOFILE) to the hard limit
+// (one below it on Linux) before main, where Pi's daemon keeps the soft limit it inherited, so an open that Pi's daemon
+// refuses with EMFILE at about 1020 handles on a default shell succeeds here up to the hard limit or maxHandles.
 func Serve(input io.Reader, output io.Writer, token string, options Options) error {
 	defaultChildSignals()
+	input, closeInput := pollableReader(input)
+	output, closeOutput := pollableWriter(output)
+	// Every way out of the process gives the descriptors' mode back: os.Exit skips defers, and a parent or a sibling that shares
+	// the open file descriptions would otherwise find them non-blocking.
+	restoreStdio := sync.OnceFunc(func() {
+		closeInput()
+		closeOutput()
+	})
+	defer restoreStdio()
+	// The signal exit ends the process itself, after giving the descriptors back. Giving the input back closes it under
+	// serveFrames' read, which then fails: unless Serve waits, it returns that error and its caller ends the process with status
+	// 1 while the exit is still on its way to 128 + the signal. The exit therefore claims the process first. The silence exit
+	// needs no claim: Serve waits for the ping goroutine it runs on before it returns.
+	var exiting atomic.Bool
+	// A client that stops the daemon (Node's `child.kill()`), or a hangup, leaves nothing running either. The signals are
+	// taken before anything starts, so none is lost to their default action.
+	exitSignals, stopExitSignals := notifyExitSignals()
+	defer stopExitSignals()
 	if _, err := fmt.Fprintf(output, "PI-ENV %s\n", token); err != nil {
 		return err
 	}
@@ -834,6 +875,24 @@ func Serve(input io.Reader, output io.Writer, token string, options Options) err
 	var lastSeen atomic.Int64
 	lastSeen.Store(time.Now().UnixMilli())
 	stop := make(chan struct{})
+	go func() {
+		select {
+		case number := <-exitSignals:
+			s.killAll()
+			if options.OnExitSignal != nil {
+				options.OnExitSignal(number)
+			} else {
+				exiting.Store(true)
+				restoreStdio()
+				exitProcess := os.Exit
+				if options.exit != nil {
+					exitProcess = options.exit
+				}
+				exitProcess(128 + number)
+			}
+		case <-stop:
+		}
+	}()
 	var pings sync.WaitGroup
 	pings.Go(func() {
 		ticker := time.NewTicker(options.PingInterval)
@@ -851,6 +910,7 @@ func Serve(input io.Reader, output io.Writer, token string, options Options) err
 				if options.OnSilence != nil {
 					options.OnSilence()
 				} else {
+					restoreStdio()
 					os.Exit(0)
 				}
 				return
@@ -858,6 +918,11 @@ func Serve(input io.Reader, output io.Writer, token string, options Options) err
 		}
 	})
 	err := s.serveFrames(bufio.NewReaderSize(seen{reader: input, lastSeen: &lastSeen}, 1<<20))
+	if exiting.Load() {
+		// The signal exit gave the input back under the read above and ends the process with its own status; returning would
+		// have the caller end it with this error's.
+		select {}
+	}
 	// However input ended, the client is gone: stop everything it started.
 	close(stop)
 	pings.Wait()

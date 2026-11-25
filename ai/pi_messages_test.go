@@ -3,13 +3,16 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type piMessagesRecordedRequest struct {
@@ -95,6 +98,57 @@ func collectPiMessages(t *testing.T, provider Provider, opts StreamOptions) ([]A
 	return events, stream.Result()
 }
 
+// iteratePiMessagesAsTheAgentDoes creates the provider's stream and iterates it inside one stream continuation, as the Agent does (agent/agent_loop.go requestStream). Pi's for-await consumer attaches in the tick that created the stream, before any response I/O can complete (packages/agent/src/agent-loop.ts:412 awaits streamFunction, :424 iterates), so its Start event reads the message createEventConverter builds (stopReason "pending") however long the creating turn takes. A goroutine that calls Events after Stream returns can run after the provider has read the whole buffered response and read the terminal state at Start: the converter mutates one partial in place and every event carries it (packages/ai/src/api/pi-messages.ts:185,290), the queue holds that reference (packages/ai/src/utils/event-stream.ts:43-86), and the consumer reads it at its own tick. whileCreating, if set, runs in the creating turn after Stream returns and before its first await.
+func iteratePiMessagesAsTheAgentDoes(t *testing.T, provider Provider, opts StreamOptions, whileCreating func(*continuationExecutor) error) (*AssistantMessageEventStream, []AssistantMessageEvent, StopReason) {
+	t.Helper()
+	ctx := WithStreamContinuations(t.Context())
+	_, executor := withContinuationExecutor(ctx)
+	var (
+		stream            *AssistantMessageEventStream
+		events            []AssistantMessageEvent
+		initialStopReason StopReason
+	)
+	err := RunStreamContinuation(ctx, func(observation *StreamObservation) error {
+		var err error
+		if stream, err = provider.Stream(ctx, piMessagesTestContext(), opts); err != nil {
+			return err
+		}
+		if whileCreating != nil {
+			if err := whileCreating(executor); err != nil {
+				return err
+			}
+		}
+		for event := range stream.Events(observation.Context(ctx)) {
+			if start, ok := event.(StartEvent); ok {
+				initialStopReason = start.Partial.Observe().StopReason
+			}
+			events = append(events, event)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stream, events, initialStopReason
+}
+
+// awaitPiMessagesResponseReady returns once the provider has read its response and queued its response turn behind the creating turn, which still holds execution. That is the order a loaded runner reaches when the consumer is descheduled between Stream and its first await, made certain: a consumer that does not hold the turn would then run after the provider finished the response. The wait spins on the executor's external queue because the executor offers nothing to block on: responseContinuation queues the provider's grant there and returns without a notification, and only an external reaction that runs reaches executorTrace.external, which cannot happen while the creating turn holds execution. A hook for it would be production code for one test. The deadline only bounds a hang.
+func awaitPiMessagesResponseReady(executor *continuationExecutor) error {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		executor.mu.Lock()
+		queued := executor.external.len()
+		executor.mu.Unlock()
+		if queued > 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("the provider never queued its response turn behind the creating turn")
+		}
+		runtime.Gosched()
+	}
+}
+
 // Ported from pi-messages.test.ts "streams text and tool calls and resolves the terminal message".
 func TestPiMessagesStreamsTextAndToolCalls(t *testing.T) {
 	baseURL, requests := startPiMessagesServer(t, piMessagesResponder{events: []any{
@@ -107,27 +161,16 @@ func TestPiMessagesStreamsTextAndToolCalls(t *testing.T) {
 		map[string]any{"type": "toolcall_delta", "contentIndex": 1, "delta": `{"path":`},
 		map[string]any{"type": "toolcall_delta", "contentIndex": 1, "delta": `"a.txt"}`},
 		map[string]any{"type": "toolcall_end", "contentIndex": 1, "toolCall": map[string]any{"type": "toolCall", "id": "call_1", "name": "read", "arguments": map[string]any{"path": "a.txt"}}},
-		map[string]any{"type": "done", "reason": "toolUse", "usage": piMessagesTestUsage, "responseId": "resp_1", "providerThinkingLevel": "high"},
+		map[string]any{"type": "done", "reason": "toolUse", "usage": piMessagesTestUsage, "responseId": "resp_1", "responseModel": "claude-opus-5-5", "providerThinkingLevel": "high"},
 	}})
 	provider := newTestPiMessagesProvider(baseURL, nil)
 
-	stream, err := provider.Stream(t.Context(), piMessagesTestContext(), StreamOptions{SessionID: "session-1", MaxTokens: 100, Headers: ProviderHeaders{"x-custom": new("1")}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var events []AssistantMessageEvent
-	var initialStopReason StopReason
-	for event := range stream.Events(t.Context()) {
-		if start, ok := event.(StartEvent); ok {
-			initialStopReason = start.Partial.Observe().StopReason
-		}
-		events = append(events, event)
-	}
+	stream, events, initialStopReason := iteratePiMessagesAsTheAgentDoes(t, provider, StreamOptions{SessionID: "session-1", MaxTokens: 100, Headers: ProviderHeaders{"x-custom": new("1")}}, awaitPiMessagesResponseReady)
 	message := stream.Result()
 	if _, ok := events[0].(StartEvent); !ok || initialStopReason != StopReasonPending {
 		t.Fatalf("first event = %#v, initial stop reason=%s", events[0], initialStopReason)
 	}
-	if message.StopReason != StopReasonToolUse || message.Usage != piMessagesWantUsage || message.ResponseID != "resp_1" || message.ProviderThinkingLevel != "high" || message.Model != "auto" || message.Provider != "radius" {
+	if message.StopReason != StopReasonToolUse || message.Usage != piMessagesWantUsage || message.ResponseID != "resp_1" || message.ResponseModel != "claude-opus-5-5" || message.ProviderThinkingLevel != "high" || message.Model != "auto" || message.Provider != "radius" {
 		t.Fatalf("message = %+v", message)
 	}
 	wantContent := []AssistantContentBlock{TextContent{Text: "Hello"}, ToolCall{ID: "call_1", Name: "read", Arguments: JsonObject{"path": "a.txt"}}}
@@ -182,7 +225,8 @@ func TestPiMessagesDebugAndOnResponse(t *testing.T) {
 		return nil
 	}})
 
-	if message.StopReason != StopReasonStop {
+	// pi-messages.test.ts: a done event without responseModel leaves the message without one (Pi 14c811841).
+	if message.StopReason != StopReasonStop || message.ResponseModel != "" {
 		t.Fatalf("message = %+v", message)
 	}
 	recorded := requests()
@@ -226,12 +270,12 @@ func TestPiMessagesUnstructuredErrorBodyIsTruncatedInDiagnostics(t *testing.T) {
 func TestPiMessagesPropagatesServerErrorEvents(t *testing.T) {
 	baseURL, _ := startPiMessagesServer(t, piMessagesResponder{events: []any{
 		map[string]any{"type": "start"},
-		map[string]any{"type": "error", "reason": "error", "usage": piMessagesTestUsage, "errorMessage": "Upstream failed"},
+		map[string]any{"type": "error", "reason": "error", "usage": piMessagesTestUsage, "errorMessage": "Upstream failed", "responseModel": "claude-opus-5-5"},
 	}})
 
 	_, message := collectPiMessages(t, newTestPiMessagesProvider(baseURL, nil), StreamOptions{})
 
-	if message.StopReason != StopReasonError || message.ErrorMessage != "Upstream failed" || message.Usage != piMessagesWantUsage {
+	if message.StopReason != StopReasonError || message.ErrorMessage != "Upstream failed" || message.Usage != piMessagesWantUsage || message.ResponseModel != "claude-opus-5-5" {
 		t.Fatalf("message = %+v", message)
 	}
 }
@@ -259,6 +303,46 @@ func TestPiMessagesErrorsWhenStreamEndsWithoutTerminal(t *testing.T) {
 
 	if message.StopReason != StopReasonError || !strings.Contains(message.ErrorMessage, "stream ended without a terminal event") {
 		t.Fatalf("message = %+v", message)
+	}
+}
+
+// Ported from pi-messages.test.ts "rejects content indexes that are not the next or an existing block".
+func TestPiMessagesRejectsContentIndexesThatAreNotTheNextOrAnExistingBlock(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		events []any
+		want   string
+	}{
+		{"huge start", []any{map[string]any{"type": "text_start", "contentIndex": 4294967000}}, "Invalid contentIndex 4294967000 in pi-messages text_start event"},
+		{"past int64", []any{map[string]any{"type": "text_start", "contentIndex": uint64(1) << 63}}, "Invalid contentIndex 9223372036854776000 in pi-messages text_start event"},
+		{"string start", []any{map[string]any{"type": "text_start", "contentIndex": "__proto__"}}, `Invalid contentIndex "__proto__" in pi-messages text_start event`},
+		{"string end", []any{
+			map[string]any{"type": "text_start", "contentIndex": 0},
+			map[string]any{"type": "toolcall_end", "contentIndex": "__proto__", "toolCall": map[string]any{"polluted": true}},
+		}, `Invalid contentIndex "__proto__" in pi-messages toolcall_end event`},
+		{"delta without a block", []any{map[string]any{"type": "text_delta", "contentIndex": 0, "delta": "x"}}, "Invalid contentIndex 0 in pi-messages text_delta event"},
+		{"negative", []any{map[string]any{"type": "text_start", "contentIndex": -1}}, "Invalid contentIndex -1 in pi-messages text_start event"},
+		{"fraction", []any{map[string]any{"type": "text_start", "contentIndex": 0.5}}, "Invalid contentIndex 0.5 in pi-messages text_start event"},
+		{"null", []any{map[string]any{"type": "text_start", "contentIndex": nil}}, "Invalid contentIndex null in pi-messages text_start event"},
+		{"skipped block", []any{
+			map[string]any{"type": "text_start", "contentIndex": 0},
+			map[string]any{"type": "text_start", "contentIndex": 2},
+		}, "Invalid contentIndex 2 in pi-messages text_start event"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			events := append([]any{map[string]any{"type": "start"}}, test.events...)
+			events = append(events, map[string]any{"type": "done", "reason": "stop", "usage": piMessagesTestUsage})
+			baseURL, _ := startPiMessagesServer(t, piMessagesResponder{events: events})
+
+			_, message := collectPiMessages(t, newTestPiMessagesProvider(baseURL, nil), StreamOptions{})
+
+			if message.StopReason != StopReasonError || !strings.Contains(message.ErrorMessage, test.want) {
+				t.Fatalf("message = %+v, want an error containing %q", message, test.want)
+			}
+			if len(message.Content) > 1 {
+				t.Fatalf("content = %+v, want at most the block started before the bad event", message.Content)
+			}
+		})
 	}
 }
 

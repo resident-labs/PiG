@@ -69,6 +69,9 @@ type registerMsg struct {
 	// MarkdownTransformer reports a registered Markdown transformer; the host
 	// runs it with markdown_transform requests.
 	MarkdownTransformer bool `json:"markdown_transformer,omitempty"`
+	// OwnsThinkingRuns reports that the extension owns the thinking runs of assistant messages (PiG-only).
+	// pig additive (D214)
+	OwnsThinkingRuns bool `json:"owns_thinking_runs,omitempty"`
 	// ToolRenderers is the number of tool renderer resolvers registered while the factory ran.
 	ToolRenderers int `json:"tool_renderers,omitempty"`
 	// McpServers and VirtualModels are the registrations made while the factory ran; the host applies them when the extension loads.
@@ -102,18 +105,18 @@ type virtualModelDecl struct {
 }
 
 type toolDef struct {
-	Name                string   `json:"name"`
-	Label               string   `json:"label,omitempty"` // upstream ToolDefinition.label
-	Description         string   `json:"description"`
-	Parameters          Schema   `json:"parameters"`                     // JSON Schema: must match host's ToolDecl.Parameters
-	ConstrainedSampling any      `json:"constrained_sampling,omitempty"` // false | ConstrainedSampling: provider-side constrained sampling request
-	PromptSnippet       string   `json:"prompt_snippet,omitempty"`
-	ExecutionMode       string   `json:"execution_mode,omitempty"`
-	PromptGuidelines    []string `json:"prompt_guidelines,omitempty"` // Bullets injected into system prompt Guidelines section when tool is active
-	Source              string   `json:"source,omitempty"`            // pig additive (D23): optional per-tool source; defaults to extension name
-	RenderShell         string   `json:"render_shell,omitempty"`      // "self" when the renderers draw their own framing
-	RendersCall         bool     `json:"renders_call,omitempty"`      // the tool has a call renderer
-	RendersResult       bool     `json:"renders_result,omitempty"`    // the tool has a result renderer
+	Name                string     `json:"name"`
+	Label               string     `json:"label,omitempty"` // upstream ToolDefinition.label
+	Description         string     `json:"description"`
+	Parameters          schemaRoot `json:"parameters"`                     // JSON Schema: must match host's ToolDecl.Parameters; the root is written in the order TSchema.Schema recorded
+	ConstrainedSampling any        `json:"constrained_sampling,omitempty"` // false | ConstrainedSampling: provider-side constrained sampling request
+	PromptSnippet       string     `json:"prompt_snippet,omitempty"`
+	ExecutionMode       string     `json:"execution_mode,omitempty"`
+	PromptGuidelines    []string   `json:"prompt_guidelines,omitempty"` // Bullets injected into system prompt Guidelines section when tool is active
+	Source              string     `json:"source,omitempty"`            // pig additive (D23): optional per-tool source; defaults to extension name
+	RenderShell         string     `json:"render_shell,omitempty"`      // "self" when the renderers draw their own framing
+	RendersCall         bool       `json:"renders_call,omitempty"`      // the tool has a call renderer
+	RendersResult       bool       `json:"renders_result,omitempty"`    // the tool has a result renderer
 	// The upstream 0.99.1 tool definition fields, in the host's ToolDecl shape.
 	OutputSchema    Schema           `json:"output_schema,omitempty"`
 	Exposure        ToolExposure     `json:"exposure,omitempty"`
@@ -641,6 +644,26 @@ func (c *conn) notify(method string, args any) error {
 		Type:   msgNotify,
 		Notify: &notifyMsg{Method: method, Args: argsJSON},
 	})
+}
+
+// notifyResult sends method with the arguments {"request_id": requestID, "result": result}. A result that is already encoded (json.RawMessage, such as the wire of an event an
+// author pushed) is written into the arguments as it is, without being encoded or checked again.
+func (c *conn) notifyResult(method, requestID string, result any) error {
+	raw, ok := result.(json.RawMessage)
+	if !ok {
+		return c.notify(method, map[string]any{"request_id": requestID, "result": result})
+	}
+	id, err := json.MarshalJS(requestID)
+	if err != nil {
+		return err
+	}
+	args := make([]byte, 0, len(`{"request_id":,"result":}`)+len(id)+len(raw))
+	args = append(args, `{"request_id":`...)
+	args = append(args, id...)
+	args = append(args, `,"result":`...)
+	args = append(args, raw...)
+	args = append(args, '}')
+	return c.send(envelope{Type: msgNotify, Notify: &notifyMsg{Method: method, Args: args}})
 }
 
 // respond sends a response to a host request.

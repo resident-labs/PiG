@@ -123,6 +123,7 @@ def calculate_cost(model: Mapping[str, Any], usage: dict[str, Any]) -> dict[str,
     cost["cacheRead"] = (rate("cacheRead") / 1000000) * _number(usage.get("cacheRead", _ABSENT))
     cost["cacheWrite"] = (rate("cacheWrite") * short_write + rate("input") * 2 * long_write) / 1000000
     cost["total"] = cost["input"] + cost["output"] + cost["cacheRead"] + cost["cacheWrite"]
+    cost["totalFromProvider"] = False
     return cost
 
 
@@ -438,6 +439,7 @@ _OVERFLOW_PATTERNS = _compile_each(
     r"input is too long for requested model",
     r"exceeds the context window",
     r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))",
+    r"context window exceeded",
     r"input token count.*exceeds the maximum",
     r"maximum prompt length is \d+",
     r"reduce the length of the messages",
@@ -467,6 +469,7 @@ _NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = _js_regexp("|".join([
     "subscription_sharing_usage_limit_exceeded",
     # Sign in with ChatGPT on a ChatGPT Business plan: a usage limit set by the workspace admin. Only the admin can raise it.
     "subscription_sharing_workplace_individual_usage_limit_exceeded",
+    r'"code"\s*:\s*"?1308(?![0-9])',
 ]))
 _RETRYABLE_PROVIDER_ERROR_PATTERN = _js_regexp("|".join([
     "overloaded", "server_busy", "servers are currently busy", "currently experiencing high demand", "model is at capacity", "rate.?limit", "too many requests",

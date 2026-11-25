@@ -7,7 +7,9 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/jsstring/localecompare"
 	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
 )
 
@@ -96,22 +98,26 @@ func splitThinkingSuffix(text string) (base, level string, ok bool) {
 	return base, suffix, true
 }
 
+// splitProviderPrefix is model-resolver.ts splitProviderPrefix: a provider id may contain "/" (a URL-derived id), so the text is
+// compared with the provider ids of the catalog, not split at its first "/". A provider matches when the text, up to the first "/" at
+// or after the end of its lowercased trimmed id, trims to that id; among matches the one with the longest id wins, the first in
+// catalog order on a tie. Positions are UTF-16 units of the lowercased text, as in the source.
 func splitProviderPrefix(text string, models []RuntimeModel) (provider, modelText string, ok bool) {
-	before, after, ok := strings.Cut(text, "/")
-	if !ok {
-		return "", "", false
-	}
-	prefix := jsstring.ToLower(jsstring.Trim(before))
-	modelText = jsstring.Trim(after)
-	if prefix == "" || modelText == "" {
-		return "", "", false
-	}
+	lowerText := jsstring.ToLower(text)
 	for _, model := range models {
-		if jsstring.ToLower(model.Provider) == prefix {
-			return model.Provider, modelText, true
+		prefix := jsstring.ToLower(jsstring.Trim(model.Provider))
+		if prefix == "" || (ok && jsstring.Length(provider) >= jsstring.Length(model.Provider)) {
+			continue
+		}
+		slash := jsstring.IndexOf(lowerText, "/", jsstring.Length(prefix))
+		if slash == -1 || jsstring.Trim(jsstring.Slice(lowerText, 0, slash)) != prefix {
+			continue
+		}
+		if rest := jsstring.Trim(jsstring.Slice(text, slash+1)); rest != "" {
+			provider, modelText, ok = model.Provider, rest, true
 		}
 	}
-	return "", "", false
+	return provider, modelText, ok
 }
 
 // ResolveModelReference mirrors upstream resolveModelReference. usable only breaks ties between providers.
@@ -130,6 +136,7 @@ func ResolveModelReference(request ModelReferenceRequest, models []RuntimeModel,
 			}
 		}
 	}
+	pool = withNamedRoutingVariants(pool, text)
 	result := resolveReferenceText(text, request, pool, usable)
 	if result.Status != ModelReferenceNotFound {
 		return result
@@ -234,7 +241,7 @@ func selectReference(text string, pool []RuntimeModel, fuzzy bool, usable func(s
 	lowerText := jsstring.ToLower(text)
 	var raw []RuntimeModel
 	for _, model := range pool {
-		if jsstring.ToLower(model.ID) == lowerText {
+		if jsstring.LowerEquals(model.ID, lowerText) {
 			raw = append(raw, model)
 		}
 	}
@@ -248,7 +255,7 @@ func selectReference(text string, pool []RuntimeModel, fuzzy bool, usable func(s
 		}
 		lowerModelText := jsstring.ToLower(modelText)
 		// The provider's own literal id (OpenRouter's `openrouter/free`) beats its fuzzy matches
-		if i := slices.IndexFunc(providerModels, func(model RuntimeModel) bool { return jsstring.ToLower(model.ID) == lowerModelText }); i >= 0 {
+		if i := slices.IndexFunc(providerModels, func(model RuntimeModel) bool { return jsstring.LowerEquals(model.ID, lowerModelText) }); i >= 0 {
 			named = &providerModels[i]
 		} else if i := slices.IndexFunc(raw, func(model RuntimeModel) bool { return model.Provider == provider }); i >= 0 {
 			named = &raw[i]
@@ -299,11 +306,77 @@ func distinctProviders(models []RuntimeModel) int {
 	return len(seen)
 }
 
+// withNamedRoutingVariants adds to pool the OpenRouter routing variants that text names, each derived from a model of pool the text may mean, so that
+// the reference "openrouter/openai/gpt-5.2:nitro" finds a variant the pool, which lists the bundled models of Pi, does not hold. A text that
+// names no variant leaves pool as it is.
+//
+// pig divergence (D199): Pi lists no OpenRouter routing variant; PiG derives the one a reference names from its base model.
+func withNamedRoutingVariants(pool []RuntimeModel, text string) []RuntimeModel {
+	// Every variant is named after a colon, so a text without one, which is nearly every text, names none and costs nothing.
+	if !strings.Contains(text, ":") {
+		return pool
+	}
+	lower := jsstring.ToLower(text)
+	var extended []RuntimeModel
+	for _, variant := range ai.OpenRouterRoutingVariants {
+		named := indexVariantName(lower, variant)
+		if named < 0 {
+			continue
+		}
+		stem := lower[:named]
+		if stem == "" {
+			continue
+		}
+		for _, model := range pool {
+			if !ai.IsOpenRouterBase(model.Provider, model.ID) {
+				continue
+			}
+			id := model.ID + ":" + variant
+			// The text may lead with the provider ("openrouter/gpt-4o:nitro"), which the model text after it need not repeat.
+			modelStem := strings.TrimPrefix(stem, jsstring.ToLower(model.Provider)+"/")
+			if !strings.Contains(jsstring.ToLower(model.ID), modelStem) && !strings.Contains(jsstring.ToLower(model.Name), modelStem) && !strings.Contains(jsstring.ToLower(model.Provider+"/"+model.ID), stem) {
+				continue
+			}
+			if slices.ContainsFunc(pool, func(other RuntimeModel) bool { return other.Provider == model.Provider && other.ID == id }) {
+				continue
+			}
+			derived := model
+			derived.ID = id
+			derived.Name = model.Name + " (" + variant + ")"
+			extended = append(extended, derived)
+		}
+	}
+	if extended == nil {
+		return pool
+	}
+	return append(slices.Clip(pool), extended...)
+}
+
+// indexVariantName is the index of ":"+variant in text, or -1, without building the joined string.
+func indexVariantName(text, variant string) int {
+	for from := 0; ; {
+		colon := strings.IndexByte(text[from:], ':')
+		if colon < 0 {
+			return -1
+		}
+		colon += from
+		//portlint:allow utf16units D199 routing-variant lookup has no Pi counterpart (model-resolver.ts lists no variants); the offset only indexes back into the same Go string and is never a JS length
+		if strings.HasPrefix(text[colon+1:], variant) {
+			return colon
+		}
+		from = colon + 1
+	}
+}
+
 func fuzzyMatches(text string, models []RuntimeModel) []RuntimeModel {
 	lower := jsstring.ToLower(text)
 	var matches []RuntimeModel
 	for _, model := range models {
-		if strings.Contains(jsstring.ToLower(model.ID), lower) || strings.Contains(jsstring.ToLower(model.Name), lower) {
+		// pig divergence (D199): an OpenRouter routing variant is a partial-match candidate only when the text names it, so a partial text resolves as it does in Pi, which lists none.
+		if _, variant, ok := ai.OpenRouterRoutingVariant(model.Provider, model.ID); ok && indexVariantName(lower, variant) < 0 {
+			continue
+		}
+		if jsstring.LowerContains(model.ID, lower) || jsstring.LowerContains(model.Name, lower) {
 			matches = append(matches, model)
 		}
 	}
@@ -362,7 +435,7 @@ func bestFuzzyMatch(matches []RuntimeModel) *RuntimeModel {
 	if len(candidates) == 0 {
 		return nil
 	}
-	collator := jsstring.NewCollator()
+	collator := localecompare.NewCollator()
 	slices.SortStableFunc(candidates, func(a, b RuntimeModel) int {
 		return collator.CompareString(b.ID, a.ID)
 	})

@@ -6,7 +6,7 @@ import { existsSync, readFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { test } from "node:test"
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context"
-import { Type } from "@earendil-works/pi-ai"
+import { Type } from "typebox"
 import { createModels } from "@earendil-works/pi-ai/models"
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux"
 import { createRegistry, defineDoc, defineExtension, defineTool } from "../src/facade/index.ts"
@@ -60,7 +60,7 @@ type Rig = ReturnType<typeof rig>
 const reports: unknown[] = []
 
 async function open(path: string, r: Rig, core: unknown = module(), extra: Record<string, unknown> = {}) {
-  return Harness.open(await openNodeSqliteStorage(path) as never, { models: r.models, registry: r.registry, core, onReport: (e: unknown) => { reports.push(e) }, ...extra } as never, context)
+  return Harness.open(await openNodeSqliteStorage(path) as never, { models: r.models, registry: r.registry, core, onReport: (report: { error: unknown }) => { reports.push(report.error) }, ...extra } as never, context)
 }
 
 /** What a conversation left, without ids and clocks: the transcript's entry kinds and the text of its messages. */
@@ -352,7 +352,7 @@ test("a watch survives a trap at any event of a commit: it ends on the committed
       await again(() => h.commit(async (tx: any) => { (await tx.doc(Live, id)).items.push(0) }, context))
       const watch = (await h.watchDoc(Live, id, context))! as any
       const seen: number[][] = []
-      watch.start(async (value: { items: number[] }) => { seen.push([...value.items]) })
+      watch.start(async ({ value }: { value: { items: number[] } }) => { seen.push([...value.items]) })
       const fault = inject(n => plan(n - baseline))
       const baseline = fault.state.events
       try {

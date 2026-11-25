@@ -16,6 +16,7 @@ import (
 	durableenv "github.com/MichaelKinsy/PiG/durable/env"
 
 	"github.com/MichaelKinsy/PiG/internal/nodeerrno"
+	"github.com/MichaelKinsy/PiG/internal/nodefs"
 )
 
 // pig divergence (D96): the Go daemon takes its target system from the build instead of Rust's cfg!.
@@ -109,7 +110,7 @@ func mkdir(path string, recursive bool) (Object, *Failure) {
 // openWrite opens a file in one of Node's write modes. Windows reports a directory in the way as access denied,
 // where libuv reports EISDIR.
 func openWrite(path string, flags int) (*os.File, error) {
-	file, err := os.OpenFile(path, flags, 0o666)
+	file, err := nodefs.OpenFile(path, flags, 0o666)
 	if err != nil && windowsOS && errorCode(err) != "EISDIR" {
 		if stats, statErr := os.Stat(path); statErr == nil && stats.IsDir() {
 			return nil, synthetic("EISDIR")
@@ -134,9 +135,12 @@ func writeFile(path string, appendMode, parents bool, content []byte) (*os.File,
 	if err != nil {
 		return nil, ioFailure(err, "open", path)
 	}
-	if _, err := file.Write(content); err != nil {
-		_ = file.Close()
-		return nil, ioFailure(err, "write", path)
+	// write_all of nothing makes no system call, which /dev/full would fail.
+	if len(content) > 0 {
+		if _, err := file.Write(content); err != nil {
+			_ = file.Close()
+			return nil, ioFailure(err, "write", path)
+		}
 	}
 	return file, nil
 }
@@ -187,7 +191,7 @@ func fsync(path string) (Object, *Failure) {
 }
 
 func rename(from, to string) (Object, *Failure) {
-	if err := os.Rename(from, to); err != nil {
+	if err := nodeerrno.Rename(from, to); err != nil {
 		return nil, ioFailureBetween(err, "rename", from, to)
 	}
 	return Object{}, nil
@@ -346,5 +350,17 @@ func decodeUTF8(name string) string {
 	return decoder.Decode([]byte(name)) + decoder.Flush()
 }
 
-// realPath resolves every symbolic link of an existing path.
-func realPath(path string) (string, error) { return filepath.EvalSymlinks(path) }
+// realPath is realpath(3): every symbolic link of an existing path resolved. A failure that names no system error, such
+// as a loop of links, is the error the system gives for the path itself.
+func realPath(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		return resolved, nil
+	}
+	if _, ok := errors.AsType[syscall.Errno](err); !ok {
+		if _, statErr := os.Stat(path); statErr != nil {
+			return "", statErr
+		}
+	}
+	return "", err
+}

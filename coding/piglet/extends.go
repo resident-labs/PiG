@@ -55,6 +55,23 @@ type ResolveOptions struct {
 	//
 	// pig additive (D194): Piglet resolution installs Packages without running lifecycle scripts unless the user opts in.
 	AllowInstallScripts bool
+	// Base, when set, is the Piglet the chain's root implicitly extends: a Piglet Binary's baked Piglet, offered as the base of an overlay selected at launch. The resolved Piglet keeps the base's name and cannot replace, remove or widen what the base baked.
+	//
+	// pig additive (D202): a Piglet Binary can declare that it accepts overlay Piglets.
+	Base *OverlayBase
+}
+
+// BakedSkill reports whether the skill is one the Piglet Binary baked and the overlay left as it was: it has no file, so its
+// location is the Binary's, not the overlay's. It is false for a Piglet that is no overlay.
+func (p *Piglet) BakedSkill(name string) bool { return p != nil && p.bakedSkills[name] }
+
+// OverlayOf names the Piglet Binary this Piglet is an overlay of (D202), or reports false when it is not one. A Piglet Binary's
+// baked Piglet is no overlay; one that resolved a Piglet selected at launch is.
+func (p *Piglet) OverlayOf() (binary string, ok bool) {
+	if p == nil || len(p.lineage) == 0 {
+		return "", false
+	}
+	return strings.CutPrefix(p.lineage[0].Source, "binary:")
 }
 
 // ResolveEffective resolves with no workspace anchor. Piglets that require a
@@ -79,7 +96,17 @@ func ResolveEffectiveWithOptions(path string, options ResolveOptions) (*Effectiv
 
 func resolveEffectiveRoot(canonical string, options ResolveOptions) (*EffectiveResolution, error) {
 	resolved, err := resolveEffective(canonical, "local:"+filepath.ToSlash(filepath.Base(canonical)), nil, 0, options)
+	if err == nil && options.Base != nil {
+		err = checkOverlay(options.Base.Piglet, resolved.Piglet)
+		resolved.Piglet.Name = options.Base.Piglet.Name
+		if err == nil {
+			resolved.Piglet.bakedSkills = unchangedBakedSkills(options.Base.Piglet, resolved.Piglet)
+		}
+	}
 	if err != nil {
+		if options.Base != nil {
+			return nil, fmt.Errorf("overlay %s on Piglet Binary %q: %w", canonical, options.Base.Piglet.Name, err)
+		}
 		return nil, err
 	}
 	var graph strings.Builder
@@ -124,7 +151,15 @@ func resolveEffective(path, sourceIdentity string, visits []lineageVisit, depth 
 	}
 	visits = append(slices.Clone(visits), lineageVisit{path: path, digest: digest})
 
-	if p.Extends == nil {
+	// pig additive (D202): an extends block that names no source extends the Piglet Binary the Piglet is selected on, so an
+	// overlay can spell extends.remove and extends.allowWiden without another Piglet to name.
+	if p.Extends != nil && p.Extends.Source == "" && options.Base == nil {
+		return nil, fmt.Errorf("Piglet %s: extends.source is required unless a Piglet Binary that is not built closed runs the Piglet as an overlay", path)
+	}
+	if p.Extends == nil || p.Extends.Source == "" {
+		if options.Base != nil {
+			return resolveOverlayRoot(p, entry, digest, options.Base)
+		}
 		effective := clearDerivationMetadata(p)
 		if err := effective.Validate(); err != nil {
 			return nil, fmt.Errorf("effective Piglet %s: %w", path, err)
@@ -250,6 +285,9 @@ func mergePiglets(base, child *Piglet) (*Piglet, error) {
 	}
 	if child.present["discovery"] {
 		result.Discovery = child.Discovery
+	}
+	if child.present["contextFiles"] {
+		result.ContextFiles = child.ContextFiles
 	}
 	if child.present["systemPrompt"] {
 		result.SystemPrompt = child.SystemPrompt
@@ -437,6 +475,9 @@ func rejectUnsafeWidening(base, child *Piglet) error {
 	}
 	if child.present["discovery"] && discoveryWidens(base.Discovery, child.Discovery) {
 		widened = append(widened, "discovery")
+	}
+	if child.present["contextFiles"] && base.ContextFiles == ContextFilesTrustedOnly && child.ContextFiles != ContextFilesTrustedOnly {
+		widened = append(widened, "contextFiles")
 	}
 	if child.present["agentEnv"] && agentEnvironmentWidens(base.AgentEnv, child.AgentEnv) {
 		widened = append(widened, "agentEnv")
@@ -826,7 +867,7 @@ func clonePiglet(p *Piglet) *Piglet {
 	return &Piglet{
 		Name: p.Name, Description: p.Description,
 		Extends: extends, BuiltinTools: cloneStringList(p.BuiltinTools), Packages: maps.Clone(p.Packages), Extensions: extensions, Skills: skills,
-		Discovery: discovery, SystemPrompt: prompt, AgentEnv: environment, Model: model, Slots: slots,
+		Discovery: discovery, ContextFiles: p.ContextFiles, SystemPrompt: prompt, AgentEnv: environment, Model: model, Slots: slots,
 		Build: build, Release: release, Secrets: slices.Clone(p.Secrets), Strip: cloneStrip(p.Strip),
 		sourceDir: p.sourceDir, sourcePath: p.sourcePath, present: maps.Clone(p.present), nullFields: maps.Clone(p.nullFields),
 		lineage: slices.Clone(p.lineage), effectiveDigest: p.effectiveDigest, graphDigest: p.graphDigest,

@@ -108,11 +108,8 @@ func (b *bridgeTool) Schema() ai.ToolSchema {
 // upstream: tool-definition-wrapper.ts:17,52 (outputSchema)
 func (b *bridgeTool) OutputSchema() json.RawMessage { return b.def.OutputSchema }
 
-// ArgumentSchema keeps TypeBox's non-enumerable conversion metadata off provider requests.
+// ArgumentSchema is the JSON Schema the agent loop validates a call's arguments against: the tool's parameters.
 func (b *bridgeTool) ArgumentSchema() json.RawMessage {
-	if len(b.def.ValidationParameters) > 0 {
-		return b.def.ValidationParameters
-	}
 	if len(b.def.Parameters) > 0 {
 		return b.def.Parameters
 	}

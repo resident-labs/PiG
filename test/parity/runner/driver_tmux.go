@@ -198,6 +198,7 @@ func (tmuxDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scen
 	var createOutput []byte
 	var createErr error
 	if serverErr == nil {
+		//nolint:gosec // G204 (class a): program is literal tmux; cmdStr is a sh -c string that embeds bin.Path and scenario args, each shellQuote'd, and is the value of new-session.
 		createOutput, createErr = exec.CommandContext(ctx, "tmux", tmuxArgs(createTmuxSessionArgs(session, cmdStr, cfg)...)...).CombinedOutput()
 	}
 	tmuxServerMu.Unlock()
@@ -209,9 +210,8 @@ func (tmuxDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scen
 	}
 	started = true
 	transcriptPath := filepath.Join(tc.tempRoot, "terminal-transcript.log")
-	pipeCommand := "cat >> " + shellQuote(transcriptPath)
-	if err := exec.CommandContext(ctx, "tmux", tmuxArgs("pipe-pane", "-o", "-t", session, pipeCommand)...).Run(); err != nil {
-		return Result{Err: fmt.Errorf("tmux pipe-pane: %w", err)}
+	if err := attachTranscript(ctx, session, transcriptPath); err != nil {
+		return Result{Err: err}
 	}
 
 	// Pick the right ready pattern for this binary.
@@ -257,10 +257,7 @@ func (tmuxDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scen
 	// keys+settle fields; canonical staged scenarios use [[tmux.steps]].
 	if operationErr == nil && len(cfg.Steps) > 0 {
 		for _, step := range cfg.Steps {
-			timeout := time.Duration(step.WaitTimeoutSeconds) * time.Second
-			if timeout <= 0 {
-				timeout = 5 * time.Second
-			}
+			timeout := stepWaitTimeout(step)
 			baseline := capturePaneHistory(ctx, session, transcriptPath)
 			if err := sendTmuxKeys(ctx, session, step.Keys); err != nil {
 				operationErr = err
@@ -308,7 +305,15 @@ func (tmuxDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scen
 		}
 	}
 
-	pane, escaped, err := capturePanePair(ctx, session, cfg)
+	use := scenarioCaptureUse(sc)
+	pane, escaped, err := capturePanePair(ctx, session, cfg, use)
+	if errors.Is(err, errScreenNeverStable) {
+		return Result{
+			RuntimeMs: elapsed,
+			ReadyOK:   readyOK,
+			Err:       finalCaptureError(sc.Name, bin.Label, cfg, err),
+		}
+	}
 	if err != nil {
 		return Result{
 			RuntimeMs: elapsed,
@@ -316,6 +321,13 @@ func (tmuxDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scen
 			Err:       fmt.Errorf("capture-pane: %w (%s)", err, tmuxServerReport(ctx, session)),
 		}
 	}
+	// The waits read the transcript while the run is live; once the run is over the pane's pipe is closed and the reader's trailer must count every byte the file holds, so a reader that stopped copying fails the run instead of silently shortening what a wait saw.
+	if operationErr == nil {
+		if err := finishTranscript(ctx, session, transcriptPath, sc.Name, bin.Label, transcriptDoneTimeout); err != nil {
+			operationErr = err
+		}
+	}
+	pane, escaped, cropErr := cropCaptures(cfg, use, pane, escaped)
 	if !readyOK && paneMatchesCaptureSurface(pane, cfg) {
 		readyOK = true
 	}
@@ -338,16 +350,12 @@ func (tmuxDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scen
 
 	result = Result{
 		ChangelogSource: changelogSource,
-		Output:          pane,
-		Escaped:         escaped,
 		ExitCode:        exitCode,
 		RuntimeMs:       elapsed,
 		ReadyOK:         readyOK,
 		Err:             operationErr,
 	}
-	if result.Err == nil && readyOK && cfg.CaptureStart != "" && !strings.Contains(pane, cfg.CaptureStart) {
-		result.Err = fmt.Errorf("capture_start %q absent after scenario steps", cfg.CaptureStart)
-	}
+	result = withFinalCaptures(result, sc.Name, bin.Label, cfg, use, pane, escaped, cropErr)
 	// Coverage-only: Go integration coverage flushes on a clean process exit, but
 	// an interactive pig sits at its prompt and is SIGKILLed at teardown, losing
 	// its counters. When GOCOVERDIR is set, drive a clean quit after capture so
@@ -520,6 +528,7 @@ func waitForCaptureSurface(ctx context.Context, session string, cfg TmuxDriverCo
 		if ctx.Err() != nil {
 			return
 		}
+		//nolint:gosec // G204 (class a): program is literal tmux; args are fixed capture-pane with a harness-generated session.
 		out, err := exec.CommandContext(ctx, "tmux", tmuxArgs(capturePaneArgs(session, false, cfg)...)...).Output()
 		if err == nil && paneMatchesCaptureSurface(string(out), cfg) {
 			return
@@ -534,6 +543,7 @@ func waitForPaneOrCapture(ctx context.Context, session, pattern, captureStart st
 		if ctx.Err() != nil {
 			return false
 		}
+		//nolint:gosec // G204 (class a): program is literal tmux; args are fixed capture-pane with a harness-generated session.
 		out, _ := exec.CommandContext(ctx, "tmux", tmuxArgs("capture-pane", "-t", session, "-p")...).Output()
 		pane := string(out)
 		if paneMatchesReadyPattern(pane, pattern) || captureStart != "" && strings.Contains(pane, captureStart) {
@@ -592,12 +602,14 @@ func paneMatchesAutoReadyPattern(pane string) bool {
 // (persistent animation) simply proceeds after `limit`.
 func waitForPaneStable(ctx context.Context, session string, interval, limit time.Duration) {
 	deadline := time.Now().Add(limit)
+	//nolint:gosec // G204 (class a): program is literal tmux; args are fixed capture-pane with a harness-generated session.
 	prev, _ := exec.CommandContext(ctx, "tmux", tmuxArgs("capture-pane", "-t", session, "-p")...).Output()
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return
 		}
 		time.Sleep(interval)
+		//nolint:gosec // G204 (class a): program is literal tmux; args are fixed capture-pane with a harness-generated session.
 		cur, _ := exec.CommandContext(ctx, "tmux", tmuxArgs("capture-pane", "-t", session, "-p")...).Output()
 		if bytes.Equal(cur, prev) {
 			return
@@ -609,6 +621,7 @@ func waitForPaneStable(ctx context.Context, session string, interval, limit time
 const tmuxQuiescencePoll = 25 * time.Millisecond
 
 func capturePaneVisible(ctx context.Context, session string) string {
+	//nolint:gosec // G204 (class a): program is literal tmux; args are fixed capture-pane with a harness-generated session.
 	out, _ := exec.CommandContext(ctx, "tmux", tmuxArgs("capture-pane", "-t", session, "-p")...).Output()
 	return string(out)
 }
@@ -655,6 +668,7 @@ func waitForPaneState(ctx context.Context, session string, includes, excludes []
 		if ctx.Err() != nil {
 			return false
 		}
+		//nolint:gosec // G204 (class a): program is literal tmux; args are fixed capture-pane with a harness-generated session.
 		out, _ := exec.CommandContext(ctx, "tmux", tmuxArgs("capture-pane", "-t", session, "-p")...).Output()
 		pane := string(out)
 		matches := paneContainsAll(pane, includes)
@@ -672,8 +686,22 @@ func waitForPaneState(ctx context.Context, session string, includes, excludes []
 	return false
 }
 
+// attachTranscript records the raw bytes the session's pane receives in the file at path, for the waits and comparators that read the byte stream rather than the screen.
+func attachTranscript(ctx context.Context, session, path string) error {
+	command, err := transcriptReaderCommand(path)
+	if err != nil {
+		return err
+	}
+	//nolint:gosec // G204 (class a): program is literal tmux; the pipe command is built by transcriptReaderCommand from the test binary's path and a path under the run's temp root.
+	if err := exec.CommandContext(ctx, "tmux", tmuxArgs("pipe-pane", "-o", "-t", session, command)...).Run(); err != nil {
+		return fmt.Errorf("tmux pipe-pane: %w", err)
+	}
+	return nil
+}
+
 // capturePaneHistory returns the pane's scrollback followed by the displayed text of the terminal transcript, so a wait matches displayed text only.
 func capturePaneHistory(ctx context.Context, session, transcriptPath string) string {
+	//nolint:gosec // G204 (class a): program is literal tmux; args are fixed capture-pane -S - with a harness-generated session.
 	out, _ := exec.CommandContext(ctx, "tmux", tmuxArgs("capture-pane", "-t", session, "-p", "-S", "-")...).Output()
 	transcript, _ := os.ReadFile(transcriptPath)
 	return string(out) + "\n" + transcriptText(transcript)
@@ -805,22 +833,18 @@ func capturePaneArgs(session string, escaped bool, cfg TmuxDriverConfig) []strin
 	return append(args, "-t", session, "-p")
 }
 
-func capturePanePair(ctx context.Context, session string, cfg TmuxDriverConfig) (string, string, error) {
-	plainOut, err := exec.CommandContext(ctx, "tmux", tmuxArgs(capturePaneArgs(session, false, cfg)...)...).Output()
-	if err != nil {
-		return "", "", err
+// capturePanePair takes the final capture of the pane: the plain and the escaped screen, uncropped, of one still frame (see captureStablePair).
+func capturePanePair(ctx context.Context, session string, cfg TmuxDriverConfig, use captureUse) (string, string, error) {
+	read := func(escaped bool) (string, error) {
+		//nolint:gosec // G204 (class a): program is literal tmux; args are fixed capture-pane (plain or escaped) with a harness-generated session.
+		out, err := exec.CommandContext(ctx, "tmux", tmuxArgs(capturePaneArgs(session, escaped, cfg)...)...).Output()
+		return string(out), err
 	}
-	escapedOut, err := exec.CommandContext(ctx, "tmux", tmuxArgs(capturePaneArgs(session, true, cfg)...)...).Output()
-	if err != nil {
-		return "", "", err
+	cropsCleanly := func(plain, escaped string) bool {
+		_, _, err := cropCaptures(cfg, use, plain, escaped)
+		return err == nil
 	}
-	plain := string(plainOut)
-	escaped := string(escapedOut)
-	if cfg.CaptureStart != "" || cfg.CaptureEnd != "" || cfg.CaptureEndRegex != "" {
-		plain = cropCapture(plain, cfg.CaptureStart, cfg.CaptureEnd, cfg.CaptureEndRegex, cfg.CaptureStartLast)
-		escaped = cropCapture(escaped, cfg.CaptureStart, cfg.CaptureEnd, cfg.CaptureEndRegex, cfg.CaptureStartLast)
-	}
-	return plain, escaped, nil
+	return captureStablePair(ctx, wallClock, read, cropsCleanly, finalCaptureBudget(cfg), tmuxQuiescencePoll)
 }
 
 // sessionRegistry tracks every tmux session created by Run() so we can
@@ -868,6 +892,7 @@ func ensureTmuxServer() error {
 	tmuxKeeperErr = nil
 	tmuxKeeperStarted = false
 	// Ignore host tmux configuration and configure the private server before either application starts. Pi checks these options asynchronously (interactive-mode.ts:1214-1259); both sides must see the same supported keyboard protocol, not race a startup warning against scenario input.
+	//nolint:gosec // G204 (class a): program is literal tmux; args are fixed -f /dev/null new-session with the const keeper command.
 	output, err := exec.Command("tmux", tmuxArgs("-f", os.DevNull,
 		"new-session", "-d", "-s", tmuxKeeperSession, "sleep 2147483647",
 		";", "set-option", "-g", "extended-keys", "on")...).CombinedOutput()
@@ -878,6 +903,7 @@ func ensureTmuxServer() error {
 	tmuxKeeperStarted = true
 	recordTmuxServerPID(context.Background())
 	// extended-keys-format arrived in tmux 3.5. Older tmux (Ubuntu 24.04 ships 3.4) has no such option and always emits its one extended-key format; Pi then reads an empty format and raises no warning (interactive-mode.ts:1214-1259), so both sides still see the same setup.
+	//nolint:gosec // G204 (class a): program is literal tmux; args are fixed set-option -g extended-keys-format csi-u.
 	output, err = exec.Command("tmux", tmuxArgs("set-option", "-g", "extended-keys-format", "csi-u")...).CombinedOutput()
 	switch {
 	case err == nil:
@@ -905,6 +931,7 @@ func noteLostTmuxServer(lost, current int) {
 
 // tmuxKeeperPresent reports whether the keeper session, and so the server configured around it, is still there.
 func tmuxKeeperPresent() bool {
+	//nolint:gosec // G204 (class a): program is literal tmux; args are fixed has-session -t =<const keeper>.
 	return exec.Command("tmux", tmuxArgs("has-session", "-t", "="+tmuxKeeperSession)...).Run() == nil
 }
 
@@ -934,10 +961,12 @@ func cleanupAllSessions() {
 	tmuxServerMu.Lock()
 	defer tmuxServerMu.Unlock()
 	for _, n := range names {
+		//nolint:gosec // G204 (class a): program is literal tmux; args are fixed kill-session -t <name> for registered harness session names.
 		_ = exec.Command("tmux", tmuxArgs("kill-session", "-t", n)...).Run()
 	}
 	// Helper processes can inherit the run ID without starting a server. They must not kill the parent's keeper when their TestMain exits.
 	if tmuxKeeperStarted {
+		//nolint:gosec // G204 (class a): program is literal tmux; args are fixed kill-session -t <const keeper>.
 		_ = exec.Command("tmux", tmuxArgs("kill-session", "-t", tmuxKeeperSession)...).Run()
 	}
 }
@@ -947,6 +976,7 @@ func killSession(session string) {
 	// this one named session. Creation and teardown share a lock so cleanup
 	// cannot remove a session while another test is creating one.
 	tmuxServerMu.Lock()
+	//nolint:gosec // G204 (class a): program is literal tmux; args are fixed kill-session -t <harness session>.
 	_ = exec.Command("tmux", tmuxArgs("kill-session", "-t", session)...).Run()
 	tmuxServerMu.Unlock()
 	unregisterSession(session)
@@ -999,11 +1029,14 @@ func sendTmuxKey(ctx context.Context, session, key string) error {
 	if after, ok := strings.CutPrefix(key, "hex:"); ok {
 		args := []string{"send-keys", "-t", session, "-H"}
 		args = append(args, strings.Fields(after)...)
+		//nolint:gosec // G204 (class a): program is literal tmux; args are "send-keys -t <session> -H" plus strings.Fields of a scenario hex: key with no `--`.
 		return exec.CommandContext(ctx, "tmux", tmuxArgs(args...)...).Run()
 	}
 	if isSpecialTmuxKey(key) {
+		//nolint:gosec // G204 (class a): program is literal tmux; key is a scenario key that matched the fixed isSpecialTmuxKey list.
 		return exec.CommandContext(ctx, "tmux", tmuxArgs("send-keys", "-t", session, key)...).Run()
 	}
+	//nolint:gosec // G204 (class a): program is literal tmux; "-l" followed by a scenario literal key that may start with "-" and is not preceded by `--`.
 	return exec.CommandContext(ctx, "tmux", tmuxArgs("send-keys", "-t", session, "-l", key)...).Run()
 }
 
@@ -1018,16 +1051,18 @@ func isSpecialTmuxKey(key string) bool {
 	}
 }
 
-func cropCapture(s, start, end, endRegex string, startLast bool) string {
+// cropCapture cuts a capture to the scenario's capture markers. A capture_start that is not in the capture is an error: returning the whole screen instead would compare a different region than the scenario names.
+func cropCapture(s, start, end, endRegex string, startLast bool) (string, error) {
 	from := 0
 	if start != "" {
 		idx := strings.Index(s, start)
 		if startLast {
 			idx = strings.LastIndex(s, start)
 		}
-		if idx >= 0 {
-			from = idx
+		if idx < 0 {
+			return s, fmt.Errorf("capture_start %q not found", start)
 		}
+		from = idx
 	}
 	to := len(s)
 	if end != "" {
@@ -1042,9 +1077,9 @@ func cropCapture(s, start, end, endRegex string, startLast bool) string {
 		}
 	}
 	if from > to {
-		return s
+		return s, nil
 	}
-	return strings.TrimRight(s[from:to], "\n")
+	return strings.TrimRight(s[from:to], "\n"), nil
 }
 
 // tmuxServerReport states what the isolated tmux server looks like now, so a capture that fails because the whole server vanished is told apart from one session ending: the recorded server process, the socket file, the sessions that remain, and whether the named session is among them.
@@ -1066,6 +1101,7 @@ func tmuxServerReport(ctx context.Context, session string) string {
 	} else {
 		parts = append(parts, "socket present: "+socket)
 	}
+	//nolint:gosec // G204 (class a): program is literal tmux; args are fixed "list-sessions -F #{session_name}".
 	out, err := exec.CommandContext(ctx, "tmux", tmuxArgs("list-sessions", "-F", "#{session_name}")...).CombinedOutput()
 	if err != nil {
 		parts = append(parts, fmt.Sprintf("server unreachable: %v: %s", err, strings.TrimSpace(string(out))))
@@ -1091,6 +1127,7 @@ func tmuxSocketPath() string {
 
 // recordTmuxServerPID remembers the isolated server's process for tmuxServerReport.
 func recordTmuxServerPID(ctx context.Context) {
+	//nolint:gosec // G204 (class a): program is literal tmux; args are fixed "display-message -p #{pid}".
 	out, err := exec.CommandContext(ctx, "tmux", tmuxArgs("display-message", "-p", "#{pid}")...).Output()
 	if err != nil {
 		return

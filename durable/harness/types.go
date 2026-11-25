@@ -11,7 +11,8 @@ import (
 	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
-// HookApi is what a hook may use: committed reads and the asking task's memos, which hooks and the task share.
+// HookApi is what a hook may use: committed reads and the asking task's memos, which hooks and the task share. Hooks
+// run off the Session line, so reads see what is committed when they run; a hook rerun after a crash may see more.
 type HookApi interface {
 	durable.DocumentReader
 	TaskId() durable.TaskId
@@ -22,11 +23,39 @@ type HookApi interface {
 	Memo(ctx context.Context, name string) (value durable.JsonValue, ok bool, err error)
 	// MemoCandidate stores candidate unless a memo already exists and returns the durable winner.
 	MemoCandidate(ctx context.Context, name string, candidate durable.JsonValue) (durable.JsonValue, error)
+	// Entry is a committed entry visible from the task's conversation, as TaskRuntime.Entry; nil when the entry is
+	// absent or not visible. A typed read is HookEntry.
+	Entry(ctx context.Context, id durable.EntryId) (*durable.EntryRecord, error)
+	// Entries is the committed raw history of the task's conversation, as TaskRuntime.Entries.
+	Entries(ctx context.Context, query durable.EntryQuery, limit int, cursor durable.Cursor) (durable.Page[durable.EntryRecord, durable.Cursor], error)
+}
+
+// HookEntry is the typed overload of HookApi.entry (harness/types.ts:953): the committed entry visible from the task's
+// conversation when it is present and has the token's kind, nil otherwise. A method cannot take the token's type parameter, so
+// the read is a function, as durable.TaskEntry is for a task's runtime.
+func HookEntry[D any](ctx context.Context, api HookApi, token durable.Entry[D], id durable.EntryId) (*durable.TypedEntry[D], error) {
+	entry, err := api.Entry(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return token.As(entry)
 }
 
 // GenerationRequest is the request a beforeRequest hook may replace.
 type GenerationRequest struct {
 	Messages []ai.Message
+}
+
+// ProviderRequest is what a beforeProviderRequest hook sees: the model of the request and its provider request body, in
+// the format of the model's API (Model.ProviderMeta.API).
+type ProviderRequest struct {
+	Model   *ai.Model
+	Payload any
+}
+
+// ProviderPayload is the beforeProviderRequest result that replaces the provider request body.
+type ProviderPayload struct {
+	Payload any
 }
 
 // YieldContinue is the onYield result that appends a user message and continues the run.
@@ -38,12 +67,69 @@ type YieldContinue struct {
 type GenerationHooks struct {
 	// BeforeRequest runs before every request attempt, including recovery; a non-nil result is used for that request only.
 	BeforeRequest func(ctx context.Context, request GenerationRequest, api HookApi) (*GenerationRequest, error)
+	// BeforeProviderRequest runs after pi-ai builds the provider request body, before it is sent; a non-nil result replaces
+	// the body for that request only. pi-ai calls it once per request, before it retries the provider request, so the hook does
+	// not run again for a retry.
+	// The body is in the provider API's own format (request.Model.ProviderMeta.API), so a hook checks the API before changing it.
+	BeforeProviderRequest func(ctx context.Context, request ProviderRequest, api HookApi) (*ProviderPayload, error)
 	// AfterResponse sees every terminal provider message, before classification.
 	AfterResponse func(ctx context.Context, message ai.AssistantMessage, api HookApi) error
 	// OnYield sees a final answer; the first non-nil result appends a user message and continues the run.
 	OnYield func(ctx context.Context, answer ai.AssistantMessage, api HookApi) (*YieldContinue, error)
 	// AfterTools runs after every tool of the round is terminal; results are the round's result entries in call order.
 	AfterTools func(ctx context.Context, assistant durable.EntryId, results []durable.EntryId, api HookApi) error
+	// AfterRun runs after a run answered, its answer committed and its inputs settled done: a final answer, or a
+	// terminate round; not when an onYield continuation is taken, and never after a failure or an abort. The requested
+	// tasks of every hook are created together as children of the generation, which keeps the run, and the conversation
+	// busy, until they are terminal; then queued items are placed and the run ends (spec §8.3). A crash before they are
+	// created asks again; once created, never again for this run.
+	AfterRun func(ctx context.Context, run RunSummary, api HookApi) (*RunEndTasks, error)
+}
+
+// RunEndReason is how a run ended, for afterRun hooks.
+type RunEndReason string
+
+const (
+	// RunEndAnswer is a final answer.
+	RunEndAnswer RunEndReason = "answer"
+	// RunEndTerminate is a tool round whose every call asked to terminate.
+	RunEndTerminate RunEndReason = "terminate"
+)
+
+// RunSummary is how a run ended, for afterRun hooks. Read the run's history with
+// api.Entries(durable.EntryQuery{MinEntryId: &first, MaxEntryId: &last}, ...).
+type RunSummary struct {
+	Reason RunEndReason `json:"reason"`
+	// First is the run's first entry (LiveRun.First): the first one the boundary that started it placed, for a continue
+	// the failed run's it continues, otherwise its first tool-calling answer; the answer itself for a run that has none
+	// of these.
+	First durable.EntryId `json:"first"`
+	// Answer is the answer, or the terminating round's tool-calling answer, whose results follow it.
+	Answer durable.EntryId `json:"answer"`
+	// Last is the run's last entry: the answer; for a terminate round its newest result, or the reset of its handoff.
+	Last durable.EntryId `json:"last"`
+}
+
+// MarshalJSON writes the members in the order Pi stores them in a generation's finish checkpoint: the held end, then
+// first.
+func (run RunSummary) MarshalJSON() ([]byte, error) {
+	return marshalPlain(struct {
+		Reason RunEndReason    `json:"reason"`
+		Answer durable.EntryId `json:"answer"`
+		Last   durable.EntryId `json:"last"`
+		First  durable.EntryId `json:"first"`
+	}{run.Reason, run.Answer, run.Last, run.First})
+}
+
+// RunEndTask is a task an afterRun hook asks for, built by RunEndTaskOf. Input is JSON.
+type RunEndTask struct {
+	Task  durable.AnyTask
+	Input durable.JsonValue
+}
+
+// RunEndTasks is what an afterRun hook asks for: the tasks to create and wait for.
+type RunEndTasks struct {
+	Tasks []RunEndTask
 }
 
 // ToolParent is the calling task and call ID of a nested call.
@@ -168,15 +254,16 @@ type HarnessOptions struct {
 	// OnWake wakes the process for sleeping tasks instead of a SetTimer timer. Without it, while scheduling runs, a timer
 	// that keeps the process alive resumes sleeping tasks when they are due. With it, the Harness arms no timer for
 	// them: it calls OnWake after open and whenever Harness.Wake() changes, and the host arms its own wakeup, such as a
-	// Durable Object alarm, and calls Resume() when it fires. Called off the Session line, after the commit that changed
-	// the value, so a host arms a recovery wakeup before calls that can start work. It may call Wake and Resume, and
-	// must not block. A panic is reported, and the value is offered again at the next change.
+	// Durable Object alarm, and calls Resume() when it fires. Called in a goroutine the Session line never waits for,
+	// after the commit that changed the value was adopted, so a host arms a recovery wakeup before calls that can start
+	// work. It may call Wake and Resume, and must not block. A panic is reported, and the value is offered again at the
+	// next change.
 	OnWake func(wake Wake)
 	// OnReport receives failures that do not fail the calling operation, such as a panicking hook or listener, a task
-	// that faulted, and the error that fails the Session, once. info says what happened: a host can tell a failed
-	// Session (ReportSessionFailed, often a platform reset) from a faulted task (ReportTaskFaulted) or a parked one
-	// (ReportTaskParked). A panic of its own is dropped.
-	OnReport func(err error, info durable.ReportInfo)
+	// that faulted, and the error that fails the Session, once: one durable.Report, the Error and what happened (Kind and
+	// the fields of its ReportInfo). A host can tell a failed Session (ReportStorageFailed, often a platform reset) from a
+	// faulted task (ReportTaskFaulted). A panic of its own is dropped.
+	OnReport func(report durable.Report)
 	// ReadOnly opens for reading only, as a viewer of a session that another process drives, for example a synced copy on a
 	// device that only shows it. Open recovers nothing: a running task stays as committed. Every commit with writes fails
 	// with *durable.ReadOnlySession before it reaches Storage, and so does Resume (a panic, as it throws upstream) and every
@@ -201,14 +288,14 @@ type TaskInspectionKind string
 
 const (
 	TaskInspectionRunning    TaskInspectionKind = "running"
-	TaskInspectionReady      TaskInspectionKind = "ready"
+	TaskInspectionPending    TaskInspectionKind = "pending"
 	TaskInspectionWaiting    TaskInspectionKind = "waiting"
 	TaskInspectionSleeping   TaskInspectionKind = "sleeping"
 	TaskInspectionCompleting TaskInspectionKind = "completing"
 	TaskInspectionBlocked    TaskInspectionKind = "blocked"
 )
 
-// TaskInspectionState is what the scheduler would do with a live task: running (an invocation is active); ready (the next scheduling pass reserves it; Migrates when its definition is newer and has a migration); waiting (on these live tasks: the live part of its on, or, when abort-marked, its live ordinary owned work); sleeping (until the Harness clock reaches Until); completing (outcome held until its ordinary owned work drains); blocked (no registered definition can take it, or the restart limit parked it, with Reason missing_task, task_too_old, migration_failed, or restart_limit and an optional Error).
+// TaskInspectionState is what the scheduler would do with a live task: running (an invocation is active); pending (the next scheduling pass reserves it; Migrates when its definition is newer and has a migration); waiting (on these live tasks: the live part of its on, or, when abort-marked, its live ordinary owned work); sleeping (until the Harness clock reaches Until); completing (outcome held until its ordinary owned work drains); blocked (no registered definition can take it, with Reason missing_task, task_too_old, or migration_failed and an optional Error).
 type TaskInspectionState struct {
 	Kind     TaskInspectionKind
 	Migrates bool
@@ -232,7 +319,7 @@ type HarnessInspection struct {
 	Submissions []durable.SubmissionRecord
 }
 
-// ConversationWatch is a serialized exact-frame watch of the structural view.
+// ConversationWatch is a serialized watch of the structural view.
 type ConversationWatch = durable.WatchHandle[ConversationView]
 
 // Conversation is a stateless handle for one conversation, bound to the Harness that returned it. Compare handles by Id.
@@ -242,14 +329,16 @@ type Conversation interface {
 	Agent(ctx context.Context) (durable.Agent, error)
 	// Configure applies change in its own commit.
 	Configure(ctx context.Context, change AgentChange) error
-	// Submit durably admits user input or a passive entry write. A busy conversation, or one with queued items, queues it in pi.inbox; WhenBusy reject fails with ConversationBusy instead and writes nothing.
+	// Submit durably admits user input, a passive entry write, or a continue. A busy conversation, or one with queued items, queues input and writes that affect model context in pi.inbox; WhenBusy reject rejects input with ConversationBusy instead and writes nothing. An idle conversation rejects WhenIdle reject input with ConversationIdle and writes nothing. A write of only Kind and Data (no Model, Head, or Edits) is appended at once, even mid-run, as it changes nothing the model sees. A continue starts a run on the context as it is, after placing queued items; a busy conversation rejects it with ConversationBusy, as it never queues.
 	Submit(ctx context.Context, submission durable.SubmissionDraft) (durable.Submission, error)
+	// SubmitIn admits a submission inside the caller's commit tx (Harness.Commit, Conversation.Commit, a task's runtime Commit), with the same rules, and returns its ID: the admission is stored with that commit, or not at all when the callback fails later or the commit fails. Call it before the commit's first table write (AppendEntry, CreateTask, CreateSubmission, another admission): otherwise it fails with ReadAfterWrite, on every path. Documents may be read and written before and after it. A rejection (ConversationBusy, ConversationIdle) fails before any write, so the callback may handle it. Do not call Submission or other Harness reads inside the callback: they wait for the commit holding the line. Its pi.durable.submit span covers the admission only, so its result is provisional. Fails for a transaction of another Session.
+	SubmitIn(tx durable.Tx, submission durable.SubmissionDraft) (durable.SubmissionId, error)
 	// Reset admits a write of a pi.reset entry that starts a new context, carrying handoff as a user message when non-nil. It returns after admission; while busy, it is placed at the next boundary.
 	Reset(ctx context.Context, handoff *string) error
 	// Compact admits a manual compaction task and returns its ID (spec §8.7).
 	Compact(ctx context.Context, instructions *string) (durable.TaskId, error)
-	// Commit runs a Session commit whose tx.CreateTask defaults to this conversation.
-	Commit(ctx context.Context, change func(tx durable.Tx) (any, error)) (any, error)
+	// Commit runs a Session commit whose tx.CreateTask defaults to this conversation; options are as for Session.Commit.
+	Commit(ctx context.Context, change func(tx durable.Tx) (any, error), options ...durable.CommitOptions) (any, error)
 	// Context returns the committed raw active transcript and model context. With options.At, it returns the context as
 	// of that visible entry: the same view Fork(at) would start with, without creating a conversation.
 	Context(ctx context.Context, options *durable.ContextOptions) (durable.ContextView, error)
@@ -261,8 +350,10 @@ type Conversation interface {
 	Abort(ctx context.Context, options *durable.ConversationAbortOptions) error
 	// WaitForIdle returns when the ordinary ownership scope has no live non-background task.
 	WaitForIdle(ctx context.Context) error
-	// Watch returns the structural view (spec §9.3) as a serialized exact-frame watch with bounded pending frames.
-	Watch(ctx context.Context) (ConversationWatch, error)
+	// Watch returns the structural view (spec §9.3) as a serialized watch; commits made while its listener runs arrive folded.
+	// Its Entries are a window over the transcript, as window says: the newest 50 by default, then appends, dropping the
+	// oldest past 100. A nil window takes the defaults. It is built on the same mount as Harness.ObserveConversation.
+	Watch(ctx context.Context, window *ConversationWindow) (ConversationWatch, error)
 }
 
 // Harness is a durable agent harness over one Session.
@@ -287,9 +378,6 @@ type Harness interface {
 	Submission(ctx context.Context, id durable.SubmissionId) (durable.Submission, error)
 	// AbortSubmission returns not_found for an unknown submission or one of another conversation than conversationId, when given.
 	AbortSubmission(ctx context.Context, id durable.SubmissionId, conversationId *durable.ConversationId) (durable.SubmissionAbortResult, error)
-	// RetryTask runs a task parked by settings.restartLimit again: it clears its restart count and enables scheduling. It
-	// does nothing for a task that is not parked, and fails for an unknown one.
-	RetryTask(ctx context.Context, id durable.TaskId) error
 	// AbortTask commits the abort mark, signals and joins an active run invocation, and schedules the abort invocation. A task whose definition cannot take it settles as orphaned instead. It returns marked or terminal.
 	AbortTask(ctx context.Context, id durable.TaskId) (string, error)
 	// WaitForTask returns the terminal receipt; cancelling ctx cancels only this wait. A conversation-owned task nothing waits for commits in
@@ -301,8 +389,17 @@ type Harness interface {
 	// Usage is the Session total: every conversation's pi.usage summed.
 	Usage(ctx context.Context) (UsageState, error)
 	// WatchTaskGraph returns every live task with its owner edge, status, and owned conversations (spec §9.5), as a
-	// serialized exact-frame watch with bounded pending frames.
+	// serialized watch; commits made while its listener runs arrive folded.
 	WatchTaskGraph(ctx context.Context) (TaskGraphWatch, error)
+	// ObserveConversation attaches a synchronous Observer to a conversation's structural view (spec §9.3), atomically on
+	// the Session line, for adapters: Advance gets each next revision with its operations as memory adopts the commit,
+	// inside Storage's adopt for a stored one and before it is stored for a deferred one, so it only records it. window is as
+	// for Conversation.Watch; each observer has its own. ctx governs only the attachment.
+	ObserveConversation(ctx context.Context, id durable.ConversationId, observer durable.Observer[ConversationView], window *ConversationWindow) (durable.Observation[ConversationView], error)
+	// ObserveTaskGraph attaches a synchronous Observer to the task graph (spec §9.5), as ObserveConversation does to a view. A
+	// blocked reason that changes without a commit (a registry change, a failed migration) advances it on the Session line
+	// outside any commit and adopt, with the background context.
+	ObserveTaskGraph(ctx context.Context, observer durable.Observer[TaskGraph]) (durable.Observation[TaskGraph], error)
 }
 
 // DefaultHarnessIdentity is the request identity of a Harness's model requests: the ai package's defaults with provider attribution to PiG.

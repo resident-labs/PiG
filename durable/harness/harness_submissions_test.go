@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -14,16 +15,11 @@ import (
 
 	"github.com/MichaelKinsy/PiG/durable"
 	"github.com/MichaelKinsy/PiG/durable/session"
-	sqlitenode "github.com/MichaelKinsy/PiG/durable/storage/sqlite/node"
 )
 
 func openSqlite(t *testing.T, path string) durable.Storage {
 	t.Helper()
-	storage, err := sqlitenode.OpenNodeSqliteStorage(path, sqlitenode.NodeSqliteStorageOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return storage
+	return openNodeSqliteStorage(t, path)
 }
 
 func liveOf(t *testing.T, harness Harness, id durable.ConversationId) *LiveState {
@@ -196,9 +192,14 @@ func TestSubmissions(t *testing.T) {
 		release := deferred()
 		storage := &heldSubmissionReads{controlledStorage: newControlledStorage(), entered: entered, release: release}
 		setup := chatSetup(t)
-		setup.Faux.SetResponses([]ai.FauxResponseStep{unanswered().step})
-		harness, root := openChat(t, storage, setup)
-		submission := must(root.Submit(testContext, durable.SubmissionDraft{Type: durable.SubmissionTypeInput, Content: ai.UserText("hi")}))
+		setup.Faux.SetResponses([]ai.FauxResponseStep{unanswered().step, unanswered().step})
+		first, root := openChat(t, storage, setup)
+		id := must(root.Submit(testContext, durable.SubmissionDraft{Type: durable.SubmissionTypeInput, Content: ai.UserText("hi")})).Id()
+		closeHarness(t, first)
+		// Reopen: the Session caches the submissions it writes, so only a reopened one reads it from Storage.
+		storage.Reopen()
+		harness, _ := openChat(t, storage, setup)
+		submission := must(harness.Submission(testContext, id))
 		storage.hold.Store(true)
 		waiting := make(chan error, 1)
 		go func() { _, err := submission.Wait(testContext); waiting <- err }()
@@ -212,6 +213,46 @@ func TestSubmissions(t *testing.T) {
 		if err := <-closing; err != nil {
 			t.Fatal(err)
 		}
+	})
+
+	// Upstream resolves a wait inside the observer, at the commit, so a close whose seal runs before the code awaiting it
+	// resumes cannot reject it. A Go listener closes on a goroutine of its own, so this one waits until the seal has rejected
+	// what it rejects, which it learns from a wait no commit settles, and only then returns for the publication to wake the
+	// waits.
+	t.Run("keeps a wait resolved when a host listener's close has sealed the Harness before the publication wakes the waits", func(t *testing.T) {
+		setup := chatSetup(t)
+		release := deferred()
+		setup.Faux.SetResponses([]ai.FauxResponseStep{fauxAfter(release, "answer")})
+		harness, root := openChat(t, newControlledStorage(), setup)
+		submission := must(root.Submit(testContext, durable.SubmissionDraft{Type: durable.SubmissionTypeInput, Content: ai.UserText("hi")}))
+		sealed := harness.(*harnessImpl).submissions.waiters.Add(testContext, harness.(*harnessImpl).SessionImpl, 999_999)
+		go func() { _, _ = sealed.Wait() }()
+		closing := make(chan struct{})
+		var once sync.Once
+		observeStored(harness, func(_ context.Context, publication durable.CommitPublication) {
+			for _, change := range publication.Changes {
+				if write, ok := change.(durable.SubmissionWrite); ok && write.Value.Id == submission.Id() && write.Value.Status == durable.SubmissionDone {
+					once.Do(func() {
+						go func() { _ = harness.Close(testContext); close(closing) }()
+						<-sealed.Done()
+					})
+				}
+			}
+		})
+		type waitResult struct {
+			record durable.SettledSubmissionRecord
+			err    error
+		}
+		waited := make(chan waitResult, 1)
+		callAsync(func() {
+			record, err := submission.Wait(testContext)
+			waited <- waitResult{record, err}
+		})
+		release.resolve()
+		if result := <-waited; result.err != nil || result.record.Status != durable.SubmissionDone {
+			t.Fatalf("wait %+v %v", result.record, result.err)
+		}
+		<-closing
 	})
 
 	t.Run("reacquires a submission after reopen and settles it durably", func(t *testing.T) {
@@ -448,6 +489,32 @@ func TestSubmissionDraftIgnoresTheFieldsOfTheOtherType(t *testing.T) {
 		}))
 		if record := must(write.Status(testContext)); record.Status != durable.SubmissionQueued || record.Type != durable.SubmissionTypeWrite {
 			t.Fatalf("record = %+v, want a queued write", record)
+		}
+		closeHarness(t, harness)
+	})
+
+	t.Run("resumes a wait only once observeCommits() observers saw the commit that settled it", func(t *testing.T) {
+		setup := chatSetup(t)
+		setup.Faux.SetResponses([]ai.FauxResponseStep{fauxAnswer("hi")})
+		harness, root := openChat(t, newLateResolvingStorage(), setup)
+		var mu sync.Mutex
+		settled := map[durable.SubmissionId]bool{}
+		observeStored(harness, func(_ context.Context, publication durable.CommitPublication) {
+			for _, change := range publication.Changes {
+				if write, ok := change.(durable.SubmissionWrite); ok && write.Value.Status == durable.SubmissionDone {
+					mu.Lock()
+					settled[write.Value.Id] = true
+					mu.Unlock()
+				}
+			}
+		})
+		submission := must(root.Submit(testContext, durable.SubmissionDraft{Type: durable.SubmissionTypeInput, Content: ai.UserText("hello")}))
+		must(submission.Wait(testContext))
+		mu.Lock()
+		saw := settled[submission.Id()]
+		mu.Unlock()
+		if !saw {
+			t.Fatal("the wait resumed before the observeCommits() observers saw the settling commit")
 		}
 		closeHarness(t, harness)
 	})

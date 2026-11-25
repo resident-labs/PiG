@@ -28,6 +28,10 @@ func StreamSimple(ctx context.Context, model *Model, transcript TranscriptContex
 func streamSimpleAs(ctx context.Context, api API, model *Model, transcript TranscriptContext, options StreamOptions) (*AssistantMessageEventStream, error) {
 	meta := model.ProviderMeta
 	meta.API = api
+	// upstream: compat.ts:290-293 (streamSimple resolves the api before the provider asserts any key)
+	if !directAPIKnown(api) {
+		return nil, NoAPIProviderError(api)
+	}
 	key, err := directSimpleAPIKey(meta, options)
 	if err != nil {
 		// The module's streamSimple asserts the key before its stream exists (for example openai-completions.ts streamSimple), so lazyApi's setup rejects.
@@ -120,7 +124,7 @@ func directAPIProviderFor(api API, model *Model, key string, env ProviderEnv) (P
 		return NewOpenAICodexResponsesProvider(OpenAICodexResponsesConfig{ModelMetadata: model, APIKey: key, Model: model.ID, ProviderID: meta.ProviderID, BaseURL: meta.BaseURL, ExtraHeaders: meta.Headers, Compat: meta.Compat, ThinkingLevelMap: model.ThinkingLevelMap}), nil
 	case APIBedrockConverseStream:
 		// pig additive (D92): the API constructors report a stripped API (strip.apis).
-		return NewBedrockAPIProvider(*model)
+		return NewOptionalAPIProvider(api, *model)
 	case APIGoogleGenerativeAI:
 		return NewGoogleProvider(GoogleConfig{ModelMetadata: model, APIKey: key, Model: model.ID, ProviderID: meta.ProviderID, BaseURL: meta.BaseURL, ExtraHeaders: meta.Headers, ThinkingLevelMap: model.ThinkingLevelMap}), nil
 	case APIGoogleVertex:
@@ -128,8 +132,17 @@ func directAPIProviderFor(api API, model *Model, key string, env ProviderEnv) (P
 	case APIMistralConversations:
 		return NewMistralAPIProvider(MistralConfig{ModelMetadata: model, APIKey: key, Model: model.ID, ProviderID: meta.ProviderID, BaseURL: meta.BaseURL, ExtraHeaders: meta.Headers, Reasoning: meta.Reasoning})
 	default:
-		return nil, fmt.Errorf("Provider %s has no API implementation for %s", meta.ProviderID, api)
+		return nil, NoAPIProviderError(api)
 	}
+}
+
+// directAPIKnown reports whether directAPIProviderFor builds a provider for api: the cases of its switch.
+func directAPIKnown(api API) bool {
+	switch api {
+	case APIAnthropicMessages, APIOpenAICompletions, APIOpenAIResponses, APIAzureOpenAIResponses, APIOpenAICodexResponses, APIBedrockConverseStream, APIGoogleGenerativeAI, APIGoogleVertex, APIMistralConversations:
+		return true
+	}
+	return false
 }
 
 // ApplyOmittedReasoning sets the native thinking options a simple stream sends when `reasoning` is omitted: Anthropic disables thinking and Google and Vertex send `thinking: { enabled: false }` unless the caller supplied native thinking.

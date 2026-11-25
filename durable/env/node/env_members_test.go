@@ -66,12 +66,12 @@ func TestNodeExecutionEnvOpenDirReaderPagesEntries(t *testing.T) {
 func TestWatchTargetExcludeSuppressesNamedAndHiddenChanges(t *testing.T) {
 	env := NewNodeExecutionEnv(NodeExecutionEnvOptions{Cwd: t.TempDir(), Watch: NodeWatchOptions{Mode: durableenv.WatchPolling, PollIntervalMs: new(20)}})
 	mustDo(t, env.CreateDir(background, "tree", nil))
-	changes := make(chan durableenv.WatchChange, 100)
+	changes := make(chan durableenv.FileChange, 100)
 	watcher, err := env.Watch(background, []durableenv.WatchTarget{{
 		Path: "tree", Recursive: true, Exclude: &durableenv.WatchExclude{Hidden: true, Names: []string{"skip.txt"}},
-	}}, func(change durableenv.WatchChange) { changes <- change })
+	}}, func(change durableenv.FileChange) { changes <- change })
 	mustDo(t, err)
-	defer func() { _ = watcher.Close(background) }()
+	defer func() { _ = watcher.Stop(background) }()
 
 	mustDo(t, env.WriteFile(background, "tree/skip.txt", "x"))
 	mustDo(t, env.WriteFile(background, "tree/.hidden", "x"))
@@ -81,7 +81,7 @@ func TestWatchTargetExcludeSuppressesNamedAndHiddenChanges(t *testing.T) {
 	for {
 		select {
 		case change := <-changes:
-			paths, ok := change.(durableenv.WatchChangePaths)
+			paths, ok := change.(durableenv.FileChangePaths)
 			if !ok {
 				continue
 			}
@@ -104,11 +104,11 @@ func TestWatchTargetExcludeSuppressesNamedAndHiddenChanges(t *testing.T) {
 func TestNodeWatchOptionsModeForcesTheWatcherMode(t *testing.T) {
 	for _, mode := range []durableenv.WatchMode{durableenv.WatchNative, durableenv.WatchPolling} {
 		env := NewNodeExecutionEnv(NodeExecutionEnvOptions{Cwd: t.TempDir(), Watch: NodeWatchOptions{Mode: mode}})
-		watcher, err := env.Watch(background, []durableenv.WatchTarget{{Path: "."}}, func(durableenv.WatchChange) {})
+		watcher, err := env.Watch(background, []durableenv.WatchTarget{{Path: "."}}, func(durableenv.FileChange) {})
 		mustDo(t, err)
 		if got := watcher.Mode(); got != mode {
 			t.Errorf("forced mode %q: watcher mode = %q", mode, got)
 		}
-		mustDo(t, watcher.Close(background))
+		mustDo(t, watcher.Stop(background))
 	}
 }

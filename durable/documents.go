@@ -371,13 +371,23 @@ type typedWatch[T any] struct {
 	decoded *atomic.Pointer[typedValue[T]]
 }
 
-type typedValue[T any] struct{ value *T }
+type typedValue[T any] struct{ value T }
 
-// Value is the acquisition or latest delivered revision; nil once the document retired. A revision that does not
-// decode as the token's type breaks the document's definition: Start's listener fails and ends the watch with its
-// listener_error, and Value keeps returning the latest revision that decoded.
-func (watch typedWatch[T]) Value() *T {
-	if value, err := DecodeDoc[T](watch.WatchHandle.Value()); err == nil {
+// decodeValue decodes a document value as T; a document value is never null.
+func decodeValue[T any](value JsonObject) (T, error) {
+	decoded, err := DecodeDoc[T](value)
+	if err != nil || decoded == nil {
+		var zero T
+		return zero, err
+	}
+	return *decoded, nil
+}
+
+// Value is the acquisition or latest delivered revision. A revision that does not decode as the token's type breaks the
+// document's definition: Start's listener fails and ends the watch with its listener_error, and Value keeps returning the
+// latest revision that decoded.
+func (watch typedWatch[T]) Value() T {
+	if value, err := decodeValue[T](watch.WatchHandle.Value()); err == nil {
 		watch.decoded.Store(&typedValue[T]{value})
 		return value
 	}
@@ -385,27 +395,36 @@ func (watch typedWatch[T]) Value() *T {
 }
 
 // Start installs the sole listener; a value that does not decode ends the watch with its listener_error.
-func (watch typedWatch[T]) Start(listener func(ctx context.Context, value *T, ops []Op) error) {
-	watch.WatchHandle.Start(func(ctx context.Context, value JsonObject, ops []Op) error {
-		decoded, err := DecodeDoc[T](value)
+//
+// A listener that blocks on something the host cannot see before it returns (a channel send or receive, a mutex, network I/O, a
+// child process) holds back every wait that follows its delivery until it returns: the Harness waits, and the Session's
+// publication of the next commit of a call, which waits for the synchronous part of each listener (pig divergence (D224): Pi's
+// listener awaits, which ends its synchronous part, and nothing waits for it). Such a listener calls chord.DeliveryEntered before it
+// blocks, or does the blocking on a goroutine of its own and returns.
+func (watch typedWatch[T]) Start(listener func(ctx context.Context, call WatchCall[T]) error) {
+	watch.WatchHandle.Start(func(ctx context.Context, call WatchCall[JsonObject]) error {
+		if call.Kind == WatchCallFailed {
+			return listener(ctx, WatchCall[T]{Kind: WatchCallFailed, Error: call.Error})
+		}
+		decoded, err := decodeValue[T](call.Value)
 		if err != nil {
 			return err
 		}
 		watch.decoded.Store(&typedValue[T]{decoded})
-		return listener(ctx, decoded, ops)
+		return listener(ctx, WatchCall[T]{Kind: WatchCallValue, Value: decoded, Ops: call.Ops, Retired: call.Retired})
 	})
 }
 
-// WatchDoc returns a watch of a document's committed value decoded as T, or nil when the document is absent; the
-// value is nil once the document retires. args are the owner ID and family key as for TxDoc. The erased form is
-// DocumentObserver.WatchDocErased.
+// WatchDoc returns a watch of a document's committed value decoded as T, or nil when the document is absent. The watch
+// follows the document's address: a retirement is a call with Retired set, and a document created there later arrives on
+// the same watch. args are the owner ID and family key as for TxDoc. The erased form is DocumentObserver.WatchDocErased.
 func WatchDoc[T any](ctx context.Context, observer DocumentObserver, token DocTokenOf[T], args ...any) (DocumentWatch[T], error) {
 	watch, err := observer.WatchDocErased(ctx, token, args...)
 	if err != nil || watch == nil {
 		return nil, err
 	}
 	// The acquisition value is checked like Snapshot's.
-	acquired, err := DecodeDoc[T](watch.Value())
+	acquired, err := decodeValue[T](watch.Value())
 	if err != nil {
 		_, _ = watch.Stop()
 		return nil, err
@@ -413,6 +432,48 @@ func WatchDoc[T any](ctx context.Context, observer DocumentObserver, token DocTo
 	decoded := new(atomic.Pointer[typedValue[T]])
 	decoded.Store(&typedValue[T]{acquired})
 	return typedWatch[T]{watch, decoded}, nil
+}
+
+// typedObserver is an observer of decoded values over an erased one.
+type typedObserver[T any] struct{ observer Observer[T] }
+
+// Advance decodes the call; a value that does not decode panics, which the Session reports as the observer's
+// listener_error, detaching and ending it.
+func (typed typedObserver[T]) Advance(ctx context.Context, call WatchCall[JsonObject]) {
+	if call.Kind == WatchCallFailed {
+		typed.observer.Advance(ctx, WatchCall[T]{Kind: WatchCallFailed, Error: call.Error})
+		return
+	}
+	value, err := decodeValue[T](call.Value)
+	if err != nil {
+		panic(err)
+	}
+	typed.observer.Advance(ctx, WatchCall[T]{Kind: WatchCallValue, Value: value, Ops: call.Ops, Retired: call.Retired})
+}
+
+func (typed typedObserver[T]) End(end WatchEnd) { typed.observer.End(end) }
+
+// typedObservation is an observation whose value decoded as T.
+type typedObservation[T any] struct {
+	Observation[JsonObject]
+	value T
+}
+
+func (observation typedObservation[T]) Value() T { return observation.value }
+
+// ObserveDoc attaches a synchronous observer to a document address and decodes its values as T, as Session.ObserveDocErased
+// does for JSON; the observation is nil when the document is absent. args are the owner ID and family key as for TxDoc.
+func ObserveDoc[T any](ctx context.Context, session Session, token DocTokenOf[T], observer Observer[T], args ...any) (Observation[T], error) {
+	observation, err := session.ObserveDocErased(ctx, token, typedObserver[T]{observer}, args...)
+	if err != nil || observation == nil {
+		return nil, err
+	}
+	value, err := decodeValue[T](observation.Value())
+	if err != nil {
+		observation.Detach()
+		return nil, err
+	}
+	return typedObservation[T]{observation, value}, nil
 }
 
 // TxRetireDoc retires a document; args are the owner ID and family key as for TxDoc, without a seed.

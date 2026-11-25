@@ -24,7 +24,7 @@ func TestWindowsInputWaiterTimesOutSignalsAndCancels(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	waiter, err := newTerminalInputWaiter(ctx)
+	waiter, err := newTerminalInputWaiter(ctx, file)
 	if err != nil {
 		t.Fatal(err)
 	}

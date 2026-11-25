@@ -55,7 +55,7 @@ func newTerminalReader(ctx context.Context, source io.Reader) (*terminalReader, 
 	r := &terminalReader{ctx: ctx, source: source}
 	if file, ok := source.(*os.File); ok {
 		r.file = file
-		waiter, err := newTerminalInputWaiter(ctx)
+		waiter, err := newTerminalInputWaiter(ctx, file)
 		if err != nil {
 			return nil, err
 		}
@@ -74,6 +74,11 @@ func newTerminalReader(ctx context.Context, source io.Reader) (*terminalReader, 
 func (r *terminalReader) read(ms int) ([]byte, error) {
 	if err := r.ctx.Err(); err != nil {
 		return nil, err
+	}
+	if r.file != nil {
+		if data, isPipe, err := r.waiter.readPipe(r.file, ms); isPipe {
+			return data, err
+		}
 	}
 	if r.file != nil && !terminalInputBuffered(r.file) {
 		ready, err := r.waiter.wait(r.file, ms)

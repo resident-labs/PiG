@@ -258,7 +258,7 @@ func TestInteractiveMode_UsesChatContainerChildCountForUserSpacer(t *testing.T) 
 	if !m.chatContainer.IsEmpty() {
 		t.Fatal("new chat container should be empty")
 	}
-	m.appendToChat(tui.NewUserMessageComponent("first", nil, 1, nil))
+	m.appendToChat(tui.NewUserMessageComponent("first", nil, 1, nil, "", ""))
 	if m.chatContainer.IsEmpty() {
 		t.Fatal("chat container should not be empty after first message")
 	}
@@ -553,7 +553,8 @@ func TestShortenPath(t *testing.T) {
 		want string
 	}{
 		{"home itself", home, "~"},
-		{"subdir", home + "/projects/foo", "~/projects/foo"},
+		// Pi's shortenHomePath writes the rest with the platform's separator ("~\projects\foo" on Windows).
+		{"subdir", filepath.Join(home, "projects", "foo"), filepath.Join("~", "projects", "foo")},
 		{"not under home", "/tmp/bar", "/tmp/bar"},
 		{"empty", "", ""},
 	}

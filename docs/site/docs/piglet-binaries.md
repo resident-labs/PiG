@@ -104,13 +104,25 @@ NAME      SCOPE  SOURCE                                BINARY       IMAGE  DESCR
 reviewer  user   /home/you/.pig/piglets/reviewer.yaml  linux/amd64  -      Reviews a change and lists risks.
 ```
 
-Run it like `pig`, with no `--piglet` option, because the Piglet is built in. Checked with a test model, the provider request carried the Piglet's own system prompt text and only the tools the Piglet allows (`read`, and `codemode` because an MCP server was configured on that machine):
+Run it like `pig`, with no `--piglet` option, because the Piglet is built in (a Binary accepts `--piglet` as an [overlay](#accept-overlay-piglets) unless it is built with `build.closed: true`). Checked with a test model, the provider request carried the Piglet's own system prompt text and only the tools the Piglet allows (`read`, and `codemode` because an MCP server was configured on that machine):
 
 ```bash
 ./pig-reviewer -p "Review the last commit"
 ```
 
 Copy the file to another computer of the same operating system and architecture and it runs there with no PiG installed. It still needs a model and credentials on that computer.
+
+### Static linking
+
+A Binary is statically linked when nothing in it uses cgo, so on Linux it needs no libc and runs in an empty container. The builder chooses `CGO_ENABLED=0` for the Go build unless one of these holds:
+
+- you set `CGO_ENABLED` in the environment or with `go env -w CGO_ENABLED=...`; your value is used unchanged;
+- a package the Binary builds has cgo sources (a fused Go member or one of its dependencies imports `"C"`); the Go default stays, which links dynamically where cgo is on;
+- the target is Android outside arm64, where the Go linker requires cgo.
+
+Standard-library cgo files, such as those of `net` and `os/user`, do not count: they have pure-Go fallbacks that the static build selects. The choice is not stored in the build or provenance records, which do not carry the build environment.
+
+To confirm, run `file ./pig-reviewer` (a static Linux Binary reports `statically linked`) or `ldd ./pig-reviewer` (`not a dynamic executable`).
 
 ## Sign a Binary
 
@@ -336,7 +348,7 @@ A normal Piglet Binary can start exact subprocess components when its plan permi
 Advantages:
 
 - process failure isolation;
-- support for Go, Rust, Python, Node, and native programs;
+- support for Go, Rust, Python, Lisp, Node, and native programs;
 - independent heartbeat and cancellation handling;
 - easier source development and reload.
 
@@ -367,6 +379,14 @@ Hint: Start without extensions using "pig -ne".
 ```
 
 A Piglet that strips `node-extensions` cannot carry a Node extension. The build stops with the conflict described in [Stripped built-ins](#stripped-built-ins).
+
+### Common Lisp extensions
+
+A Piglet Binary can carry Common Lisp extensions. The build builds each packed Lisp cell (the Lisp factories that share one image) into an executable SBCL image through the same cache that Stock PiG uses, and embeds the image in the Binary. The build needs an SBCL executable, as Stock PiG needs one to build the image: the path in `PIG_SBCL` when that variable is set, otherwise `sbcl` (`sbcl.exe` on Windows) on its `PATH`. PiG's own builds and tests use SBCL 2.6.9; the build does not check the version. A build without SBCL fails; it does not leave the cell to be built at run time. A Piglet whose only extensions are Lisp extensions builds: the embedded cell is what the Binary carries.
+
+The Binary needs no SBCL. The image holds the SBCL runtime, the Lisp SDK and the compiled members. At startup the Binary extracts the image under the PiG configuration directory and starts it through the packed-cell path that Stock PiG uses for the same extensions, so each member registers the same tools, commands and hooks as it does there. The component plan records a Lisp extension as a subprocess component with binary materialization, and the startup check refuses a Binary whose embedded cells name a different set of extensions than the plan.
+
+The image is built for the builder's own target. A Lisp extension has no cross-target build: for another target the plan reports it as host-reliant.
 
 ## External components
 
@@ -429,7 +449,7 @@ A selector or dialog that takes the editor's place, such as `/model`, `/resume`,
 
 The first frame also names the session file, the file the session persists to, or none for a session that is not persisted (`--no-session`). A later frame names it again only when it changes, such as after `/new`, `/resume`, `/fork` or `/clone`. A frontend can pass it on, for example to let another program read the conversation.
 
-A session is also the terminal that PiG's interactive mode reports its program status to: working while a run or compaction goes on, blocked while a dialog or a login waits for the user, then done, error or idle (the OSC 7501 Program Status Protocol of Pi 1.4.0). A session that implements `frontend.ProgramStatusSession` receives each change through `ProgramStatus` as the report Pi writes to a supporting terminal, including the report that clears the status. PiG calls it on its owner loop in the order the status changed, so it must return without blocking. It clears the status before `Suspend` and `Close` and reports the latest one again after `Resume`. A session without the method receives nothing. Either way, while a session may draw, PiG writes neither the OSC 7501 support query nor a report to the terminal itself.
+A session is also the terminal that PiG's interactive mode reports its program status to: working while a run or compaction goes on, blocked while a dialog or a login waits for the user, then done, error or idle (the OSC 7501 Program Status Protocol of Pi 1.5.0). A session that implements `frontend.ProgramStatusSession` receives each change through `ProgramStatus` as the report Pi writes to a supporting terminal, including the report that clears the status. PiG calls it on its owner loop in the order the status changed, so it must return without blocking. It clears the status before `Suspend` and `Close` and reports the latest one again after `Resume`. A session without the method receives nothing. Either way, while a session may draw, PiG writes neither the OSC 7501 support query nor a report to the terminal itself.
 
 When a session asks to fall back, or fails to draw a frame, PiG closes it, repaints with its configured terminal renderer and shows a warning. While a session draws, PiG refuses to switch the TUI mode. `--print`, JSON and RPC modes never consult the member.
 
@@ -446,6 +466,89 @@ The Binary record lists each stripped ID with its kind and disposition in its `s
 A keep-mode list ([Piglets](piglets.md#keep-mode)) reaches the Binary expanded: the build compiles out every built-in of that list the Piglet does not keep, and the `strip` field lists each one. The record states the intent too: `stripKeep` lists each keep-mode list with the IDs it keeps (`[{"kind": "extension", "ids": []}]`), and `pig piglet show` prints it above the expanded rows (`extensions  keep([])`). A deny-mode Piglet has no `stripKeep` field. The baked Piglet keeps the keep lists, not their expansion, and the Binary expands them again at startup against its own table, which is the table it was built from.
 
 Every Binary record also keeps `stripTable`, the strip table of the PiG that built it, one list of IDs per kind. A later PiG compares its own table with it and prints the [strip delta report](piglets.md#strip-delta-report) on `pig piglet build` and `pig piglet show`: the new built-ins a keep-mode list leaves out and the ones a deny-mode list now includes.
+
+## Accept overlay Piglets
+
+A Piglet Binary behaves as stock PiG started with its built-in Piglet (D202). It accepts `--piglet`, `PIG_PIGLET_PATH` and `PIG_PIGLET_NAME`, and it takes the selected Piglet as an overlay on its own Piglet. It also accepts `--system-prompt`, and it discovers ambient extensions and skills as its effective Piglet's `discovery` says.
+
+An organization can close a Binary. Set `build.closed: true` in the Piglet you build:
+
+```yaml
+name: pig-base
+build:
+  closed: true
+strip:
+  extensions: [mcp]
+```
+
+The default is `false`, so a Binary is open. A closed Binary runs only its built-in Piglet. It refuses the overlay selectors and `--system-prompt`, and it discovers no ambient extensions or skills. A Binary built with 0.5.3 behaved this way, so `build.closed: true` keeps the 0.5.3 behavior. Like all of `build`, the setting belongs to the Piglet you build: a Piglet that `extends` a base with `build.closed: true` does not inherit it. The builder keeps the setting in the Piglet it bakes, so it is part of the digest the Binary's record and signed manifest name. A signed Binary whose setting was changed refuses to start, and `pig piglet verify <binary> --source <piglet.yaml>` fails when the source flips it. `pig piglet show` in a Binary session says whether the Binary is open or closed.
+
+A closed Binary also runs only the extensions and MCP servers its signed closure lists. It refuses `-e`/`--extension` (a path, `npm:` or `git:` source), `pig install`, `pig remove` and `pig update --extensions` (also `--all`, `--extension <source>` and a package source), and `pig mcp add`; each prints one message that names the refused option, the Binary and `build.closed`, and exits 1. It ignores `settings.extensions` entries and the servers of the user and project `mcp.json` and says so in a notice. `pig update` for pig itself and `--models` still work, and servers that an extension in the closure registers still start. An open Binary accepts all of them, as stock PiG does.
+
+An open Binary takes the same selectors stock PiG does and resolves them the same way, with the same project trust, user and system Piglet directories, and Package install flow (lifecycle scripts stay off unless you allow them):
+
+```bash
+./pig-base --piglet ./extra.yaml
+PIG_PIGLET_PATH=./extra.yaml ./pig-base
+```
+
+The overlay is an ordinary Piglet file with its own `name`; its own `extends` chain works as usual. The Binary keeps its name for `/piglet` and for strip messages, and `/piglet` also prints `Overlay of: <Binary>`. A Binary starts exactly as before when you select no Piglet: it installs nothing and resolves nothing.
+
+An overlay merges onto the Binary's Piglet exactly as an `extends` child merges onto its base, so an open Binary behaves like stock pig started with a different Piglet.
+
+- `systemPrompt` replaces the Binary's prompt. `--system-prompt` is accepted with stock precedence (the flag wins over the Piglet's prompt); a closed Binary refuses it and names `build.closed`.
+- `extends.remove` removes Binary members: `extensions`, `skills`, `packages`, `slots: [frontend]` (the Binary then starts without its compiled-in frontend) and `strip` entries.
+- `extends.allowWiden: true` allows what widens the Binary's ceilings: `tools`, `discovery`, `agentEnv`, an extension's `tools`, and removing a strip entry. Without it resolution fails with `capability widening [...] requires extends.allowWiden: true`, as for any `extends` child.
+- An `extends` block with no `source` extends the Binary itself. It carries only `remove`, `allowWiden` and nothing else; a Piglet file with such a block resolves only as an overlay on an open Piglet Binary, and stock pig refuses it by name.
+
+```yaml
+name: tern-lite
+systemPrompt:
+  text: You answer in one paragraph.
+extends:
+  allowWiden: true
+  remove:
+    slots: [frontend]
+    extensions: [codegraph]
+    strip:
+      tools: [bash]
+```
+
+A name in `extends.remove` must exist in the Binary. Naming a member the Binary does not have fails with `remove.extensions: "codegraph" is absent`. The `tern-lite` overlay above needs a Binary that has an extension named `codegraph`.
+
+To test an overlay, start the Binary with the overlay as its Piglet, for example `./pig-base --piglet ./tern-lite.yaml`. Stock `pig piglet validate` rejects an overlay file by design, because an `extends` block without a `source` has no base to extend.
+
+Three things stay fixed, because they are compiled into the Binary. Each refusal names the field, the Binary and the reason:
+
+| The overlay | Why it is refused |
+|---|---|
+| sets `slots.frontend` (a new one, or another under the Binary's) | A frontend is Go code linked into the Binary. Removing the Binary's frontend with `extends.remove.slots: [frontend]` is allowed. |
+| removes a `strip` entry whose built-in a build tag compiled out: `strip.extensions` (`mcp`, `codemode` and the other built-in extensions), `strip.apis`, and the compile-out `strip.features` (`docs` is one) | The code is not in the executable. `pig piglet show` marks these `stripped(binary)`. |
+| names a fused or embedded extension again with `origins` | The Binary selects its own members by name and cannot build another at run time under that name. Remove it with `extends.remove.extensions` and add the new one under another name. |
+
+An overlay can undo runtime strips: `strip.tools`, `strip.commands` and the runtime-only features (`themes`, `skills`, `prompt-templates`), which `pig piglet show` marks `stripped(runtime)`. It cannot undo a `stripped(binary)` entry.
+
+An open Binary otherwise behaves as stock pig running the same Piglet: every CLI flag, environment variable, setting, Package and `pig install`, `-e` source, `/reload` and discovery of extensions, skills, prompts and themes was compared against `pig --piglet`. Ambient discovery follows the Piglet's `discovery` list, as it does for stock pig; a closed Binary discovers no ambient extensions or skills. These differences remain, each with its reason:
+
+| Difference from stock pig | Reason |
+|---|---|
+| The compiled-in frontend, fused extensions and prebuilt cells start from the executable, not from source: no build, no `cells/go` or toolchain cache files. | They are linked into the Binary. |
+| `strip` entries marked `stripped(binary)` stay off, and `pig mcp` or `pig docs` say they are stripped. | A build tag removed the code. |
+| `pig update` refuses with the immutable-Binary message when the Piglet sets `release.version`. | The Binary's release owns its updates. |
+| `pig version` and `pig diagnose` report the Binary's build identity. | The artifact is built by `pig piglet build`, not stamped from the PiG checkout. |
+| A baked skill or fused extension has no file, so its location in `/skill:` blocks, `get_commands` and `sourceInfo` is `builtin:piglet` or the extension name. | Nothing exists on disk to point at. |
+| `/piglet` prints the Binary's name, and `Overlay of: <Binary>` when an overlay is selected. | Stock pig has no Binary. |
+| A standalone overlay file inherits the Binary's members; stock `--piglet` starts from nothing. `PIG_PIGLET_NAME` and `PIG_PIGLET_PATH` select the overlay without `--piglet`, as they select the Piglet for stock pig. | The Binary's Piglet is the base the overlay extends. |
+| An overlay load error names the overlay and the Binary: `overlay <path> on Piglet Binary "<name>": ...`. | The Binary is the base of the derivation. |
+| `pig login`, `pig mcp` and the other subcommands run before any overlay is resolved and see the Binary's Piglet. | Subcommands never read `--piglet`, on stock pig either. |
+
+A closed Binary refuses the selector and names itself and `build.closed`:
+
+```text
+pig: this Piglet Binary (pig-base) was built with build.closed: true, so it runs only its built-in Piglet and does not accept --piglet overlays (nor PIG_PIGLET_PATH or PIG_PIGLET_NAME); rebuild its Piglet without build.closed to accept them, or run the Piglet with stock pig (pig --piglet <name|path>)
+```
+
+Accepting overlays changes neither the Binary's verification nor its update ownership: it still verifies its signature, Piglet and component closure before anything else, and `pig update` still refuses to modify an immutable Binary. The overlay is input you supplied, outside that closure. An open Binary that you ship to others runs whatever Piglet its user selects, within the rules above. Build it with `build.closed: true` when it must not.
 
 ## Startup verification
 

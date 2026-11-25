@@ -131,6 +131,7 @@ func allHarnessCases() []harnessCase {
 		{name: "subprocess-node-packed", make: makeSubprocessNodePackedHarness, extName: "node-sdk-fixture"},
 		{name: "subprocess-rust", make: makeSubprocessRustHarness, extName: "rust-sdk-fixture"},
 		{name: "subprocess-python", make: makeSubprocessPythonHarness, extName: "python-sdk-fixture"},
+		{name: "subprocess-lisp", make: makeSubprocessLispHarness, extName: lispFixtureName},
 		{name: "fused-go", make: makeFusedGoHarness, extName: "sdk-fixture"},
 	}
 }
@@ -140,12 +141,12 @@ func sdkHarnessCases() []harnessCase {
 	return cases[1:]
 }
 
-// packedSDKHarnessCases are the Go, Rust and Python SDKs loaded into one shared runtime cell beside a peer extension, through the production
+// packedSDKHarnessCases are the Go, Rust, Python and Lisp SDKs loaded into one shared runtime cell beside a peer extension, through the production
 // factory builder. Node's packed case is in allHarnessCases.
 func packedSDKHarnessCases() []harnessCase {
 	var cases []harnessCase
-	for _, language := range []string{"go", "rust", "python"} {
-		extName := map[string]string{"go": "sdk-fixture", "rust": "rust-sdk-fixture", "python": "python-sdk-fixture"}[language]
+	for _, language := range []string{"go", "rust", "python", "lisp"} {
+		extName := map[string]string{"go": "sdk-fixture", "rust": "rust-sdk-fixture", "python": "python-sdk-fixture", "lisp": lispFixtureName}[language]
 		cases = append(cases, harnessCase{name: "subprocess-" + language + "-packed", extName: extName, make: func(t *testing.T) *harness { return makePackedUIHarness(t, language) }})
 	}
 	return cases
@@ -175,82 +176,86 @@ func TestConformance_TransportsMatch(t *testing.T) {
 
 	cases := allHarnessCases()
 
-	var baseline recording
-	var baselineName string
+	// record is one row's work: the row's harness, its recording and the checks every row passes.
+	record := func(t *testing.T, tc harnessCase) recording {
+		t.Helper()
+		h := tc.make(t)
+		defer func() {
+			if h.cleanup != nil {
+				h.cleanup()
+			}
+			if h.host != nil {
+				h.host.Shutdown("test done")
+			}
+		}()
+		got := captureRecording(t, h)
+		// Pi hands extensions the collection-complete options (system-prompt.ts:37-64): every empty collection is present. An SDK or host that drops empty collections reports "absent".
+		const wantShape = "spo_shape=selectedTools:array:2,toolSnippets:object:0,toolGuidelines:object:1,promptGuidelines:array:0,appendSystemPrompt:string:0,sections:object:0,contextFiles:array:0,skills:array:1"
+		if !strings.Contains(got.ContextProbe, wantShape) {
+			t.Fatalf("%s: context probe = %q, want it to contain %q", tc.name, got.ContextProbe, wantShape)
+		}
+		// packages/coding-agent/src/core/extensions/types.ts:1692-1715 (ExtensionAPI.sendMessage, sendUserMessage, appendEntry, setSessionName): each
+		// call reaches the host with the arguments the extension passed, in every SDK, not only the same as the baseline transport's recording.
+		for _, wantAction := range []string{
+			"sendMessage:notice:hello-custom:steer:true",
+			"sendMessage:notice:default:unset:unset",
+			"sendMessage:notice:no-turn:unset:false",
+			"sendUserMessage:hello-user:followUp",
+			"setSessionName:conformance-session",
+			"appendEntry:conformance-entry:hello-entry",
+		} {
+			if !slices.Contains(got.ActionCalls, wantAction) {
+				t.Errorf("%s: host action %q was not recorded; got %v", tc.name, wantAction, got.ActionCalls)
+			}
+		}
+		// packages/coding-agent/src/core/extensions/types.ts:1676-1682 (ExtensionAPI.registerMessageRenderer, registerEntryRenderer): the renderer an extension
+		// registers for a custom type draws the host's message and entry at width 72 in every SDK.
+		if want := []string{"renderer:hello:expanded=true:width=72"}; !slices.Equal(got.MessageRenderer, want) {
+			t.Errorf("%s: registerMessageRenderer lines = %q, want %q", tc.name, got.MessageRenderer, want)
+		}
+		if want := []string{"entryrenderer:hi-entry:expanded=true:width=72"}; !slices.Equal(got.EntryRenderer, want) {
+			t.Errorf("%s: registerEntryRenderer lines = %q, want %q", tc.name, got.EntryRenderer, want)
+		}
+		// packages/coding-agent/src/core/extensions/types.ts:735-789 (pi.on session_start, session_shutdown, session_info_changed, session_before_compact,
+		// session_compact, session_compact_failed) and :680 (pi.on project_trust), :994 (pi.on agent_before_settle), :1006-1014 (pi.on ui_prompt_start, ui_prompt_end):
+		// each SDK's handler receives the event the host emitted with its payload fields, so the recording is the literal below and not only the baseline's.
+		wantSessionEvents := []string{
+			"session_start:startup:info", "session_shutdown:quit:info", "session_info_changed:conformance-session:info",
+			"session_before_compact:threshold:true:info", "session_compact:threshold:true:true:info",
+			"session_compact_failed:overflow:recovery failed:false:false:true:info", "turn_end:assistant-entry:tool-entry:info",
+		}
+		if !slices.Equal(got.SessionEventNotify, wantSessionEvents) {
+			t.Errorf("%s: session events = %q, want %q", tc.name, got.SessionEventNotify, wantSessionEvents)
+		}
+		if !strings.HasPrefix(got.AgentBeforeSettle, "agent_before_settle:completed:") {
+			t.Errorf("%s: agent_before_settle = %q", tc.name, got.AgentBeforeSettle)
+		}
+		if got.ProjectTrustDecision != "yes" {
+			t.Errorf("%s: project_trust decision = %q, want yes", tc.name, got.ProjectTrustDecision)
+		}
+		for _, promptEvent := range []string{"ui_prompt:ui_prompt_start:ui_prompt:select:Pick:info", "ui_prompt:ui_prompt_end:ui_prompt:select:Pick:info"} {
+			if !slices.Contains(got.UIPromptEvents, promptEvent) {
+				t.Errorf("%s: ui_prompt events lack %q: %q", tc.name, promptEvent, got.UIPromptEvents)
+			}
+		}
+		return got
+	}
+
+	// The first row is the reference. It records it, and so does the first later row when -run leaves it out.
+	baseline := referenceRow[recording]{name: cases[0].name}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h := tc.make(t)
-			t.Cleanup(func() {
-				if h.cleanup != nil {
-					h.cleanup()
-				}
-				if h.host != nil {
-					h.host.Shutdown("test done")
-				}
-			})
-			got := captureRecording(t, h)
-			// Pi hands extensions the collection-complete options (system-prompt.ts:37-64): every empty collection is present. An SDK or host that drops empty collections reports "absent".
-			const wantShape = "spo_shape=selectedTools:array:2,toolSnippets:object:0,toolGuidelines:object:1,promptGuidelines:array:0,appendSystemPrompt:string:0,sections:object:0,contextFiles:array:0,skills:array:1"
-			if !strings.Contains(got.ContextProbe, wantShape) {
-				t.Fatalf("%s: context probe = %q, want it to contain %q", tc.name, got.ContextProbe, wantShape)
-			}
-			// packages/coding-agent/src/core/extensions/types.ts:1692-1715 (ExtensionAPI.sendMessage, sendUserMessage, appendEntry, setSessionName): each
-			// call reaches the host with the arguments the extension passed, in every SDK, not only the same as the baseline transport's recording.
-			for _, wantAction := range []string{
-				"sendMessage:notice:hello-custom:steer:true",
-				"sendMessage:notice:default:unset:unset",
-				"sendMessage:notice:no-turn:unset:false",
-				"sendUserMessage:hello-user:followUp",
-				"setSessionName:conformance-session",
-				"appendEntry:conformance-entry:hello-entry",
-			} {
-				if !slices.Contains(got.ActionCalls, wantAction) {
-					t.Errorf("%s: host action %q was not recorded; got %v", tc.name, wantAction, got.ActionCalls)
-				}
-			}
-			// packages/coding-agent/src/core/extensions/types.ts:1676-1682 (ExtensionAPI.registerMessageRenderer, registerEntryRenderer): the renderer an extension
-			// registers for a custom type draws the host's message and entry at width 72 in every SDK.
-			if want := []string{"renderer:hello:expanded=true:width=72"}; !slices.Equal(got.MessageRenderer, want) {
-				t.Errorf("%s: registerMessageRenderer lines = %q, want %q", tc.name, got.MessageRenderer, want)
-			}
-			if want := []string{"entryrenderer:hi-entry:expanded=true:width=72"}; !slices.Equal(got.EntryRenderer, want) {
-				t.Errorf("%s: registerEntryRenderer lines = %q, want %q", tc.name, got.EntryRenderer, want)
-			}
-			// packages/coding-agent/src/core/extensions/types.ts:735-789 (pi.on session_start, session_shutdown, session_info_changed, session_before_compact,
-			// session_compact, session_compact_failed) and :680 (pi.on project_trust), :994 (pi.on agent_before_settle), :1006-1014 (pi.on ui_prompt_start, ui_prompt_end):
-			// each SDK's handler receives the event the host emitted with its payload fields, so the recording is the literal below and not only the baseline's.
-			wantSessionEvents := []string{
-				"session_start:startup:info", "session_shutdown:quit:info", "session_info_changed:conformance-session:info",
-				"session_before_compact:threshold:true:info", "session_compact:threshold:true:true:info",
-				"session_compact_failed:overflow:recovery failed:false:false:true:info", "turn_end:assistant-entry:tool-entry:info",
-			}
-			if !slices.Equal(got.SessionEventNotify, wantSessionEvents) {
-				t.Errorf("%s: session events = %q, want %q", tc.name, got.SessionEventNotify, wantSessionEvents)
-			}
-			if !strings.HasPrefix(got.AgentBeforeSettle, "agent_before_settle:completed:") {
-				t.Errorf("%s: agent_before_settle = %q", tc.name, got.AgentBeforeSettle)
-			}
-			if got.ProjectTrustDecision != "yes" {
-				t.Errorf("%s: project_trust decision = %q, want yes", tc.name, got.ProjectTrustDecision)
-			}
-			for _, promptEvent := range []string{"ui_prompt:ui_prompt_start:ui_prompt:select:Pick:info", "ui_prompt:ui_prompt_end:ui_prompt:select:Pick:info"} {
-				if !slices.Contains(got.UIPromptEvents, promptEvent) {
-					t.Errorf("%s: ui_prompt events lack %q: %q", tc.name, promptEvent, got.UIPromptEvents)
-				}
-			}
 			if i == 0 {
-				baseline = got
-				baselineName = tc.name
+				baseline.set(t, record(t, tc))
 				return
 			}
-			if baselineName == "" {
-				t.Skip("baseline subtest was filtered out by -run; run the full suite")
-			}
-			if !reflect.DeepEqual(got, baseline) {
+			want := baseline.get(t, func() recording { return record(t, cases[0]) })
+			got := record(t, tc)
+			if !reflect.DeepEqual(got, want) {
 				gb, _ := json.MarshalIndent(got, "", "  ")
-				wb, _ := json.MarshalIndent(baseline, "", "  ")
+				wb, _ := json.MarshalIndent(want, "", "  ")
 				t.Fatalf("transport %q diverged from %q baseline\n--- baseline (%s) ---\n%s\n--- got (%s) ---\n%s",
-					tc.name, baselineName, baselineName, wb, tc.name, gb)
+					tc.name, cases[0].name, cases[0].name, wb, tc.name, gb)
 			}
 		})
 	}
@@ -492,9 +497,10 @@ func TestModelEventPayloadsMatchAcrossSDKs(t *testing.T) {
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
+			h := test.make(t)
+			// The deadline starts after make: a harness may first build its fixture, which can outlast it, and an emit under an expired context delivers nothing yet reports no error.
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			h := test.make(t)
 			t.Cleanup(func() {
 				if h.cleanup != nil {
 					h.cleanup()
@@ -513,6 +519,9 @@ func TestModelEventPayloadsMatchAcrossSDKs(t *testing.T) {
 				if _, err := h.runner.Emit(ctx, event); err != nil {
 					t.Fatalf("emit %T: %v", event, err)
 				}
+			}
+			if err := ctx.Err(); err != nil {
+				t.Fatalf("the emit context ended before every event was delivered: %v", err)
 			}
 			waitFor(t, func() bool { return len(h.ui.Recorded()) >= len(want) })
 			if got := h.ui.Recorded(); !reflect.DeepEqual(got, want) {
@@ -1199,6 +1208,11 @@ func makeInprocFixture(ui extension.UIContext, actions *[]string) extension.Exte
 		Path:         "inproc-conformance-fixture",
 		ResolvedPath: "inproc-conformance-fixture",
 		MessageRenderers: map[string]extension.MessageRenderer{
+			// Test fixture, Pi 9376c8d1 (#4748): KeyText and KeyHint on the message options. The content is the keybinding id.
+			"keyhints-message": func(message extension.CustomMessage, options extension.MessageRenderOptions, _ extension.Theme) extension.Component {
+				id, _ := message.Content.(string)
+				return &conformanceLinesComponent{lines: []string{options.KeyText(id) + " | " + options.KeyHint(id, "to expand")}}
+			},
 			"conformance-message": func(message extension.CustomMessage, options extension.MessageRenderOptions, _ extension.Theme) extension.Component {
 				custom := message
 				if custom.Content == "padding-options" {
@@ -1209,6 +1223,11 @@ func makeInprocFixture(ui extension.UIContext, actions *[]string) extension.Exte
 			},
 		},
 		EntryRenderers: map[string]extension.EntryRenderer{
+			// Test fixture, Pi 9376c8d1 (#4748): KeyText and KeyHint on the entry options. The data is the keybinding id.
+			"keyhints-entry": func(entry extension.CustomEntry, options extension.EntryRenderOptions, _ extension.Theme) extension.Component {
+				id, _ := entry.Data.(string)
+				return &conformanceLinesComponent{lines: []string{options.KeyText(id) + " | " + options.KeyHint(id, "to expand")}}
+			},
 			"conformance-entry": func(entry extension.CustomEntry, options extension.EntryRenderOptions, _ extension.Theme) extension.Component {
 				return &conformanceLinesComponent{lines: []string{fmt.Sprintf("entryrenderer:%v:expanded=%t:width=72", entry.Data, options.Expanded)}}
 			},
@@ -1227,6 +1246,13 @@ func makeInprocFixture(ui extension.UIContext, actions *[]string) extension.Exte
 			switch tool {
 			case "conformance_tool_renderer":
 				return &extension.ToolRenderers{RenderCall: line("resolved")}
+			case "conformance_keyhints":
+				return &extension.ToolRenderers{RenderCall: func(args json.RawMessage, _ extension.Theme, render extension.ToolRenderContext) extension.Component {
+					var parsed map[string]any
+					_ = json.Unmarshal(args, &parsed)
+					id, _ := parsed["q"].(string)
+					return &conformanceLinesComponent{lines: []string{render.KeyText(id) + " | " + render.KeyHint(id, "to expand")}}
+				}}
 			case "conformance_no_renderer":
 				return nil
 			case "conformance_fill":
@@ -1420,6 +1446,39 @@ func makeInprocFixture(ui extension.UIContext, actions *[]string) extension.Exte
 						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "echo: " + input.Text}}},
 
 							nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"type-schema-tool": {
+				Definition: extension.ToolDefinition{
+					Name:        "type-schema-tool",
+					Description: "Parameters built with Type",
+					Parameters:  typeSchemaToolParameters(),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "ok"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"type-engine-tool": {
+				Definition: extension.ToolDefinition{
+					Name:        "type-engine-tool",
+					Description: "Parameters built with the engine members of Type",
+					Parameters:  typeEngineToolParameters(),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "ok"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"refine-probe": {
+				Definition: extension.ToolDefinition{
+					Name:        "refine-probe",
+					Description: "Arguments checked by refinements",
+					Parameters:  refineProbeParameters(),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "ok"}}}, nil
 					},
 				},
 				Source: inprocFixtureName,
@@ -1906,6 +1965,11 @@ func makeInprocFixture(ui extension.UIContext, actions *[]string) extension.Exte
 			// The in-process reference for exec_abort_test.go's SDK rows: the host's own ExecCommand under a cancelled context, which that test runs itself.
 			"exec-abort-probe": {
 				Name: "exec-abort-probe", Description: "Abort a running exec through its signal",
+				Handler: func(context.Context, string) error { return nil },
+			},
+			// The in-process reference for exec_limits_test.go's SDK rows: the host's own ExecCommand, which that test runs itself.
+			"exec-limits-probe": {
+				Name: "exec-limits-probe", Description: "Exec with a maxBuffer",
 				Handler: func(context.Context, string) error { return nil },
 			},
 			"exec-reject-probe": {
@@ -3278,7 +3342,7 @@ func buildSDKFixture(t *testing.T) string {
 		}
 		return p
 	}
-	binPath, err := sdkFixtureBinary()
+	binPath, err := sdkFixtureBinary.Do(t, buildSDKFixtureBinary)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3305,7 +3369,7 @@ func buildRustSDKFixture(t *testing.T) string {
 		}
 		return p
 	}
-	binPath, err := rustFixtureBinary()
+	binPath, err := rustFixtureBinary.Do(t, buildRustFixtureBinary)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3505,7 +3569,7 @@ func testPythonExecutable() string {
 	return toolchain.PythonExecutable(runtime.GOOS, exec.LookPath)
 }
 
-func findModuleRoot(t *testing.T) string {
+func findModuleRoot(t testing.TB) string {
 	t.Helper()
 	dir, err := os.Getwd()
 	if err != nil {
@@ -3587,7 +3651,7 @@ func TestConformance_TerminalInput(t *testing.T) {
 	t.Parallel()
 
 	cases := allHarnessCases()
-	for _, language := range []string{"go", "rust", "python"} {
+	for _, language := range []string{"go", "rust", "python", "lisp"} {
 		cases = append(cases, harnessCase{name: "packed-" + language, make: func(t *testing.T) *harness { return makePackedUIHarness(t, language) }})
 	}
 

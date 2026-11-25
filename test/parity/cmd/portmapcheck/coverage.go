@@ -98,8 +98,8 @@ func (d *digester) goFiles(dir string) []string {
 	return files
 }
 
-// of hashes the cited Go files, every Go file of the packages that hold the evidence tests, the tests, and for a marker row the
-// mutants it must kill (a killed mutant is part of the record).
+// of hashes the cited Go files, every Go file of the packages that hold the evidence tests, the tests, the files the row's coverage
+// record must show executed, and for a marker row the mutants it must kill (a killed mutant is part of the record).
 func (d *digester) of(res result, mutants []mutant) string {
 	h := sha256.New()
 	h.Write([]byte(digestSalt + "\x00"))
@@ -116,6 +116,11 @@ func (d *digester) of(res result, mutants []mutant) string {
 	}
 	for _, t := range res.Tests {
 		h.Write([]byte(t + "\x00"))
+	}
+	// The files a record must show covered: rows of one package that name the same tests but map different cited files (every
+	// providers/*.models.ts row of ai) must not share a record that holds the coverage of only one of them.
+	for _, f := range coverageFiles(res) {
+		h.Write([]byte("covers\x00" + f + "\x00"))
 	}
 	if res.Marker {
 		b, _ := json.Marshal(mutants)
@@ -206,6 +211,7 @@ func evidenceEnv(scratch string) []string {
 	env := make([]string, 0, len(os.Environ())+len(agentDirVariables)+2)
 	for _, name := range []string{"GOCACHE", "GOMODCACHE"} {
 		if os.Getenv(name) == "" {
+			//nolint:gosec // G204 (class a): program is literal go; name iterates the literal {GOCACHE,GOMODCACHE} list.
 			if out, err := exec.Command("go", "env", name).Output(); err == nil {
 				env = append(env, name+"="+strings.TrimSpace(string(out)))
 			}
@@ -230,7 +236,36 @@ func evidenceEnv(scratch string) []string {
 	return env
 }
 
-// lastLines is the tail of a failed evidence run, so the check names why it failed instead of only that it did.
+// failureReport says why a failed evidence run failed: every line that names a failing test or a crash, then the tail of the output, where
+// a failing test's own message often is not (a test that prints a large value ends the run with that value). The full output is kept in a
+// file under build/portmap-failures, named in the report.
+func failureReport(root, dir string, out []byte) string {
+	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	var named []string
+	for _, line := range lines {
+		text := strings.TrimSpace(line)
+		if strings.HasPrefix(text, "--- FAIL") || strings.HasPrefix(text, "panic:") || strings.HasPrefix(text, "fatal error:") || strings.HasPrefix(text, "FAIL") {
+			named = append(named, line)
+		}
+	}
+	tail := lines
+	if len(tail) > 40 {
+		tail = tail[len(tail)-40:]
+	}
+	report := "failing tests and crashes:\n" + strings.Join(named, "\n") + "\nlast lines:\n" + strings.Join(tail, "\n")
+	failures := filepath.Join(root, "build", "portmap-failures")
+	if err := os.MkdirAll(failures, 0o755); err == nil {
+		if file, err := os.CreateTemp(failures, strings.ReplaceAll(dir, "/", "_")+"-*.log"); err == nil {
+			_, written := file.Write(out)
+			if closed := file.Close(); written == nil && closed == nil {
+				report += "\nfull output: " + file.Name()
+			}
+		}
+	}
+	return report
+}
+
+// lastLines is the tail of a failed build, so the check names why it failed instead of only that it did.
 func lastLines(out []byte, n int) string {
 	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
 	if len(lines) > n {

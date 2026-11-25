@@ -103,6 +103,20 @@ func (c *fusedHostConn) Close() error {
 	return c.Conn.Close()
 }
 
+// encodeReadFrame is the length-prefixed frame Read hands out: the host's frame with args spliced in where the encoder left its placeholder, or
+// shell alone when the frame has no split args. length is the frame's size without the prefix.
+func encodeReadFrame(shell, args []byte, suffixLen, length int) []byte {
+	frame := make([]byte, 4, 4+length)
+	if args == nil {
+		frame = append(frame, shell...)
+	} else {
+		at := len(shell) - suffixLen
+		frame = append(append(append(frame, shell[:at-len(argsPlaceholder)]...), args...), shell[at:]...)
+	}
+	binary.BigEndian.PutUint32(frame, uint32(length))
+	return frame
+}
+
 // Read reads the host's frames as the byte stream a socket carries, length prefix and all, for a peer that does not read by parts. A peer reads one way or the other: ReadFrameParts never sees the rest of a frame Read began.
 func (c *fusedExtConn) Read(b []byte) (int, error) {
 	if len(c.pending) == 0 {
@@ -110,15 +124,18 @@ func (c *fusedExtConn) Read(b []byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		frame := make([]byte, 4, 4+len(shell)+len(args))
-		if args == nil {
-			frame = append(frame, shell...)
-		} else {
-			at := len(shell) - c.suffixLen
-			frame = append(append(append(frame, shell[:at-len(argsPlaceholder)]...), args...), shell[at:]...)
+		// The host encodes no frame over MaxFrameSize (encodeEnvelope), and a reader of this stream rejects one as every SDK reader does. Each part is bounded before the parts are added up, so the size never overflows.
+		if len(shell) > MaxFrameSize || len(args) > MaxFrameSize {
+			return 0, &FrameTooLargeError{Size: max(len(shell), len(args)), Max: MaxFrameSize}
 		}
-		binary.BigEndian.PutUint32(frame, uint32(len(frame)-4))
-		c.pending = frame
+		length := len(shell) + len(args)
+		if args != nil {
+			length -= len(argsPlaceholder)
+		}
+		if length > MaxFrameSize {
+			return 0, &FrameTooLargeError{Size: length, Max: MaxFrameSize}
+		}
+		c.pending = encodeReadFrame(shell, args, c.suffixLen, length)
 	}
 	n := copy(b, c.pending)
 	c.pending = c.pending[n:]

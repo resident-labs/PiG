@@ -5,7 +5,9 @@ set -euo pipefail
 case "${1:-}" in
   go) bases=(go buildkit syft grype) ;;
   parity) bases=(go-builder wolfi buildkit syft grype) ;;
-  *) echo "usage: automation/ci/seed-ci-image-bases.sh <go|parity>" >&2; exit 2 ;;
+  # The published-image check builds nothing and scans nothing: it needs only the SBOM generator.
+  sbom) bases=(syft) ;;
+  *) echo "usage: automation/ci/seed-ci-image-bases.sh <go|parity|sbom>" >&2; exit 2 ;;
 esac
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -47,10 +49,9 @@ temporary="$(mktemp -d "${TMPDIR:-/tmp}/pig.XXXXXXXX")"
 trap 'rm -rf "$temporary"' EXIT
 crane_archive="$temporary/crane.tar.gz"
 crane="$temporary/crane"
-curl -fsSL \
-  https://github.com/google/go-containerregistry/releases/download/v0.20.6/go-containerregistry_Linux_x86_64.tar.gz \
-  -o "$crane_archive"
-echo 'c1d593d01551f2c9a3df5ca0a0be4385a839bd9b86d4a76e18d7b17d16559127  '"$crane_archive" | sha256sum -c - >/dev/null
+crane_asset=go-containerregistry_Linux_x86_64.tar.gz
+"$root/automation/ci/fetch-pinned.sh" c1d593d01551f2c9a3df5ca0a0be4385a839bd9b86d4a76e18d7b17d16559127 "$crane_archive" \
+  "https://github.com/google/go-containerregistry/releases/download/v0.20.6/$crane_asset"
 tar -xzf "$crane_archive" -C "$temporary" crane
 
 pull_context() {

@@ -60,13 +60,20 @@ func graphResolved(resources []icodingagent.ResolvedResource) []map[string]any {
 		if resource.Metadata.BaseDir != "" {
 			metadata["baseDir"] = resource.Metadata.BaseDir
 		}
+		if resource.Metadata.ChangelogPath != "" {
+			metadata["changelogPath"] = resource.Metadata.ChangelogPath
+		}
 		out = append(out, map[string]any{"path": resource.Path, "enabled": resource.Enabled, "metadata": metadata})
 	}
 	return out
 }
 
 func graphResolvedPaths(paths packagemanager.ResolvedPaths) map[string]any {
-	return map[string]any{"extensions": graphResolved(paths.Extensions), "skills": graphResolved(paths.Skills), "prompts": graphResolved(paths.Prompts), "themes": graphResolved(paths.Themes)}
+	failures := make([]any, 0, len(paths.InstallFailures))
+	for _, failure := range paths.InstallFailures {
+		failures = append(failures, map[string]any{"source": failure.Source, "scope": failure.Scope, "message": failure.Message})
+	}
+	return map[string]any{"extensions": graphResolved(paths.Extensions), "skills": graphResolved(paths.Skills), "prompts": graphResolved(paths.Prompts), "themes": graphResolved(paths.Themes), "installFailures": failures}
 }
 
 // Call runs a DefaultPackageManager method.

@@ -1,18 +1,27 @@
-// The watch declarations of pi-durable's types.ts (WatchEnd, WatchHandle, JsonObject), kept structural so the facade does not
-// import the package it replaces.
-import type { Context } from "@earendil-works/chord"
-import type { Op } from "@earendil-works/chord/delta"
+// The watch and observer declarations of pi-durable's types.ts (JsonObject, Observer, Observation), kept structural so the
+// facade does not import the package it replaces. The watch types themselves are Chord's.
+import type { Context, WatchCall, WatchEnd } from "@earendil-works/chord"
 
 export type JsonObject = { [key: string]: unknown }
 
-export type WatchEnd =
-  | { reason: "stopped" | "cancelled" | "session_closed" | "retired" }
-  | { reason: "listener_error"; error: Error }
-  | { reason: "session_failed"; error: unknown }
-
-export interface WatchHandle<T> {
-  readonly value: T
-  start(listener: (value: T, ops: readonly Op[], context: Context) => Promise<void>): void
-  stop(): Promise<WatchEnd>
-  readonly closed: Promise<WatchEnd>
+/** pi-durable's `Observer`: a synchronous observer of committed state, with the shapes of Chord's watch. `advance` only records the call; `end` is called once. */
+export type Observer<T> = {
+  advance(call: WatchCall<T>, context: Context): void
+  end(end: WatchEnd): void
 }
+
+/** An attached `Observer`: the value at attachment, and how to detach it. */
+export type Observation<T> = {
+  readonly value: T
+  /** Idempotent: no `advance` or `end` follows it. */
+  detach(): void
+}
+
+/** pi-durable's `CommitObserver`: a synchronous observer of stored commits (`Session.observeCommits()`): `advance` gets each publication, `end` the Session's close. */
+export type CommitObserver = {
+  advance(publication: unknown, context: Context): void
+  end(end: WatchEnd): void
+}
+
+/** An attached `CommitObserver`: how to detach it. Idempotent: no `advance` or `end` follows it. */
+export type CommitObservation = { detach(): void }

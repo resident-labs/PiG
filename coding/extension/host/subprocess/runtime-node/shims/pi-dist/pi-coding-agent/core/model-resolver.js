@@ -11,7 +11,7 @@ export const defaultModelPerProvider = {
     "amazon-bedrock": "us.anthropic.claude-opus-4-6-v1",
     "ant-ling": "Ring-2.6-1T",
     anthropic: "claude-opus-4-8",
-    openai: "gpt-5.5",
+    openai: "gpt-6.1-sol",
     azure: "gpt-5.4",
     "openai-codex": "gpt-6.1-sol",
     radius: "balanced",
@@ -58,15 +58,21 @@ function splitThinkingSuffix(text) {
     return { base: text.substring(0, colonIndex), thinkingLevel: suffix };
 }
 function splitProviderPrefix(text, models) {
-    const slashIndex = text.indexOf("/");
-    if (slashIndex === -1)
-        return undefined;
-    const prefix = text.substring(0, slashIndex).trim().toLowerCase();
-    const modelText = text.substring(slashIndex + 1).trim();
-    if (!prefix || !modelText)
-        return undefined;
-    const provider = models.find((model) => model.provider.toLowerCase() === prefix)?.provider;
-    return provider ? { provider, modelText } : undefined;
+    // Provider ids may contain "/" themselves (e.g. URL-derived ids), so match known ids, longest first
+    const lowerText = text.toLowerCase();
+    let best;
+    for (const { provider } of models) {
+        const prefix = provider.trim().toLowerCase();
+        if (!prefix || (best && best.provider.length >= provider.length))
+            continue;
+        const slashIndex = lowerText.indexOf("/", prefix.length);
+        if (slashIndex === -1 || lowerText.substring(0, slashIndex).trim() !== prefix)
+            continue;
+        const modelText = text.substring(slashIndex + 1).trim();
+        if (modelText)
+            best = { provider, modelText };
+    }
+    return best;
 }
 /**
  * `usable` only breaks ties between providers, so a unique match resolves even without credentials

@@ -30,8 +30,9 @@ const MAX_CACHED_OFFSCREEN_KITTY_DECODED_BYTES = 64 * 1024 * 1024;
 const DOUBLE_CLICK_INTERVAL_MS = 500;
 const COPY_ERROR_FLASH_DURATION_MS = 5000;
 // Regular mode delegates double-click selection to the terminal emulator. Fullscreen owns mouse selection,
-// so mirror common terminal word-selection behavior by keeping paths and kebab-case tokens whole.
-const TERMINAL_WORD_SELECTION_JOINERS = new Set(["/", "-"]);
+// so it uses iTerm2's default "characters considered part of a word" set:
+// https://github.com/gnachman/iTerm2/blob/7f4ff739721f95d0b93003d8701c4523a7edf261/sources/Settings/iTermPreferences.m#L743
+const TERMINAL_WORD_SELECTION_JOINERS = new Set(["/", "-", "+", "\\", "~", "_", "."]);
 import { wordSegmenter } from "../../pi-tui-segmenters.mjs";
 /** Alternate-screen TUI with a scrollable, application-owned viewport. */
 export class TuiAltScreen extends TuiBase {
@@ -473,7 +474,10 @@ export class TuiAltScreen extends TuiBase {
     flash(message, durationMs) {
         this.flashes.flash(message, durationMs);
     }
-    shouldDeferViewportInputToOverlay() {
+    /** Focused overlays and components that capture viewport input receive viewport keys instead of the transcript. */
+    shouldDeferViewportInput() {
+        if (this.getFocusedComponent()?.capturesViewportInput)
+            return true;
         return this.isOverlayFocused() && this.activeSearch?.overlay?.isFocused() !== true;
     }
     clearComponentMouseGesture() {
@@ -556,7 +560,7 @@ export class TuiAltScreen extends TuiBase {
                 return { consume: true };
             }
         }
-        if (this.shouldDeferViewportInputToOverlay())
+        if (this.shouldDeferViewportInput())
             return undefined;
         if (keybindings.matches(data, "tui.altScreen.pageUp")) {
             if (!isRelease) {

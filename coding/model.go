@@ -105,14 +105,6 @@ func buildModelFromEntry(providerID, modelID string, entry icodingagent.ModelEnt
 	}
 	provider = newRequestOptionsProvider(provider, providerID, entry.Headers)
 
-	if providerID == "test-faux" {
-		entry.Input = []string{"text", "image"}
-		entry.ContextWindow = ai.TestFauxContextWindow
-		entry.MaxTokens = ai.TestFauxMaxTokens
-		entry.DisplayName = "Test Faux"
-		entry.API = "test-faux"
-		entry.BaseURL = "http://localhost:0"
-	}
 	return modelFromEntry(entry, provider), nil
 }
 
@@ -175,11 +167,10 @@ func thinkingMaxLevelForEntry(entry icodingagent.ModelEntry) ai.ThinkingLevel {
 	return ai.ThinkingLevel(levels[len(levels)-1])
 }
 
+// lookupGeneratedModel matches only providerID's own catalog, so a model of a provider that is not registered yet
+// never takes another provider's API and base URL.
 func lookupGeneratedModel(providerID, modelID string) (*ai.GeneratedModel, bool) {
-	if generated, ok := ai.LookupModel(providerID + "/" + modelID); ok {
-		return generated, true
-	}
-	return ai.LookupModel(modelID)
+	return ai.LookupModelExact(providerID + "/" + modelID)
 }
 
 // buildProviderForEntry builds the provider for entry. A non-empty explicitKey
@@ -212,10 +203,12 @@ func buildLeafProviderForEntry(providerID, modelID string, apiKind ai.API, entry
 		if os.Getenv("PIG_TEST_FAUX") != "1" {
 			return nil, fmt.Errorf("coding: BuildModel: test-faux is disabled")
 		}
-		return svcs.testFauxProvider(), nil
+		return svcs.testFauxProvider()
 	}
 
-	if providerID == "github-copilot" && !resolvedAuth {
+	// Pi uses a built-in provider own stream only for an api that provider catalog lists (compat.ts:236-239 getBuiltinProviderForModel); any other api, no api at all included, goes to the
+	// API registry, which refuses a name nothing is registered for (compat.ts:244-247). A provider with a stream of its own (the Copilot provider sends every api name it is given as chat completions) is built only for such an api.
+	if !resolvedAuth && ai.ProviderHasOwnStreamFor(providerID, apiKind) {
 		// Re-open auth from disk so this provider has its own handle
 		// (the Services-owned handle is shared and may be in-use).
 		auth, err := ai.NewAuthStorage(filepath.Join(svcs.AgentDir(), "auth.json"))
@@ -364,7 +357,7 @@ func buildLeafProviderForEntry(providerID, modelID string, apiKind ai.API, entry
 		// AWS SDK resolves credentials at request time. The selected model
 		// carries the configured provider identity (bedrock-converse-stream.ts:130
 		// reports model.provider), the base URL and the limits.
-		return ai.NewBedrockAPIProvider(*modelFromEntry(entry, nil))
+		return ai.NewOptionalAPIProvider(ai.APIBedrockConverseStream, *modelFromEntry(entry, nil))
 	case ai.APIMistralConversations:
 		return ai.NewMistralAPIProvider(ai.MistralConfig{
 			ModelMetadata: modelFromEntry(entry, nil),
@@ -392,20 +385,11 @@ func buildLeafProviderForEntry(providerID, modelID string, apiKind ai.API, entry
 		}
 		return ai.NewPiMessagesProvider(config), nil
 	default:
-		return ai.NewOpenAIProvider(ai.OpenAIConfig{
-			ModelMetadata:                 modelFromEntry(entry, nil),
-			BaseURL:                       baseURL,
-			APIKey:                        apiKey,
-			GetAPIKey:                     resolveAPIKey,
-			Model:                         modelID,
-			ProviderID:                    providerID,
-			ExtraHeaders:                  extraHeaders,
-			SamplingParams:                maps.Clone(entry.SamplingParams),
-			SamplingParamsByThinkingLevel: cloneSamplingParamsByThinkingLevel(entry.SamplingParamsByThinkingLevel),
-			Env:                           ai.ProviderEnv(maps.Clone(entry.Env)),
-			Compat:                        cloneCompat(entry.Compat),
-			Insecure:                      entry.Insecure,
-		}), nil
+		// An api no case above implements is looked up in the API registry when the request starts, and a name nothing is registered for is refused there.
+		// upstream: provider-composer.ts:603-604 (composeModelProvider's streamWith: getApiProvider(model.api), then the throw)
+		provider := &apiRegistryProvider{id: providerID, api: apiKind, apiKey: resolveAPIKey}
+		provider.model = modelFromEntry(entry, provider)
+		return provider, nil
 	}
 }
 

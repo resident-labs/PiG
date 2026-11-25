@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
+	"github.com/MichaelKinsy/PiG/internal/nodeerrno"
 	"github.com/MichaelKinsy/PiG/tui"
 	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
@@ -46,6 +49,32 @@ func (m *InteractiveMode) exitIfDeadTerminal(err error) {
 	}
 }
 
+// exitOnDeadTerminalWrite is Pi's terminalErrorHandler for a failed terminal write: a write that fails because the terminal is gone (EIO,
+// EPIPE, ENOTCONN, ENOTTY) ends the process as emergencyTerminalExit does, and any other write error is rethrown, which Pi's uncaughtException
+// handler turns into a crash report, a crash record and exit 1 (uncaughtOffLoop here). Pi's registerSignalHandlers adds this "error" listener
+// to process.stdout and process.stderr and keeps it until shutdown finishes. The returned call removes it.
+// Ports packages/coding-agent/src/modes/interactive/interactive-mode.ts (registerSignalHandlers terminalErrorHandler).
+func (m *InteractiveMode) exitOnDeadTerminalWrite() (remove func()) {
+	// The exit's own restore writes fail on the same terminal and come back here; only the first failure runs the exit.
+	// emergencyTerminalExit guards the exit itself, across this handler and the input reader's path.
+	var exiting atomic.Bool
+	return tui.OnTerminalWriteError(func(err error) {
+		if !exiting.CompareAndSwap(false, true) {
+			return
+		}
+		if emergencyExiting.Load() {
+			// The exiting goroutine's own restore writes (RestoreTerminalOnExit writes through this handler). A caller
+			// that blocked here would stall the owner.
+			return
+		}
+		if isDeadTerminalError(err) {
+			m.emergencyTerminalExit("terminal gone: " + err.Error())
+			return
+		}
+		m.uncaughtOffLoop(err, debug.Stack())
+	})
+}
+
 // emergencyTerminalExit exits without the normal teardown: the terminal is gone, so TUI and extension cleanup would write
 // restore sequences and fail again. Pi's process.exit(129) still runs the TUI's exit handler, which writes the mode resets
 // synchronously and swallows the write errors (9df819de, #11170); tui.RestoreTerminalOnExit does the same here.
@@ -54,9 +83,18 @@ func (m *InteractiveMode) exitIfDeadTerminal(err error) {
 // processes in their own process groups, so it kills them too, or they would keep writing into the session's
 // directories.
 // Ports packages/coding-agent/src/modes/interactive/interactive-mode.ts (emergencyTerminalExit).
+//
+// The input reader, a failed terminal write and a crash on a dead terminal can all arrive here at once (exit_ending.go has
+// the ordering contract). Pi's is `never`: the first caller ends the process with 129, and a later caller blocks behind it
+// and never returns either, because its callers (uncaughtCrash, Run's unwinding to exit 1) assume the call does not return.
+// pig additive (D102): the exit.log line is the first cause observed and is flushed before os.Exit. The exit code, the restore
+// writes, the output and the timing are Pi's.
 func (m *InteractiveMode) emergencyTerminalExit(reason string) {
+	if !emergencyExiting.CompareAndSwap(false, true) {
+		select {}
+	}
 	// pig additive (D102): Pi exits here with no trace.
-	RecordExit(m.opts.AgentDir, reason+" (exit 129)")
+	RecordEnding(m.opts.AgentDir, reason+" (exit 129)")
 	tools.KillTrackedDetachedChildren()
 	if m.opts.TerminateExtensionProcesses != nil {
 		m.opts.TerminateExtensionProcesses()
@@ -67,12 +105,19 @@ func (m *InteractiveMode) emergencyTerminalExit(reason string) {
 	os.Exit(129)
 }
 
+// emergencyExiting is set by the one emergencyTerminalExit that runs; the process ends in it.
+var emergencyExiting atomic.Bool
+
 // isDeadTerminalError reports whether err says the terminal is gone. EIO is a tty read or ioctl from an orphaned
 // background process group, or a write after hangup. ENOTTY is a revoked tty (macOS) that stdin no longer reports as
 // a terminal.
 // Ports packages/coding-agent/src/modes/interactive/interactive-mode.ts (isDeadTerminalError).
 func isDeadTerminalError(err error) bool {
-	return errors.Is(err, syscall.EIO) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ENOTCONN) || errors.Is(err, syscall.ENOTTY)
+	switch nodeerrno.ErrorCode(err) {
+	case "EIO", "EPIPE", "ENOTCONN", "ENOTTY":
+		return true
+	}
+	return false
 }
 
 // inputLoop reads terminal input from source and dispatches to the editor or
@@ -235,13 +280,22 @@ func (m *InteractiveMode) dispatchRoutedInput(ctx context.Context, input inputCh
 // Handling each sequence as its own loop turn painted every prefix of a typed
 // "/compact" with the popup its stale suggestions opened, which grew the
 // transcript and left the main screen scrolled further than upstream.
+//
+// The Promise jobs the read's keys queued run once its last sequence is
+// handled and before the next read: the editor's autocomplete request, which
+// needs no I/O for a command name or a command's arguments, opens its menu
+// there (editor.ts startAutocompleteRequest), so the next read's Enter finds
+// the menu open and accepts it instead of submitting the typed text.
 func (m *InteractiveMode) dispatchTerminalRead(ctx context.Context, input inputChunk, readCh *chan inputChunk, errCh <-chan error) (err error) {
 	dispatched := false
-	// Match upstream's immediate keyboard paint before asynchronous
-	// autocomplete results request their throttled follow-up frame.
+	// Match upstream's immediate keyboard paint before the autocomplete
+	// request resolves and asks for its throttled follow-up frame.
 	defer func() {
 		if dispatched && err == nil {
 			m.tuiInst.Render()
+		}
+		if err == nil && m.editor != nil {
+			m.editor.FlushAutocomplete()
 		}
 	}()
 	for {
@@ -290,6 +344,8 @@ func (m *InteractiveMode) finishInteractiveShutdown() error {
 		return err
 	}
 	if !fromSignal {
+		// Pi's dispose awaits session.abort() first (agent-session-runtime.ts dispose, D247): the run that streams at the quit ends on this owner loop.
+		m.settleRunAtQuit()
 		m.emitQuitShutdown()
 		m.printResumeHint()
 	}
@@ -634,7 +690,7 @@ func (m *InteractiveMode) dispatchInputChunk(ctx context.Context, data string, t
 	if m.consumeTerminalThemeInput(data) {
 		return nil
 	}
-	if pending := m.autocompletePending; pending != nil {
+	if pending := m.autocompletePending; pending != nil && !closedChannel(pending) {
 		ticket.await()
 		m.backgroundTasks.Go(func() {
 			select {
@@ -832,6 +888,10 @@ func (m *InteractiveMode) handleEditorAction(ctx context.Context, action keyActi
 	// and newlines are editor content: Ctrl+D must fall through to the editor's
 	// delete-char-forward binding rather than exit.
 	editorEmpty := m.editor.Text() == ""
+	// pig divergence (D228): Terminal.app sends Option+Up as plain Up, so with an empty editor and a queued message plain Up is the dequeue key there.
+	if action == actionInsert && tui.MatchesKeyID(data, "up") && m.appleTerminalUpDequeues() {
+		action = actionDequeue
+	}
 	// When the slash-autocomplete popup is open, intercept
 	// Esc (dismiss) and Enter (accept + maybe submit) before the
 	// idle/working state machine sees them. Tab and arrows are
@@ -1127,7 +1187,11 @@ func (m *InteractiveMode) handleEditorAction(ctx context.Context, action keyActi
 		return nil
 
 	default:
+		recalled := m.watchQueuedHistoryRecall(data)
 		m.editor.HandleInput(data)
+		if recalled != nil {
+			recalled()
+		}
 	}
 	m.tuiInst.RequestRender()
 	return nil
@@ -1277,14 +1341,50 @@ func (m *InteractiveMode) settleActiveRun() error {
 	if settled == nil && (session == nil || session.IsIdle()) {
 		return nil
 	}
-	owner := m.runCtx
-	if owner == nil {
-		owner = context.Background()
+	return m.serveOwnerLoopUntil(func(ctx context.Context) error { return waitForSessionIdle(ctx, settled, session) })
+}
+
+// settleRunAtQuit is the first step of Pi's dispose, `await this.session.abort()` (agent-session-runtime.ts dispose, agent-session.ts abort), for the quit by keys, whose dispose runs on the owner loop after the TUI stopped (finishInteractiveShutdown). Pi's loop turns under that await: the aborted run publishes its last events, which the extensions handle and the session file takes, agent_settled follows, and only then is the Session idle (_emitAgentSettled resolves the idle wait) and session_shutdown emitted. Here the run needs the owner loop to end: Session.RunAgentPrompt waits until the loop acknowledged its flush, and the turn's cleanup is posted to the loop. So the mode aborts the run and serves the loop, as settleActiveRun does for a replacement, until the run's goroutine has returned, which is after its agent_settled handlers. A dispose that awaited the run on the loop without serving it never ended.
+//
+// A user's bash command is not joined: Pi's abort does not wait for it.
+func (m *InteractiveMode) settleRunAtQuit() {
+	m.queueMu.Lock()
+	settled, ended, session := m.turnSettled, m.turnEnded, m.opts.SessionHandle
+	m.queueMu.Unlock()
+	if settled != nil || session != nil && !session.IsIdle() {
+		m.abortRun(m.runCtx)
+	} else {
+		// No run is active. One whose goroutine has not returned yet is still joined.
+		if ended == nil {
+			return
+		}
+		select {
+		case <-ended:
+			return
+		default:
+		}
 	}
-	ctx, cancel := context.WithCancel(owner)
+	_ = m.serveOwnerLoopUntil(func(ctx context.Context) error {
+		if err := waitForSessionIdle(ctx, settled, session); err != nil {
+			return err
+		}
+		if ended != nil {
+			select {
+			case <-ended:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	})
+}
+
+// serveOwnerLoopUntil runs wait on a goroutine of its own and meanwhile, on the owner loop, keeps handling Session events, posted UI tasks and scheduled frames, which a settling run needs. It returns wait's result, or an error when the mode shuts down first.
+func (m *InteractiveMode) serveOwnerLoopUntil(wait func(context.Context) error) error {
+	ctx, cancel := context.WithCancel(m.runCtx)
 	var workers sync.WaitGroup
 	idle := make(chan error, 1)
-	workers.Go(func() { idle <- waitForSessionIdle(ctx, settled, session) })
+	workers.Go(func() { idle <- wait(ctx) })
 	defer func() { cancel(); workers.Wait() }()
 	for {
 		select {
@@ -1354,3 +1454,13 @@ func (m *InteractiveMode) hasActiveAgentTurn() bool {
 }
 
 // handleSubmit fires before_agent_start, then starts the agent in a goroutine.
+
+// closedChannel reports whether done is closed, and forgets none of it: a released hold stays in autocompletePending until the next input finds it.
+func closedChannel(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
+}

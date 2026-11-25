@@ -13,6 +13,7 @@ import (
 
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/durable"
+	"github.com/MichaelKinsy/PiG/durable/durabletest"
 )
 
 type blockedState struct {
@@ -32,15 +33,15 @@ type failOnceCommit struct {
 	err    error
 }
 
-func (s *failOnceCommit) Commit(ctx context.Context, writes []durable.StorageWrite, adopt func(durable.Seq)) (durable.Seq, error) {
+func (s *failOnceCommit) Commit(ctx context.Context, batches [][]durable.StorageWrite, receive func(index int, seq durable.Seq)) (durable.CommitResult, error) {
 	s.mu.Lock()
 	fail := !s.failed
 	s.failed = true
 	s.mu.Unlock()
 	if fail {
-		return 0, s.err
+		return durable.CommitResult{}, s.err
 	}
-	return s.Storage.Commit(ctx, writes, adopt)
+	return s.Storage.Commit(ctx, batches, receive)
 }
 
 func TestBlockedTasksOnTheReference(t *testing.T) {
@@ -70,7 +71,7 @@ func TestBlockedTasksOnTheReference(t *testing.T) {
 		completing := *record
 		completing.Memos = nil
 		completing.State = durable.TaskState[durable.JsonValue, durable.JsonValue]{Status: durable.TaskCompleting, Outcome: &durable.TaskOutcome[durable.JsonValue]{Status: durable.OutcomeCompleted, Result: &completed}}
-		if _, err := raw.Commit(testContext, []durable.StorageWrite{durable.TaskWrite{Value: completing}}, func(durable.Seq) {}); err != nil {
+		if _, err := durabletest.CommitWrites(testContext, raw, []durable.StorageWrite{durable.TaskWrite{Value: completing}}); err != nil {
 			t.Fatal(err)
 		}
 		if err := raw.Close(testContext); err != nil {
@@ -90,7 +91,7 @@ func TestBlockedTasksOnTheReference(t *testing.T) {
 			t.Fatal(err)
 		}
 		<-harness.Closed()
-		if end := harness.End(); end.Reason != durable.SessionEndFailed {
+		if end := harness.End(); end.Kind != durable.SessionEndFailed {
 			t.Fatalf("session end %+v, want failed", end)
 		}
 		// The host was told work is underway, and never that it ended: its recovery alarm stays.
@@ -126,14 +127,23 @@ func TestBlockedTasksOnTheReference(t *testing.T) {
 		if err := started.wait(testContext); err != nil {
 			t.Fatal(err)
 		}
-		// Hold the line; the abort mark is admitted behind it, then close begins.
-		gate := deferred()
+		// Hold the line; the abort mark is admitted behind it, then close begins. Upstream's root.commit(), abortTask() and
+		// close() reach the line in call order: commitWith checks assertUsable and enqueues in one synchronous turn
+		// (session.ts:235-243, #enqueue at :847-853). Here each call is a goroutine, so the test waits for each to be on the
+		// line itself. A count of line jobs cannot show that: the scheduler's own pass can still be on the line after the
+		// task started, and let the abort mark in ahead of the held commit, or close before it.
+		gate, entered := deferred(), deferred()
 		holding := make(chan error, 1)
 		go func() {
-			_, err := root.Commit(testContext, func(durable.Tx) (any, error) { return nil, gate.wait(testContext) })
+			_, err := root.Commit(testContext, func(durable.Tx) (any, error) {
+				entered.resolve()
+				return nil, gate.wait(testContext)
+			})
 			holding <- err
 		}()
-		eventually(t, func() bool { return harness.(*harnessImpl).LineJobs() > 0 })
+		if err := entered.wait(testContext); err != nil {
+			t.Fatal(err)
+		}
 		aborting := tkMarkAdmitted(t, harness, id)
 		closing := tkCloseSealed(t, harness)
 		// The invocation ends while the line is held; its write-back waits behind the abort mark.
@@ -157,16 +167,20 @@ func TestBlockedTasksOnTheReference(t *testing.T) {
 	})
 }
 
-// tkMarkAdmitted starts AbortTask and returns once its request is queued on the line, behind the commit holding it.
+// tkMarkAdmitted starts AbortTask and returns once its request is queued on the line, behind the commit holding it. It
+// waits for that goroutine to queue, not for a count of line jobs to rise, which the scheduler's own jobs also do.
 func tkMarkAdmitted(t *testing.T, harness Harness, id durable.TaskId) <-chan tkAbortResult {
 	t.Helper()
 	aborting := make(chan tkAbortResult, 1)
-	jobs := harness.(*harnessImpl).LineJobs()
-	go func() {
-		result, err := harness.AbortTask(testContext, id)
-		aborting <- tkAbortResult{result: result, err: err}
-	}()
-	eventually(t, func() bool { return harness.(*harnessImpl).LineJobs() > jobs })
+	queueOnLineAdmitted(t, func(ctx context.Context) <-chan struct{} {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			result, err := harness.AbortTask(ctx, id)
+			aborting <- tkAbortResult{result: result, err: err}
+		}()
+		return done
+	})
 	return aborting
 }
 

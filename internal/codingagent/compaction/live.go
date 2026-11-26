@@ -92,8 +92,9 @@ func CompactLive(ctx context.Context, prep CompactionPreparation, request LiveRe
 	}, nil
 }
 
-func summarizeLive(ctx context.Context, request LiveRequest, prompt string, retry *ai.RetryPolicy, callbacks ai.RetryCallbacks) (string, *ai.Usage, error) {
+func summarizeLive(ctx context.Context, request LiveRequest, basePrompt string, retry *ai.RetryPolicy, callbacks ai.RetryCallbacks) (string, *ai.Usage, error) {
 	messages := request.Messages
+	prompt := basePrompt
 	nudged := false
 	for {
 		text, usage, err := completeSimpleWithRetries(ctx, retry, callbacks, func() (string, *ai.Usage, error) {
@@ -102,7 +103,7 @@ func summarizeLive(ctx context.Context, request LiveRequest, prompt string, retr
 		switch {
 		case errors.Is(err, ErrSummarizationToolCall) && !nudged:
 			nudged = true
-			prompt += liveToolCallNudge
+			prompt = basePrompt + liveToolCallNudge
 		case err != nil && isOverflow(err):
 			trimmed := dropOldest(messages)
 			if len(trimmed) == len(messages) {

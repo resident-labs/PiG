@@ -18,6 +18,7 @@ import (
 // Ports packages/coding-agent/src/core/package-manager.ts (spawnCommand, runCommand).
 // RunPackageProcess runs a package command in dir. With [CommandOutputInherit] (and for the zero value) the child's output goes to the terminal without being retained; when the host owns stdout, both streams go to stderr and stdin is ignored. With [CommandOutputCapture] it goes nowhere and git and ssh cannot prompt (runPackageProcessCaptured). The caller waits for completion before reporting an error or persisting settings.
 func RunPackageProcess(output CommandOutput, dir, name string, args ...string) error {
+	//portlint:allow ctxbackground this synchronous entry point has no caller context; RunPackageProcessContext takes one
 	return RunPackageProcessContext(context.Background(), output, dir, name, args...)
 }
 
@@ -49,6 +50,9 @@ func RunPackageProcessContext(ctx context.Context, output CommandOutput, dir, na
 
 func runInstallProcess(opts []InstallOption, dir, name string, args ...string) error {
 	options := resolveInstallOptions(opts)
+	if options.ctx == nil {
+		return RunPackageProcess(options.output, dir, name, args...)
+	}
 	return RunPackageProcessContext(options.ctx, options.output, dir, name, args...)
 }
 

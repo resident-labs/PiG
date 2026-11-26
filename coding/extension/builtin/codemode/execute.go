@@ -30,6 +30,7 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/jsnumber"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/outputfiles"
+	"github.com/MichaelKinsy/PiG/internal/sessionentry"
 )
 
 const (
@@ -388,30 +389,34 @@ func decodeObjectMembers(raw json.RawMessage) (map[string]json.RawMessage, bool)
 	return members, true
 }
 
-// storeOf reads the values of `load()`: the `codemode-store` entries on the branch, applied from the root. Entries
-// with malformed data are ignored.
+// applyStoreEntry replays one codemode-store record. Non-custom entries are skipped without reading their records.
+func applyStoreEntry(store map[string]json.RawMessage, entry codingagent.SessionEntry) {
+	if entry.Base().Type != "custom" {
+		return
+	}
+	raw, err := sessionentry.ReadRaw(entry)
+	var fields struct {
+		CustomType string          `json:"customType"`
+		Data       json.RawMessage `json:"data"`
+	}
+	if err != nil || json.Unmarshal(raw, &fields) != nil || fields.CustomType != StoreEntryType {
+		return
+	}
+	set, deleted, ok := storeEntryData(fields.Data)
+	if !ok {
+		return
+	}
+	for _, key := range deleted {
+		delete(store, key)
+	}
+	maps.Copy(store, set)
+}
+
+// storeOf reads the values of `load()`: the `codemode-store` entries on the branch, applied from the root.
 func storeOf(branch []codingagent.SessionEntry) map[string]json.RawMessage {
 	store := map[string]json.RawMessage{}
 	for _, entry := range branch {
-		if entry.Base().Type != "custom" {
-			continue
-		}
-		var fields struct {
-			CustomType string          `json:"customType"`
-			Data       json.RawMessage `json:"data"`
-		}
-		raw, err := json.Marshal(entry)
-		if err != nil || json.Unmarshal(raw, &fields) != nil || fields.CustomType != StoreEntryType {
-			continue
-		}
-		set, deleted, ok := storeEntryData(fields.Data)
-		if !ok {
-			continue
-		}
-		for _, key := range deleted {
-			delete(store, key)
-		}
-		maps.Copy(store, set)
+		applyStoreEntry(store, entry)
 	}
 	return store
 }
@@ -457,26 +462,8 @@ func (c *branchStoreCache) read(manager extension.ReadonlySessionManager) map[st
 	if found {
 		maps.Copy(values, c.values)
 	}
-	// Replay only custom records, in root-to-leaf order, preserving deletion.
 	for _, entry := range slices.Backward(entries) {
-		if entry.Base().Type != "custom" {
-			continue
-		}
-		raw, err := json.Marshal(entry)
-		var fields struct {
-			CustomType string          `json:"customType"`
-			Data       json.RawMessage `json:"data"`
-		}
-		if err != nil || json.Unmarshal(raw, &fields) != nil || fields.CustomType != StoreEntryType {
-			continue
-		}
-		set, deleted, ok := storeEntryData(fields.Data)
-		if ok {
-			for _, key := range deleted {
-				delete(values, key)
-			}
-			maps.Copy(values, set)
-		}
+		applyStoreEntry(values, entry)
 	}
 	c.sessionID, c.leaf, c.values = id, "", values
 	if leaf != nil {

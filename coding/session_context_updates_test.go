@@ -2,6 +2,7 @@ package coding
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -162,6 +163,60 @@ func TestTheLatestOfAnUpdateAndASystemMessageHoldsTheSections(t *testing.T) {
 	}
 	if held := heldSections([]agent.AgentMessage{system("a"), update, system("c")}, *system("c").System); held["goal"] != "c" {
 		t.Fatalf("after a system message: %v", held)
+	}
+}
+
+type contextUpdateTestDetails struct{}
+
+func (contextUpdateTestDetails) MarshalJSON() ([]byte, error) {
+	return []byte(`{"Sections":{"goal":"custom","empty":null}}`), nil
+}
+
+func TestContextUpdateDetailsMatchBeforeAndAfterRestore(t *testing.T) {
+	type tagged struct {
+		Text map[string]any `json:"Sections"`
+	}
+	for _, tc := range []struct {
+		name    string
+		details any
+		want    map[string]string
+	}{
+		{name: "native sections", details: map[string]any{"sections": map[string]any{"goal": "native", "empty": nil}}, want: map[string]string{"goal": "native", "empty": ""}},
+		{name: "typed sections", details: map[string]any{"sections": map[string]string{"goal": "typed"}}, want: map[string]string{"goal": "typed"}},
+		{name: "invalid byte in typed text", details: map[string]any{"sections": map[string]string{"goal": "a\xffb"}}, want: map[string]string{"goal": "a\uFFFDb"}},
+		{name: "invalid key collision", details: map[string]any{"sections": map[string]any{"\uFFFD": "first", "\xff": "last"}}, want: map[string]string{"\uFFFD": "last"}},
+		{name: "WTF-8 lone surrogate", details: map[string]any{"sections": map[string]any{"goal": "a\xed\xa0\x80b"}}, want: map[string]string{"goal": "a\xed\xa0\x80b"}},
+		{name: "raw section object", details: map[string]any{"sections": json.RawMessage(`{"goal":"raw","empty":null}`)}, want: map[string]string{"goal": "raw", "empty": ""}},
+		{name: "raw section members", details: map[string]any{"sections": map[string]json.RawMessage{"goal": json.RawMessage(`"raw"`), "empty": json.RawMessage(`null`)}}, want: map[string]string{"goal": "raw", "empty": ""}},
+		{name: "tagged struct", details: tagged{Text: map[string]any{"goal": "tagged", "empty": nil}}, want: map[string]string{"goal": "tagged", "empty": ""}},
+		{name: "custom marshaler", details: contextUpdateTestDetails{}, want: map[string]string{"goal": "custom", "empty": ""}},
+		{name: "case aliases", details: map[string]any{"Sections": map[string]string{"goal": "first", "retained": "yes"}, "sections": map[string]any{"goal": nil}}, want: map[string]string{"goal": "", "retained": "yes"}},
+		{name: "empty sections", details: map[string]any{"sections": map[string]string{}}, want: map[string]string{}},
+		{name: "nil sections", details: map[string]any{"sections": map[string]string(nil)}},
+		{name: "null section object", details: map[string]any{"sections": json.RawMessage(`null`)}},
+		{name: "absent sections", details: map[string]any{"unrelated": true}},
+		{name: "non-text member", details: map[string]any{"sections": map[string]any{"goal": 42}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			native := agent.AgentMessage{Custom: map[string]any{
+				"role": agent.RoleCustom, "customType": contextUpdateType,
+				"content": "[Context update]", "display": false, "timestamp": 1, "details": tc.details,
+			}}
+			wire, err := native.MarshalJSON()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var restored agent.AgentMessage
+			if err := restored.UnmarshalJSON(wire); err != nil {
+				t.Fatal(err)
+			}
+			for stage, message := range map[string]agent.AgentMessage{"native": native, "restored": restored} {
+				got, ok := contextUpdateSections(message)
+				if ok != (tc.want != nil) || (got == nil) != (tc.want == nil) || !maps.Equal(got, tc.want) {
+					t.Errorf("%s sections = (%#v, %t), want (%#v, %t)", stage, got, ok, tc.want, tc.want != nil)
+				}
+			}
+		})
 	}
 }
 

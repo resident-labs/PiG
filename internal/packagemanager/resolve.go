@@ -56,6 +56,7 @@ type MissingSourceCallback func(source string) (MissingSourceAction, error)
 
 // Resolve is upstream's resolve: it resolves the Packages, settings entries and auto-discovered locations into the resources they enable, per resource type (package-manager.ts:920-985). Each Package that is not installed, or whose installation does not satisfy its configured version, is installed unless onMissing decides otherwise; a nil onMissing installs it, as DefaultPackageManager does. A local Package that does not exist, and every missing Package in offline mode, contributes nothing. The result lists each type's Package resources, settings entries and auto-discovered resources as a first-wins accumulator keyed by path, ordered by resourcePrecedenceRank. A skill is keyed by its SKILL.md file when it has one.
 func (m *PackageManager) Resolve(onMissing MissingSourceCallback) (ResolvedPaths, error) {
+	//portlint:allow ctxbackground this synchronous entry point has no caller context; ResolveContext takes one
 	return m.ResolveContext(context.Background(), onMissing)
 }
 
@@ -108,6 +109,7 @@ func (m *PackageManager) ResolveContext(ctx context.Context, onMissing MissingSo
 
 // InstallMissing is the install step of resolve: it installs each configured npm or git Package that needs it, asking onMissing first when it is set (package-manager.ts:1282-1340 resolvePackageSources, installMissing). A Package whose install fails is skipped, as offline mode skips it, and reported in the result (Pi 6dfb54678); an onMissing error or "error" decision still fails.
 func (m *PackageManager) InstallMissing(onMissing MissingSourceCallback) ([]PackageInstallFailure, error) {
+	//portlint:allow ctxbackground this synchronous entry point has no caller context; ResolveContext takes one for resolution including installs
 	return m.installMissing(context.Background(), onMissing)
 }
 
@@ -145,6 +147,7 @@ func (m *PackageManager) installMissing(ctx context.Context, onMissing MissingSo
 
 // ResolveExtensionSources is upstream's resolveExtensionSources: it resolves each source, an `-e` argument, into the extensions and other resources it exposes, in the scope "temporary", "project" or "user" that temporary and local select (package-manager.ts:991-1010). A `builtin:<name>` source is an enabled built-in extension. A local source that does not exist contributes nothing; an npm or git source that is not installed installs unless offline mode is on. A temporary source installs below the agent's temporary extension folder, and an unpinned cached git checkout refreshes first.
 func (m *PackageManager) ResolveExtensionSources(sources []string, local, temporary bool) (ResolvedPaths, error) {
+	//portlint:allow ctxbackground this synchronous entry point has no caller context; ResolveExtensionSourcesContext takes one
 	return m.ResolveExtensionSourcesContext(context.Background(), sources, local, temporary)
 }
 

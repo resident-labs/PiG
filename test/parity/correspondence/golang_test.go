@@ -84,17 +84,27 @@ func TestExtractGoCurrentSettingsAndPrompts(t *testing.T) {
 		t.Fatalf("function count = %d, want 10", len(inventory.Functions))
 	}
 	compact := inventory.Functions[0]
-	if compact.Name != "compact" || compact.Async || !reflect.DeepEqual(compact.CancellationInputs, []string{"ctx"}) || len(compact.Callers) != 1 || !strings.HasPrefix(compact.Callers[0].Expression, "compaction.Compact") {
+	if compact.Name != "compact" || compact.Async || !reflect.DeepEqual(compact.CancellationInputs, []string{"ctx"}) {
 		t.Fatalf("compact identity = %#v", compact)
 	}
-	var ordered []string
-	for _, call := range compact.Calls {
-		if call.Callee == "GenerateSummaryWithUsageUsing" || call.Callee == "generateTurnPrefixSummary" || call.Callee == "combineUsage" {
-			ordered = append(ordered, call.Callee)
-		}
+	var callers []string
+	for _, caller := range compact.Callers {
+		callee, _, _ := strings.Cut(caller.Expression, "(")
+		callers = append(callers, caller.Symbol+" → "+callee)
 	}
-	if !reflect.DeepEqual(ordered, []string{"GenerateSummaryWithUsageUsing", "generateTurnPrefixSummary", "combineUsage", "GenerateSummaryWithUsageUsing"}) {
+	if !slices.Equal(callers, []string{"runDefaultCompaction → compaction.CompactStandalone", "Compact → compact", "CompactStandalone → compact"}) {
+		t.Fatalf("compact callers = %v", callers)
+	}
+	ordered, calls := normalizedCalls(compact.Calls, CompactionSettingsRules().CalleeTargets, true)
+	if !slices.Equal(ordered, []string{"generateSummary", "generateTurnPrefixSummary", "combineUsage", "generateSummary"}) {
 		t.Fatalf("compact ordered calls = %v", ordered)
+	}
+	if got := callConditionProfile(calls); !slices.Equal(got, []string{"2:then", "1:then", "1:then", "1:else"}) {
+		t.Fatalf("compact call branches = %v", got)
+	}
+	prefix := inventory.Functions[1]
+	if prefix.Name != "generateTurnPrefixSummary" || len(prefix.Callers) != 1 || prefix.Callers[0].Symbol != "compact" {
+		t.Fatalf("turn prefix callers = %#v", prefix.Callers)
 	}
 	var stateProfile []string
 	for _, transition := range compact.Transitions {
@@ -202,12 +212,30 @@ func TestAddGoFunctionCallersRetainsAllReviewedCallSites(t *testing.T) {
 	// The caller inventory pins edges, not a unique invocation per function.
 	// In particular Load can merge global/overrides on the untrusted branch
 	// and global/project/overrides on the trusted branch.
+	const dispatch = `package fixture
+func runDefaultCompaction() error {
+	if live, ok := s.liveCompactionRequest(model); ok { return compaction.CompactLive(ctx, live) }
+	return compaction.CompactStandalone(ctx)
+}
+`
+	const compactionSource = `package fixture
+func Compact() error { return compact(ctx, false) }
+func CompactStandalone() error { return compact(ctx, true) }
+func compact(ctx context.Context, standalone bool) error { return generateTurnPrefixSummary(ctx) }
+`
 	for _, tc := range []struct {
-		name string
-		body string
-		want []FunctionCaller
+		name    string
+		body    string
+		want    []FunctionCaller
+		replace [2]string
+		wantErr string
 	}{
-		{name: "missing", body: "return\n"},
+		{name: "missing", body: "return\n", wantErr: "Load has 0 calls to mergeSettings"},
+		{name: "missing standalone dispatch", replace: [2]string{"compaction.CompactStandalone(ctx)", "compaction.CompactLive(ctx)"}, wantErr: "runDefaultCompaction has 0 matching returns of compaction.CompactStandalone"},
+		{name: "missing live dispatch", replace: [2]string{"compaction.CompactLive(ctx, live)", "nil"}, wantErr: "runDefaultCompaction has 0 matching returns of compaction.CompactLive"},
+		{name: "wrong live branch", replace: [2]string{"; ok {", "; !ok {"}, wantErr: "runDefaultCompaction has 0 matching returns of compaction.CompactLive"},
+		{name: "wrong standalone flag", replace: [2]string{"return compact(ctx, true)", "return compact(ctx, false)"}, wantErr: "CompactStandalone has 0 matching returns of compact"},
+		{name: "missing prefix call", replace: [2]string{"return generateTurnPrefixSummary(ctx)", "return nil"}, wantErr: "compact has 0 calls to generateTurnPrefixSummary"},
 		{name: "single", body: "mergeSettings(global, project)\n", want: []FunctionCaller{
 			{Expression: "mergeSettings(global, project)", StartLine: 3},
 		}},
@@ -233,13 +261,16 @@ func TestAddGoFunctionCallersRetainsAllReviewedCallSites(t *testing.T) {
 			}
 			// These are parser inputs for the reviewed caller paths, not runtime stubs.
 			for path, source := range map[string]string{
-				"coding/session_summarization_auth.go":           "package fixture\nfunc runDefaultCompaction() { compaction.Compact() }\n",
-				"internal/codingagent/compaction/compaction.go":  "package fixture\nfunc Compact() { generateTurnPrefixSummary() }\n",
+				"coding/session_summarization_auth.go":           dispatch,
+				"internal/codingagent/compaction/compaction.go":  compactionSource,
 				"internal/codingagent/settings.go":               "package fixture\nfunc Load() {\n" + tc.body + "}\nfunc UpdateGlobal() { updateGlobalOrdered() }\nfunc updateGlobalOrdered() { updateGlobalReplacing() }\nfunc updateGlobalReplacing() { saveScope() }\nfunc saveScope() { saveSettingsPatchReplacing() }\nfunc SetBlockImages() { sm.UpdateGlobal() }\nfunc SetProjectPackages() { sm.UpdateProject() }\n",
 				"coding/cli/cli_runtime_build.go":                "package fixture\ntype cliRuntimeBuilder struct{}\nfunc (b *cliRuntimeBuilder) buildResources() { services.SettingsManager().SetProjectTrusted(true) }\n",
 				"internal/codingagent/interactive_commands.go":   "package fixture\nfunc buildSlashContext() { m.opts.SettingsManager.Reload() }\n",
 				"internal/codingagent/slash_session_handlers.go": "package fixture\nfunc settingsHandlerTUI() {}\nfunc settingsHandler() { settingsHandlerTUI() }\n",
 			} {
+				if tc.replace[0] != "" {
+					source = strings.Replace(source, tc.replace[0], tc.replace[1], 1)
+				}
 				path = filepath.Join(root, path)
 				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 					t.Fatal(err)
@@ -251,9 +282,9 @@ func TestAddGoFunctionCallersRetainsAllReviewedCallSites(t *testing.T) {
 			commit := repositorySnapshotCommit(t, root)
 			functions := []Function{{Name: "compact"}, {Name: "generateTurnPrefixSummary"}, {Name: "mergeSettings"}, {Name: "setProjectTrusted"}, {Name: "reload"}, {Name: "persistScopedSettings"}, {Name: "saveGlobal"}, {Name: "saveProject"}, {Name: "settingsOrchestration"}}
 			err := addGoFunctionCallers(t.Context(), root, "", commit, functions)
-			if len(tc.want) == 0 {
-				if err == nil || !strings.Contains(err.Error(), "Load has 0 calls to mergeSettings") {
-					t.Fatalf("missing caller error = %v", err)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("caller error = %v, want %q", err, tc.wantErr)
 				}
 				return
 			}
@@ -274,6 +305,49 @@ func TestAddGoFunctionCallersRetainsAllReviewedCallSites(t *testing.T) {
 			wantTrust := []FunctionCaller{{Path: "coding/cli/cli_runtime_build.go", Symbol: "buildResources", Expression: trustCall, StartLine: 3, SourceHash: hashString(trustCall)}}
 			if got := functions[3].Callers; !reflect.DeepEqual(got, wantTrust) {
 				t.Fatalf("setProjectTrusted callsite pins = %#v, want %#v", got, wantTrust)
+			}
+		})
+	}
+}
+
+func TestGoSummaryBindingRejectsWrongGeneratorOrScope(t *testing.T) {
+	const valid = `package compaction
+func compact(standalone bool) {
+	generateSummary := GenerateSummaryWithUsageUsing
+	if standalone {
+		generateSummary = generateSummaryChunk
+	}
+	generateSummary()
+}
+`
+	for _, tc := range []struct {
+		name    string
+		replace [2]string
+		wantErr string
+	}{
+		{name: "both routes"},
+		{name: "wrong default", replace: [2]string{"GenerateSummaryWithUsageUsing", "generateSummaryChunk"}, wantErr: "must bind"},
+		{name: "wrong standalone generator", replace: [2]string{"= generateSummaryChunk", "= GenerateSummaryWithUsageUsing"}, wantErr: "must bind"},
+		{name: "wrong scope", replace: [2]string{"if standalone {", "if !standalone {"}, wantErr: "must bind"},
+		{name: "shadowed call", replace: [2]string{"\n\tgenerateSummary()", "\n\tif standalone { generateSummary := generateSummaryChunk; generateSummary() }"}, wantErr: "unexpected use"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := valid
+			if tc.replace[0] != "" {
+				source = strings.Replace(source, tc.replace[0], tc.replace[1], 1)
+			}
+			files := token.NewFileSet()
+			file, err := parser.ParseFile(files, "compaction.go", source, parser.SkipObjectResolution)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = validateGoSummaryBinding(findGoFunction(file, "compact"), []byte(source), files)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("summary binding error = %v, want %q", err, tc.wantErr)
 			}
 		})
 	}

@@ -165,7 +165,7 @@ func (g *GraphPackageManager) Call(ctx context.Context, method string, raw json.
 				return packagemanager.MissingSourceAction(action), nil
 			}
 		}
-		paths, err := manager.Resolve(onMissing)
+		paths, err := manager.ResolveContext(ctx, onMissing)
 		if err != nil {
 			return nil, err
 		}
@@ -182,7 +182,7 @@ func (g *GraphPackageManager) Call(ctx context.Context, method string, raw json.
 		if err := args.Unmarshal(1, func(raw json.RawMessage) error { return json.Unmarshal(raw, &options) }); err != nil {
 			return nil, err
 		}
-		paths, err := manager.ResolveExtensionSources(sources, options.Local, options.Temporary)
+		paths, err := manager.ResolveExtensionSourcesContext(ctx, sources, options.Local, options.Temporary)
 		if err != nil {
 			return nil, err
 		}

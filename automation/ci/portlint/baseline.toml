@@ -6309,12 +6309,6 @@ snippet = "return packageCommand(context.Background(), installedPath, \"git\", a
 [[hit]]
 check = "ctxbackground"
 file = "internal/packagemanager/process.go"
-func = "RunPackageProcess"
-snippet = "cmd := packageCommand(context.Background(), dir, name, args...)"
-
-[[hit]]
-check = "ctxbackground"
-file = "internal/packagemanager/process.go"
 func = "RunPackageCapture"
 snippet = "ctx, cancel := context.WithTimeout(context.Background(), UpdateCheckNetworkTimeout)"
 
@@ -6467,12 +6461,6 @@ check = "jsonclone"
 file = "coding/cli/rpc_mode.go"
 func = "rpcUserBashOverride"
 snippet = "if err := json.Unmarshal(encoded, &result); err != nil {"
-
-[[hit]]
-check = "jsonclone"
-file = "coding/extension/builtin/codemode/execute.go"
-func = "storeOf"
-snippet = "if err != nil || json.Unmarshal(raw, &fields) != nil || fields.CustomType != StoreEntryType {"
 
 [[hit]]
 check = "jsonclone"

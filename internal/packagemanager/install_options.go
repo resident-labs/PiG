@@ -48,7 +48,7 @@ func WithProgressReporter(progress ProgressCallback) InstallOption {
 }
 
 func resolveInstallOptions(opts []InstallOption) installOptions {
-	options := installOptions{ctx: context.Background()}
+	var options installOptions
 	for _, opt := range opts {
 		opt(&options)
 	}

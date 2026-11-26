@@ -1276,14 +1276,6 @@ count = 1
 class = "hot-kept: unfixed at integrate-042 tip, fix pending on a port lane; shrink-only"
 
 [[hit]]
-file = "coding/extension/builtin/codemode/execute.go"
-func = "storeOf"
-pattern = "json-roundtrip"
-detail = "marshal+unmarshal"
-count = 1
-class = "hot-kept: once per codemode execute; only codemode-store entries are encoded now, other entries are skipped"
-
-[[hit]]
 file = "coding/extension/builtin/codemode/models_args.go"
 func = "checkClassifierContext"
 pattern = "loop-format"

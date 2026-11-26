@@ -104,8 +104,15 @@ func TestRenderProxyLiveLoaderAdvancesInCachingContainer(t *testing.T) {
 				},
 			})
 			waitForRenderProxy(t, func() bool {
-				return strings.Contains(strings.Join(parent.Render(60), "\n"), "settled")
+				// req2 arrived while requesting was true. Wait for the loop to
+				// publish that answer and its dirty flag before drawing it.
+				proxy.mu.Lock()
+				defer proxy.mu.Unlock()
+				return !proxy.requesting
 			})
+			if rendered := strings.Join(parent.Render(60), "\n"); !strings.Contains(rendered, "settled") {
+				t.Fatalf("static replacement did not render: %q", rendered)
+			}
 			if proxy.IsDirty() {
 				t.Fatalf("static view still reported IsDirty=true after render")
 			}

@@ -4511,6 +4511,17 @@
       "shapeHash": "sha256:ad86c9323e6a2f26ca7ca2aa503825a5f2cca8380d7e7a29614ec1224426e697"
     },
     {
+      "id": "go:github.com/MichaelKinsy/PiG/agent#UserMessage.ReplaceContentBlocks",
+      "package": "github.com/MichaelKinsy/PiG/agent",
+      "name": "UserMessage.ReplaceContentBlocks",
+      "kind": "function",
+      "exported": true,
+      "shape": {
+        "type": "func(content github.com/MichaelKinsy/PiG/ai.UserContentBlocks) error"
+      },
+      "shapeHash": "sha256:93cadb0698cb115cbc5a1b8cf83a9ff318428e3d9c3b413c1884f0843f6dab4d"
+    },
+    {
       "id": "go:github.com/MichaelKinsy/PiG/agent#ValidateUserMembers",
       "package": "github.com/MichaelKinsy/PiG/agent",
       "name": "ValidateUserMembers",
@@ -7666,6 +7677,17 @@
         "type": "func(source *messageSource, empty string) *messageSource"
       },
       "shapeHash": "sha256:ba2c5924c46598f406e8dd0387477c66221bec731c07193241e293589d00203c"
+    },
+    {
+      "id": "go:github.com/MichaelKinsy/PiG/agent#withMessageContent",
+      "package": "github.com/MichaelKinsy/PiG/agent",
+      "name": "withMessageContent",
+      "kind": "function",
+      "exported": false,
+      "shape": {
+        "type": "func(source *messageSource, content github.com/MichaelKinsy/PiG/extensions/sdk/json.RawMessage) (*messageSource, error)"
+      },
+      "shapeHash": "sha256:59ed92e5559ae204d49df8adb09065196efc252789a9e2af513c1017c5ac88e0"
     },
     {
       "id": "go:github.com/MichaelKinsy/PiG/agent#withRegistrationTurn",
@@ -82353,9 +82375,9 @@
       "kind": "function",
       "exported": false,
       "shape": {
-        "type": "func(event github.com/MichaelKinsy/PiG/agent.MessageStartEvent)"
+        "type": "func(event github.com/MichaelKinsy/PiG/agent.MessageStartEvent) error"
       },
-      "shapeHash": "sha256:13963ba1e6eade87e664aaeba432d1f62a5345c4892da894cc5555c93423f0da"
+      "shapeHash": "sha256:4df197b2e6b69756b7efd8ed261bebf3420d03cca3a0c9f78a2d12bc1def1cda"
     },
     {
       "id": "go:github.com/MichaelKinsy/PiG/coding#Session.noteAssistantMessageEnd",

@@ -67,6 +67,11 @@ func TestSessionRemovesAnImageOnlySteeringMessageAfterDelivery(t *testing.T) {
 func TestSessionResizesImagesInQueuedSteeringAndFollowUpMessages(t *testing.T) {
 	waiting := createQueueWaitingHarness(t, extension.Extension{})
 	h := waiting.h
+	disk, err := newSessionManagerForDir(h.session.services, t.TempDir()).Create("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.session.ReplaceInner(disk)
 	original := tallPNG(t)
 	var sent []ai.ImageContent
 	record := func(messages []ai.Message) *ai.AssistantMessage {
@@ -88,6 +93,7 @@ func TestSessionResizesImagesInQueuedSteeringAndFollowUpMessages(t *testing.T) {
 	waiting.releaseToolExecution()
 	waiting.join()
 	checked := 0
+	var resizedSteer string
 	for _, message := range h.session.Messages() {
 		if message.User == nil {
 			continue
@@ -107,16 +113,29 @@ func TestSessionResizesImagesInQueuedSteeringAndFollowUpMessages(t *testing.T) {
 		if len(images) != 1 || images[0].Data == original.Data {
 			t.Fatalf("%q kept its full-size image (%d images)", text, len(images))
 		}
+		if strings.HasPrefix(text, "steer") {
+			resizedSteer = images[0].Data
+		}
 		if !strings.Contains(text, "original 1200x9000, displayed at 267x2000") {
 			t.Fatalf("%q lacks the resize hint: %q", text, text)
 		}
 	}
-	data, err := os.ReadFile(h.session.Path())
+	data, err := os.ReadFile(disk.Path())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(data, []byte(`"deliveryId":"queued-image"`)) || bytes.Contains(data, []byte(original.Data)) {
-		t.Fatal("persisted steer lost its member or kept its original image")
+	var recorded []byte
+	for line := range bytes.SplitSeq(data, []byte{'\n'}) {
+		if bytes.Contains(line, []byte(`"deliveryId":"queued-image"`)) {
+			recorded = line
+			break
+		}
+	}
+	if recorded == nil {
+		t.Fatal("recorded steer lost its deliveryId")
+	}
+	if bytes.Contains(recorded, []byte(original.Data)) || resizedSteer == "" || !bytes.Contains(recorded, []byte(resizedSteer)) {
+		t.Fatal("recorded steer did not keep the resized image in the transcript")
 	}
 	if checked != 3 {
 		t.Fatalf("checked %d queued messages, want 3", checked)

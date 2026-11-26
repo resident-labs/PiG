@@ -69,19 +69,7 @@ func (c ProviderCompleter) CompleteSimple(
 	if err != nil {
 		return "", nil, fmt.Errorf("compaction completer: stream: %w", err)
 	}
-	if progress := compactprogress.From(ctx); progress != nil {
-		// pig divergence (D652): the interactive compaction line shows the size of the summary as it streams. The events are only counted; the result below is what Result returned before, the caller's context cancels the iteration as it ends the request.
-		progress.Reset()
-		for _, event := range stream.ObservePublishedEvents(ctx) {
-			switch event := event.(type) {
-			case ai.TextDeltaEvent:
-				progress.Add(len(event.Delta))
-			case ai.ThinkingDeltaEvent:
-				progress.Add(len(event.Delta))
-			}
-		}
-	}
-	message := stream.Result()
+	message := resultWithProgress(ctx, stream)
 	if ctx.Err() != nil {
 		return "", nil, ctx.Err()
 	}
@@ -108,4 +96,20 @@ func (c ProviderCompleter) CompleteSimple(
 	}
 	usage := message.Usage
 	return text.String(), &usage, nil
+}
+
+func resultWithProgress(ctx context.Context, stream *ai.AssistantMessageEventStream) *ai.AssistantMessage {
+	if progress := compactprogress.From(ctx); progress != nil {
+		// pig divergence (D652): the interactive compaction line counts the streamed summary. The request's context also bounds event observation.
+		progress.Reset()
+		for _, event := range stream.ObservePublishedEvents(ctx) {
+			switch event := event.(type) {
+			case ai.TextDeltaEvent:
+				progress.Add(len(event.Delta))
+			case ai.ThinkingDeltaEvent:
+				progress.Add(len(event.Delta))
+			}
+		}
+	}
+	return stream.Result()
 }

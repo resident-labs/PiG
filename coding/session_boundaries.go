@@ -63,7 +63,9 @@ func (s *Session) handleAgentEvent(ctx context.Context, event agent.AgentEvent) 
 				s.notifyAgentEventListeners(update)
 				s.publishQueueEvent(update)
 			}
-			s.normalizeDeliveredImages(event)
+			if err := s.normalizeDeliveredImages(event); err != nil {
+				return err
+			}
 		}
 	case agent.AgentStartEvent:
 		s.boundaryTurnIndex = 0

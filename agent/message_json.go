@@ -563,25 +563,51 @@ func (m AgentMessage) NullContent() bool {
 	return false
 }
 
+// ReplaceContentBlocks updates the content a user message sends and records. A retained JSON source keeps its other members and their order.
+func (m *UserMessage) ReplaceContentBlocks(content ai.UserContentBlocks) error {
+	if m.source != nil {
+		blocks, err := marshalAgentContent(content)
+		if err != nil {
+			return err
+		}
+		raw, err := json.AppendStringify(nil, blocks)
+		if err != nil {
+			return err
+		}
+		updated, err := withMessageContent(m.source, raw)
+		if err != nil {
+			return err
+		}
+		m.source = updated
+	}
+	m.Content = content
+	return nil
+}
+
 // withEmptyContent sets the content member of a decoded message's text to empty, or returns nil when there is no text or it cannot be rewritten, so the fields encode the message.
 func withEmptyContent(source *messageSource, empty string) *messageSource {
+	rewritten, _ := withMessageContent(source, json.RawMessage(empty))
+	return rewritten
+}
+
+func withMessageContent(source *messageSource, content json.RawMessage) (*messageSource, error) {
 	if source == nil {
-		return nil
+		return nil, nil
 	}
 	members, err := orderedjson.Parse(source.text)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	members.Set("content", json.RawMessage(empty))
+	members.Set("content", content)
 	encoded, err := members.MarshalJSON()
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	canonical, err := jsonstringify.Canonicalize(encoded)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return &messageSource{text: canonical}
+	return &messageSource{text: canonical}, nil
 }
 
 // UnmarshalJSON decodes the upstream flat role-discriminated AgentMessage union and retains lone UTF-16 units in user content as WTF-8. When the decoded fields would encode to other text than JSON.stringify writes for data (member order, members PiG does not model, or a spelling the fields cannot keep), the message keeps that text: Pi holds the parsed object and writes it unchanged.

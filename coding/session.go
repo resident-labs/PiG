@@ -1528,6 +1528,7 @@ func (s *Session) ReplaceInner(sess *icodingagent.Session) {
 	s.inner.Store(sess)
 	// The messages of the session left are no message of the one installed: the numbering does not hold them.
 	s.messageSeqs.reset()
+	s.lastRequest.Store(nil)
 	// upstream: runner.ts:889-891. Extensions see the log the Session now owns, and nothing keeps the replaced one alive.
 	if runner := s.currentRunner(); runner != nil {
 		runner.BindSessionManager(sess)
@@ -2012,25 +2013,26 @@ func (s *Session) trackQueuedImageMessage(message *agent.UserMessage, images []a
 // to its text (agent-session.ts _normalizeQueuedMessageImages). The Agent's message_start carries a copy of the message that shares its
 // content array, so the transcript's message and the event both change, before listeners and persistence see either. It runs after the
 // queue entry was matched by its original text. It does nothing for a message that was not queued with images.
-func (s *Session) normalizeDeliveredImages(event agent.MessageStartEvent) {
+func (s *Session) normalizeDeliveredImages(event agent.MessageStartEvent) error {
 	user := event.Message.User
-	if user == nil {
-		return
-	}
 	blocks, isBlocks := user.Content.(ai.UserContentBlocks)
 	if !isBlocks || len(blocks) == 0 {
-		return
+		return nil
 	}
 	stored, ok := s.queuedImageMessages.LoadAndDelete(&blocks[0])
 	if !ok {
-		return
+		return nil
 	}
 	if _, isText := blocks[0].(ai.TextContent); !isText {
-		return
+		return nil
 	}
 	content := ai.UserContentBlocks(icodingagent.NormalizePromptContent(blocks, s.SettingsManager().GetImageAutoResize(), s.limitsModel(), s.processImage))
-	user.Content = content
-	stored.(*agent.UserMessage).Content = content
+	queued := stored.(*agent.UserMessage)
+	if err := queued.ReplaceContentBlocks(content); err != nil {
+		return err
+	}
+	*user = *queued
+	return nil
 }
 
 // GetSteeringMessages returns queued steering text in admission order.

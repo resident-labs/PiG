@@ -122,7 +122,7 @@ func isOverflow(err error) bool {
 func sendLive(ctx context.Context, request LiveRequest, messages []ai.Message, prompt string) (string, *ai.Usage, error) {
 	ask := ai.UserMessage{Content: ai.UserContentBlocks{ai.TextContent{Text: prompt}}, Timestamp: time.Now().UnixMilli()}
 	full := append(messages[:len(messages):len(messages)], ask)
-	message := request.Stream(ctx, request.Model, ai.Context{Messages: full}, request.Options).Result()
+	message := resultWithProgress(ctx, request.Stream(ctx, request.Model, ai.Context{Messages: full}, request.Options))
 	if ctx.Err() != nil {
 		return "", nil, ctx.Err()
 	}

@@ -75,14 +75,26 @@ func (m *InteractiveMode) exitOnDeadTerminalWrite() (remove func()) {
 	})
 }
 
-// emergencyTerminalExit exits without the normal teardown: the terminal is gone, so TUI and extension cleanup would write
+// emergencyTerminalExit exits without the normal teardown: the terminal is gone, so the TUI's cleanup would write
 // restore sequences and fail again. Pi's process.exit(129) still runs the TUI's exit handler, which writes the mode resets
 // synchronously and swallows the write errors (9df819de, #11170); tui.RestoreTerminalOnExit does the same here.
 // It kills the tracked detached children first, as upstream does, so a running shell command does not outlive the exit
 // in its own process group. Pi's extensions run inside the exiting process and die with it; pig's run as child
 // processes in their own process groups, so it kills them too, or they would keep writing into the session's
 // directories.
-// Ports packages/coding-agent/src/modes/interactive/interactive-mode.ts (emergencyTerminalExit).
+//
+// Extensions get session_shutdown first. In Pi a terminal that goes away reaches a session through SIGHUP: the handler
+// (registerSignalHandlers) kills the tracked children and runs shutdown({fromSignal: true}), which awaits
+// runtimeHost.dispose() (the interrupted run settles, then session_shutdown with the reason "quit") before any terminal
+// write; the restore writes that follow meet EIO and end in emergencyTerminalExit. Measured on Pi 1.5.2 in a git
+// repository (tmux kill-session and kill-pane, a closed pty master as session leader and under a shell; 16 of 16): the
+// handler ran, its awaited write landed, exit 129. PiG's input reader sees the hung-up terminal before any signal and
+// used to exit here without the event; it also killed the extension processes under an emission the signal goroutine
+// had started. The shutdown below is that handler's: it writes nothing to the terminal, a handler's failed terminal
+// write is swallowed by exitOnDeadTerminalWrite once emergencyExiting is set, and Run is not unwound, so none of the
+// normal teardown's writes (input drain, cursor, bracketed paste, Kitty, modifyOtherKeys, the alternate screen, the
+// final frame, the resume hint) is made.
+// Ports packages/coding-agent/src/modes/interactive/interactive-mode.ts (emergencyTerminalExit, registerSignalHandlers, shutdown).
 //
 // The input reader, a failed terminal write and a crash on a dead terminal can all arrive here at once (exit_ending.go has
 // the ordering contract). Pi's is `never`: the first caller ends the process with 129, and a later caller blocks behind it
@@ -96,8 +108,23 @@ func (m *InteractiveMode) emergencyTerminalExit(reason string) {
 	// pig additive (D102): Pi exits here with no trace.
 	RecordEnding(m.opts.AgentDir, reason+" (exit 129)")
 	tools.KillTrackedDetachedChildren()
+	// pig divergence (D186): Pi awaits the handlers without a limit and emits nothing when its event loop is empty at the hangup
+	// or a terminal write fails first; PiG always emits and waits at most the second of shutdownExtensionsBriefly, so no handler
+	// holds a process whose terminal is gone.
+	m.shutdownExtensionsBriefly()
 	if m.opts.TerminateExtensionProcesses != nil {
 		m.opts.TerminateExtensionProcesses()
+	}
+	// pig additive (D614): the view endpoint's socket does not outlive the session. It writes nothing to the terminal,
+	// and it gets a second: nothing may hold this exit.
+	closed := make(chan struct{})
+	go func() {
+		m.closeViewEndpoint()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
 	}
 	EndSessionMarker()
 	// Pi's process.exit(129) runs the TUI's exit handler, which restores the terminal modes (9df819de, #11170).
@@ -130,6 +157,8 @@ func (m *InteractiveMode) inputLoopUntil(ctx context.Context, source io.Reader, 
 	defer m.enterOwnerLoop()()
 	m.startTerminalInput(ctx, source)
 	if until == nil {
+		// The outer loop is the last that drains uiTaskCh: a post that waits for the loop to take it is released from here on, before Stop and before Run returns (the quit by keys starts the hosts' shutdown from inside this loop's exit, and that shutdown may wait for such a post).
+		defer m.runEnded.end()
 		defer func() {
 			if err := m.stopTerminalInput(); err != nil {
 				resultErr = errors.Join(resultErr, err)
@@ -145,6 +174,11 @@ func (m *InteractiveMode) inputLoopUntil(ctx context.Context, source io.Reader, 
 		}()
 	}
 
+	// submitLoopPrompt is run()'s `await this.session.prompt(userInput)` for the text the resolved getUserInput promise delivered.
+	submitLoopPrompt := func(text string) {
+		userInput = nil
+		m.promptLoopSubmit(ctx, text, nil)
+	}
 	dispatchRead := func(input inputChunk) error {
 		return m.dispatchTerminalRead(ctx, input, &readCh, errCh)
 	}
@@ -165,16 +199,22 @@ func (m *InteractiveMode) inputLoopUntil(ctx context.Context, source io.Reader, 
 		if m.requestExit.Load() {
 			return m.finishInteractiveShutdown()
 		}
-		if until == nil && userInput == nil && m.initialMessagesDone == nil && !m.hasActiveAgentTurn() {
+		if until == nil && userInput == nil && m.initialMessagesDone == nil && !m.hasActiveAgentTurn() && !m.promptCommandPending() {
 			userInput = m.getUserInput()
 		}
 		// Pi resumes the resolved getUserInput promise after this read's synchronous sequences, before another terminal-read event.
 		select {
 		case text := <-userInput:
-			userInput = nil
-			m.handleSubmit(ctx, text)
+			submitLoopPrompt(text)
 			continue
 		default:
+		}
+		// Keys a /reload took after its last awaited step had completed precede everything routed after that step (awaitReloadStep).
+		if tail, ok := m.takeReloadTailInput(); ok {
+			if err := dispatchRead(inputChunk{data: tail}); err != nil {
+				return err
+			}
+			continue
 		}
 		// Prioritize terminal input over agent/render events. During tool output or
 		// streaming, eventCh/uiTaskCh can stay hot; without this pre-check a waiting
@@ -208,8 +248,7 @@ func (m *InteractiveMode) inputLoopUntil(ctx context.Context, source io.Reader, 
 		case <-m.initialMessagesDone:
 			m.initialMessagesDone = nil
 		case text := <-userInput:
-			userInput = nil
-			m.handleSubmit(ctx, text)
+			submitLoopPrompt(text)
 		case err := <-errCh:
 			return err
 		case <-until:
@@ -291,7 +330,7 @@ func (m *InteractiveMode) dispatchTerminalRead(ctx context.Context, input inputC
 	// Match upstream's immediate keyboard paint before the autocomplete
 	// request resolves and asks for its throttled follow-up frame.
 	defer func() {
-		if dispatched && err == nil {
+		if dispatched && err == nil && !m.frameHold {
 			m.tuiInst.Render()
 		}
 		if err == nil && m.editor != nil {
@@ -307,8 +346,16 @@ func (m *InteractiveMode) dispatchTerminalRead(ctx context.Context, input inputC
 		// render once per acknowledged frame, and an animation then runs
 		// at the frontend's frame rate instead of its own.
 		dispatched = dispatched || (len(input.data) > 0 && !m.frontendTookInput)
-		if dispatchErr != nil || changed == nil {
+		if dispatchErr != nil {
 			return dispatchErr
+		}
+		// The keys a /reload took after its last awaited step follow this chunk, before the rest of its read and everything routed later.
+		if tail, ok := m.takeReloadTailInput(); ok {
+			input = inputChunk{data: tail}
+			continue
+		}
+		if changed == nil {
+			return nil
 		}
 		select {
 		case <-ctx.Done():
@@ -330,23 +377,37 @@ func (m *InteractiveMode) dispatchTerminalRead(ctx context.Context, input inputC
 	}
 }
 
+// quitEnteredChan is the channel markQuitEntered closes; it is made on first use so a mode built without a constructor has it.
+func (m *InteractiveMode) quitEnteredChan() chan struct{} {
+	m.quitEnteredOnce.Do(func() { m.quitEntered = make(chan struct{}) })
+	return m.quitEntered
+}
+
+// markQuitEntered records that the owner loop left its input loop for the exit and will wait for shutdownMu.
+func (m *InteractiveMode) markQuitEntered() {
+	m.quitEnteredCloseOnce.Do(func() { close(m.quitEnteredChan()) })
+}
+
 func (m *InteractiveMode) finishInteractiveShutdown() error {
+	m.markQuitEntered()
 	m.shutdownMu.Lock()
 	defer m.shutdownMu.Unlock()
 	fromSignal := m.signalShutdownDone.Swap(true)
+	m.quitByKeys = !fromSignal
 	inputErr := m.stopTerminalInput()
 	m.remoteEditorEvents.drain()
 	m.stopInteractiveTui()
 	if err := m.requestedExitError(); err != nil {
+		m.quitDisposing.Store(false)
 		if inputErr != nil {
 			return errors.Join(inputErr, err)
 		}
 		return err
 	}
 	if !fromSignal {
-		// Pi's dispose awaits session.abort() first (agent-session-runtime.ts dispose, D247): the run that streams at the quit ends on this owner loop.
-		m.settleRunAtQuit()
-		m.emitQuitShutdown()
+		// A stop that an earlier caller already ran marked nothing: the quit is pending from here at the latest.
+		m.quitDisposing.Store(true)
+		m.emitQuitShutdownAfterStop()
 		m.printResumeHint()
 	}
 	return inputErr
@@ -374,11 +435,12 @@ func (m *InteractiveMode) startTerminalInput(ctx context.Context, source io.Read
 	m.inputErrCh = make(chan error, 1)
 	if file, ok := source.(*os.File); ok {
 		owner.router = m.newTerminalInputRouter(ctx, m.inputReadCh, m.inputErrCh, true)
-		owner.reader = newInteractiveTerminalReader(ctx, file, owner.router)
+		owner.reader = newHeldInteractiveTerminalReader(ctx, file, owner.router, m.inputHold)
 		m.inputReader = owner.reader
 		return
 	}
 	owner.done = make(chan struct{})
+	//portlint:allow asyncorder Node hands each stdin chunk to Pi's listener in arrival order (terminal.ts:281-283, :304) and ProcessTerminal.stop removes the listener; this router of a source that is not the terminal feeds the loop through the unbuffered inputReadCh and is joined by stopTerminalInput (<-owner.done); TestInteractiveShutdownJoinsInputBeforeTerminalTeardown holds the join, TestPendingTerminalInputBackpressuresReader the unbuffered hand-off
 	go func() {
 		defer close(owner.done)
 		owner.err = m.pumpTerminalInput(ctx, source, m.inputReadCh, m.inputErrCh)
@@ -606,6 +668,7 @@ func (*InteractiveMode) rawInputChannels(ctx context.Context, source io.Reader) 
 			close(closeDone)
 		})
 	}
+	//portlint:allow asyncorder a read worker Node has no counterpart of: its stdin chunks are events in arrival order (terminal.ts:304); each read goes to the router over the unbuffered data channel, and the returned stop function, which pumpTerminalInput defers, joins the worker (cancel, <-done); TestInteractiveShutdownReturnsReaderCloseErrorAfterJoining holds the join, TestPendingTerminalInputBackpressuresReader the one read ahead
 	go func() {
 		defer close(done)
 		disarmClose := func() {
@@ -833,22 +896,30 @@ func (m *InteractiveMode) defaultCustomEditor() *CustomEditor {
 	if m.customEditor != nil && m.customEditor.Editor == m.editor && m.customEditor.keybindings == m.keybindings {
 		return m.customEditor
 	}
+	editor := m.newCustomEditor()
+	m.setupKeyHandlers(editor)
+	return editor
+}
+
+// newCustomEditor builds the CustomEditor over the current default editor, as interactive-mode.ts:645-651 constructs it, with no app handler bound.
+func (m *InteractiveMode) newCustomEditor() *CustomEditor {
 	// interactive-mode.ts:645-651 builds the editor from the settings' editorPaddingX and autocompleteMaxVisible.
 	paddingX, autocompleteMaxVisible := m.opts.Settings.GetEditorPaddingX(), m.opts.Settings.GetAutocompleteMaxVisible()
 	options := CustomEditorOptions{PaddingX: &paddingX, AutocompleteMaxVisible: &autocompleteMaxVisible, EmbedWorkingStatus: true}
-	superInput := func(data string) {
-		m.runEditorAction(classifyKeyWithBindings(data, m.keybindings), data)
-	}
 	if m.editor == nil {
 		// interactive-mode.ts:645 `new CustomEditor(this.ui, getEditorTheme(), this.keybindings, {...})`: the default editor is the CustomEditor's own.
 		m.customEditor = NewCustomEditor(m.tuiInst, tui.EditorTheme{}, m.keybindings, options)
-		m.customEditor.superInput = superInput
+		m.customEditor.superInput = m.editorSuperInput
 		m.editor = m.customEditor.Editor
 	} else {
-		m.customEditor = wrapCustomEditor(m.editor, m.keybindings, superInput, options)
+		m.customEditor = wrapCustomEditor(m.editor, m.keybindings, m.editorSuperInput, options)
 	}
-	m.setupKeyHandlers(m.customEditor)
 	return m.customEditor
+}
+
+// editorSuperInput is what the CustomEditor does with a key no app action takes once startup completed.
+func (m *InteractiveMode) editorSuperInput(data string) {
+	m.runEditorAction(classifyKeyWithBindings(data, m.keybindings), data)
 }
 
 // runEditorAction runs the editor handling for one classified key under the key's context and keeps the first error for handleCustomEditorKey.
@@ -945,7 +1016,7 @@ func (m *InteractiveMode) handleEditorAction(ctx context.Context, action keyActi
 
 	// Upstream onEscape aborts the running `!` command (session.abortBash) when no agent run streams, and asks nothing
 	// else to abort. A deferred command can outlive the run that was streaming when it started.
-	if action == actionInterrupt && m.bashCancel != nil && m.retryCountdownStop == nil && !m.runStreaming() {
+	if action == actionInterrupt && m.bashCancel != nil && !m.retryEscapeHandler && !m.runStreaming() {
 		m.bashCancel()
 		return nil
 	}
@@ -959,7 +1030,7 @@ func (m *InteractiveMode) handleEditorAction(ctx context.Context, action keyActi
 		// Esc while working. During an automatic-retry countdown upstream
 		// swaps in an Escape handler that only cancels the retry delay, so
 		// the run itself settles with the failed attempt.
-		if m.retryCountdownStop != nil && m.opts.SessionHandle != nil {
+		if m.retryEscapeHandler && m.opts.SessionHandle != nil {
 			m.opts.SessionHandle.AbortRetry()
 			return nil
 		}
@@ -1246,12 +1317,7 @@ func (m *InteractiveMode) syncExtensionSlashCommands() {
 			Name:        cmdName,
 			Description: rc.Description,
 			Handler: func(_ *ExtensionContext, args string) error {
-				baseCtx := m.runCtx
-				if baseCtx == nil {
-					baseCtx = context.Background()
-				}
-				// Use the runner's command context and error channel, as Session command dispatch does. IPC stays off the input loop.
-				go nr.ExecuteCommand(baseCtx, cmdName, args)
+				m.startExtensionCommand(nr, cmdName, args)
 				return nil
 			},
 		})
@@ -1295,7 +1361,7 @@ func (m *InteractiveMode) restoreQueuedMessagesToEditor(abort bool) int {
 		}
 		m.compactionQueue = nil
 		combined := strings.Join(texts, "\n\n")
-		if current := m.editor.Text(); widthx.JSTrim(current) != "" {
+		if current := m.editor.GetExpandedText(); widthx.JSTrim(current) != "" {
 			combined += "\n\n" + current
 		}
 		m.editor.SetText(combined)
@@ -1347,6 +1413,10 @@ func (m *InteractiveMode) settleActiveRun() error {
 // settleRunAtQuit is the first step of Pi's dispose, `await this.session.abort()` (agent-session-runtime.ts dispose, agent-session.ts abort), for the quit by keys, whose dispose runs on the owner loop after the TUI stopped (finishInteractiveShutdown). Pi's loop turns under that await: the aborted run publishes its last events, which the extensions handle and the session file takes, agent_settled follows, and only then is the Session idle (_emitAgentSettled resolves the idle wait) and session_shutdown emitted. Here the run needs the owner loop to end: Session.RunAgentPrompt waits until the loop acknowledged its flush, and the turn's cleanup is posted to the loop. So the mode aborts the run and serves the loop, as settleActiveRun does for a replacement, until the run's goroutine has returned, which is after its agent_settled handlers. A dispose that awaited the run on the loop without serving it never ended.
 //
 // A user's bash command is not joined: Pi's abort does not wait for it.
+//
+// A message an agent_settled handler of the interrupted run sent (pi.sendUserMessage, a custom message that triggers a turn) starts its run once the handlers returned, and Pi's idle wait
+// resolves only after that run's own settle (agent-session.ts _emitAgentSettled awaits the deferred actions before _resolveIdleWaitIfIdle): the quit joins every run that follows, up to
+// the end of its agent_settled handlers, and only the first is aborted. The posted start is flushed through the owner loop before the check for a following run.
 func (m *InteractiveMode) settleRunAtQuit() {
 	m.queueMu.Lock()
 	settled, ended, session := m.turnSettled, m.turnEnded, m.opts.SessionHandle
@@ -1354,28 +1424,32 @@ func (m *InteractiveMode) settleRunAtQuit() {
 	if settled != nil || session != nil && !session.IsIdle() {
 		m.abortRun(m.runCtx)
 	} else {
-		// No run is active. One whose goroutine has not returned yet is still joined.
-		if ended == nil {
-			return
-		}
-		select {
-		case <-ended:
-			return
-		default:
-		}
+		// No run is active: the Session is idle, which Pi's waitForIdle resolves at once (agent-session.ts:1549 isIdle; _emitAgentSettled clears _isAgentRunActive before it emits agent_settled, agent-session.ts:1139-1161). A run whose goroutine is still in its agent_settled handlers is not joined: Pi's dispose does not await them either.
+		return
 	}
 	_ = m.serveOwnerLoopUntil(func(ctx context.Context) error {
-		if err := waitForSessionIdle(ctx, settled, session); err != nil {
-			return err
-		}
-		if ended != nil {
-			select {
-			case <-ended:
-			case <-ctx.Done():
-				return ctx.Err()
+		for {
+			if err := waitForSessionIdle(ctx, settled, session); err != nil {
+				return err
 			}
+			if ended != nil {
+				select {
+				case <-ended:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			if err := m.runOnMainAndWait(ctx, func() error { return nil }); err != nil {
+				return err
+			}
+			m.queueMu.Lock()
+			nextSettled, nextEnded := m.turnSettled, m.turnEnded
+			m.queueMu.Unlock()
+			if nextEnded == ended {
+				return nil
+			}
+			settled, ended = nextSettled, nextEnded
 		}
-		return nil
 	})
 }
 

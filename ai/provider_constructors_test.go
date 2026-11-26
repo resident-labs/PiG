@@ -16,7 +16,7 @@ func TestProviderConstructorsMatchCatalog(t *testing.T) {
 		"meta": MetaProvider, "minimax": MinimaxProvider, "minimax-cn": MinimaxCnProvider, "mistral": MistralProvider,
 		"moonshotai": MoonshotaiProvider, "moonshotai-cn": MoonshotaiCnProvider, "nvidia": NvidiaProvider, "openai": OpenaiProvider,
 		"openai-codex": OpenaiCodexProvider, "opencode": OpencodeProvider, "opencode-go": OpenCodeGoProvider, "openrouter": OpenrouterProvider,
-		"qwen-token-plan": QwenTokenPlanProvider, "qwen-token-plan-cn": QwenTokenPlanCnProvider, "qwen-token-plan-individual": QwenTokenPlanIndividualProvider,
+		"qwen-token-plan": QwenTokenPlanProvider, "qwen-token-plan-cn": QwenTokenPlanCnProvider, "qwen-token-plan-individual": QwenTokenPlanIndividualProvider, "qwen-token-plan-individual-cn": QwenTokenPlanIndividualCnProvider,
 		"together": TogetherProvider, "vercel-ai-gateway": VercelAIGatewayProvider, "xai": XaiProvider, "xiaomi": XiaomiProvider,
 		"xiaomi-token-plan-ams": XiaomiTokenPlanAmsProvider, "xiaomi-token-plan-cn": XiaomiTokenPlanCnProvider, "xiaomi-token-plan-sgp": XiaomiTokenPlanSgpProvider,
 		"zai": ZaiProvider, "zai-coding-cn": ZaiCodingCnProvider,
@@ -25,6 +25,13 @@ func TestProviderConstructorsMatchCatalog(t *testing.T) {
 	for id, construct := range constructors {
 		if !slices.Contains(known, id) {
 			t.Errorf("%s is not a catalog provider", id)
+			continue
+		}
+		if slices.Contains(BuiltStrippedProviders(), id) {
+			// A build with the pig_strip tag of this provider's API has nothing to construct: CreateProvider refuses a provider without an implementation.
+			if !panics(func() { construct() }) {
+				t.Errorf("%s: the constructor built a stripped provider", id)
+			}
 			continue
 		}
 		provider := construct()
@@ -56,10 +63,10 @@ func TestOpenCodeProvidersAddSessionHeaderToStreams(t *testing.T) {
 	}
 }
 
-// providers/all.ts: every catalog provider is built by its own constructor; BuiltinProviders agrees with the constructor table for each id and serves the whole catalog.
+// providers/all.ts: every catalog provider is built by its own constructor; BuiltinProviders agrees with the constructor table for each id and serves the whole catalog (without the provider a pig_strip_<api> build strips).
 func TestBuiltinProvidersAreBuiltByTheirConstructors(t *testing.T) {
 	built := BuiltinProviders()
-	ids := ListProviders()
+	ids := builtCatalogProviders()
 	if len(built) != len(ids) {
 		t.Fatalf("%d providers for %d catalog ids", len(built), len(ids))
 	}

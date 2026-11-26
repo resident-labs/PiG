@@ -140,7 +140,11 @@ func recordChangelogVersionAndMaybeReportInstall(sm *SettingsManager, appVersion
 	if lastSeen == appVersion {
 		return nil
 	}
-	newEntries := GetNewEntries(allEntries, lastSeen)
+	newEntries, ok := GetNewEntries(allEntries, lastSeen)
+	if !ok {
+		_ = sm.SetLastChangelogVersion(appVersion)
+		return nil
+	}
 	if len(newEntries) == 0 {
 		return nil
 	}

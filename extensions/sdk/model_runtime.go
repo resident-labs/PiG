@@ -259,6 +259,12 @@ func (r *ModelRuntime) Logout(provider string) error {
 	return err
 }
 
+// SettleCredentialWrites waits until the credential writes already in progress finish, such as an OAuth refresh a background catalog refresh started, so a process that exits next does not lose the rotated token (Pi's ModelRuntime.settleCredentialWrites). It waits only for writes started before the call, takes no cancellation of its own (Pi's takes no signal) and fails only when the host connection does.
+func (r *ModelRuntime) SettleCredentialWrites() error {
+	_, err := graphMethodAsync[graphDone](r.object, "settleCredentialWrites")
+	return err
+}
+
 // Refresh refreshes the model catalogs and availability.
 func (r *ModelRuntime) Refresh(options ModelsRefreshOptions) (ModelsRefreshResult, error) {
 	return graphMethodAsync[ModelsRefreshResult](r.object, "refresh", options)
@@ -348,12 +354,12 @@ func (r *ModelRuntime) registry() ModelRegistry { return ModelRegistry{context: 
 
 // Stream streams a model response through the runtime, with the provider's own options (request and options as for [ModelRegistry.Stream]).
 func (r *ModelRuntime) Stream(model, request, options map[string]any) *ModelEventStream {
-	return r.registry().streamOn(r.Handle(), model, request, options, false)
+	return r.registry().streamOn(r.object, model, request, options, false)
 }
 
 // StreamSimple is Stream with the simple options of Pi's streamSimple.
 func (r *ModelRuntime) StreamSimple(model, request, options map[string]any) *ModelEventStream {
-	return r.registry().streamOn(r.Handle(), model, request, options, true)
+	return r.registry().streamOn(r.object, model, request, options, true)
 }
 
 // Complete is the final message of Stream.

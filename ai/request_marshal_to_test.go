@@ -19,14 +19,20 @@ func TestRequestTypesEncodeAsTheirMarshalJSON(t *testing.T) {
 		anthContentBlock{Type: "redacted_thinking", Data: text},
 		anthContentBlock{Type: "tool_use", ID: "toolu_1", Name: "write", Input: json.RawMessage(`{"path":"a<b>.go","content":"` + "x\\n" + `"}`)},
 		anthContentBlock{Type: "tool_result", ToolUseID: "toolu_1", Content: []anthContentBlock{{Type: "text", Text: text}}, IsError: &isError},
-		anthContentBlock{Type: "image", Source: map[string]any{"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+		anthContentBlock{Type: "image", Source: &anthImageSource{Type: "base64", MediaType: "image/png", Data: "AAAA"}},
 		anthContentBlock{Type: "tool_addition", Tool: &anthToolChange{Type: "tool_definition", Definition: &anthTool{Name: "t", Description: text, InputSchema: map[string]any{"type": "object"}}}},
 		anthTool{Name: "read", Description: text, Strict: &strict, EagerInputStream: true, InputSchema: map[string]any{"type": "object", "properties": map[string]any{"z": map[string]any{"type": "string"}, "a": map[string]any{}}}, inputSchemaOrder: schemaObjectOrder{"": {"type", "properties"}, "properties": {"z", "a"}}, CacheControl: &anthCacheControl{Type: "ephemeral"}},
 		deferredToolPlaceholder(),
 		ResponsesTool{Type: "function", Name: "read", Description: text, Parameters: map[string]any{"type": "object", "b": 1, "a": 2}, parameterOrder: schemaObjectOrder{"": {"type", "b", "a"}}, Strict: json.RawMessage("null"), DeferLoading: true},
 		ResponsesTool{Type: "custom", Name: "g", Format: &ResponsesToolFormat{Type: "grammar", Syntax: "lark", Definition: text}},
 		respRequest{Model: "m", Input: json.RawMessage(`[{"role":"user","content":"<x> & y"}]`), Stream: true, Store: &strict, Tools: []ResponsesTool{{Type: "function", Name: "n"}}, ToolChoice: "auto", Reasoning: &respReasoning{Effort: "high"}},
-		respRequest{Model: "m", Input: json.RawMessage(`[]`), Stream: true, Instructions: text, Text: map[string]string{"verbosity": "low"}, Include: []string{"reasoning.encrypted_content"}, codex: true},
+		respRequest{Model: "m", Input: json.RawMessage(`[]`), Stream: true, PromptCacheKey: text, Text: map[string]string{"verbosity": "low"}, Include: []string{"reasoning.encrypted_content"}, codex: true},
+		ResponsesInputItem{Type: "tool_search_call", CallID: "c", Execution: "client", Status: "completed", Arguments: json.RawMessage(`{"query":"a <b>","limit":1}`)},
+		ResponsesInputItem{Type: "tool_search_output", CallID: "c", Execution: "client", Status: "completed", Tools: []ResponsesTool{{Type: "function", Name: "n"}}},
+		ResponsesInputItem{Type: "reasoning", ID: "rs_1", stored: json.RawMessage(`{"id":"rs_1","type":"reasoning","x":"a <b> & c","summary":[]}`)},
+		ResponsesInputItem{Type: "function_call", ID: "fc_1", CallID: "c", Name: "read", Arguments: json.RawMessage(`"{}"`)},
+		oaiMessage{Role: "assistant", Content: text, ReasoningContent: new("plan"), ToolCalls: []oaiRequestToolCall{{ID: "c", Type: "function"}}},
+		oaiMessage{Role: "assistant", Content: nil, Reasoning: text, ToolCalls: []oaiRequestToolCall{{ID: "c", Type: "function"}}, ReasoningContent: new(""), reasoningContentLast: true},
 	}
 	for i, value := range values {
 		want, err := value.MarshalJSON()

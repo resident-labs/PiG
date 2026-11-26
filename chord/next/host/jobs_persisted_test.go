@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"path/filepath"
 	"slices"
@@ -22,9 +23,10 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/store"
 	"github.com/MichaelKinsy/PiG/chord/sqlite"
 	"github.com/MichaelKinsy/PiG/chord/sqlite/node"
+	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
-// Ports packages/chord/test/next/jobs/persisted.test.ts: persisted jobs (slice 6b §4, D5-D8, R3): run records and state
+// Ports packages/chord/test/jobs/persisted.test.ts: persisted jobs (slice 6b §4, D5-D8, R3): run records and state
 // documents in the object's store, every transition of §4.2 across a crash (the store closed under a live host, reopened
 // by a new one), the clean stop and the close writer, a seal and its retry, the restart limit and its reset, the finish
 // failure count, a stored abort, deferred state.
@@ -36,9 +38,9 @@ import (
 // test's end. `RETENTION_MS` and `vi.spyOn(Residency.prototype, "touch")` are `documents.RetentionMs` on the host's
 // virtual loop and a check of what the run states are (the spy has no Go form).
 //
-// pi: packages/chord/src/next/jobs/persisted.ts
-// pi: packages/chord/src/next/jobs/run-states.ts
-// pi: packages/chord/src/next/jobs/stored.ts
+// pi: packages/chord/src/jobs/persisted.ts
+// pi: packages/chord/src/jobs/run-states.ts
+// pi: packages/chord/src/jobs/stored.ts
 
 var jobImportProgress = mustDefineState(documents.DefineState("import.progress", documents.StateOptions{
 	Schema:  contracts.Obj(contracts.Prop("done", contracts.Int())),
@@ -188,7 +190,7 @@ func (o *jobsOpened) Finished() []Outcome {
 // hang is `() => new Promise(() => {})`: a run that never settles until the test ends.
 func hang(t *testing.T) func(any, JobCtx) (any, error) {
 	return func(any, JobCtx) (any, error) {
-		<-t.Context().Done()
+		parkedOn(t.Context().Done())
 		return nil, errors.New("the test ended")
 	}
 }
@@ -208,6 +210,16 @@ func openedWith(
 	abandonedRun func(args any, ctx JobCtx) (any, error), declared ...*JobDefinition,
 ) *jobsOpened {
 	t.Helper()
+	return openedRecorded(t, st, nil, run, finish, abandonedRun, declared...)
+}
+
+// openedRecorded is openedWith over a host that records on recorder (nil: no adapter).
+func openedRecorded(
+	t *testing.T, st *store.ChordStore, recorder *telemetry.InMemoryTelemetryContext,
+	run func(args any, ctx JobCtx) (any, error), finish func(outcome Outcome) error,
+	abandonedRun func(args any, ctx JobCtx) (any, error), declared ...*JobDefinition,
+) *jobsOpened {
+	t.Helper()
 	definition := jobImport
 	if len(declared) > 0 {
 		definition = declared[0]
@@ -216,7 +228,11 @@ func openedWith(
 		abandonedRun = func(any, JobCtx) (any, error) { return countResult(0), nil }
 	}
 	result := &jobsOpened{t: t, Store: st, Errors: &hostErrors{}}
-	host := newJobHost(t, HostOptions{Store: st, OnError: result.Errors.push, CloseTimeout: new(200 * time.Millisecond)})
+	options := HostOptions{Store: st, OnError: result.Errors.push, CloseTimeout: new(200 * time.Millisecond)}
+	if recorder != nil {
+		options.Telemetry = recorder
+	}
+	host := newJobHost(t, options)
 	mustLoad(t)(host.Load([]HostFacet{{Name: "notes", Facet: DefineFacet(func(h FacetHost, _ FacetSelf) error {
 		return h.Serve(jobNotesStore, func(_ *delta.JsonObject, self Self) (contracts.Implementation, error) {
 			result.Imports = self.Job(definition, JobImplementation{
@@ -277,7 +293,18 @@ func (o *jobsOpened) Close() {
 // Crash is a crash: the store's backend closes under the live host, which is left behind.
 func (o *jobsOpened) Crash() { must(o.t, o.Store.Close(background)) }
 
-func (o *jobsOpened) settle() {
+// settle is Pi's `delivered()` (test/support.ts:138, a `setTimeout(0)`): the host's deliveries are made and every chain
+// of microtasks the host started has run to its next wait for something outside it, a persisted run's reservation (the
+// store write of its `running` phase) and the invocation after it included (deliveredOn, joining the loop's counted
+// tasks: no sleep, no poll). A run that waits for the test (a gate, the test's end) waits parked, which the join does
+// not wait for.
+func (o *jobsOpened) settle() { deliveredOn(o.Host) }
+
+// settleHeld is settle for the two cases that hold a reservation's commit on purpose (a commit queue or a backend transaction
+// the test holds): the task that waits for the held commit waits for something outside the host that the host cannot say
+// it waits for (the store's step is a raw wait), so the join would wait for the test. The clock barrier (the host's deliveries
+// and nexttest.Flushed) stands for Pi's `await delivered()` there, as it did for every case.
+func (o *jobsOpened) settleHeld() {
 	hostDelivered(o.Host)
 	nexttest.Flushed()
 }
@@ -464,7 +491,7 @@ func TestPersistedCrashesAStateChangeResetsTheRestartCountStoredAtOnce(t *testin
 			return nil, err
 		}
 		reset.Open()
-		<-t.Context().Done()
+		parkedOn(t.Context().Done())
 		return nil, errors.New("the test ended")
 	}, nil)
 	reset.Wait()
@@ -656,7 +683,7 @@ func TestPersistedASealDuringTheReservationAReservationQueuedBehindAHeldCommitQu
 	<-gate.Entered()
 	release := heldCommitQueue(t, st, gate)
 	run := <-started
-	jobs.settle()
+	jobs.settleHeld()
 	failLive(jobs.Self, data.NewChordError(data.ChordErrorInit{Code: data.CodeUnavailable, Message: "seal queued reservation"}, nil))
 	jobs.Retry()
 	release()
@@ -691,7 +718,7 @@ func TestPersistedASealDuringTheReservationAnAbortJoinedToAReservationThatCommit
 		must(t, err)
 		aborting <- result
 	}()
-	jobs.settle()
+	jobs.settleHeld()
 	failLive(jobs.Self, data.NewChordError(data.ChordErrorInit{Code: data.CodeUnavailable, Message: "seal after reservation"}, nil))
 	second.Release()
 	if result := <-aborting; result != AbortMarked {
@@ -958,7 +985,7 @@ func TestPersistedLoadingALoadThatFailsLosesNothingTheRetryLoadsTheRunsAgainAndC
 		mu.Lock()
 		invocations++
 		mu.Unlock()
-		<-t.Context().Done()
+		parkedOn(t.Context().Done())
 		return nil, errors.New("the test ended")
 	}, nil)
 	var activationFailed bool
@@ -1297,7 +1324,7 @@ func TestPersistedDeferredStateFoldsHeldWrites100SetsOfOneLeafKeepOneOp(t *testi
 			return nil, err
 		}
 		changed.Open()
-		<-t.Context().Done()
+		parkedOn(t.Context().Done())
 		return nil, errors.New("the test ended")
 	}, nil)
 	jobStart(t, jobs.Imports, pathArgs("a"), background)
@@ -1345,7 +1372,7 @@ func TestPersistedDeferredStateAnOverflowOfHeldOpsStoresTheNextChangeAsABase(t *
 			return nil, err
 		}
 		changed.Open()
-		<-t.Context().Done()
+		parkedOn(t.Context().Done())
 		return nil, errors.New("the test ended")
 	}, nil, declared)
 	jobStart(t, jobs.Imports, pathArgs("a"), background)
@@ -1367,7 +1394,7 @@ func TestPersistedDeferredStateIsStoredByTheCloseWriterAtACleanStopAndAfterWithi
 			return nil, err
 		}
 		held.Open()
-		<-t.Context().Done()
+		parkedOn(t.Context().Done())
 		return nil, errors.New("the test ended")
 	}, nil)
 	run := jobStart(t, jobs.Imports, pathArgs("a"), background)
@@ -1388,7 +1415,7 @@ func TestPersistedDeferredStateIsStoredByTheCloseWriterAtACleanStopAndAfterWithi
 			return nil, err
 		}
 		timed.Open()
-		<-t.Context().Done()
+		parkedOn(t.Context().Done())
 		return nil, errors.New("the test ended")
 	}, nil)
 	timed.Wait()
@@ -1458,7 +1485,7 @@ func TestPersistedGCSettledRunsCancelledAbortWaitsAndAnEndedObjectWithAHeldChang
 				return nil, err
 			}
 			held.Open()
-			<-ctx.Done()
+			untilDone(ctx)
 			return nil, ctx.Err()
 		}, nil, nil)
 		settled := jobStart(t, jobs.Abandoned, pathArgs("a"), background)
@@ -1550,8 +1577,7 @@ func TestPersistedVersionsResolvedByAReloadAPersistedRunBlockedForItsVersionAtIt
 	}
 	host := newJobHost(t, HostOptions{Store: st, OnError: func(HostError) {}})
 	mustLoad(t)(host.Load([]HostFacet{{Name: "notes", Facet: serve(jobImportV2)}}, background))
-	hostDelivered(host)
-	nexttest.Flushed()
+	deliveredOn(host)
 	mu.Lock()
 	if len(finished) != 0 {
 		t.Fatalf("finished = %+v before the reload", finished)
@@ -1566,8 +1592,8 @@ func TestPersistedVersionsResolvedByAReloadAPersistedRunBlockedForItsVersionAtIt
 		defer mu.Unlock()
 		return len(finished) == 1
 	})
-	// Pi's `toMatchObject([one outcome])` after its sleep: a second, spurious finish would show once a turn passed.
-	nexttest.Flushed()
+	// Pi's `toMatchObject([one outcome])` after its sleep: a second, spurious finish would show once the chain ran on.
+	deliveredOn(host)
 	mu.Lock()
 	all := append([]Outcome(nil), finished...)
 	mu.Unlock()
@@ -1643,4 +1669,71 @@ func TestStoredRunKeepsTheCountersOfARunAndOfAChange(t *testing.T) {
 	if got.Restarts != 4 || got.FinishFailures != 5 {
 		t.Fatalf("a change's counters = %d restarts, %d finish failures, want 4 and 5", got.Restarts, got.FinishFailures)
 	}
+}
+
+// persisted.test.ts › trace (slice 9) › runs, resumed after a crash in a new attempt and host, and finishes under its
+// start's stored carrier
+func TestPersistedTraceRunsResumedAfterACrashInANewAttemptAndHostAndFinishesUnderItsStartsStoredCarrier(t *testing.T) {
+	recorder := telemetry.NewInMemoryTelemetryContext()
+	open := storeFile(t)
+	jobs := openedRecorded(t, open(), recorder, hang(t), nil, nil)
+	var run Run
+	tracedUnder(t, recorder, "request", func(ctx context.Context) { run = jobStart(t, jobs.Imports, pathArgs("a"), ctx) })
+	eventually(t, "the record to carry its trace", func() bool {
+		stored := record(t, jobs.Store, run.ID())
+		_, ok := stored["trace"]
+		return ok
+	})
+	waitRecord(t, jobs.Store, run.ID(), map[string]any{"phase": "running"})
+	jobs.Crash()
+	jobs = openedRecorded(t, open(), recorder, func(any, JobCtx) (any, error) { return countResult(1), nil }, nil, nil)
+	finished := jobs.expectFinished(1)
+	if finished[0].Kind != OutcomeDone || !nexttest.JSONEqual(finished[0].Result, countResult(1)) {
+		t.Fatalf("finished = %+v, want done {count: 1}", finished)
+	}
+	eventually(t, "the finish span", func() bool {
+		for _, span := range spansNamed(recorder, "chord.job") {
+			if phase, _ := span.Attributes.Get("phase"); phase == "finish" && span.Settled {
+				return true
+			}
+		}
+		return false
+	})
+	request := spanWhere(t, recorder, "request", nil)
+	phases := spansNamed(recorder, "chord.job")
+	if len(phases) != 4 {
+		var seen []string
+		for _, span := range phases {
+			phase, _ := span.Attributes.Get("phase")
+			seen = append(seen, fmt.Sprint(phase, " settled=", span.Settled))
+		}
+		t.Fatalf("chord.job spans = %v, want 4 (intent, cut-off run, rerun, finish)", seen)
+	}
+	intent := phases[0]
+	spanAttributesAre(t, intent, telemetry.SpanAttributes{
+		telemetry.Attr("chord.host", "client"), telemetry.Attr("job", "notes.import"), telemetry.Attr("phase", "intent"),
+		telemetry.Attr("object", "notes.store"), telemetry.Attr("outcome", "ok"), telemetry.Attr("job.id", run.ID()),
+	})
+	if !childOf(intent, request) {
+		t.Errorf("the intent's parent = %v, want the request", intent.ParentID)
+	}
+	// The run cut off by the crash (never settled), the rerun and the finish: one trace, children of the intent.
+	for index, want := range []struct {
+		phase   string
+		settled bool
+	}{{"run", false}, {"run", true}, {"finish", true}} {
+		span := phases[index+1]
+		if phase, _ := span.Attributes.Get("phase"); phase != want.phase || !childOf(span, intent) || span.Settled != want.settled {
+			t.Errorf("span %d = phase %v parent %v settled %v, want %s child of the intent settled %v",
+				index+1, phase, span.ParentID, span.Settled, want.phase, want.settled)
+		}
+	}
+	traces := map[string]bool{}
+	for _, span := range phases {
+		traces[span.Context["pi-memory-trace"]] = true
+	}
+	if len(traces) != 1 {
+		t.Errorf("traces = %v, want one", traces)
+	}
+	jobs.Close()
 }

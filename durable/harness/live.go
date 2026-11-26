@@ -17,7 +17,10 @@ type ToolSlotStatus string
 const (
 	ToolSlotPending ToolSlotStatus = "pending"
 	ToolSlotRunning ToolSlotStatus = "running"
-	ToolSlotDone    ToolSlotStatus = "done"
+	// ToolSlotSleeping and ToolSlotWaiting show a call parked (spec suspendable §4.2); a parked slot holds no output.
+	ToolSlotSleeping ToolSlotStatus = "sleeping"
+	ToolSlotWaiting  ToolSlotStatus = "waiting"
+	ToolSlotDone     ToolSlotStatus = "done"
 )
 
 // ToolSlot is the presentation of one tool call of the current round (live.ts:11-31).
@@ -163,6 +166,16 @@ type LiveRun struct {
 	// AfterRun is present once the run answered and its generation waits for the tasks afterRun hooks asked for, listed
 	// once created: queued items stay queued until they are terminal, and the run then ends without a failure.
 	AfterRun *LiveRunAfterRun `json:"afterRun,omitempty"`
+	// Yield is present while tasks an onYield hook asked for decide whether the answer stands (spec suspendable §6): the
+	// answer's entry, which the tasks read, and the tasks. The inputs stay open; every exit but a continuation settles them
+	// done with this answer.
+	Yield *LiveRunYield `json:"yield,omitempty"`
+}
+
+// LiveRunYield is LiveRun.Yield.
+type LiveRunYield struct {
+	Answer durable.EntryId  `json:"answer"`
+	Tasks  []durable.TaskId `json:"tasks"`
 }
 
 // LiveRunAfterRun is LiveRun.AfterRun: the tasks afterRun hooks asked for.
@@ -213,54 +226,52 @@ type LiveState struct {
 // §8.2): no generation and no running tool slot. That bounds the delta chain to one generation or one round's tools,
 // and a slot holds output only while running, so every base is small.
 var LiveDoc = durable.DefineDoc(durable.DocDefinition[LiveState]{
-	CommonDocDefinition: durable.CommonDocDefinition[LiveState]{
-		Kind:    "pi.live",
-		Version: 3,
-		// Version 1 named a compaction's trigger `reason`, in `compactions` and `compactionFailure`. Versions 1 and 2 (as
-		// builds before `run.turns` stored it) may lack `run.turns`: a run in flight across the upgrade counts its turns
-		// from 0. Version 2 already names the trigger `trigger`, so renaming leaves it alone.
-		Migrate: func(value durable.JsonObject, _ int) (LiveState, error) {
-			live := value.Clone()
-			if run, ok := value.Get("run"); ok {
-				migrated := run.(durable.JsonObject).Clone()
-				if turns, _ := migrated.Get("turns"); !isJSONNumber(turns) {
-					migrated.Set("turns", float64(0))
-				}
-				live.Set("run", migrated)
+	Kind:    "pi.live",
+	Version: 3,
+	// Version 1 named a compaction's trigger `reason`, in `compactions` and `compactionFailure`. Versions 1 and 2 (as
+	// builds before `run.turns` stored it) may lack `run.turns`: a run in flight across the upgrade counts its turns
+	// from 0. Version 2 already names the trigger `trigger`, so renaming leaves it alone.
+	Migrate: func(value durable.JsonObject, _ int) (LiveState, error) {
+		live := value.Clone()
+		if run, ok := value.Get("run"); ok {
+			migrated := run.(durable.JsonObject).Clone()
+			if turns, _ := migrated.Get("turns"); !isJSONNumber(turns) {
+				migrated.Set("turns", float64(0))
 			}
-			if list, ok := value.Get("compactions"); ok {
-				statuses, _ := list.([]any)
-				renamed := make([]any, len(statuses))
-				for i, status := range statuses {
-					renamed[i] = renameReason(status.(durable.JsonObject))
-				}
-				live.Set("compactions", renamed)
+			live.Set("run", migrated)
+		}
+		if list, ok := value.Get("compactions"); ok {
+			statuses, _ := list.([]any)
+			renamed := make([]any, len(statuses))
+			for i, status := range statuses {
+				renamed[i] = renameReason(status.(durable.JsonObject))
 			}
-			if failure, ok := value.Get("compactionFailure"); ok {
-				live.Set("compactionFailure", renameReason(failure.(durable.JsonObject)))
-			}
-			return durable.FromJsonValue[LiveState](live)
-		},
-		CheckpointWhenRaw: func(value durable.JsonObject, _ []durable.Op, _ durable.CheckpointInfo) bool {
-			if generation, _ := value.Get("generation"); generation != nil {
-				return false
-			}
-			for _, key := range [...]string{"tools", "nestedTools"} {
-				list, _ := value.Get(key)
-				slots, _ := list.([]any)
-				for _, entry := range slots {
-					if slot, ok := entry.(*delta.JsonObject); ok {
-						if status, _ := slot.Get("status"); status == string(ToolSlotRunning) {
-							return false
-						}
+			live.Set("compactions", renamed)
+		}
+		if failure, ok := value.Get("compactionFailure"); ok {
+			live.Set("compactionFailure", renameReason(failure.(durable.JsonObject)))
+		}
+		return durable.FromJsonValue[LiveState](live)
+	},
+	CheckpointWhenRaw: func(value durable.JsonObject, _ []durable.Op, _ durable.CheckpointInfo) bool {
+		if generation, _ := value.Get("generation"); generation != nil {
+			return false
+		}
+		for _, key := range [...]string{"tools", "nestedTools"} {
+			list, _ := value.Get(key)
+			slots, _ := list.([]any)
+			for _, entry := range slots {
+				if slot, ok := entry.(*delta.JsonObject); ok {
+					if status, _ := slot.Get("status"); status == string(ToolSlotRunning) {
+						return false
 					}
 				}
 			}
-			return true
-		},
-
-		Initial: func() LiveState { return LiveState{} },
+		}
+		return true
 	},
+
+	Initial:           func() LiveState { return LiveState{} },
 	DocumentSemantics: durable.NewLatestConversationSemantics(durable.ForkInitial).DocumentSemantics,
 })
 
@@ -535,11 +546,16 @@ func FinishSlot(slot *delta.Object) error {
 
 // ClearProgress removes what a tool published while running; its result entry or a rerun replaces it.
 func ClearProgress(slot *delta.Object) {
+	ClearOutput(slot)
+	slot.Delete("details")
+	slot.Delete("diagnostics")
+}
+
+// ClearOutput removes a slot's running output only: a parked call, and its next run, keep its details and diagnostics.
+func ClearOutput(slot *delta.Object) {
 	slot.Delete("output")
 	slot.Delete("droppedBytes")
 	slot.Delete("droppedLines")
-	slot.Delete("details")
-	slot.Delete("diagnostics")
 }
 
 // SettleSchedulerOutcome is the Harness cleanup for a terminal outcome the scheduler writes itself (faulted or
@@ -590,6 +606,14 @@ func SettleSchedulerOutcome(tx durable.Tx, record durable.TaskRecord[durable.Jso
 	}
 	if owner, ok := runTaskOf(live); !ok || owner != record.Id {
 		return nil
+	}
+	// The run answered and waited for its onYield tasks: it ends with its answer, without a failure.
+	run, err := liveRunOf(live)
+	if err != nil {
+		return err
+	}
+	if run.Yield != nil {
+		return EndRun(tx, live, record.Id, runDone(run.Yield.Answer))
 	}
 	// Cut off, the abort handler may have died converting the partial: the run ends without it.
 	if !cutOff {

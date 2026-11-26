@@ -1,5 +1,7 @@
 package sdk
 
+// pi: packages/coding-agent/src/core/extensions/pi-ai-extension-view.ts (Type and StringEnum against the pinned extension view)
+
 import (
 	"context"
 	"encoding/json"
@@ -285,6 +287,57 @@ func TestZhipuUsageLimit1308IsNotRetryable(t *testing.T) {
 		`429 {"error":{"code":"1308","message":"Usage limit reached for 5 hour."}}`: false,
 		`429 {"error":{"code":1308,"message":"Usage limit reached"}}`:               false,
 		`429 {"error":{"code":"13081","message":"Too many requests"}}`:              true,
+	} {
+		if got := IsRetryableAssistantError(map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": text}); got != want {
+			t.Errorf("IsRetryableAssistantError(%q) = %v, want %v", text, got, want)
+		}
+	}
+}
+
+// Pi 9b88b94e2 packages/ai/test/retry.test.ts:106 (#12064): a gateway ends the stream with an Anthropic-style api_error event reading "Connection closed.".
+func TestConnectionClosedIsRetryable(t *testing.T) {
+	for text, want := range map[string]bool{
+		`{"type":"error","error":{"type":"api_error","message":"Connection closed."}}`:                    true,
+		"Connection closed by proxy server before the response completed":                                 true,
+		`{"type":"error","error":{"type":"api_error","message":"Connection closed. insufficient_quota"}}`: false,
+		"The connection was closed by the user":                                                           false,
+	} {
+		if got := IsRetryableAssistantError(map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": text}); got != want {
+			t.Errorf("IsRetryableAssistantError(%q) = %v, want %v", text, got, want)
+		}
+	}
+}
+
+// Pi 4699b5b26 packages/ai/test/retry.test.ts:65,77 (#12128): a provider error that reports only a Node socket error code is retried; a code inside a longer identifier is not.
+func TestNodeSocketErrorCodesAreRetryable(t *testing.T) {
+	for text, want := range map[string]bool{
+		"read ECONNRESET":                    true,
+		"connect ETIMEDOUT 140.82.113.3:443": true,
+		"write EPIPE":                        true,
+		"connect ECONNREFUSED 127.0.0.1:443": true,
+		"ECONNABORTED":                       true,
+		"Connection reset by peer":           true,
+		"Invalid value EXECONNRESET":         false,
+		"Unknown field ETIMEDOUTX":           false,
+		"Invalid key ERR_EPIPE_ID":           false,
+	} {
+		if got := IsRetryableAssistantError(map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": text}); got != want {
+			t.Errorf("IsRetryableAssistantError(%q) = %v, want %v", text, got, want)
+		}
+	}
+}
+
+// Pi bb1a2b3542b5 packages/ai/test/retry.test.ts (#12124): the Codex WebSocket lifetime limit, as text or as the error code, is retried; a generic connection limit is not.
+func TestCodexWebSocketConnectionLimitIsRetryable(t *testing.T) {
+	for text, want := range map[string]bool{
+		"Codex error: Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.": true,
+		"Codex error: websocket_connection_limit_reached":                                                                        true,
+		"WEBSOCKET CONNECTION LIMIT REACHED":                                                                                     true,
+		"websocket-connection-limit-reached":                                                                                     true,
+		"connection limit reached":                                                                                               false,
+		"websocket connection limit":                                                                                             false,
+		"connection limit reached on the websocket":                                                                              false,
+		"websocket connection limit reached: insufficient_quota":                                                                 false,
 	} {
 		if got := IsRetryableAssistantError(map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": text}); got != want {
 			t.Errorf("IsRetryableAssistantError(%q) = %v, want %v", text, got, want)

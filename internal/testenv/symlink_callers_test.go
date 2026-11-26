@@ -37,6 +37,9 @@ func windowsTestFiles(t *testing.T) (root string, files []string) {
 			switch entry.Name() {
 			case ".git", ".upstream", "node_modules", "testdata", "target":
 				return filepath.SkipDir
+			case "tmp":
+				// Scratch that git ignores (`tmp/` in .gitignore), not the repository's code.
+				return filepath.SkipDir
 			}
 			// A nested module cannot import this package.
 			if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
@@ -85,6 +88,11 @@ func TestWindowsTestsCreateSymlinksThroughSymlink(t *testing.T) {
 
 // fileSymlinkCallers lists every function that may call Symlink, keyed by "module-relative file::function". Symlink skips on a Windows host without the symlink privilege, so a caller belongs here only when its behavior depends on a file symbolic link or on a link whose target is missing or cyclic, which a privilege-free junction cannot stand in for. A link to an existing directory uses RequireDirectoryLink and runs on stock Windows.
 var fileSymlinkCallers = map[string]string{
+	"ai/auth_create_through_link_eloop_test.go::TestAuthStorageCreateThroughSymlinkChainFollowsTheKernelsLimit":                                                "dangling and cyclic file links; the directory-loop link uses RequireDirectoryLink",
+	"ai/auth_store_fs_error_upstream_test.go::symlinkedReadOnlyStore":                                                                                          "file link; the store path itself is a symlink to a read-only target file",
+	"ai/auth_store_fs_error_upstream_test.go::danglingStoreInMissingDir":                                                                                       "dangling file link; the store path is a symlink into a missing directory, which a junction cannot express",
+	"chord/nextnode/tui/tui_actions_test.go::TestAttachingAFileShowsThePathByItsTextBeforeTheYesRefusesADirectoryAMissingFileAndOneOver16MiBAlikeOpusL2E5E9":   "file link; after the yes the file the link names is asked about again",
+	"chord/nextnode/tui/tui_actions_test.go::TestAttachingAFileReadsOnlyTheFileConfirmedAParentDirectorySwappedForALinkAfterTheYesIsRefusedOpusR1":             "file link; the test attaches a link to a file and the attach must read the confirmed file only",
 	"chord/nextnode/plugins/plugins_watcher_test.go::TestTheWatcherAndLinksSurvivesALinkLoopCreatedUnderARootItsStatNeverEscapesTheCallbackAndStillMarksItSol": "cyclic link; a junction names only an existing directory, so the loop (`a/loop` -> `loop`) needs a real symbolic link",
 	"chord/nextnode/http/file_test.go::TestFileResponseWithARootRefusesAFileWhoseRealPathLiesOutsideIt403ServesOneInside":                                      "file link; the response's real path is a file outside the root that the link names",
 	"coding/extension/host/subprocess/host_file_mutation_test.go::TestFileMutationEnterFailsForAnUnresolvablePath":                                             "cyclic file links; a junction names only an existing directory, so the loop that makes the path unresolvable needs a file link",
@@ -104,12 +112,15 @@ var fileSymlinkCallers = map[string]string{
 	"coding/cli/self_update_npm_registry_test.go::isolatedNpmBin":                                                                                              "file link",
 	"coding/cli/self_update_npm_registry_test.go::TestIsolatedNpmBinBypassesVersionManagerWrapper":                                                             "file link",
 	"bench/k8s/cmd/k8sbench/bundle_test.go::fakeBundle":                                                                                                        "file link; npm's node_modules/.bin entries link to package files, and the bundle pack must keep them as links",
+	"internal/pioracle/bin_test.go::bundledOracle":                                                                                                             "file link; npm's node_modules/.bin/pi links to the bundle's cli.js, and the check reads the bundle pi runs through that link (the callers skip on Windows)",
 	"coding/extension/host/runtimecell/cache_identity_test.go::TestPublishedEntryRejectsForeignIdentity":                                                       "file link",
 	"coding/mcpext/connection_test.go::TestMCPConnectionsExpandsTildeInTheCommandArgumentsAndCwdOfStdioServers":                                                "file link; the test skips on Windows",
 	"coding/packagecontent/entry_shapes_test.go::TestExtensionDirectoryFollowsSymlinksAndIgnoreFiles":                                                          "file link",
 	"coding/packagecontent/packagecontent_test.go::TestValidateRejectsSymlinkedManifest":                                                                       "file link",
 	"durable/env/node/watch_link_alias_test.go::TestNodeFileWatcherReportsALinkedTargetForAnEventNamedByTheResolvedFile":                                       "file link; the watcher follows a link to a file",
 	"durable/env/node/filesystem_test.go::TestFilesystemListsSymlinksAsSymlinks":                                                                               "file link",
+	"coding/extension/host/runtimecell/hash_go_module_single_read_test.go::writeSyntheticModule":                                                               "file link; the golden digest covers a link to a file (the caller skips on Windows)",
+	"internal/atomicfile/atomicfile_windows_test.go::TestWindowsWriteFileFollowsASymbolicLink":                                                                 "file link; the write follows a link to a file and the link stays a link",
 	"durable/env/node/filesystem_test.go::TestFilesystemReturnsFileInfoForFilesDirectoriesAndSymlinksWithoutFollowingSymlinks":                                 "file link; the directory case uses RequireDirectoryLink",
 	"durable/tools/tools_test.go::TestEditEditsRegularFilesThroughSymlinks":                                                                                    "file link",
 	"durable/tools/tools_test.go::TestEditSerializesConcurrentEditsThroughCanonicalAndSymlinkPaths":                                                            "file link",
@@ -136,6 +147,11 @@ var fileSymlinkCallers = map[string]string{
 	"internal/codingagent/tools/zz_review_fifo_test.go::TestReviewWriteQueueErrorVisible":                                                                      "cyclic links",
 	"internal/pilock/legacy_test.go::TestLegacyReplacementRefusesChangedIdentity":                                                                              "file link",
 	"internal/pilock/legacy_test.go::TestLegacyUpgradePreservesOtherPaths":                                                                                     "file link; the directory case uses RequireDirectoryLink",
+	"ai/auth_dangling_link_test.go::TestAuthStorageCreatesTheTargetOfADanglingSymlinkedAuthFile":                                                               "dangling file link; auth.json links to a shared file that does not exist yet, and a junction cannot point at a missing target",
+	"ai/auth_dangling_link_test.go::TestFileModelsStoreCreatesTheTargetOfADanglingSymlinkedFile":                                                               "dangling file link; the store file links to a target that does not exist yet, and a junction cannot point at a missing target",
+	"internal/pilock/symlink_alias_test.go::TestAuthLocksShareOneLockAcrossSymlinkedPaths":                                                                     "file link; the alias names the real auth.json file, which a junction (an existing directory only) cannot express",
+	"internal/pilock/symlink_alias_test.go::TestAuthLockOfASymlinkedFileInAnotherDirectoryIsTheRealFilesLock":                                                  "file link; the agent directory's auth.json links to a shared file",
+	"internal/pilock/symlink_alias_test.go::TestSettingsLockStaysOnTheGivenPath":                                                                               "file link; the alias names the settings file",
 	"internal/pilock/link_test.go::linkLockPath":                                                                                                               "file link; the directory cases use RequireDirectoryLink",
 	"test/parity/cmd/closure/main_test.go::TestCommittedBundlePathsIgnoreUntrackedAndRejectDirty":                                                              "file link",
 	"bench/k8s/cmd/k8sbench/arms_test.go::fakeArmInstall":                                                                                                      "file link; npm's node_modules/.bin entry links to the package's bin file",
@@ -152,7 +168,10 @@ var fileSymlinkCallers = map[string]string{
 	"internal/codingagent/context_files_symlink_test.go::TestLoadProjectContextFilesNestedWorktreeSymlinkedContext":                                            "file link; AGENTS.md in a nested worktree links to the main repo's file (#10681)",
 	"automation/ci/preflight/scanner_test.go::TestSymlinksOfAPRAreNotFollowed":                                                                                 "file link; the pull request's head commits a link to a file outside the checkout, which the scan must flatten instead of following",
 	"automation/ci/preflight/scanner_test.go::TestFlattenSymlinksNeverEntersALink":                                                                             "file links, one relative; the directory link uses RequireDirectoryLink",
-	"internal/atomicfile/atomicfile_windows_test.go::TestWindowsWriteFileFollowsASymbolicLink":                                                                 "file link; the write must follow a link to a file and replace the file it names, which a junction (a directory link) cannot stand in for",
+	"coding/extension/host/runtimecell/sdk_tree_memo_test.go::TestSDKTreeHashIsTheHashOfTheFilesWhereverItIsAnsweredFrom":                                      "file link; the staged SDK tree hash must see a file link appear or replace a file (the memo hashes files, not directory links)",
+	"coding/extension/host/runtimecell/sdk_tree_memo_test.go::TestStagedSDKHashFollowsEveryChangeOfASizeATimeOrTheFiles":                                       "file link; the staged SDK tree hash must see a file link appear or replace a file (the memo hashes files, not directory links)",
+	"coding/extension/host/runtimecell/sdk_tree_memo_test.go::TestStagedSDKHashDoesNotAnswerToWhatTheHashIgnores":                                              "file link; the staged SDK tree hash must see a file link appear or replace a file (the memo hashes files, not directory links)",
+	"coding/mcpext/storage_create_race_internal_test.go::TestFileAuthStorageBackendCreatesOwnerOnlyAndFollowsDanglingSymlink":                                  "dangling file link; the create must follow the link and create its target file, which a junction cannot express",
 }
 
 // Windows-building tests keep Symlink for file links only, so the directory-link behavior they exercise runs on a stock Windows host.

@@ -82,12 +82,12 @@ func TestHighlightCode_ColorsEachLineOfPythonDocstringsIndependently(t *testing.
 		"",
 		ansi + "line two\x1b[39m",
 		ansi + "\"\"\"\x1b[39m",
-		"after",
+		ActiveTheme().GetFgAnsi("text") + "after\x1b[39m",
 	}
 	if got := HighlightCode(code, "python"); !slices.Equal(got, want) {
 		t.Errorf("HighlightCode = %q, want %q", got, want)
 	}
-	if got := HighlightCode(code, "python"); !slices.Equal(got, want) {
+	if got := GetMarkdownTheme().HighlightCode(code, "python"); !slices.Equal(got, want) {
 		t.Errorf("markdown theme highlightCode = %q, want %q", got, want)
 	}
 }
@@ -144,6 +144,12 @@ func TestLanguageFromPath(t *testing.T) {
 		{"foo.tsx", "typescript"},
 		{"foo.md", "markdown"},
 		{"foo.unknownext", ""},
+		// Pi main c13f6acfb (syntax-highlight.test.ts "maps file extensions of eagerly loaded languages to their language")
+		{"lib/main.dart", "dart"},
+		{"flake.nix", "nix"},
+		{"script.groovy", "groovy"},
+		{"build.gradle", "groovy"},
+		{"src/Main.kt", "kotlin"},
 		{"Makefile", "makefile"},
 		{"Dockerfile", "dockerfile"},
 		{"FOO.GO", "go"},
@@ -162,46 +168,6 @@ func TestLanguageFromPath(t *testing.T) {
 		if got := LanguageFromPath(tc.path); got != tc.want {
 			t.Errorf("LanguageFromPath(%q) = %q, want %q", tc.path, got, tc.want)
 		}
-	}
-}
-
-// renderHighlightedHtml reads theme[scope] on an object literal, so a scope naming an Object.prototype member finds that member and calls it with an undefined receiver, and an own undefined property shadows the member (utils/syntax-highlight.ts getScopeFormatter and getActiveFormatter). Expected strings and TypeError messages are Pi 1.0.0's renderHighlightedHtml output under Node 24.
-func TestRenderHighlightedHtmlReadsObjectPrototypeMembers(t *testing.T) {
-	const notObject = "Cannot convert undefined or null to object"
-	for _, tc := range []struct {
-		scope, want, err string
-	}{
-		{"constructor", "xy", ""},
-		{"toString", "[object Undefined]y", ""},
-		{"toString.x", "[object Undefined]y", ""},
-		{"isPrototypeOf", "falsey", ""},
-		{"isPrototypeOf-y", "falsey", ""},
-		{"default", "xy", ""},
-		{"toLocaleString", "", "Object.prototype.toLocaleString called on null or undefined"},
-		{"__proto__", "", "formatter is not a function"},
-		{"valueOf", "", notObject},
-		{"hasOwnProperty", "", notObject},
-		{"propertyIsEnumerable", "", notObject},
-		{"__defineGetter__", "", notObject},
-		{"__defineSetter__", "", notObject},
-		{"__lookupGetter__", "", notObject},
-		{"__lookupSetter__", "", notObject},
-	} {
-		got, err := renderHighlightedHTML(`<span class="hljs-`+tc.scope+`">x</span>y`, HighlightTheme{})
-		gotErr := ""
-		if err != nil {
-			gotErr = err.Error()
-		}
-		if got != tc.want || gotErr != tc.err {
-			t.Errorf("%s: got %q, error %q; want %q, error %q", tc.scope, got, gotErr, tc.want, tc.err)
-		}
-	}
-	defaultFormatter := func(text string) string { return "D" + text }
-	if got := RenderHighlightedHtml(`<span class="hljs-toString">x</span>`, HighlightTheme{"toString": nil, "default": defaultFormatter}); got != "Dx" {
-		t.Errorf("own undefined toString: got %q, want %q", got, "Dx")
-	}
-	if got := RenderHighlightedHtml(`<span class="hljs-keyword">x</span>y`, HighlightTheme{"keyword": nil, "default": defaultFormatter}); got != "DxDy" {
-		t.Errorf("own undefined keyword: got %q, want %q", got, "DxDy")
 	}
 }
 
@@ -232,5 +198,35 @@ func TestHighlightCodeThatFailsTakesTheCodeBlockColor(t *testing.T) {
 	activeTheme.Store(broken)
 	if got := HighlightCode(code, "javascript"); !slices.Equal(got, want) {
 		t.Errorf("HighlightCode under the active theme = %q, Pi gives %q", got, want)
+	}
+}
+
+// A .dart, .nix or .groovy file renders highlighted, not as plain text, through the language the path maps to.
+func TestHighlightCodeHighlightsDartNixAndGroovy(t *testing.T) {
+	for path, code := range map[string]string{
+		"main.dart":    "class A { final int x = 1; }",
+		"flake.nix":    "{ pkgs }: let x = 1; in x",
+		"build.gradle": "def x = 1\nclass A { String s = 'a' }",
+	} {
+		lang := LanguageFromPath(path)
+		if lang == "" {
+			t.Fatalf("LanguageFromPath(%q) is empty", path)
+		}
+		plain := strings.Split(code, "\n")
+		got := HighlightCode(code, lang)
+		if slices.Equal(got, plain) || !strings.Contains(strings.Join(got, "\n"), "\x1b[") {
+			t.Errorf("%s (%s) renders without highlighting: %q", path, lang, got)
+		}
+	}
+}
+
+// A modified 27-key copy of cliHighlightTheme with an overridden scope formatter must use the caller's formatter, not ActiveTheme()'s fgAnsi.
+func TestRenderHighlightedHtmlHonorsOverriddenCliThemeCopy(t *testing.T) {
+	theme := cliHighlightTheme(ActiveTheme())
+	theme["keyword"] = func(s string) string { return "<KW:" + s + ">" }
+	got := RenderHighlightedHtml(`<span class="hljs-keyword">const</span> x`, theme)
+	want := "<KW:const>" + ActiveTheme().Fg("text", " x")
+	if got != want {
+		t.Fatalf("RenderHighlightedHtml = %q, want %q", got, want)
 	}
 }

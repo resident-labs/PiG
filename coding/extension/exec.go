@@ -16,6 +16,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -71,7 +72,8 @@ type ExecOptions struct {
 type ExecResult struct {
 	Stdout string `json:"stdout"`
 	Stderr string `json:"stderr"`
-	Code   int    `json:"code"`
+	// Code is the exit code, or 128 + the signal number when a signal terminated the command (143 for SIGTERM), as a shell reports it.
+	Code int `json:"code"`
 	// Killed reports that pi terminated the command: timeout, abort, or output over MaxBuffer.
 	Killed bool `json:"killed"`
 	// Truncated reports that output exceeded MaxBuffer: Stdout and Stderr are incomplete and Code is nonzero.
@@ -81,6 +83,11 @@ type ExecResult struct {
 // execDrainHooksKey carries the childwait hooks that a test installs on the
 // context of one ExecCommand call.
 type execDrainHooksKey struct{}
+
+// execBeforeSignalKey carries the function that a test installs on the context of one ExecCommand call (export_test.go). killProcess calls it once,
+// just before the SIGTERM (Process.Kill on Windows), with the read ends of the command's stdout and stderr, so that a test can see whether the call
+// had closed them by then: it had on a cap, and it had not on a timeout or an abort (exec.ts:111-113 against exec.ts:88-98).
+type execBeforeSignalKey struct{}
 
 // ExecCommand runs a shell command synchronously and returns the result.
 // This is the default implementation backing API.Exec when the host
@@ -107,15 +114,20 @@ type execDrainHooksKey struct{}
 // kill terminates the process), and execForceKillDelay later with SIGKILL if
 // the child has not exited by then. No descendant is signalled. The result's
 // code is the child's exit code; a child that a signal ended has none, and
-// upstream resolves it as 0 (`code ?? 0`). On Windows a child that the kill
-// ended has none either: libuv reports the signal it was sent instead of the
-// exit status 1, so the code is 0 there too.
+// upstream reports 128 + the signal number, as a shell does (143 for SIGTERM,
+// 137 for SIGKILL), so a timeout, an abort or a crash does not read as success.
+// With neither a code nor a signal it is 1. On Windows a child that the kill
+// ended has no code either: libuv reports the signal it was sent instead of the
+// exit status 1, so the code is 143 there too.
 //
 // opts.MaxBuffer caps the bytes of stdout and stderr together (default 256 MiB,
 // capped by the runtime string limit; an invalid value fails the call, as
 // upstream's RangeError rejects it, before anything runs). Output past the cap
-// is dropped at the byte: both pipes are closed, the child is terminated, and
-// the result carries Truncated, Killed and a nonzero code. Each stream is
+// is dropped at the byte: both pipes are closed and then the child is
+// signalled, in upstream's order (exec.ts:111-113), and the result carries
+// Truncated, Killed and a nonzero code: the command's own when it had exited
+// by then (1 for a 0), 141 when its next write met the closed pipe before the
+// SIGTERM did (SIGPIPE), 143 when the SIGTERM came first. Each stream is
 // decoded across chunk boundaries (utf8stream); a character the cap cuts is
 // dropped with the bytes a decoder still holds, and a stream that ends inside
 // a character yields one U+FFFD.
@@ -147,11 +159,14 @@ func ExecCommand(ctx context.Context, cwd, command string, args []string, opts *
 
 	// The child writes straight into OS pipes, so Wait returns when the child
 	// exits even if a descendant still holds a write end.
-	stdoutRead, stdoutWrite, pipeErr := os.Pipe()
+	// pig divergence (D631): Node gives the command a socket pair for stdout and one for stderr (libuv). These are pipes: a command can open one again
+	// through /dev/stdout, which a socket refuses (ENXIO), and its write after the close raises SIGPIPE, where a socket's first one fails with ECONNRESET.
+	stdoutRead, stdoutWrite, pipeErr := childwait.NewPipe()
 	if pipeErr != nil {
 		return ExecResult{Code: 1}, nil
 	}
-	stderrRead, stderrWrite, pipeErr := os.Pipe()
+	// pig divergence (D631): a pipe where Node gives a socket pair, as for stdout above.
+	stderrRead, stderrWrite, pipeErr := childwait.NewPipe()
 	if pipeErr != nil {
 		_ = stdoutRead.Close()
 		_ = stdoutWrite.Close()
@@ -210,6 +225,7 @@ func ExecCommand(ctx context.Context, cwd, command string, args []string, opts *
 	// Only a test installs drain hooks (export_test.go); every other call
 	// measures the grace on the wall clock.
 	hooks, _ := ctx.Value(execDrainHooksKey{}).(*childwait.Hooks)
+	beforeSignal, _ := ctx.Value(execBeforeSignalKey{}).(func(stdout, stderr *os.File))
 
 	// Like upstream, killed reports that the timeout, cancellation or cap fired,
 	// even after the child exited: upstream's abort listener and timer stay
@@ -227,6 +243,9 @@ func ExecCommand(ctx context.Context, cwd, command string, args []string, opts *
 			return
 		}
 		killed = true
+		if beforeSignal != nil {
+			beforeSignal(stdoutRead, stderrRead)
+		}
 		terminated = terminate(cmd.Process)
 		// exec.ts checks that the child has not exited (exitCode and signalCode): a signal to a reaped child fails and changes nothing.
 		forceKill = time.AfterFunc(execForceKillDelay, func() { forceTerminate(cmd.Process) })
@@ -246,13 +265,14 @@ func ExecCommand(ctx context.Context, cwd, command string, args []string, opts *
 		}
 		if remaining := maxBuffer - outputBytes; int64(len(chunk)) > remaining {
 			truncated = true
-			// exec.ts destroys the pipes first (Node closes the descriptors at once) and signals the child a few microseconds later, so there a
-			// writer can die of SIGPIPE and a shell that forked it can exit with that status, 141, before SIGTERM lands: a scheduling race that
-			// Pi's runs show on a busy host. Here SIGTERM goes first, so the child ends by the signal (code 0, 1 once truncated), the outcome
-			// Pi reaches in most runs, and the result does not depend on that race.
-			killProcess()
-			_ = stdoutRead.Close()
-			_ = stderrRead.Close()
+			// exec.ts:111-113 destroys both pipes and then calls killProcess, and Node's destroy() closes the descriptor before it returns, so the
+			// child's next write meets a closed pipe before SIGTERM is sent. The order decides the code of a command that is still writing: the
+			// writer can die of SIGPIPE, and a shell that waited for it can run on into the same closed pipe, before SIGTERM lands (141), or
+			// SIGTERM lands first (143); a command that had already exited keeps its own code (1 once truncated). Signalling first ends every
+			// such command by SIGTERM and never reports 141, which most of Pi's runs of an endless writer report. Close returns once the reader
+			// of the other pipe has left its wait, so both descriptors are closed when the signal goes.
+			// On Windows, Close on a pipe blocks behind the sibling overlapped reader goroutine; closing before killProcess lets MSYS2 sh observe a broken pipe and exit with 1 or raw status 3328 (13 << 8) before TerminateProcess runs. Kill first on Windows, then close both pipes.
+			stopOnTruncationOrder(runtime.GOOS == "windows", func() { _ = stdoutRead.Close() }, func() { _ = stderrRead.Close() }, killProcess)
 			chunk = chunk[:max(remaining, 0)]
 		}
 		outputBytes += int64(len(chunk))
@@ -307,15 +327,12 @@ func ExecCommand(ctx context.Context, cwd, command string, args []string, opts *
 		Killed:    killed,
 		Truncated: truncated,
 	}
-	// A child that a signal ended has no exit code (ExitCode is -1), nor has
-	// a Windows child that terminate ended, and upstream resolves `code ?? 0`.
-	switch state := cmd.ProcessState; {
-	case state == nil:
+	// A child that a signal ended has no exit code (ExitCode is -1), nor has a Windows child that terminate ended: exitCode gives them
+	// 128 + the signal number, as upstream does (#12088).
+	if state := cmd.ProcessState; state == nil {
 		result.Code = 1
-	case terminated:
-		result.Code = 0
-	default:
-		result.Code = max(state.ExitCode(), 0)
+	} else {
+		result.Code = exitCode(state, terminated)
 	}
 	// A truncated result never reads as success.
 	if truncated && result.Code == 0 {
@@ -331,4 +348,19 @@ func NodeTimerDelay(ms float64) time.Duration {
 	}
 	//portlint:allow numbers ms is within [1, 2147483647] here (NaN and out-of-range returned above), so int64(ms) is the truncation Node applies and cannot overflow
 	return time.Duration(int64(ms)) * time.Millisecond
+}
+
+// stopOnTruncationOrder runs the pipe closes and process kill in the platform order on maxBuffer overflow.
+// On Unix it closes both pipes before signalling (matching exec.ts:111-113 so a writer meets SIGPIPE before SIGTERM);
+// on Windows it kills before closing so a blocking overlapped Close cannot let MSYS2 sh exit on broken pipe first.
+func stopOnTruncationOrder(killBeforeClose bool, closeStdout, closeStderr, kill func()) {
+	if killBeforeClose {
+		kill()
+		closeStdout()
+		closeStderr()
+		return
+	}
+	closeStdout()
+	closeStderr()
+	kill()
 }

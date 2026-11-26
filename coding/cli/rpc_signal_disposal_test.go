@@ -16,11 +16,12 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/testbudget"
 )
 
-// Pi's RPC signal handler kills tracked children and awaits runtimeHost.dispose on its one event loop
-// (rpc-mode.ts:366-376,726-744). The killed bash call's exit is I/O, so the run reaches its tool result only if a
-// session_shutdown handler awaits a timer or I/O first. A throwing handler never yields: Pi exits with the tool call
-// unanswered and sends no second provider request. A slow handler yields, so the run persists the tool result and
-// sends the next request while the handler waits. Pi 1.1.0 probe: throw → 1 request, 6 session lines; slow → 2 requests.
+// Pi's RPC signal handler kills tracked children and awaits runtimeHost.dispose (rpc-mode.ts:383-391,744-751), which
+// awaits session.abort() before it emits session_shutdown (agent-session-runtime.ts:409-417; Pi main 7a53c310a). The
+// killed bash call's exit is I/O that the abort's wait lets the event loop see, so the run reaches and persists its tool
+// result before any session_shutdown handler runs, whether the handler throws, waits on a timer or waits for idle.
+// Pi at the pin (c23b9ec1), print mode's identical dispose (scenario print/09): the session holds the tool result and
+// the aborted assistant message.
 func TestRPCSignalDisposalHoldsTheRunLikePisEventLoop(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs the binary")
@@ -37,30 +38,37 @@ func TestRPCSignalDisposalHoldsTheRunLikePisEventLoop(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// A Python handler reports no window; its waitForIdle is a Promise-shaped host call, where a Node handler would
-	// await and Pi's loop would turn. The call releases the hold, so the run reaches its tool result and the call returns.
-	// Without that the held run never ends and SIGTERM never exits the process.
-	waitsForIdle := filepath.Join(extensions, "waits_for_idle")
-	if err := os.MkdirAll(waitsForIdle, 0o755); err != nil {
+	// A Python handler reports no window. A handler may not call waitForIdle (a command-context member, Pi runner.ts:1016),
+	// so it makes another Promise-shaped host call, exec, which returns at once: the run settled before session_shutdown,
+	// and the call is served while the signal's disposal waits for the handler. The handler must end without an extension
+	// error.
+	makesHostCall := filepath.Join(extensions, "makes_host_call")
+	if err := os.MkdirAll(makesHostCall, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(waitsForIdle, "waits_for_idle.py"), []byte(`import pig_sdk
+	if err := os.WriteFile(filepath.Join(makesHostCall, "makes_host_call.py"), []byte(`import pig_sdk
+
+
+def shutdown(ctx, data):
+    done = ctx.exec("true")
+    if done.exit_code != 0:
+        raise RuntimeError("exec true exited with %d" % done.exit_code)
 
 
 def new_extension() -> pig_sdk.Extension:
-    e = pig_sdk.Extension("waits_for_idle")
-    e.on_event("session_shutdown", lambda ctx, data: ctx.wait_for_idle())
+    e = pig_sdk.Extension("makes_host_call")
+    e.on_event("session_shutdown", shutdown)
     return e
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
-		name, extension string
-		wantToolResult  bool
+		name, extension    string
+		wantExtensionError bool
 	}{
-		{"throwing handler", throwing, false},
-		{"slow handler", slow, true},
-		{"python handler waiting for idle", waitsForIdle, true},
+		{"throwing handler", throwing, true},
+		{"slow handler", slow, false},
+		{"python handler making a host call", makesHostCall, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			workDir, agentDir, sessionDir := t.TempDir(), t.TempDir(), t.TempDir()
@@ -109,6 +117,9 @@ def new_extension() -> pig_sdk.Extension:
 			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 143 {
 				t.Fatalf("wait = %v, want exit status 143; stderr:\n%s", err, stderr.String())
 			}
+			if got := strings.Contains(stdout.String(), `"type":"extension_error"`); got != tc.wantExtensionError {
+				t.Fatalf("stdout has an extension_error event = %v, want %v:\nstdout:\n%s\nstderr:\n%s", got, tc.wantExtensionError, stdout.String(), stderr.String())
+			}
 			files, _ := filepath.Glob(filepath.Join(sessionDir, "*.jsonl"))
 			if len(files) != 1 {
 				t.Fatalf("session files = %v", files)
@@ -117,8 +128,8 @@ def new_extension() -> pig_sdk.Extension:
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := strings.Contains(string(data), `"role":"toolResult"`); got != tc.wantToolResult {
-				t.Fatalf("session has a tool result = %v, want %v:\n%s\nstdout:\n%s", got, tc.wantToolResult, data, stdout.String())
+			if !strings.Contains(string(data), `"role":"toolResult"`) {
+				t.Fatalf("session has no tool result; the run the signal's disposal settled persists it:\n%s\nstdout:\n%s", data, stdout.String())
 			}
 		})
 	}

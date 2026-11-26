@@ -15,29 +15,22 @@ import (
 	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
 )
 
-// BuildModel constructs an *ai.Model from a "provider/model" spec
-// string, using the given Services for auth and registry lookup. The test-faux backend reuses one provider per Services container so tool-call counters survive request preparation.
+// BuildModel constructs an *ai.Model from a "provider/model" spec string, using the given Services for auth and registry lookup. The test-faux backend reuses
+// one provider per Services container so tool-call counters survive request preparation.
 //
-// Recognised provider prefixes:
+// The model is one the Services' registry lists: a model of the bundled catalog or of the remote catalog the Services hold, a model that models.json defines
+// or an extension registers. A spec whose id nothing lists (a typo, a model a catalog update removed) names no model, as in Pi, where modelRuntime.getModel
+// finds nothing for it: BuildModel returns the error "Model not found: <provider>/<model>" and no model, never a model with no API, endpoint or limits that a
+// request would send to a host the caller did not configure. A caller that wants a custom id on a provider uses [BuildFallbackModel], the copy of the
+// provider's default model that `--model` makes (model-resolver.ts buildFallbackModel).
 //
-//   - "github-copilot/<model>"  : uses the OAuth token in auth.json
-//   - "openai/<model>"          : OPENAI_API_KEY (or registry override)
-//   - "openrouter/<model>"      : OPENROUTER_API_KEY
-//   - "groq/<model>"            : GROQ_API_KEY
-//   - "ollama/<model>"          : OLLAMA_HOST or http://localhost:11434/v1
-//   - any other "<id>/<model>"  : treated as OpenAI-compatible;
-//     API key from <ID_UPPER>_API_KEY env var
+// A bare "<model>" with no slash is interpreted as "openai/<model>" for backward compatibility with environments that hardcode OpenAI.
 //
-// A bare "<model>" with no slash is interpreted as "openai/<model>"
-// for backward compatibility with environments that hardcode OpenAI.
+// No provider id has a base URL of its own, as in Pi: a model is sent to the base URL its models.json or catalog entry states, and an OpenAI-compatible
+// model whose entry states none goes to the OpenAI default, https://api.openai.com/v1. A local server such as Ollama is a models.json provider with its
+// "baseUrl" and an "apiKey".
 //
-// The catalog (context window, cost, capabilities) is resolved via
-// ai.LookupModel; if the spec isn't in the codegen registry, the
-// returned Model still works but has empty cost/window data
-// (status-line just shows blank context %).
-//
-// Library consumers can use this to construct models without
-// hand-rolling provider switching:
+// Library consumers can use this to construct models without hand-rolling provider switching:
 //
 //	svcs, _ := coding.CreateAgentSessionServices(...)
 //	defer svcs.Close()
@@ -64,20 +57,81 @@ func buildModel(spec string, svcs *AgentSessionServices, apiKey string) (*ai.Mod
 
 	registry := svcs.Registry()
 	if registry.GetProvider(providerID) != nil {
-		model := svcs.ModelRuntime().GetModel(providerID, modelID)
-		if model == nil {
-			return nil, fmt.Errorf("model not found: %s/%s", providerID, modelID)
+		if model := svcs.ModelRuntime().GetModel(providerID, modelID); model != nil {
+			return model, nil
 		}
-		return model, nil
+		return nil, notListedError(providerID, modelID)
 	}
-	generated, hasGenerated := lookupGeneratedModel(providerID, modelID)
-	var entry icodingagent.ModelEntry
-	if hasGenerated {
-		entry = registry.ResolveGeneratedModel(providerID, modelID, generated)
-	} else {
-		entry, _ = registry.Resolve(providerID, modelID)
+	entry, listed := lookupModelEntry(svcs, providerID, modelID)
+	if !listed {
+		return nil, notListedError(providerID, modelID)
 	}
 	return buildModelFromEntry(providerID, modelID, entry, svcs, apiKey)
+}
+
+// notListedError is the refusal of a model no catalog, models.json definition or registration lists. Pi has no object for such an id: modelRuntime.getModel and getAvailableSnapshot return nothing for it
+// and every caller refuses with this text or falls back (sdk.ts:224-231 restore, rpc-mode.ts:493-499 set_model, interactive-mode.ts:5409-5440 /model). The one model made from an unlisted id is the CLI's
+// `--model` copy of a provider's default model (BuildFallbackModel, model-resolver.ts:302-317, 527).
+func notListedError(providerID, modelID string) error {
+	return fmt.Errorf("Model not found: %s/%s", providerID, modelID)
+}
+
+// lookupModelEntry is the entry of providerID/modelID in the registry the session lists from, and whether any catalog (remote or bundled), models.json definition or registration lists the model.
+func lookupModelEntry(svcs *AgentSessionServices, providerID, modelID string) (icodingagent.ModelEntry, bool) {
+	registry := svcs.Registry()
+	if remote, found := registry.ResolveRemoteCatalogModel(providerID, modelID); found {
+		// The remote catalog's record is the model's catalog entry, as ModelRuntime.getModel returns it (sdk.ts:224-229): a model only the remote catalog carries has no bundled record.
+		return remote, true
+	}
+	if generated, hasGenerated := lookupGeneratedModel(providerID, modelID); hasGenerated {
+		return registry.ResolveGeneratedModel(providerID, modelID, generated), true
+	}
+	entry, _ := registry.Resolve(providerID, modelID)
+	// Only a model some list names is listed. A provider whose registration or models.json entry states a connection but no model for this id (a base URL or key override, a models list without the id) names no model for it:
+	// Pi's registry has no object there, and a request for the id would go to a host the list never described.
+	return entry, registry.HasModelDefinition(providerID, modelID)
+}
+
+// resolveModelEntry is the entry of providerID/modelID for the connection of a model object that no registry lists (buildRequestModel): the registry's entry, or the provider's settings alone.
+func resolveModelEntry(svcs *AgentSessionServices, providerID, modelID string) icodingagent.ModelEntry {
+	entry, _ := lookupModelEntry(svcs, providerID, modelID)
+	return entry
+}
+
+// buildRequestModel is buildModel for the request of a model object an extension set. Pi's request uses the model object it is given and resolves only the provider's auth
+// (model-runtime.ts:667-689 prepareRequest), so the provider's entry gives the credentials, the request headers, the environment and the transport, and
+// every member of the model is the model's own: its API, endpoint, compat, limits, headers and sampling. A model that names no API or endpoint takes the
+// entry's.
+func buildRequestModel(model *ai.Model, svcs *AgentSessionServices, apiKey string) (*ai.Model, error) {
+	if svcs == nil {
+		return nil, fmt.Errorf("coding: BuildModel: Services is required")
+	}
+	providerID, modelID := providerID(model), model.ID
+	if svcs.Registry().GetProvider(providerID) != nil {
+		return svcs.ModelRuntime().bindNativeModel(model), nil
+	}
+	entry := resolveModelEntry(svcs, providerID, modelID)
+	own := icodingagent.NativeModelEntry(model)
+	own.APIKey, own.Headers, own.AuthHeader, own.Env, own.Insecure = entry.APIKey, entry.Headers, entry.AuthHeader, entry.Env, entry.Insecure
+	if own.API == "" {
+		own.API = entry.API
+	}
+	if own.BaseURL == "" {
+		own.BaseURL = entry.BaseURL
+	}
+	return buildModelFromEntry(providerID, modelID, own, svcs, apiKey)
+}
+
+// buildUnauthenticatedRequestModel builds the request's model of model where the registry resolved no credentials for its provider (prepareRequest).
+// listed is the registry's model of the same provider and id, nil when it lists none; object reports a model object an extension set. A model object
+// and a model the registry does not list are built from their own members (buildRequestModel): the start-up copy of a custom model id
+// (BuildFallbackModel) has no definition but itself, and built by provider and id it is the provider's connection alone, with no output limit and
+// no compat. A model the registry lists is built by provider and id.
+func buildUnauthenticatedRequestModel(model, listed *ai.Model, object bool, svcs *AgentSessionServices, apiKey string) (*ai.Model, error) {
+	if object || listed == nil {
+		return buildRequestModel(model, svcs, apiKey)
+	}
+	return buildModel(model.ProviderMeta.ProviderID+"/"+model.ID, svcs, apiKey)
 }
 
 // BuildModelFromEntry constructs the Model for an already-resolved entry. The
@@ -106,6 +160,35 @@ func buildModelFromEntry(providerID, modelID string, entry icodingagent.ModelEnt
 	provider = newRequestOptionsProvider(provider, providerID, entry.Headers)
 
 	return modelFromEntry(entry, provider), nil
+}
+
+// BuildFallbackModel builds the session model of fallback: a copy of one of its provider's models under an id no catalog carries, as
+// ResolveCliModel returns for an unknown `--model` id. Pi gives the session that object (main.ts:536-537 `options.model = resolved.model`),
+// so the model is built from the copy's own members and only the provider's connection is resolved. Resolving the provider and id a
+// second time finds the provider's connection settings and no model: no window, no output limit, no prices, no compat.
+func BuildFallbackModel(fallback *ai.Model, svcs *AgentSessionServices) (*ai.Model, error) {
+	if svcs == nil {
+		return nil, fmt.Errorf("coding: BuildFallbackModel: Services is required")
+	}
+	registry := svcs.Registry()
+	providerID, modelID := fallback.ProviderMeta.ProviderID, fallback.ID
+	if registry.GetProvider(providerID) != nil {
+		// A provider object streams the model it is given: the copy is bound to it as the catalog's own models are.
+		unbound := new(*fallback)
+		unbound.Provider = nil
+		return svcs.ModelRuntime().bindNativeModel(unbound), nil
+	}
+	entry := registry.ResolveFallbackModel(fallback)
+	if native := registry.NativeProvider(providerID); native != nil {
+		return bindNativeEntry(registry.ModelRegistry, native, entry), nil
+	}
+	// Radius runtime keys are in-memory metadata; the shared builder owns stored credential reads and refresh.
+	if _, radius := registry.RadiusOAuth(providerID); radius {
+		if key, ok := registry.RuntimeAPIKey(providerID); ok && key != "" {
+			entry.APIKey = key
+		}
+	}
+	return buildModelFromEntry(providerID, modelID, entry, svcs, "")
 }
 
 func modelFromEntry(entry icodingagent.ModelEntry, provider ai.Provider) *ai.Model {
@@ -143,6 +226,7 @@ func modelFromEntry(entry icodingagent.ModelEntry, provider ai.Provider) *ai.Mod
 	model.ThinkingLevelMap = cloneThinkingLevelMap(entry.ThinkingLevelMap)
 	model.SamplingParams = maps.Clone(entry.SamplingParams)
 	model.SamplingParamsByThinkingLevel = cloneSamplingParamsByThinkingLevel(entry.SamplingParamsByThinkingLevel)
+	model.SamplingParamsOrder, model.SamplingParamsByThinkingLevelOrder = entry.SamplingParamsOrder, entry.SamplingParamsByThinkingLevelOrder
 	model.PromptCache = maps.Clone(entry.PromptCache)
 	model.ProviderMeta = ai.ProviderMetadata{
 		ProviderID: entry.ProviderID,
@@ -259,37 +343,38 @@ func buildLeafProviderForEntry(providerID, modelID string, apiKind ai.API, entry
 	}
 	switch apiKind {
 	case ai.APIOpenAICompletions:
-		if providerID == "ollama" && baseURL == "" {
-			baseURL = firstNonEmpty(os.Getenv("OLLAMA_HOST"), "http://localhost:11434/v1")
-		}
 		return ai.NewOpenAIProvider(ai.OpenAIConfig{
-			ModelMetadata:                 modelFromEntry(entry, nil),
-			BaseURL:                       baseURL,
-			APIKey:                        apiKey,
-			GetAPIKey:                     resolveAPIKey,
-			Model:                         modelID,
-			ProviderID:                    providerID,
-			ExtraHeaders:                  extraHeaders,
-			SamplingParams:                maps.Clone(entry.SamplingParams),
-			SamplingParamsByThinkingLevel: cloneSamplingParamsByThinkingLevel(entry.SamplingParamsByThinkingLevel),
-			Env:                           ai.ProviderEnv(maps.Clone(entry.Env)),
-			Compat:                        cloneCompat(entry.Compat),
-			Insecure:                      entry.Insecure,
+			ModelMetadata:                      modelFromEntry(entry, nil),
+			BaseURL:                            baseURL,
+			APIKey:                             apiKey,
+			GetAPIKey:                          resolveAPIKey,
+			Model:                              modelID,
+			ProviderID:                         providerID,
+			ExtraHeaders:                       extraHeaders,
+			SamplingParams:                     maps.Clone(entry.SamplingParams),
+			SamplingParamsByThinkingLevel:      cloneSamplingParamsByThinkingLevel(entry.SamplingParamsByThinkingLevel),
+			SamplingParamsOrder:                entry.SamplingParamsOrder,
+			SamplingParamsByThinkingLevelOrder: entry.SamplingParamsByThinkingLevelOrder,
+			Env:                                ai.ProviderEnv(maps.Clone(entry.Env)),
+			Compat:                             cloneCompat(entry.Compat),
+			Insecure:                           entry.Insecure,
 		}), nil
 	case ai.APIOpenAIResponses:
 		return ai.NewOpenAIResponsesProvider(ai.OpenAIResponsesConfig{
-			ModelMetadata:                 modelFromEntry(entry, nil),
-			BaseURL:                       baseURL,
-			APIKey:                        apiKey,
-			GetAPIKey:                     resolveAPIKey,
-			Model:                         modelID,
-			ProviderID:                    providerID,
-			ExtraHeaders:                  extraHeaders,
-			SamplingParams:                maps.Clone(entry.SamplingParams),
-			SamplingParamsByThinkingLevel: cloneSamplingParamsByThinkingLevel(entry.SamplingParamsByThinkingLevel),
-			Env:                           ai.ProviderEnv(maps.Clone(entry.Env)),
-			Compat:                        cloneCompat(entry.Compat),
-			IsReasoning:                   entry.Reasoning,
+			ModelMetadata:                      modelFromEntry(entry, nil),
+			BaseURL:                            baseURL,
+			APIKey:                             apiKey,
+			GetAPIKey:                          resolveAPIKey,
+			Model:                              modelID,
+			ProviderID:                         providerID,
+			ExtraHeaders:                       extraHeaders,
+			SamplingParams:                     maps.Clone(entry.SamplingParams),
+			SamplingParamsByThinkingLevel:      cloneSamplingParamsByThinkingLevel(entry.SamplingParamsByThinkingLevel),
+			SamplingParamsOrder:                entry.SamplingParamsOrder,
+			SamplingParamsByThinkingLevelOrder: entry.SamplingParamsByThinkingLevelOrder,
+			Env:                                ai.ProviderEnv(maps.Clone(entry.Env)),
+			Compat:                             cloneCompat(entry.Compat),
+			IsReasoning:                        entry.Reasoning,
 		}), nil
 	case ai.APIOpenAICodexResponses:
 		return ai.NewOpenAICodexResponsesProvider(ai.OpenAICodexResponsesConfig{
@@ -303,17 +388,19 @@ func buildLeafProviderForEntry(providerID, modelID string, apiKind ai.API, entry
 		}), nil
 	case ai.APIAzureOpenAIResponses:
 		return ai.NewAzureOpenAIResponsesProvider(ai.AzureOpenAIResponsesConfig{
-			ModelMetadata:                 modelFromEntry(entry, nil),
-			Compat:                        cloneCompat(entry.Compat),
-			BaseURL:                       baseURL,
-			APIKey:                        apiKey,
-			Model:                         modelID,
-			ProviderID:                    providerID,
-			ExtraHeaders:                  extraHeaders,
-			SamplingParams:                maps.Clone(entry.SamplingParams),
-			SamplingParamsByThinkingLevel: cloneSamplingParamsByThinkingLevel(entry.SamplingParamsByThinkingLevel),
-			Env:                           ai.ProviderEnv(maps.Clone(entry.Env)),
-			IsReasoning:                   entry.Reasoning,
+			ModelMetadata:                      modelFromEntry(entry, nil),
+			Compat:                             cloneCompat(entry.Compat),
+			BaseURL:                            baseURL,
+			APIKey:                             apiKey,
+			Model:                              modelID,
+			ProviderID:                         providerID,
+			ExtraHeaders:                       extraHeaders,
+			SamplingParams:                     maps.Clone(entry.SamplingParams),
+			SamplingParamsByThinkingLevel:      cloneSamplingParamsByThinkingLevel(entry.SamplingParamsByThinkingLevel),
+			SamplingParamsOrder:                entry.SamplingParamsOrder,
+			SamplingParamsByThinkingLevelOrder: entry.SamplingParamsByThinkingLevelOrder,
+			Env:                                ai.ProviderEnv(maps.Clone(entry.Env)),
+			IsReasoning:                        entry.Reasoning,
 		}), nil
 	case ai.APIAnthropicMessages:
 		config := ai.AnthropicConfig{
@@ -386,7 +473,7 @@ func buildLeafProviderForEntry(providerID, modelID string, apiKind ai.API, entry
 		return ai.NewPiMessagesProvider(config), nil
 	default:
 		// An api no case above implements is looked up in the API registry when the request starts, and a name nothing is registered for is refused there.
-		// upstream: provider-composer.ts:603-604 (composeModelProvider's streamWith: getApiProvider(model.api), then the throw)
+		// upstream: provider-composer.ts:605-606 (composeModelProvider's streamWith: getApiProvider(model.api), then the throw)
 		provider := &apiRegistryProvider{id: providerID, api: apiKind, apiKey: resolveAPIKey}
 		provider.model = modelFromEntry(entry, provider)
 		return provider, nil
@@ -436,15 +523,6 @@ func storedAPIKey(authPath, providerID, fallback string) func(context.Context) (
 		}
 		return fallback, nil
 	}
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
 }
 
 func googleAPIVersionForBaseURL(baseURL string) string {
@@ -538,15 +616,24 @@ func newRequestOptionsProvider(provider ai.Provider, providerID string, configur
 	return &requestOptionsProvider{Provider: provider, providerID: providerID, configured: maps.Clone(configured)}
 }
 
+// prepareSimpleStreamOptions is the one simple-stream option lowering shared by ModelRuntime.StreamSimple, requestOptionsProvider.SimpleStreamOptions, and builtinStreamSimple.
+// Every API module's streamSimple except pi-messages.ts (:432-444) lowers omitted/simple reasoning and clamps maxTokens with buildBaseOptions; pi-messages sends the caller's options.
+func prepareSimpleStreamOptions(model *ai.Model, transcript ai.TranscriptContext, options ai.StreamOptions) ai.StreamOptions {
+	if model == nil || model.ProviderMeta.API == ai.APIPiMessages {
+		return options
+	}
+	ai.ApplyOmittedReasoning(model, &options)
+	options.MaxTokens = ai.ClampMaxTokensToContext(model, transcript, cmp.Or(options.MaxTokens, model.Capabilities.MaxOutputTokens))
+	return options
+}
+
 // SimpleStreamOptions prepares the request options of a simple stream the way ModelRuntime.StreamSimple does for a registry-built provider (start): an omitted reasoning level sends the API's native thinking off, and the output budget stays within the room the context window leaves (simple-options.ts buildBaseOptions). A provider of extension-registered stream callbacks or a native provider prepares its own options.
 func (provider *requestOptionsProvider) SimpleStreamOptions(model *ai.Model, transcript ai.TranscriptContext, options ai.StreamOptions) ai.StreamOptions {
 	switch provider.Provider.(type) {
 	case *registeredStreamProvider, *nativeModelProvider:
 		return options
 	}
-	ai.ApplyOmittedReasoning(model, &options)
-	options.MaxTokens = ai.ClampMaxTokensToContext(model, transcript, cmp.Or(options.MaxTokens, model.Capabilities.MaxOutputTokens))
-	return options
+	return prepareSimpleStreamOptions(model, transcript, options)
 }
 
 // Stream merges the configured headers under the request's and runs the request's header transform (before_provider_headers) on the result, as ModelRuntime applyAuth does for a registry-built provider. The built-in OpenCode providers add the session header below both, as providers/opencode.ts withOpenCodeSessionHeader does; a direct pi-ai call that the extension bridge streams through BuildModel carries no attribution, as under Pi.

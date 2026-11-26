@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/internal/jsonopts"
 	"github.com/MichaelKinsy/PiG/internal/jsonparse"
 	"github.com/MichaelKinsy/PiG/internal/managementhttp"
 )
@@ -101,23 +103,24 @@ func supportedRemoteModelType(raw json.RawMessage) bool {
 
 // orderedObjectValues returns the values of a JSON object in document order.
 func orderedObjectValues(data json.RawMessage) ([]json.RawMessage, map[string]json.RawMessage, error) {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	if _, err := decoder.Token(); err != nil {
+	decoder := jsontext.NewDecoder(bytes.NewReader(data), jsonopts.Parse)
+	if _, err := decoder.ReadToken(); err != nil {
 		return nil, nil, err
 	}
 	var values []json.RawMessage
 	byKey := map[string]json.RawMessage{}
-	for decoder.More() {
-		name, err := decoder.Token()
+	for decoder.PeekKind() != '}' {
+		key, err := jsonopts.ReadName(decoder) // the JavaScript key, not Token.String(): see jsonopts.ReadName
 		if err != nil {
 			return nil, nil, err
 		}
-		var value json.RawMessage
-		if err := decoder.Decode(&value); err != nil {
+		valueBytes, err := decoder.ReadValue()
+		if err != nil {
 			return nil, nil, err
 		}
+		value := json.RawMessage(bytes.Clone(valueBytes))
 		values = append(values, value)
-		byKey[name.(string)] = value
+		byKey[key] = value
 	}
 	return values, byKey, nil
 }
@@ -196,7 +199,10 @@ func encodeURIComponent(value string) string {
 	return encoded.String()
 }
 
-// newCatalogRequest is the GET of a provider's catalog, with the validator of a stored body when there is one.
+// newCatalogRequest is the GET of a provider's catalog, with the validator of a stored body when there is one. The User-Agent carries
+// this client's version, and Pi's catalog protocol serves a `pi/<version>` client the newest catalog published for a minimum version
+// at or below it (Pi's scripts/model-catalog-minimum-version.mjs and selectModelCatalog() in scripts/model-catalog-protocol.ts). So a
+// client receives catalogs published after its release, and those catalogs must work with this client's code.
 // upstream: remote-catalog-provider.ts:requestCatalog (ee409a85 factors it out of withRemoteCatalog)
 func newCatalogRequest(ctx context.Context, providerID, catalogBaseURL, validator string) (*http.Request, error) {
 	// new URL("/api/models/providers/<id>", catalogBaseUrl): the absolute route replaces the base URL's path and query.
@@ -315,6 +321,8 @@ func withRemoteCatalogOverlay(provider *ai.ModelsProvider, catalogBaseURL string
 		}
 		return mergeRemoteCatalogModels(baseline, overlay.snapshot()), nil
 	}
+	// pi.dev serves the catalog, so a stale provider login must not block or fail its refresh.
+	wrapped.RefreshModelsAuth = ai.RefreshModelsAuthConfigured
 	wrapped.RefreshModels = func(refresh ai.RefreshModelsContext) error {
 		return refreshRemoteCatalog(provider.ID, catalogBaseURL, localGeneratedAt, overlay, refresh)
 	}

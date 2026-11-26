@@ -628,6 +628,8 @@ func retainReadOnlyCredentialFields(raw json.RawMessage, credential Credential) 
 	if len(credential.Extra) == 0 {
 		credential.Extra = nil
 	}
+	// Pi returns the JSON.parse'd entry (auth-storage.ts:260-269 ReadOnlyAuthStorage.read), so the credential keeps the file's member order, as a credential the writable store decodes does (decodeStoredCredential).
+	credential.order = decodedCredentialOrder(raw).retainedFor(credential.marshalFields)
 	return credential, true
 }
 
@@ -679,8 +681,11 @@ func (s *ReadOnlyAuthStorage) Delete(context.Context, string) error {
 	return errors.New("Read-only credential storage cannot modify auth.json")
 }
 
-// ReadRawCredential uses GetRaw when the store exposes it. Otherwise it calls Read, which may resolve configuration values according to the supplied store's contract.
+// ReadRawCredential uses GetRaw when the store exposes it; an AuthStorage reads in ctx's operation. Otherwise it calls Read, which may resolve configuration values according to the supplied store's contract.
 func ReadRawCredential(ctx context.Context, store CredentialStore, providerID string) (Credential, bool, error) {
+	if auth, ok := store.(*AuthStorage); ok {
+		return auth.credentialIn(ctx, providerID)
+	}
 	if raw, ok := store.(interface {
 		GetRaw(string) (Credential, bool, error)
 	}); ok {

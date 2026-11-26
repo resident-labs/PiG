@@ -21,11 +21,17 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
 	"github.com/MichaelKinsy/PiG/internal/orderedjson"
 	"github.com/MichaelKinsy/PiG/internal/sessionentry"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 	"github.com/MichaelKinsy/PiG/tui"
 	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
 
 func (m *InteractiveMode) deliverUserMessage(content any, deliverAs extension.DeliverAs) error {
+	return m.deliverUserMessageAfter(content, deliverAs, nil)
+}
+
+// deliverUserMessageAfter is deliverUserMessage for a send whose caller asked to make the refusal's report when the sending code's run ends (subprocess.SendUserMessageOptions.AfterRun).
+func (m *InteractiveMode) deliverUserMessageAfter(content any, deliverAs extension.DeliverAs, after func(report func())) error {
 	parsed, err := subprocessUserContent(content)
 	if err != nil {
 		return fmt.Errorf("sendUserMessage: %w", err)
@@ -64,17 +70,14 @@ func (m *InteractiveMode) deliverUserMessage(content any, deliverAs extension.De
 	// message. The run goroutine clears turnActive before it queues the cleanup
 	// that restores isIdle, so a task landing in that window reads isIdle false
 	// with no goroutine left to drain a steering queue, and the message is lost.
-	// Upstream prompt() throws when a run is active and no streaming
-	// behavior was given.
+	// Upstream prompt() throws when a run is active and no streaming behavior was given (agent-session.ts:2240-2244); the bound action reports
+	// the refusal as the extension error `send_user_message` and the call returns (:3565-3572), as the Session's binding does in print, JSON and RPC.
 	if deliverAs == "" && m.runStreaming() {
-		return errors.New("Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.")
+		m.reportRuntimeErrorAfter(after, "send_user_message", errors.New("Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."))
+		return nil
 	}
 	return m.postToMain(m.runCtx, func() {
 		if m.agent == nil {
-			return
-		}
-		// A start posted before a quit key set requestExit must not begin a turn the quit settle would wait for (D247).
-		if m.requestExit.Load() {
 			return
 		}
 		// Upstream sendUserMessage is prompt() with source "extension" and
@@ -82,6 +85,21 @@ func (m *InteractiveMode) deliverUserMessage(content any, deliverAs extension.De
 		// after the check above receives an unspecified delivery as a
 		// follow-up.
 		m.promptUserInput(m.runCtx, text, images, deliverAs != extension.DeliverAsSteer, extension.InputSourceExtension, false)
+	})
+}
+
+// extensionAbort is an extension's ctx.abort() in interactive mode, for subprocess and in-process extensions alike. It is Pi's restoreQueuedMessagesToEditor({ abort: true }): the queued steering and follow-up messages go back to the editor, then `void this.session.abort()` cancels the retry delay, compaction, branch summary and run. Both happened when it returns, as in Pi, where they run before abort()'s first await: ctx.hasPendingMessages() is false and the run's signal is aborted. Nothing waits for the end of the run, so a handler the run awaits can call it. The owner loop runs it as one of its tasks (inline for a caller on the loop), and a mode that stops first drops it.
+// upstream: packages/coding-agent/src/modes/interactive/interactive-mode.ts:2399-2401, :4925-4941
+func (m *InteractiveMode) extensionAbort() {
+	_ = m.runOnMainAndWait(m.runCtx, func() error {
+		m.restoreQueuedMessagesToEditor(false)
+		if m.opts.SessionHandle != nil {
+			m.opts.SessionHandle.AbortRetry()
+			m.opts.SessionHandle.AbortCompaction()
+			m.opts.SessionHandle.AbortBranchSummary()
+		}
+		m.abortRun(m.runCtx)
+		return nil
 	})
 }
 
@@ -231,13 +249,9 @@ func (m *InteractiveMode) wireInprocContextActions() {
 		GetSignal:          m.extensionSignal,
 		IsProjectTrusted:   func() bool { return m.projectTrusted() },
 		HasPendingMessages: m.extensionHasPendingMessages,
-		Abort: func() {
-			if m.agent != nil {
-				m.abortFn()
-			}
-		},
-		Shutdown:        m.requestExtensionShutdown,
-		GetContextUsage: m.extensionContextUsage,
+		Abort:              m.extensionAbort,
+		Shutdown:           m.requestExtensionShutdown,
+		GetContextUsage:    m.extensionContextUsage,
 		GetSystemPrompt: func() string {
 			return m.currentSystemPrompt()
 		},
@@ -268,7 +282,8 @@ func (m *InteractiveMode) wireInprocContextActions() {
 				if opts != nil {
 					options = *opts
 				}
-				return m.sendExtensionMessage(msg, options)
+				m.reportRuntimeError("send_message", m.sendExtensionMessage(msg, options))
+				return nil
 			},
 			// upstream: agent-session.ts:3416-3465 (_bindExtensionCore) binds these in every mode; the mode's bind replaces the Session's.
 			AppendEntry:      m.appendExtensionEntry,
@@ -443,7 +458,7 @@ func (m *InteractiveMode) renderWidgetsLocked() {
 		entries = append(entries, widgetEntry{component: proxy, below: placement == string(extension.WidgetPlacementBelowEditor), order: order})
 	}
 	// A proxy seen for the first time, or with a new bridge order (replaced or moved), was set now: it takes the next sequences in bridge order.
-	slices.SortFunc(entries, func(a, b widgetEntry) int { return cmp.Compare(a.order, b.order) })
+	sortx.Func(entries, func(a, b widgetEntry) int { return cmp.Compare(a.order, b.order) })
 	seqs := make(map[*subprocess.PushProxy]bridgeWidgetSeq, len(entries))
 	for i := range entries {
 		proxy := entries[i].component.(*subprocess.PushProxy)
@@ -472,7 +487,7 @@ func (m *InteractiveMode) renderWidgetsLocked() {
 	for _, widget := range m.inprocessWidgets {
 		entries = append(entries, widgetEntry{component: widget.component, below: widget.placement == extension.WidgetPlacementBelowEditor, seq: widget.seq})
 	}
-	slices.SortFunc(entries, func(a, b widgetEntry) int { return cmp.Compare(a.seq, b.seq) })
+	sortx.Func(entries, func(a, b widgetEntry) int { return cmp.Compare(a.seq, b.seq) })
 	above := []tui.Component{tui.NewSpacer(1)}
 	var below []tui.Component
 	for _, entry := range entries {
@@ -481,6 +496,26 @@ func (m *InteractiveMode) renderWidgetsLocked() {
 		} else {
 			above = append(above, entry.component)
 		}
+	}
+	// pig additive (D614): the mounts the terminal view client draws follow the widgets of their side, and the panels are
+	// the rows nearest the editor.
+	for _, region := range [...]viewRegion{viewAboveEditor, viewPanel, viewBelowEditor} {
+		if region == viewPanel && m.viewTabRow != nil {
+			above = append(above, m.viewTabRow)
+		}
+		for _, mount := range m.viewMounts {
+			switch {
+			case mount.slot.region != region:
+			case region == viewBelowEditor:
+				below = append(below, mount)
+			default:
+				above = append(above, mount)
+			}
+		}
+	}
+	// pig additive (D614): the row that stands for the dialogs is the row directly above the editor.
+	if m.viewWaitRow != nil {
+		above = append(above, m.viewWaitRow)
 	}
 	// pig divergence (D228): the one-time copy tip sits under the editor, after the below-editor widgets.
 	if m.queueCopyTip != nil {
@@ -504,38 +539,11 @@ func (m *InteractiveMode) sessionToolActions() (extension.ToolActions, bool) {
 	return session.ToolActions(), true
 }
 
-// extensionAbort is the extension host's abort action: ctx.abort() of a subprocess extension in interactive mode. Pi's abort handler is `void this.session.abort()` (interactive-mode.ts:2077-2078, :4840-4857), and everything before abort()'s first await has run when the call returns: the flag for agent_settled is set, the retry, compaction and branch summary are cancelled and agent.abort() has aborted the run's AbortController (agent-session.ts:2519-2530, agent.ts:350-352). So a handler that holds ctx.signal sees it aborted once its call returns, and nothing waits for the end of the run: the run waits for the handler that made the call.
-//
-// The call arrives on a goroutine of the extension host. The owner loop may be busy with an earlier task, or waiting for the handler that made this call, so the cancellation is made here and not queued behind the loop: the host replies to the extension with the state of the run's signal, which must already be aborted. A Session cancels from any goroutine (RequestAbort). A mode that owns its agent aborts the run's signal here and leaves the loop only what it owns: renewing the abort context the next run starts with, which applies to the run this call aborted and not to one that began since.
-func (m *InteractiveMode) extensionAbort() {
-	if session, ok := m.opts.SessionHandle.(interface{ RequestAbort() }); ok {
-		session.RequestAbort()
-		return
-	}
-	if session := m.opts.SessionHandle; session != nil {
-		session.AbortRetry()
-		session.AbortCompaction()
-		session.AbortBranchSummary()
-	}
-	current := m.extensionAgent.Load()
-	var run context.Context
-	if current != nil {
-		run = current.Signal()
-		current.Abort()
-	}
-	_ = m.postToMain(m.runCtx, func() {
-		if current == nil || current.Signal() == run {
-			m.abortRun(m.runCtx)
-		}
-	})
-}
-
 func (m *InteractiveMode) wireSubprocessHostCallbacks() func() {
 	b := m.opts.SubprocessUIBridge
 	detachModelRegistry := WireModelOperations(b, ModelOperationBindings{
 		CurrentModel: m.sessionModel, ModelLookup: m.opts.ModelLookup, ModelCatalog: m.opts.ModelCatalog, Classify: m.opts.ModelClassify, GenerateImages: m.opts.ModelGenerateImages,
 		Registry: m.opts.ModelRegistry, ModelBuilder: m.opts.ModelBuilder, SessionHandle: m.opts.SessionHandle,
-		Transport: ai.Transport(m.opts.Settings.Transport),
 	})
 
 	b.SetHostAction("getFlag", func(extName, name string) any {
@@ -624,17 +632,21 @@ func (m *InteractiveMode) wireSubprocessHostCallbacks() func() {
 			opts.OnError(errors.New("compaction is not available"))
 		}
 	})
-	b.SetHostAction("setModel", func(ctx context.Context, spec string) (bool, error) {
+	b.SetHostAction(subprocess.CallSetModel, func(ctx context.Context, object *ai.Model) (bool, error) {
 		m.invalidatePostLoginSelection()
 		extension.CallInitiated(ctx)
-		if m.opts.ModelBuilder == nil {
-			return false, fmt.Errorf("model switching not configured")
-		}
-		newModel, err := m.opts.ModelBuilder(spec)
+		newModel, err := m.bindExtensionModelObject(object)
 		if err != nil {
 			return false, err
 		}
 		return m.switchExtensionModel(ctx, newModel)
+	})
+	b.SetHostAction(subprocess.CallResolveModel, func(ctx context.Context, spec string) (*ai.Model, error) {
+		extension.CallInitiated(ctx)
+		if m.opts.ModelBuilder == nil {
+			return nil, fmt.Errorf("model switching not configured")
+		}
+		return m.opts.ModelBuilder(spec)
 	})
 	b.SetHostAction("getSessionName", m.extensionSessionName)
 	b.SetHostAction("getSessionID", func() string {
@@ -668,6 +680,8 @@ func (m *InteractiveMode) wireSubprocessHostCallbacks() func() {
 	b.SetHostAction("getSystemPromptOptions", func() extension.BuildSystemPromptOptions {
 		return *m.currentSystemPromptOptions()
 	})
+	// Interactive mode has no version of its base options, which an in-process extension may edit in place, so it reports no key and the bridge encodes the options for every state push.
+	b.SetHostAction("getSystemPromptOptionsKey", func() any { return nil })
 
 	// getEntriesPage backs bounded per-extension state pushes. Session entries
 	// are append-only, so a cursor beyond the current length means the session
@@ -683,33 +697,36 @@ func (m *InteractiveMode) wireSubprocessHostCallbacks() func() {
 		}
 		return page, next, next < total, leafID
 	})
+	b.SetHostAction("getMessageEntries", func(cursor int) ([]sessionentry.MessageSeq, int) {
+		if m.currentSession() == nil {
+			return nil, 0
+		}
+		return m.currentSession().MessageEntriesAfter(cursor)
+	})
 	b.SetHostAction("sessionRead", func(method string, args json.RawMessage) (any, error) {
 		return ExtensionSessionRead(ExtensionSessionView{Session: m.currentSession(), CWD: m.opts.CWD, SessionDir: ExtensionSessionDir(m.opts.SessionDir)}, method, args)
 	})
 	b.SetHostAction("exec", func(ctx context.Context, command string, args []string, opts *extension.ExecOptions) (extension.ExecResult, error) {
 		return extension.ExecCommand(ctx, m.opts.CWD, command, args, opts)
 	})
-	// agent-session.ts:3419 binds setLabel into the runner's runtime; the host action reaches that one handler. An empty label clears it (upstream label undefined).
-	b.SetHostAction("setLabel", func(entryID, label string) error {
+	// agent-session.ts:3419 binds setLabel into the runner's runtime; the host action reaches that one handler with the label as the extension gave it: a string (an empty one included), null, or none.
+	b.SetHostAction("setLabel", func(entryID string, label *string, null bool) error {
 		if m.currentSession() == nil || m.newRunner == nil || m.newRunner.Runtime().SetLabel == nil {
 			return fmt.Errorf("session not available")
 		}
-		var value *string
-		if label != "" {
-			value = &label
-		}
-		return m.newRunner.Runtime().SetLabel(entryID, value)
+		return m.newRunner.Runtime().ApplyLabel(entryID, label, null)
 	})
 	b.SetHostAction("setSessionName", m.setExtensionSessionName)
 	b.SetHostAction("sendMessage", func(msg extension.CustomMessageRef, opts subprocess.SendMessageOptions) error {
-		return m.sendExtensionMessage(msg, extension.SendMessageOptions{TriggerTurn: opts.TriggerTurn, DeliverAs: extension.DeliverAs(opts.DeliverAs)})
+		m.reportRuntimeErrorAfter(opts.AfterRun, "send_message", m.sendExtensionMessage(msg, extension.SendMessageOptions{TriggerTurn: opts.TriggerTurn, DeliverAs: extension.DeliverAs(opts.DeliverAs)}))
+		return nil
 	})
 	b.SetHostAction("sendUserMessage", func(content any, opts subprocess.SendUserMessageOptions) error {
-		deliver := func() { _ = m.deliverUserMessage(content, extension.DeliverAs(opts.DeliverAs)) }
+		deliver := func() { _ = m.deliverUserMessageAfter(content, extension.DeliverAs(opts.DeliverAs), opts.AfterRun) }
 		if m.deferSettledAction(deliver) {
 			return nil
 		}
-		return m.deliverUserMessage(content, extension.DeliverAs(opts.DeliverAs))
+		return m.deliverUserMessageAfter(content, extension.DeliverAs(opts.DeliverAs), opts.AfterRun)
 	})
 	BindAppendEntryAction(b, func() (*Session, error) {
 		if m.currentSession() == nil {
@@ -742,6 +759,17 @@ func (m *InteractiveMode) wireSubprocessHostCallbacks() func() {
 // hostStateNotifier is what the extension host's UI bridge offers the owner of state its runtimes replicate: a report that the state changed with no extension call to announce it.
 type hostStateNotifier interface{ HostStateChanged() }
 
+// hostStateScopeNotifier is a bridge that also takes the bracket around a change of the Session's identity state (UIBridge.HostStateChanging, HostStateSettled).
+type hostStateScopeNotifier interface {
+	HostStateChanging()
+	HostStateSettled()
+}
+
+// replicatedStateScopeSession is a Session that brackets the changes of its identity state (ObserveReplicatedStateScope).
+type replicatedStateScopeSession interface {
+	ObserveReplicatedStateScope(begin, end func()) func()
+}
+
 // replicatedStateSession is a Session that reports the changes of the state an extension runtime replicates (model, thinking level, session name, settings).
 type replicatedStateSession interface {
 	ObserveReplicatedState(observe func()) func()
@@ -764,6 +792,11 @@ func (m *InteractiveMode) watchReplicatedState(bridge SubprocessUIBridge) func()
 	})
 	if session, ok := m.opts.SessionHandle.(replicatedStateSession); ok {
 		stops = append(stops, session.ObserveReplicatedState(notifier.HostStateChanged))
+	}
+	if session, ok := m.opts.SessionHandle.(replicatedStateScopeSession); ok {
+		if scope, ok := bridge.(hostStateScopeNotifier); ok {
+			stops = append(stops, session.ObserveReplicatedStateScope(scope.HostStateChanging, scope.HostStateSettled))
+		}
 	}
 	if m.statusLine != nil {
 		stops = append(stops, m.statusLine.ObserveChange(notifier.HostStateChanged))
@@ -1219,6 +1252,26 @@ func subprocessRequestMetadata(raw any, path string) (map[string]string, []strin
 	return values, keys, nil
 }
 
+// subprocessSamplingParams reads samplingParams, an object. An *orderedjson.Object (the subprocess bridge's decoding of an object whose
+// members are not in sorted order) also gives the member order, which the provider keeps on the wire.
+func subprocessSamplingParams(raw any) (map[string]any, []string, error) {
+	ordered, ok := raw.(*orderedjson.Object)
+	if !ok {
+		object, ok := raw.(map[string]any)
+		if !ok {
+			return nil, nil, fmt.Errorf("model request.samplingParams must be an object")
+		}
+		return object, nil, nil
+	}
+	keys := ordered.Keys()
+	object := make(map[string]any, len(keys))
+	for _, key := range keys {
+		value, _ := ordered.Get(key)
+		object[key] = orderedjson.Value(value)
+	}
+	return object, keys, nil
+}
+
 func subprocessProviderHeaders(raw any, path string) (ai.ProviderHeaders, error) {
 	object, ok := raw.(map[string]any)
 	if !ok {
@@ -1277,11 +1330,11 @@ func subprocessStreamOptions(request map[string]any, defaults ai.StreamOptions) 
 		options.TemperatureSet = true
 	}
 	if raw, exists := request["samplingParams"]; exists {
-		object, ok := raw.(map[string]any)
-		if !ok {
-			return ai.StreamOptions{}, fmt.Errorf("model request.samplingParams must be an object")
+		object, order, err := subprocessSamplingParams(raw)
+		if err != nil {
+			return ai.StreamOptions{}, err
 		}
-		options.SamplingParams = object
+		options.SamplingParams, options.SamplingParamsOrder = object, order
 	}
 	if raw, exists := request["thinkingBudgets"]; exists {
 		object, ok := raw.(map[string]any)
@@ -1536,7 +1589,6 @@ type ModelOperationBindings struct {
 	Classify func(context.Context, *ai.ClassifierModel, ai.ClassifierContext, ...ai.ModelsClassifierOptions) ai.ClassifierResult
 	// GenerateImages is the Session runtime's generateImages; an extension's ctx.modelRegistry.generateImages reaches it. Nil answers an error result.
 	GenerateImages func(context.Context, *ai.ImageModel, ai.ImagesContext, ...ai.ModelsImagesOptions) ai.AssistantImages
-	Transport      ai.Transport
 }
 
 // WireModelOperations installs one Session-owned extension model surface and returns its catalog-listener detach function.
@@ -1703,9 +1755,15 @@ func WireModelOperations(bridge ModelOperationBridge, bindings ModelOperationBin
 		return func() {}
 	}
 	// The typed models are recomposed on the same committed registry changes that republish the catalog. The subscription is an observer: the registry's single listener slot belongs to ModelRuntime.SetChangeListener callers.
+	// The registry notifies after every commit, whether or not it changed anything (a refresh commits twice: models.json reloaded, the catalogs
+	// refreshed): a bridge that can tell sends a replica nothing it already holds.
+	publishChange := bridge.PublishModelCatalog
+	if changes, ok := bridge.(interface{ PublishModelCatalogChange() }); ok {
+		publishChange = changes.PublishModelCatalogChange
+	}
 	detach := bindings.Registry.ObserveChanges(func() {
 		catalogEncoding.invalidateTyped()
-		bridge.PublishModelCatalog()
+		publishChange()
 	})
 	bridge.PublishModelCatalog()
 	return detach
@@ -1713,19 +1771,19 @@ func WireModelOperations(bridge ModelOperationBridge, bindings ModelOperationBin
 
 // EarlyModelStream is the model stream for the pi-ai functions (`completeSimple`, `streamSimple`) an extension calls while its module loads. Pi runs them in its
 // own process with no registration gate and no Session: the model is the caller's own object and the request goes through the global API providers.
-func EarlyModelStream(transport ai.Transport) func(context.Context, map[string]any, map[string]any) (*ai.AssistantMessageEventStream, error) {
+func EarlyModelStream() func(context.Context, map[string]any, map[string]any) (*ai.AssistantMessageEventStream, error) {
 	return func(ctx context.Context, model map[string]any, request map[string]any) (*ai.AssistantMessageEventStream, error) {
-		return streamModelForSubprocess(ctx, model, request, ModelOperationBindings{Transport: transport})
+		return streamModelForSubprocess(ctx, model, request, ModelOperationBindings{})
 	}
 }
 
 // WireEarlyModelStream installs [EarlyModelStream] on a bridge. The host has no Session yet, so the Session-owned surface of [WireModelOperations] replaces it
 // when it is installed.
-func WireEarlyModelStream(bridge ModelOperationBridge, transport ai.Transport) {
+func WireEarlyModelStream(bridge ModelOperationBridge) {
 	if bridge == nil {
 		return
 	}
-	bridge.SetHostAction("streamModel", EarlyModelStream(transport))
+	bridge.SetHostAction("streamModel", EarlyModelStream())
 }
 
 func streamModelForSubprocess(ctx context.Context, model map[string]any, request map[string]any, bindings ModelOperationBindings) (*ai.AssistantMessageEventStream, error) {
@@ -1747,7 +1805,7 @@ func streamModelForSubprocess(ctx context.Context, model map[string]any, request
 	if err != nil {
 		return nil, err
 	}
-	ctx, aiRequest, options, err := decodeSubprocessStream(ctx, llmModel, request, bindings.Transport, bridgeRequest)
+	ctx, aiRequest, options, err := decodeSubprocessStream(ctx, llmModel, request, bridgeRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -1761,8 +1819,9 @@ func streamModelForSubprocess(ctx context.Context, model map[string]any, request
 	return bindings.SessionHandle.StreamModel(ctx, llmModel, aiRequest, options), nil
 }
 
-// decodeSubprocessStream turns an extension's model request (the wire map) into the provider call's context and options.
-func decodeSubprocessStream(ctx context.Context, llmModel *ai.Model, request map[string]any, transport ai.Transport, bridgeRequest extension.ModelStreamRequest) (context.Context, ai.Context, ai.StreamOptions, error) {
+// decodeSubprocessStream turns an extension's model request (the wire map) into the provider call's context and options. It adds no transport: Pi's extension model calls pass the options the extension gave (model-runtime.ts streamSimple
+// :744-776 forwards `rest`, and the pi-ai compat stream functions an extension imports pass its options on), so a transport reaches the provider only when the request names one.
+func decodeSubprocessStream(ctx context.Context, llmModel *ai.Model, request map[string]any, bridgeRequest extension.ModelStreamRequest) (context.Context, ai.Context, ai.StreamOptions, error) {
 	// A null option is an absent one: upstream providers read undefined and
 	// null alike, and extensions pass getApiKeyAndHeaders' null headers and
 	// env straight through.
@@ -1787,7 +1846,7 @@ func decodeSubprocessStream(ctx context.Context, llmModel *ai.Model, request map
 			return ctx, ai.Context{}, ai.StreamOptions{}, err
 		}
 	}
-	options, err := subprocessStreamOptions(request, ai.StreamOptions{IsReasoning: llmModel.Capabilities.MaxThinking != "", Transport: transport})
+	options, err := subprocessStreamOptions(request, ai.StreamOptions{IsReasoning: llmModel.Capabilities.MaxThinking != ""})
 	if err != nil {
 		return ctx, ai.Context{}, ai.StreamOptions{}, err
 	}
@@ -1814,7 +1873,6 @@ func decodeSubprocessStream(ctx context.Context, llmModel *ai.Model, request map
 func (m *InteractiveMode) streamForSubprocess(ctx context.Context, model map[string]any, request map[string]any) (*ai.AssistantMessageEventStream, error) {
 	return streamModelForSubprocess(ctx, model, request, ModelOperationBindings{
 		ModelBuilder: m.opts.ModelBuilder, SessionHandle: m.opts.SessionHandle,
-		Transport: ai.Transport(m.opts.Settings.Transport),
 	})
 }
 

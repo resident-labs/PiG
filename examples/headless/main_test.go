@@ -166,13 +166,13 @@ func TestHeadlessEmbedDoesNotLinkTheTypeChecker(t *testing.T) {
 		t.Fatalf("go list -deps: %v", err)
 	}
 	for dependency := range strings.FieldsSeq(string(out)) {
-		if dependency == "go/types" || strings.HasSuffix(dependency, "/extensions/sdk/upgrade") {
+		if dependency == "go/types" || strings.Contains(dependency+"/", "/extensions/sdk/upgrade/") {
 			t.Errorf("the headless embed depends on %s", dependency)
 		}
 	}
 }
 
-// The word segmenter's dictionaries (6.3 MB) belong to the terminal editor, which a program that draws no terminal never
+// The word segmenter's dictionaries (2.8 MB) belong to the terminal editor, which a program that draws no terminal never
 // links (subprocess.EnableEditorViews registers it). A stock build of the example holds none of their bytes: the probe is
 // the middle 256 bytes of each embedded dictionary, searched in the linked binary.
 func TestHeadlessEmbedBinaryHoldsNoWordDictionary(t *testing.T) {

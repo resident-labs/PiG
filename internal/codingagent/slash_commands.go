@@ -16,6 +16,7 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/pigstrip"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 	"github.com/MichaelKinsy/PiG/tui"
 	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
@@ -227,6 +228,8 @@ type SlashContext struct {
 	// reports whether session_before_switch cancelled the switch. Mirrors
 	// upstream runtimeHost.importFromJsonl.
 	ImportSession func(inputPath, cwdOverride string) (cancelled bool, err error)
+	// ForkSession forks the session at sourcePath into cwd and switches to the fork (Pi switchToForkedSession); it returns the status Pi shows, and whether an extension vetoed the switch.
+	ForkSession func(sourcePath, cwd string) (status string, cancelled bool, err error)
 
 	// Manual context compaction.
 	// CompactSession triggers a manual compact on the current session.
@@ -244,6 +247,11 @@ type SlashContext struct {
 	ShowTrustSelector func(TrustSelectorOptions) (TrustSelection, bool)
 	// ShowExtensionEditor returns the text and true, or ("", false) when the editor is dismissed (Esc).
 	ShowExtensionEditor func(title, prefill string) (string, bool)
+	// HoldFramesOnChoice arms the owner loop to hold its frames when the next dialog resolves with a choice for which holdFor returns true,
+	// before the dialog closes and the paint that follows its key; the navigation that follows releases them when it returns. A later call
+	// replaces holdFor, and nil ends the arrangement and releases any hold. A tree navigation uses it so the first frame after its prompt is
+	// the fork point.
+	HoldFramesOnChoice func(holdFor func(choice string) bool)
 	// ShowBugReportSelector and ShowBugReportEditor are the /bug prompts. Upstream's bug-report.ts builds its own
 	// ExtensionSelectorComponent (with a description under the title) and ExtensionEditorComponent in the editor slot, outside
 	// the dialog stack, and reports no blocked status. Each returns the choice or text and true, or ("", false) on Esc.
@@ -514,7 +522,7 @@ func (r *SlashRegistry) All() []HelpCommandInfo {
 			Source:      SlashSourceExtension,
 		})
 	}
-	slices.SortFunc(out, func(a, b HelpCommandInfo) int { return cmp.Compare(a.Name, b.Name) })
+	sortx.Func(out, func(a, b HelpCommandInfo) int { return cmp.Compare(a.Name, b.Name) })
 	return out
 }
 

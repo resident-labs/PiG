@@ -31,13 +31,22 @@ type SendMessagePayload struct {
 	// extension boundary.
 	Content any  `json:"content,omitempty"`
 	Display bool `json:"display"`
-	Details any  `json:"details,omitempty"`
+	// DisplayAbsent marks a message whose writer left display out, as on CustomMessageRef.
+	DisplayAbsent bool `json:"-"`
+	// DisplayNull marks a message whose writer set display to null, as on CustomMessageRef.
+	DisplayNull bool `json:"-"`
+	Details     any  `json:"details,omitempty"`
 }
 
 // UnmarshalJSON keeps the member order of the `details` object the extension wrote.
 func (p *SendMessagePayload) UnmarshalJSON(data []byte) error {
 	type plain SendMessagePayload
-	return orderedjson.UnmarshalFields(data, (*plain)(p), "details")
+	if err := orderedjson.UnmarshalFields(data, (*plain)(p), "details"); err != nil {
+		return err
+	}
+	p.DisplayAbsent = !p.Display && !orderedjson.HasMember(data, "display")
+	p.DisplayNull = !p.Display && orderedjson.IsNullMember(data, "display")
+	return nil
 }
 
 // SendMessageOptions mirrors the inline options object on sendMessage.
@@ -46,6 +55,8 @@ func (p *SendMessagePayload) UnmarshalJSON(data []byte) error {
 type SendMessageOptions struct {
 	TriggerTurn *bool     `json:"triggerTurn,omitempty"`
 	DeliverAs   DeliverAs `json:"deliverAs,omitempty"`
+	// AfterRun is SendUserMessageOptions.AfterRun for sendMessage (agent-session.ts:3544-3546).
+	AfterRun func(report func()) `json:"-"`
 }
 
 // SendUserMessageOptions mirrors the inline options object on
@@ -57,6 +68,9 @@ type SendMessageOptions struct {
 type SendUserMessageOptions struct {
 	DeliverAs             DeliverAs `json:"deliverAs,omitempty"`
 	ExpandPromptTemplates *bool     `json:"expandPromptTemplates,omitempty"`
+	// AfterRun, when set, takes the function that reports a failure of this send, and the caller makes it when the code that sent the message ends its run:
+	// Pi reports from a catch callback on the Promise sendUserMessage returns (agent-session.ts:3552-3555), a microtask after that run. Nil: reported at once.
+	AfterRun func(report func()) `json:"-"`
 }
 
 // ─── The fat API interface ───────────────────────────────────────────────
@@ -316,9 +330,10 @@ type API interface {
 	// upstream: types.ts registerToolRenderer
 	RegisterToolRenderer(resolver ToolRendererResolver)
 
-	// RegisterMarkdownTransformer registers a display-only Markdown transform.
-	// upstream: types.ts:1287
-	RegisterMarkdownTransformer(transformer MarkdownTransformer)
+	// RegisterMarkdownTransformer registers a display-only Markdown transform. By default it runs on user, assistant and thinking
+	// Markdown; options.MessageTypes selects the surfaces instead (Pi eebd5d90).
+	// upstream: types.ts registerMarkdownTransformer
+	RegisterMarkdownTransformer(transformer MarkdownTransformer, options ...MarkdownTransformerOptions)
 
 	// OwnThinkingRuns declares, or withdraws, that this extension owns the thinking runs of assistant messages: a run that is
 	// hidden or draws no rows then leaves no spacing around it. It may be called while loading and at any later time; the last
@@ -358,7 +373,7 @@ type API interface {
 	// upstream: types.ts:1184
 	GetSessionName() string
 
-	// SetLabel sets or clears a label on an entry. Pass empty string to clear.
+	// SetLabel sets or clears a label on an entry. Pass empty string to clear: the entry then holds `"label":""`, as Pi's setLabel(entryId, "") writes it.
 	// upstream: types.ts:1187
 	SetLabel(entryID string, label string)
 

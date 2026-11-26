@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/wordsegmenter"
 	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
@@ -302,7 +303,7 @@ func (t *TuiAltScreen) dispatchAutoScrollTick(fn func()) {
 // autoScrollSelection.
 func (t *TuiAltScreen) autoScrollSelection(gen uint64) {
 	t.mu.Lock()
-	if t.stopped || gen != t.selectionAutoScrollGen {
+	if t.stopped.Load() || gen != t.selectionAutoScrollGen {
 		t.mu.Unlock()
 		return
 	}
@@ -326,7 +327,7 @@ func (t *TuiAltScreen) autoScrollSelection(gen uint64) {
 	// have cancelled this generation while we were scrolling. Bailing instead
 	// of re-arming prevents resurrecting cleared selection state and leaking a
 	// zombie timer.
-	if t.stopped || gen != t.selectionAutoScrollGen {
+	if t.stopped.Load() || gen != t.selectionAutoScrollGen {
 		t.mu.Unlock()
 		return
 	}
@@ -340,7 +341,8 @@ func (t *TuiAltScreen) autoScrollSelection(gen uint64) {
 	}
 	t.selectionAutoScrollTimer = t.afterFunc(altSelectionAutoScrollInterval, func() { t.dispatchAutoScrollTick(func() { t.autoScrollSelection(gen) }) })
 	t.mu.Unlock()
-	t.RequestRender()
+	// Selection is painted onto the screen after layout, so it needs no new component output (tui-alt-screen.ts autoScrollSelection).
+	t.requestViewRender()
 }
 
 // stopSelectionAutoScrollLocked stops the auto-scroll timer and clears its
@@ -526,8 +528,9 @@ func (t *TuiAltScreen) activeSelectionTextLocked() (string, bool) {
 }
 
 // copyTextToClipboard copies through the injected clipboard, or OSC 52, and
-// flashes the outcome. It runs without t.mu. Mirrors upstream
-// copyTextToClipboard.
+// flashes the outcome. It runs without t.mu; the OSC 52 write takes outMu, so it
+// is before the bytes of a frame or after them (Pi writes it with terminal.write
+// on its one thread). Mirrors upstream copyTextToClipboard.
 func (t *TuiAltScreen) copyTextToClipboard(text string) bool {
 	if t.copySelection != nil {
 		if err := t.copySelection(text); err != nil {
@@ -539,7 +542,7 @@ func (t *TuiAltScreen) copyTextToClipboard(text string) bool {
 			return false
 		}
 	} else {
-		WriteToTerminal(t.out, fmt.Sprintf("\x1b]52;c;%s\x07", base64.StdEncoding.EncodeToString([]byte(text))))
+		t.writeOwned(t.out, fmt.Sprintf("\x1b]52;c;%s\x07", base64.StdEncoding.EncodeToString([]byte(jsstring.StreamText(text)))))
 	}
 	t.flash("Copied!", altScreenFlashDefaultDurationMS)
 	return true

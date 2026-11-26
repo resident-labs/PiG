@@ -16,15 +16,16 @@ import (
 )
 
 // Ports packages/coding-agent/src/core/package-manager.ts (spawnCommand, runCommand).
-// RunPackageProcess is [RunPackageProcessContext] with no context to end the process.
-func RunPackageProcess(dir, name string, args ...string) error {
-	return RunPackageProcessContext(context.Background(), dir, name, args...)
+// RunPackageProcess runs a package command in dir. With [CommandOutputInherit] (and for the zero value) the child's output goes to the terminal without being retained; when the host owns stdout, both streams go to stderr and stdin is ignored. With [CommandOutputCapture] it goes nowhere and git and ssh cannot prompt (runPackageProcessCaptured). The caller waits for completion before reporting an error or persisting settings.
+func RunPackageProcess(output CommandOutput, dir, name string, args ...string) error {
+	return RunPackageProcessContext(context.Background(), output, dir, name, args...)
 }
 
-// RunPackageProcessContext inherits child output without retaining it. When the host owns stdout, both streams go to stderr and stdin is ignored. The caller waits for completion before reporting an error or persisting settings.
-//
-// dyna patch P9: ctx kills the process, and the error is then ctx's.
-func RunPackageProcessContext(ctx context.Context, dir, name string, args ...string) error {
+// RunPackageProcessContext is RunPackageProcess whose child is killed when ctx ends; the error is then ctx's (dyna patch P9).
+func RunPackageProcessContext(ctx context.Context, output CommandOutput, dir, name string, args ...string) error {
+	if output == CommandOutputCapture {
+		return runPackageProcessCaptured(ctx, dir, name, args...)
+	}
 	cmd := packageCommand(ctx, dir, name, args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if codingagent.IsStdoutTakenOver() {
@@ -44,6 +45,11 @@ func RunPackageProcessContext(ctx context.Context, dir, name string, args ...str
 		return err
 	}
 	return nil
+}
+
+func runInstallProcess(opts []InstallOption, dir, name string, args ...string) error {
+	options := resolveInstallOptions(opts)
+	return RunPackageProcessContext(options.ctx, options.output, dir, name, args...)
 }
 
 // RunPackageCapture bounds metadata queries by Pi's network timeout and keeps their output off the command's inherited streams.

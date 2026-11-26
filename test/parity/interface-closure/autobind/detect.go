@@ -266,8 +266,12 @@ func typeExclude(name string) func(string) bool {
 
 // exerciseInfo is what exercises a symbol: asserting tests (best first) and the reachable function that uses it.
 type exerciseInfo struct {
-	Tests []string // test:<file>#<Test>, at most three
+	Tests []string // test:<file>#<Test>, at most evidenceCap
 	Call  string   // a function reachable from cmd/pig that is, or uses, the symbol
+	// RunsFile is set when one of Tests references a function with a body in the symbol's Go file; Spare lists the asserting tests the
+	// cap left out that do. keepFileRunners reads both.
+	RunsFile bool
+	Spare    []testEv
 }
 
 // exercised applies E1 and E2: a Go test that references the symbol and asserts, or a use reachable from cmd/pig.
@@ -275,11 +279,7 @@ func (d *detector) exercised(s *sym, keys []string, exclude func(string) bool) (
 	info := &exerciseInfo{}
 	unreached := ""
 	tests := d.ix.testsFor(keys)
-	for _, t := range tests {
-		if t.Asserts && len(info.Tests) < 3 {
-			info.Tests = append(info.Tests, t.Ref)
-		}
-	}
+	info.Tests, info.RunsFile, info.Spare = d.pickEvidence(s, tests)
 	if (s.Kind == "func" || s.Kind == "method") && d.ix.reach[s.File+"#"+s.Qualified()] {
 		info.Call = s.File + "#" + s.Qualified()
 	} else if reachable, unreachable := d.ix.prodFor(keys, s.Dir, exclude); len(reachable) > 0 {
@@ -714,13 +714,34 @@ func valueVerdict(chk *checker, up string, obj types.Object) verdict {
 			}
 			return noV("V1: constant %s differs from upstream %s", cst.Val().ExactString(), up)
 		case numberLit.MatchString(up):
-			if cst.Val().ExactString() == up {
+			if numberLitEqual(cst.Val(), up) {
 				return yesV()
 			}
 			return noV("V1: constant %s differs from upstream %s", cst.Val().ExactString(), up)
 		}
 	}
 	return chk.agree(up, obj.Type())
+}
+
+// numberLitEqual reports whether the Go constant has exactly the value of the upstream number literal. A fractional literal is compared
+// as the exact rational it denotes, because ExactString of the constant 0.15 is "3/20", never the text "0.15".
+func numberLitEqual(value constant.Value, up string) bool {
+	if k := value.Kind(); k != constant.Int && k != constant.Float {
+		return false
+	}
+	text, negative := strings.CutPrefix(up, "-")
+	kind := token.INT
+	if strings.Contains(text, ".") {
+		kind = token.FLOAT
+	}
+	want := constant.MakeFromLiteral(text, kind, 0)
+	if want.Kind() == constant.Unknown {
+		return false
+	}
+	if negative {
+		want = constant.UnaryOp(token.SUB, want, 0)
+	}
+	return constant.Compare(value, token.EQL, want)
 }
 
 // evalType applies member (M) and exercise (E) rules to an interface or class.
@@ -1323,6 +1344,7 @@ func (d *detector) all() []*decision {
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	d.keepFileRunners(out)
 	return out
 }
 
@@ -1756,7 +1778,7 @@ func (d *detector) phantomBrand(prop *upstreamEntry) bool {
 
 // phantomBrandRationale is the designed-out text of a phantom type marker.
 func phantomBrandRationale(name string) string {
-	return "Pi declares " + name + " as an optional readonly property keyed by a `declare const ...: unique symbol`, which has no run-time value: it only lets the compiler carry a type parameter through the type. No code sets or reads it, and the Go type parameter carries the same type, so no Go member exists or is needed (language mechanic, LEAD-RULINGS-1520 principle)."
+	return "Pi declares " + name + " as an optional readonly property keyed by a `declare const ...: unique symbol`, which has no run-time value: it is a compile-time brand that only lets the compiler carry a type parameter through the type. No code sets or reads it, and the Go type parameter carries the same type, so no Go member exists or is needed (language mechanic, LEAD-RULINGS-1520 principle)."
 }
 
 // nodeEventsPath is the declaration file of Node's EventEmitter members.

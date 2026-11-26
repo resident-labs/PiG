@@ -82,8 +82,8 @@ func tool(name, description string, deferred bool) *durable.ToolRegistration {
 		panic(err)
 	}
 	return harness.DefineTool(durable.ToolRegistration{
-		ToolSchema: ai.ToolSchema{Name: name, Description: description, Parameters: parameters},
-		Deferred:   deferred,
+		Name: name, Description: description, Parameters: parameters,
+		Deferred: deferred,
 		Execute: func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{ai.TextContent{Text: name + " ran"}}}, nil
 		},
@@ -259,7 +259,7 @@ func TestAppendsEachLoadedToolInLoadOrderNotRegistryOrder(t *testing.T) {
 func TestRecordsLoadsByNameUnknownAndNonDeferredNamesChangeNothingRemoveWinsAndALoadLiftsIt(t *testing.T) {
 	c := setup(t)
 	grow := harness.DefineTool(durable.ToolRegistration{
-		ToolSchema: ai.ToolSchema{Name: "grow", Description: "grow", Parameters: map[string]any{"type": "object", "properties": map[string]any{}}},
+		Name: "grow", Description: "grow", Parameters: map[string]any{"type": "object", "properties": map[string]any{}},
 		Execute: func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}, Control: &durable.ToolControl{AddTools: []string{"github_get_issue", "alpha", "ghost"}}}, nil
 		},
@@ -359,6 +359,37 @@ func TestKeepsLoadedToolsPerBranchAndInTheBaselineAfterAReset(t *testing.T) {
 	run(t, root, "fresh")
 	system := systemMessages(allEntries(t, root))
 	equal(t, "baseline", addedNames(system[len(system)-1]), []string{"alpha", "omega", "tool_search", "github_get_issue"})
+}
+
+// Pi main 6d3e342b2 packages/durable/test/tool-search.test.ts "finds a tool by a parameter description behind a local reference, and not by
+// unreferenced definitions" (#11803)
+func TestFindsAToolByAParameterDescriptionBehindALocalReferenceAndNotByUnreferencedDefinitions(t *testing.T) {
+	c := chatSetup()
+	var parameters map[string]any
+	if err := json.Unmarshal([]byte(`{"type":"object","properties":{"options":{"$ref":"#/$defs/options"}},"$defs":{"options":{"type":"object","properties":{"mode":{"type":"string","description":"reconciliation"}}},"unused":{"description":"forecast"}}}`), &parameters); err != nil {
+		t.Fatal(err)
+	}
+	addTool(t, c.registry, harness.DefineTool(durable.ToolRegistration{
+		Name: "ledger_inspect", Description: "Inspect records", Parameters: parameters,
+		Deferred: true,
+		Execute: func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
+			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{ai.TextContent{Text: "ledger_inspect ran"}}}, nil
+		},
+	}))
+	if err := c.registry.Install(CreateExtension()); err != nil {
+		t.Fatal(err)
+	}
+	c.faux.SetResponses([]ai.FauxResponseStep{
+		call("tool_search", map[string]any{"query": "forecast"}, "c1"),
+		call("tool_search", map[string]any{"query": "reconciliation"}, "c2"),
+		done(),
+	})
+	_, root := c.open(t)
+	run(t, root, "go")
+	want := []string{"No matching tools found.", "Loaded 1 tool. They are available from your next call:\n- ledger_inspect: Inspect records"}
+	if got := toolResultTexts(allEntries(t, root)); !slices.Equal(got, want) {
+		t.Errorf("results = %q, want %q", got, want)
+	}
 }
 
 // Pi 1.2.0 packages/durable/test/tool-search.test.ts:195 "finds nothing for an unrelated query and loads nothing"

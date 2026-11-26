@@ -1,7 +1,5 @@
 //go:build parity
 
-// SPDX-License-Identifier: MIT
-
 package runner
 
 import (
@@ -12,7 +10,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -36,12 +33,7 @@ func TestTranscriptReaderKeepsEveryChunkWhenCatStalls(t *testing.T) {
 		cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 		return cmd
 	}
-	// The pane's program prints nothing until the test has attached the reader and opens the gate: a fifo it blocks on reading.
-	gate := filepath.Join(t.TempDir(), "gate")
-	if err := syscall.Mkfifo(gate, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if out, err := tmux("new-session", "-d", "-s", "t", "-x", "80", "-y", "24", "read go <"+gate+"; printf one-; sleep 0.3; printf two-; sleep 0.3; printf three-; sleep 30").CombinedOutput(); err != nil {
+	if out, err := tmux("new-session", "-d", "-s", "t", "-x", "80", "-y", "24", "sleep 0.5; printf one-; sleep 0.3; printf two-; sleep 0.3; printf three-; sleep 30").CombinedOutput(); err != nil {
 		t.Fatalf("tmux new-session: %v: %s", err, out)
 	}
 	t.Cleanup(func() { _ = tmux("kill-session", "-t", "t").Run() })
@@ -52,14 +44,6 @@ func TestTranscriptReaderKeepsEveryChunkWhenCatStalls(t *testing.T) {
 	}
 	if out, err := tmux("pipe-pane", "-o", "-t", "t", command).CombinedOutput(); err != nil {
 		t.Fatalf("tmux pipe-pane: %v: %s", err, out)
-	}
-	// Attached: release the producer. Opening the fifo for writing returns once the pane's shell is reading it, and closing it ends that read.
-	release, err := os.OpenFile(gate, os.O_WRONLY, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := release.Close(); err != nil {
-		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -84,8 +68,9 @@ func TestTranscriptReaderKeepsEveryChunkWhenCatStalls(t *testing.T) {
 func TestCopyTranscriptWritesEachReadAndATrailerAtEOF(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "terminal-transcript.log")
 	in, out := io.Pipe()
-	status := make(chan error, 1)
-	go func() { status <- copyTranscript(path, in) }()
+	status := make(chan int, 1)
+	var diag strings.Builder
+	go func() { status <- copyTranscript(path, in, &diag) }()
 	waitFor := func(want string) {
 		t.Helper()
 		deadline := time.Now().Add(5 * time.Second)
@@ -112,8 +97,8 @@ func TestCopyTranscriptWritesEachReadAndATrailerAtEOF(t *testing.T) {
 	}
 	waitFor("abcde")
 	_ = out.Close()
-	if err := <-status; err != nil {
-		t.Fatalf("copyTranscript on end of input: %v", err)
+	if code := <-status; code != 0 {
+		t.Fatalf("exit status %d on end of input: %s", code, diag.String())
 	}
 	if got, _ := os.ReadFile(path + transcriptDoneSuffix); string(got) != "5\n" {
 		t.Fatalf("trailer = %q, want \"5\\n\"", got)

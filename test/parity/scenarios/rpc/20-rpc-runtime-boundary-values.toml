@@ -50,10 +50,12 @@ pi_extensions = ["../../testdata/test-faux-provider.ts", "testdata/queue-target.
 pi_args = ["--model", "test-faux/faux-1", "--session-dir", "{{TEMP}}/sessions", "--system-prompt", "RPC runtime values.", "--no-context-files", "--no-skills"]
 
 [assert]
-json_output_equal = true
+json_output_ordered_equal = true
 stderr_equal = true
 exit_code = 0
 both_contain = [
+  '{"type":"queue_update","steering":[],"followUp":[""]}',
+  '{"type":"queue_update","steering":[],"followUp":[]}',
   '"id":"model","type":"response","command":"set_model","success":false,"error":"Model not found: /"',
   '"id":"steering-mode","type":"response","command":"set_steering_mode","success":true',
   '"id":"follow-mode","type":"response","command":"set_follow_up_mode","success":true',
@@ -72,6 +74,11 @@ both_not_contain = [
   'invalid follow-up mode',
 ]
 runs = 3
+
+# Pi's agent-session.ts _handleAgentEvent (user message_start) matches a delivered message against the pending queue even when its text is empty since Pi main a63c4ec5c
+# (#8612, in the pin c23b9ec1; Pi 1.5.0 guarded the match with a truthy text and emitted nothing). The RPC stream therefore carries two queue_update records in both
+# engines, each before the message_start that caused it: the empty prompt's message_start removes the queued empty steering entry, and the delivery of the steer's message
+# removes the queued empty follow-up entry. They are compared like every other record; its divergence record is retired. both_contain pins both records so the scenario fails if either engine stops emitting them.
 
 [[assert.json_aliases]]
 paths = ["/**/sections/cwd"]

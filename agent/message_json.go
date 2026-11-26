@@ -12,10 +12,12 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/MichaelKinsy/PiG/ai"
 	json "github.com/MichaelKinsy/PiG/extensions/sdk/json"
 	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
+	"github.com/MichaelKinsy/PiG/internal/jsonwire"
 	"github.com/MichaelKinsy/PiG/internal/orderedjson"
 )
 
@@ -49,7 +51,11 @@ func (m AgentMessage) Clone() AgentMessage {
 		clone.ToolResult = &value
 	case m.Custom != nil:
 		clone.Custom = maps.Clone(m.Custom)
-		clone.source = m.source
+		if m.source != nil {
+			// The record is shared by the copies of one message, so a replacement of one reaches them all; a clone is another message.
+			record := *m.source
+			clone.source = &record
+		}
 	}
 	return clone
 }
@@ -57,7 +63,14 @@ func (m AgentMessage) Clone() AgentMessage {
 // MarshalJSON observes retained streaming messages at the serialization boundary.
 func (m AssistantMessage) MarshalJSON() ([]byte, error) {
 	type plain AssistantMessage
-	return json.Marshal((*plain)(m.Observe()))
+	encoded, err := json.Marshal((*plain)(m.Observe()))
+	if err != nil {
+		return nil, err
+	}
+	if jsonwire.MayHaveJSForms(encoded) {
+		return json.AppendJSNormalized(encoded[:0], encoded)
+	}
+	return encoded, nil
 }
 
 // AppendStringify appends the JSON.stringify text of MarshalJSON's output to dst (json.StringifyAppender).
@@ -76,16 +89,27 @@ func (m ToolResultMessage) AppendStringify(dst []byte) ([]byte, error) {
 	return AgentMessage{ToolResult: &m}.AppendStringify(dst)
 }
 
-// MarshalJSON emits the upstream flat role-discriminated AgentMessage union. User strings and text blocks retain their JavaScript UTF-16 units.
+// MarshalJSON emits the upstream flat role-discriminated AgentMessage union. User strings and text blocks retain their JavaScript UTF-16 units. A negative zero is written as 0 and an ill-formed UTF-8 byte as the replacement character, as JSON.stringify writes them.
 func (m AgentMessage) MarshalJSON() ([]byte, error) {
 	value, err := m.wire(true)
 	if err != nil {
 		return nil, err
 	}
 	if text, ok := value.(json.RawMessage); ok {
-		return text, nil
+		if !jsonwire.MayHaveJSForms(text) {
+			return text, nil
+		}
+		return json.AppendJSNormalized(text[:0], text)
 	}
-	return json.Marshal(value)
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	// JSON.stringify writes a negative zero as 0 and an ill-formed byte as the replacement character, as MarshalJSONTo does.
+	if jsonwire.MayHaveJSForms(encoded) {
+		return json.AppendJSNormalized(encoded[:0], encoded)
+	}
+	return encoded, nil
 }
 
 // AppendStringify appends the JSON.stringify text of MarshalJSON's output to dst (json.StringifyAppender), encoding the message's members
@@ -298,7 +322,7 @@ func (m AgentMessage) SourceJSON() ([]byte, error) {
 	if text := m.sourceText(); text != nil {
 		return bytes.Clone(text), nil
 	}
-	if m.Custom != nil && m.source != nil {
+	if m.Custom != nil && m.source != nil && len(m.source.text) > 0 {
 		encoded, err := orderedjson.MarshalInSourceOrder(m.Custom, m.source.text)
 		if err != nil {
 			return nil, err
@@ -468,10 +492,48 @@ func (m AgentMessage) WithEmptyContent() AgentMessage {
 		result.source = withEmptyContent(result.source, "[]")
 		m.ToolResult = &result
 	case m.Custom != nil:
+		// Pi writes {...message, content: []}: the members keep their order and content follows them.
+		order := m.customMemberOrder()
+		if order == nil {
+			// The shape's order, written out so that the member added below follows it.
+			if role, _ := m.Custom["role"].(string); role != "" {
+				order, _ = marshalCustomMessage(role, m.Custom)
+			}
+		}
 		m.Custom = maps.Clone(m.Custom)
 		m.Custom["content"] = []any{}
+		m.source = &messageSource{text: order}
 	}
 	return m
+}
+
+// WithOrderRecord gives a custom message the record of its member order that every copy of it shares (the Custom map is shared the same way), so
+// a message_end replacement applied to the copy an event carries is the order the transcript and persistence write too (agent-session.ts
+// _replaceMessageInPlace deletes the members of the shared object and assigns the replacement's, in its order). A message of another kind, or
+// one that has the record already (a decoded one), is returned as it is.
+func (m AgentMessage) WithOrderRecord() AgentMessage {
+	if m.Custom != nil && m.source == nil {
+		m.source = &messageSource{}
+	}
+	return m
+}
+
+// AdoptMemberOrder makes the member order of m, a custom message, that of replacement, a custom message that was applied to m's members, through the
+// record the copies of m share. It does nothing when m has no record (WithOrderRecord) or replacement is not a custom message.
+func (m AgentMessage) AdoptMemberOrder(replacement AgentMessage) {
+	if m.Custom == nil || m.source == nil || replacement.Custom == nil {
+		return
+	}
+	m.source.text = replacement.customMemberOrder()
+}
+
+// customMemberOrder is the JSON text whose member order m's members are written in: the text m was decoded from, or the order of its role's shape; nil
+// when that is the shape's order (a record of no text).
+func (m AgentMessage) customMemberOrder() []byte {
+	if m.source != nil && len(m.source.text) > 0 && m.source.text[0] == '{' {
+		return m.source.text
+	}
+	return nil
 }
 
 // NullContent reports a system, user, assistant or toolResult message whose content is null or missing: in the object it was decoded from, or in its fields when it was not decoded.
@@ -617,6 +679,8 @@ func (m *AgentMessage) decode(data []byte) (bool, error) {
 	if err := json.Unmarshal(data, &wire); err != nil && !numberOutsideIntegerField(err) {
 		return false, fmt.Errorf("AgentMessage: %w", err)
 	}
+	// data is valid JSON from here on (a type error comes after the syntax check), and so is every member cut from it: the decoders below take their
+	// slices without checking them again, which cost a transcript load one more scan of every message per level.
 	nullContent := len(wire.Content) == 0 || string(wire.Content) == "null"
 	if wire.Role == "" {
 		return false, fmt.Errorf("AgentMessage requires a non-empty string role")
@@ -662,12 +726,17 @@ func (m *AgentMessage) decode(data []byte) (bool, error) {
 		m.ToolResult.DetailsNull = wire.Details != nil && m.ToolResult.Details == nil
 	default:
 		var custom map[string]any
-		if err := json.Unmarshal(data, &custom); err != nil {
+		if err := json.UnmarshalTrusted(data, &custom); err != nil {
 			return false, err
 		}
-		// `details` is the opaque value an extension wrote; keep its member order.
+		// `details` and the blocks of `content` are the opaque values an extension wrote; keep their member order.
 		if _, present := custom["details"]; present {
 			custom["details"] = orderedjson.Value(wire.Details)
+		}
+		if _, present := custom["content"]; present {
+			if content := orderedjson.Value(wire.Content); content != nil {
+				custom["content"] = content
+			}
 		}
 		m.Custom = custom
 	}
@@ -824,7 +893,7 @@ func marshalAgentContentBlock(block ai.ContentBlock) (any, error) {
 func unmarshalUserContent(data []byte) (ai.UserContent, error) {
 	if len(data) > 0 && data[0] == '"' {
 		var text string
-		if err := json.Unmarshal(data, &text); err != nil {
+		if err := json.UnmarshalTrusted(data, &text); err != nil {
 			return nil, err
 		}
 		return ai.UserText(text), nil
@@ -882,13 +951,13 @@ func unmarshalAgentContent(data []byte) ([]ai.ContentBlock, error) {
 	}
 	if data[0] == '"' {
 		var text string
-		if err := json.Unmarshal(data, &text); err != nil {
+		if err := json.UnmarshalTrusted(data, &text); err != nil {
 			return nil, err
 		}
 		return []ai.ContentBlock{ai.TextContent{Text: text}}, nil
 	}
 	var raws []json.RawMessage
-	if err := json.Unmarshal(data, &raws); err != nil {
+	if err := json.UnmarshalTrusted(data, &raws); err != nil {
 		return nil, fmt.Errorf("AgentMessage content: %w", err)
 	}
 	content := make([]ai.ContentBlock, 0, len(raws))
@@ -896,14 +965,14 @@ func unmarshalAgentContent(data []byte) ([]ai.ContentBlock, error) {
 		var probe struct {
 			Type string `json:"type"`
 		}
-		if err := json.Unmarshal(raw, &probe); err != nil {
+		if err := json.UnmarshalTrusted(raw, &probe); err != nil {
 			return nil, fmt.Errorf("AgentMessage content[%d]: %w", i, err)
 		}
 		var block ai.ContentBlock
 		switch probe.Type {
 		case "text":
 			var value ai.TextContent
-			if err := json.Unmarshal(raw, &value); err != nil {
+			if err := json.UnmarshalTrusted(raw, &value); err != nil {
 				return nil, err
 			}
 			block = value
@@ -912,19 +981,19 @@ func unmarshalAgentContent(data []byte) ([]ai.ContentBlock, error) {
 				Data     string `json:"data"`
 				MIMEType string `json:"mimeType"`
 			}
-			if err := json.Unmarshal(raw, &value); err != nil {
+			if err := json.UnmarshalTrusted(raw, &value); err != nil {
 				return nil, err
 			}
 			block = ai.ImageContent{Data: value.Data, MimeType: value.MIMEType}
 		case "thinking":
 			var value ai.ThinkingContent
-			if err := json.Unmarshal(raw, &value); err != nil {
+			if err := json.UnmarshalTrusted(raw, &value); err != nil {
 				return nil, err
 			}
 			block = value
 		case "toolCall":
 			var value ai.ToolCall
-			if err := json.Unmarshal(raw, &value); err != nil {
+			if err := json.UnmarshalTrusted(raw, &value); err != nil {
 				return nil, err
 			}
 			block = value
@@ -937,7 +1006,7 @@ func unmarshalAgentContent(data []byte) ([]ai.ContentBlock, error) {
 				Input            ai.JsonObject `json:"input"`
 				ThoughtSignature string        `json:"thoughtSignature"`
 			}
-			if err := json.Unmarshal(raw, &value); err != nil {
+			if err := json.UnmarshalTrusted(raw, &value); err != nil {
 				return nil, err
 			}
 			block = ai.ToolCall{ID: value.ID, Name: value.Name, Arguments: value.Input, ThoughtSignature: value.ThoughtSignature}
@@ -947,7 +1016,7 @@ func unmarshalAgentContent(data []byte) ([]ai.ContentBlock, error) {
 			var value struct {
 				Content string `json:"content"`
 			}
-			if err := json.Unmarshal(raw, &value); err != nil {
+			if err := json.UnmarshalTrusted(raw, &value); err != nil {
 				return nil, err
 			}
 			block = ai.TextContent{Text: value.Content}
@@ -961,4 +1030,43 @@ func unmarshalAgentContent(data []byte) ([]ai.ContentBlock, error) {
 		content = append(content, block)
 	}
 	return content, nil
+}
+
+// messageEdits counts the calls of ReplaceMessageInPlace. See MessageEdits.
+var messageEdits atomic.Uint64
+
+// MessageEdits returns how many times ReplaceMessageInPlace has been called in this process. A cache of anything derived from a message's fields (internal/boundarywire.Encodings) compares it before it serves an entry: an in-place edit changes a message that keeps its address, so the address no longer names the same content.
+func MessageEdits() uint64 {
+	return messageEdits.Load()
+}
+
+// ReplaceMessageInPlace overwrites target with replacement through the
+// pointers the agent's transcript, the event and persistence share
+// (agent-session.ts _replaceMessageInPlace). A replacement of another shape is
+// ignored.
+func ReplaceMessageInPlace(target, replacement AgentMessage) {
+	messageEdits.Add(1)
+	switch {
+	case target.System != nil && replacement.System != nil:
+		*target.System = *replacement.System
+	case target.User != nil && replacement.User != nil:
+		*target.User = *replacement.User
+	case target.Assistant != nil && replacement.Assistant != nil:
+		// pig additive (D654): a replacement that names no failure response keeps the one of the message it replaces.
+		failure := target.Assistant.FailureResponse
+		*target.Assistant = *replacement.Assistant
+		if target.Assistant.FailureResponse == nil {
+			target.Assistant.FailureResponse = failure
+		}
+	case target.ToolResult != nil && replacement.ToolResult != nil:
+		*target.ToolResult = *replacement.ToolResult
+	case target.Custom != nil && replacement.Custom != nil:
+		// A handler may return the event's own message: snapshot it first,
+		// as upstream returns early when target === replacement.
+		fields := maps.Clone(replacement.Custom)
+		clear(target.Custom)
+		maps.Copy(target.Custom, fields)
+		// The members follow the replacement's order, in every copy of the message.
+		target.AdoptMemberOrder(replacement)
+	}
 }

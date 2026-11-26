@@ -74,11 +74,13 @@ function getApiKeyEnvVars(provider) {
     if (provider === "anthropic") {
         return [ANTHROPIC_AUTH_TOKEN_ENV, ANTHROPIC_OAUTH_TOKEN_ENV, ANTHROPIC_API_KEY_ENV];
     }
+    // Qwen Token Plan: the per-plan variable first, then the region variable both plans used to share.
     const envMap = {
         "ant-ling": "ANT_LING_API_KEY",
-        "qwen-token-plan": "QWEN_TOKEN_PLAN_API_KEY",
-        "qwen-token-plan-cn": "QWEN_TOKEN_PLAN_CN_API_KEY",
-        "qwen-token-plan-individual": "QWEN_TOKEN_PLAN_API_KEY",
+        "qwen-token-plan": ["QWEN_TOKEN_PLAN_TEAM_API_KEY", "QWEN_TOKEN_PLAN_API_KEY"],
+        "qwen-token-plan-cn": ["QWEN_TOKEN_PLAN_TEAM_CN_API_KEY", "QWEN_TOKEN_PLAN_CN_API_KEY"],
+        "qwen-token-plan-individual": ["QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY", "QWEN_TOKEN_PLAN_API_KEY"],
+        "qwen-token-plan-individual-cn": ["QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY", "QWEN_TOKEN_PLAN_CN_API_KEY"],
         openai: "OPENAI_API_KEY",
         azure: "AZURE_OPENAI_API_KEY",
         nvidia: "NVIDIA_API_KEY",
@@ -114,8 +116,8 @@ function getApiKeyEnvVars(provider) {
         "xiaomi-token-plan-ams": "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
         "xiaomi-token-plan-sgp": "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
     };
-    const envVar = envMap[provider];
-    return envVar ? [envVar] : undefined;
+    const envVars = envMap[provider];
+    return typeof envVars === "string" ? [envVars] : envVars;
 }
 export function findEnvKeys(provider, env) {
     const envVars = getApiKeyEnvVars(provider);

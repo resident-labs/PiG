@@ -23,7 +23,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/nextnode/plugins"
 )
 
-// Ports packages/chord/test/next-node/fixtures/workers/{control,worker}.ts: the fixture contracts (the session kind the
+// Ports packages/chord/test/node/fixtures/workers/{control,worker}.ts: the fixture contracts (the session kind the
 // workers serve, the fixture worker's `Control`, the plugin's `Notes`), the worker's start data (how it behaves), and the
 // fixture worker itself: `WorkerMain`, the shipped plugins, a JavaScript core facet serving `Control` (crash, busy, local calls)
 // and a Go core facet serving `Busy` (the app's keep-alive counts) and `Echo`. Its start data picks a behaviour for the tests:
@@ -48,6 +48,21 @@ import (
 var (
 	fixtureSession = mustFixture(contracts.NewHostKind("session", contracts.Prop("id", contracts.Str())))
 
+	// fixtureServer is the server's own kind: `hostKind("server")` (control.ts `Server`).
+	fixtureServer = mustFixture(contracts.NewHostKind("server"))
+
+	// fixtureReports is what a worker reports to the server (control.ts `Reports`).
+	fixtureReports = mustFixture(contracts.Remote("test.reports", contracts.RemoteDeclaration{
+		Version: 1,
+		Params:  contracts.Params{},
+		HostAddress: func(*delta.JsonObject) (contracts.Address, error) {
+			return fixtureServer.Address(nil), nil
+		},
+		Variants: []contracts.VariantEntry{contracts.Var("main", contracts.VariantDeclaration{Methods: []contracts.MethodEntry{
+			contracts.Meth("report", contracts.NewMethod(contracts.Str())),
+		}})},
+	}))
+
 	fixtureControl = mustFixture(contracts.Remote("test.control", contracts.RemoteDeclaration{
 		Version: 1,
 		Params:  contracts.Params{contracts.Prop("id", contracts.Str())},
@@ -60,6 +75,24 @@ var (
 			contracts.Meth("busy", contracts.NewMethod(contracts.Int())),
 			contracts.Meth("block", contracts.NewMethod(contracts.Str())),
 			contracts.Meth("localCalls", contracts.NewMethod(contracts.Int(), contracts.Int())),
+		}})},
+	}))
+
+	// fixtureReporter is Pi's `Control.report` and `Control.reportAndExit`, a type of its own at the same address: the module of the
+	// worker's NodeHost holds the server's `Reports` with the object (taken at its activation), where Pi's worker holds them from its
+	// first report, so a `Control` that had them would not be served without a server that serves `Reports` (Pi's default fleet has none).
+	fixtureReporter = mustFixture(contracts.Remote("test.reporter", contracts.RemoteDeclaration{
+		Version: 1,
+		Params:  contracts.Params{contracts.Prop("id", contracts.Str())},
+		HostAddress: func(params *delta.JsonObject) (contracts.Address, error) {
+			id, _ := params.Value("id").(string)
+			return fixtureSession.Address(delta.JsonObjectOf("id", id)), nil
+		},
+		Variants: []contracts.VariantEntry{contracts.Var("main", contracts.VariantDeclaration{Methods: []contracts.MethodEntry{
+			// Sends the server a report and returns without waiting for its answer.
+			contracts.Meth("report", contracts.NewMethod(contracts.Str())),
+			// Sends the server a report and exits (code 7) in the same turn.
+			contracts.Meth("reportAndExit", contracts.NewMethod(contracts.Str())),
 		}})},
 	}))
 
@@ -140,6 +173,18 @@ type workerBehaviour struct {
 	LocalCalls int
 	// CloserPanics: a closer fails, and the app's OnError panics on that failure once (Pi's `onError` that throws).
 	CloserPanics bool
+	// GoReload: no plugin runtime is loaded; the Go core facet is loaded on the host and the worker's Reload hook answers each
+	// reload (appending `reload <script keys>` to Log).
+	GoReload bool
+	// ProgramOnClose is a file the last closer writes after looking for the program the worker runs from (`present`, or the error):
+	// Pi's `lazyOnClose` (a closer's first import of a lazy chunk of the worker base at close).
+	ProgramOnClose string
+	// ReportAtStart: after its load, before it is ready, it sends the server this report and waits for its answer (`reportAtStart`).
+	ReportAtStart string
+	// HoldsChannel: it starts a process of its tree that inherits its IPC channel (descriptor 3): the channel stays open after the
+	// worker's exit, until the server killed its tree, so the server hears of the exit strictly before the channel closes
+	// (`holdsChannel`).
+	HoldsChannel bool
 }
 
 func (b workerBehaviour) json() *delta.JsonObject {
@@ -189,6 +234,18 @@ func (b workerBehaviour) json() *delta.JsonObject {
 	if b.CloserPanics {
 		object.Set("closerPanics", true)
 	}
+	if b.ProgramOnClose != "" {
+		object.Set("programOnClose", b.ProgramOnClose)
+	}
+	if b.ReportAtStart != "" {
+		object.Set("reportAtStart", b.ReportAtStart)
+	}
+	if b.HoldsChannel {
+		object.Set("holdsChannel", true)
+	}
+	if b.GoReload {
+		object.Set("goReload", true)
+	}
 	return object
 }
 
@@ -207,6 +264,10 @@ func behaviourOf(value delta.JsonValue) workerBehaviour {
 		b.NoConnect = true
 	}
 	b.CloserPanics, _ = object.Value("closerPanics").(bool)
+	b.GoReload, _ = object.Value("goReload").(bool)
+	b.ProgramOnClose, _ = object.Value("programOnClose").(string)
+	b.ReportAtStart, _ = object.Value("reportAtStart").(string)
+	b.HoldsChannel, _ = object.Value("holdsChannel").(bool)
 	if ms, ok := object.Value("loadMs").(float64); ok {
 		b.LoadMs = int(ms)
 	}
@@ -336,10 +397,27 @@ func holdNodeStart(ctx context.Context, name string, args ...string) *exec.Cmd {
 	return exec.CommandContext(ctx, "/bin/sh", append([]string{"-c", wait, "sh", *gate, name}, args...)...)
 }
 
+// goReloadLog is the file the GoReload behaviour's Reload hook appends to.
+var goReloadLog atomic.Pointer[string]
+
 // onErrorThrew is whether the fixture's OnError threw already.
 var onErrorThrew atomic.Bool
 
 func runWorkerFixture() {
+	if os.Getenv(fixtureReportExecutable) != "" {
+		executable, _ := os.Executable()
+		_, _ = fmt.Fprintf(os.Stdout, "executable %s\n", executable)
+	}
+	if os.Getenv(fixtureReportArgs) != "" {
+		_, _ = fmt.Fprintf(os.Stdout, "args %q\n", os.Args[1:])
+	}
+	if os.Getenv(fixtureReportCompileCache) != "" {
+		_, _ = fmt.Fprintf(os.Stdout, "compilecache %q\n", os.Getenv("NODE_COMPILE_CACHE"))
+	}
+	// A process outside the worker's tree, started before the worker opened its channel: it holds what the worker was given.
+	if os.Getenv(lastWordsGrandchild) == "before" {
+		startOutsideTree()
+	}
 	port := &countingPort{processPort: openProcessChannel()}
 	var worker host.Host
 	serve(port, func(start WorkerStart, ctx context.Context) (*WorkerResult, error) {
@@ -366,6 +444,18 @@ func runWorkerFixture() {
 			return nil, err
 		}
 		worker = created
+		// Registered first, so it runs last: after the other closers, the program the worker runs from is still there (Pi's closer that
+		// imports a lazy chunk of the base at close, `lazyOnClose`: the base's files stay until every worker exited).
+		start.OnClose(func(context.Context) error {
+			if behaviour.ProgramOnClose == "" {
+				return nil
+			}
+			report := "present"
+			if _, err := os.Stat(os.Args[0]); err != nil {
+				report = err.Error()
+			}
+			return os.WriteFile(behaviour.ProgramOnClose, []byte(report), 0o600)
+		})
 		start.OnClose(func(context.Context) error {
 			if behaviour.Log != "" {
 				appendLog(behaviour.Log, "host\n")
@@ -387,6 +477,11 @@ func runWorkerFixture() {
 		if behaviour.NoConnect {
 			return nil, sleep(ctx, 1_000_000_000*time.Millisecond)
 		}
+		if behaviour.HoldsChannel {
+			if err := holdChannel(port.processPort.(*channel)); err != nil {
+				return nil, err
+			}
+		}
 		if err := worker.Connect(start.Parent, host.LinkOptions{Principal: delta.JsonObjectOf("kind", "server"), Trusted: true}, ctx); err != nil {
 			return nil, err
 		}
@@ -398,12 +493,23 @@ func runWorkerFixture() {
 		if behaviour.Hang {
 			return nil, sleep(ctx, 1_000_000_000*time.Millisecond)
 		}
-		if _, err := start.Plugins.Load(worker, WorkerLoad{
-			Kind: "worker", Core: []plugins.CoreFacet{fixtureCoreModule()}, HostKind: fixtureSession,
-			GoCore:    []host.HostFacet{{Name: fixtureGoCoreName, Facet: fixtureGoCore()}},
+		if behaviour.GoReload {
+			goReloadLog.Store(&behaviour.Log)
+			if _, err := worker.Load([]host.HostFacet{{Name: fixtureGoCoreName, Facet: fixtureGoCore()}}, ctx); err != nil {
+				return nil, err
+			}
+			busy, err := worker.Get(ctx, fixtureBusy, delta.NewJsonObject(0), host.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+			return &WorkerResult{Busy: host.Expose(busy.Member("counts"))}, nil
+		}
+		if _, err := start.Plugins.Load(ctx, worker, WorkerLoad{
+			Kind: "worker", NodeCore: []plugins.CoreFacet{fixtureCoreModule()}, HostKind: fixtureSession,
+			Core:      []host.HostFacet{{Name: fixtureGoCoreName, Facet: fixtureGoCore()}},
 			Bridged:   []plugins.BridgedFacet{{Name: fixtureGoCoreName, Contracts: []*contracts.Contract{fixtureBusy, fixtureEcho}}},
 			Principal: delta.JsonObjectOf("kind", "worker"), Peer: delta.JsonObjectOf("kind", "server"),
-		}, ctx); err != nil {
+		}); err != nil {
 			return nil, err
 		}
 		if behaviour.LateCloseMs != 0 {
@@ -422,6 +528,17 @@ func runWorkerFixture() {
 				port.processPort.(*channel).prependDisconnect(func() { time.Sleep(20 * time.Second) })
 				port.Disconnect()
 			})
+		}
+		if behaviour.ReportAtStart != "" {
+			reports, err := worker.Get(ctx, fixtureReports, delta.NewJsonObject(0), host.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+			_, err = reports.Call("report", behaviour.ReportAtStart, ctx)
+			reports.Release()
+			if err != nil {
+				return nil, err
+			}
 		}
 		if calls := behaviour.LocalCalls; calls != 0 {
 			time.AfterFunc(300*time.Millisecond, func() {
@@ -470,9 +587,19 @@ func runWorkerFixture() {
 		if err != nil {
 			return nil, err
 		}
-		return &WorkerResult{Busy: busy.Member("counts")}, nil
+		return &WorkerResult{Busy: host.Expose(busy.Member("counts"))}, nil
 	}, WorkerMainOptions{
 		Node: plugins.NodeOptions{OnOutput: fixtureOutput(port), Command: holdNodeStart},
+		Reload: func(scripts []plugins.PluginScript, _ context.Context) (host.ReloadReport, error) {
+			keys := make([]string, len(scripts))
+			for index, script := range scripts {
+				keys[index] = scriptKey(script)
+			}
+			if log := goReloadLog.Load(); log != nil {
+				appendLog(*log, "reload "+strings.Join(keys, ",")+"\n")
+			}
+			return host.ReloadReport{Plugins: host.PluginChanges{Changed: []string{scripts[0].Plugin.Name}}}, nil
+		},
 		Redact: func(err any) CrossedError {
 			message := fmt.Sprint(err)
 			if typed, ok := err.(error); ok {

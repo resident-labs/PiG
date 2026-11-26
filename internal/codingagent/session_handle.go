@@ -54,13 +54,20 @@ type InteractiveSessionHandle interface {
 	// reference (*Session) is the same as *icodingagent.Session
 	// from coding/'s point of view.
 	Inner() *Session
+	// pig divergence (D652): CompactionStreamedTokens is the size in tokens of the summary the compaction in flight has streamed so far, 0 when none runs. The interactive compaction line reads it.
+	CompactionStreamedTokens() int64
 	// RecordUserBashResult records a user `!` command result as upstream recordBashResult: appended to the
 	// Session and live context when idle, queued until the run ends while one streams. It returns the immediate
 	// persistence failure.
 	RecordUserBashResult(command string, result BashResult, excludeFromContext bool) error
+	// QueuedUserMessage builds the user message the mode queues on the Agent while a run streams. The Session marks a message with
+	// images so they are normalized when it is delivered.
+	QueuedUserMessage(text string, images []ai.ImageContent) agent.AgentMessage
 	// Events returns the agent's streaming event channel. Used by
 	// processAgentEvents to drive live UI updates.
 	Events() <-chan agent.AgentEvent
+	// SubscribeFunc registers a synchronous listener of the Session's events and returns its unsubscribe function (agent-session.ts subscribe). The listener runs where Pi's runs: after the event's extension handlers and before the Session persists a message_end, on the goroutine that executes the event, with the message object the Session persists and keeps.
+	SubscribeFunc(listener func(agent.AgentEvent)) func()
 	// IsIdle and WaitForIdle observe the Session-owned operation, including work an extension started.
 	IsIdle() bool
 	WaitForIdle(context.Context) error
@@ -78,8 +85,8 @@ type InteractiveSessionHandle interface {
 	AvailableModelSnapshot() []*ai.Model
 	// ExtensionCompact is the compact action Pi binds for extensions: it starts a manual compaction without waiting, reports the result to options.OnComplete and a failure to options.OnError, and drops the outcome without callbacks.
 	ExtensionCompact(*extension.CompactOptions)
-	// ExtensionSetModel answers an extension's pi.setModel: false without configured credentials, otherwise it switches as SetModel does and answers true.
-	ExtensionSetModel(context.Context, *ai.Model) (bool, error)
+	// ExtensionSetModelOnMain answers an extension's pi.setModel: false without configured credentials, otherwise it switches as SetModelOnMain does (the state mutation inside the dispatcher, the model_select notifications on the caller, ending with ctx) and answers true.
+	ExtensionSetModelOnMain(context.Context, *ai.Model, func(func() error) error) (bool, error)
 	// SetThinkingLevel applies and records reasoning without changing defaults unless Persist is set.
 	SetThinkingLevel(ai.ModelThinkingLevel, ...ModelMutationOptions) error
 	// SetThinkingLevelOnMain dispatches the synchronous state mutation to the owner loop, then runs the thinking_level_select notification on the caller. The dispatcher may reject a superseded mutation.
@@ -150,4 +157,9 @@ type InteractiveSessionHandle interface {
 // its synchronous listeners.
 type eventBarrier interface {
 	AcknowledgeEvent()
+}
+
+// eventRegionMarker is an eventBarrier that bounds a task of Pi's event loop on Events (coding.Session.RunAgentPrompt, jsloop.Task). The owner loop applies the events between an opening and a closing marker together, so no frame draws a part of what Pi draws in one.
+type eventRegionMarker interface {
+	EventRegion() (open, bounds bool)
 }

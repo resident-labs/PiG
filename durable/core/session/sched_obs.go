@@ -632,7 +632,8 @@ func (s *Scheduler) reserve(then func([]*reservation, error)) {
 		}
 		// The candidates are scanned in a decision region, one tick of its own.
 		s.beginRegion()
-		for _, id := range s.runnable.Values() {
+		s.takeCandidates()
+		for _, id := range s.candidates.Values() {
 			if s.invocations[id] != nil {
 				continue
 			}
@@ -646,23 +647,25 @@ func (s *Scheduler) reserve(then func([]*reservation, error)) {
 		if err := s.endRegion(tx); err != nil {
 			return err
 		}
-		ticks++
+		// The pass is Pi 1.5.1's `await this.#planCandidates()` (scheduler.ts), an async function around the decision region: the region's
+		// tick, then the async function's return, one tick more than the `await this.#region(...)` the pass was before.
+		ticks += 2
 		defer func() { tx.ticks = ticks }()
 		var snapshot Snapshot
-		for _, id := range s.runnable.Values() {
+		for _, id := range s.candidates.Values() {
 			rec, live := s.live.get(id)
 			if !live || taskStatus(rec) == StatusCompleting || s.invocations[id] != nil {
-				s.runnable.Delete(id)
+				s.candidates.Delete(id)
 				continue
 			}
 			// It returns once what it waits for ends, its record changes, or the work below it ends.
 			if len(s.waitingOn(rec, true)) > 0 {
-				s.runnable.Delete(id)
+				s.candidates.Delete(id)
 				continue
 			}
 			// It returns at the first pass after its time comes, which the timer, Resume, or any change starts.
 			if s.notDue(rec) {
-				s.runnable.Delete(id)
+				s.candidates.Delete(id)
 				continue
 			}
 			abortMode := getBool(rec, "abortRequested")
@@ -704,22 +707,25 @@ func (s *Scheduler) reserve(then func([]*reservation, error)) {
 				}
 				continue
 			}
-			state := getObj(res.record, "state")
+			woke := s.woke(rec)
 			if res.record != rec || taskStatus(rec) != StatusRunning {
-				cp, _ := state.Get("checkpoint")
-				if err := tx.stageFresh(withState(res.record, obj("status", StatusRunning, "checkpoint", cp))); err != nil {
+				if err := tx.stageFresh(reservedRecord(res.record, woke)); err != nil {
 					return err
 				}
 			}
 			// Registered on the line, so marks and later reservations see it and close joins it; endInvocation makes it a
-			// candidate again.
-			s.runnable.Delete(id)
+			// candidate again. It leaves the runnable set once the candidates are back in it (below).
 			inv := s.createInvocation(rec, abortMode, res.task.Extension)
 			reservations = append(reservations, &reservation{inv: inv, task: res.task, snapshot: snapshot})
+		}
+		s.returnCandidates()
+		for _, r := range reservations {
+			s.runnable.Delete(r.inv.taskID)
 		}
 		return nil
 	}, TxScope{}, func(err error) {
 		s.reserveSkip = pinUnset
+		s.returnCandidates()
 		if err != nil {
 			cleanup()
 			then(nil, err)
@@ -739,6 +745,43 @@ func (s *Scheduler) reserve(then func([]*reservation, error)) {
 		}
 		then(reservations, nil)
 	})
+}
+
+// takeCandidates is the start of scheduler.ts #planCandidates (v1.5.2, lines 2005-2028): the reservation pass takes the candidates out of
+// runnable while it plans, so a task made a candidate meanwhile (a waiter whose last task ended, published while the pass waits for a gate)
+// lands in the fresh set and the pass's decision to drop it cannot erase that. A run again of the same job (a region that waited) keeps the
+// candidates it took.
+func (s *Scheduler) takeCandidates() {
+	if s.candidates != nil {
+		return
+	}
+	s.candidates = s.runnable
+	if s.spare == nil {
+		s.spare = newOrderedSet[ID]()
+	}
+	s.spare.Clear()
+	s.runnable, s.spare = s.spare, nil
+}
+
+// returnCandidates is the `finally` of #planCandidates: the candidates not dropped go back in front of the fresh set, unless they ended
+// or hold meanwhile (a status of completing). It is idempotent: the pass's end calls it again after an error.
+func (s *Scheduler) returnCandidates() {
+	candidates := s.candidates
+	if candidates == nil {
+		return
+	}
+	s.candidates = nil
+	for _, id := range candidates.Values() {
+		if rec, live := s.live.get(id); !live || taskStatus(rec) == StatusCompleting {
+			candidates.Delete(id)
+		}
+	}
+	fresh := s.runnable
+	for _, id := range fresh.Values() {
+		candidates.Add(id)
+	}
+	fresh.Clear()
+	s.runnable, s.spare = candidates, fresh
 }
 
 func (s *Scheduler) waitingOn(rec *jv.Object, first bool) []ID {
@@ -893,4 +936,64 @@ func (s *Scheduler) endInvocation(inv *invocation) {
 		stop()
 	}
 	inv.signal.AbortWith(endedError(inv))
+}
+
+// woke returns the wake reason object a run-mode reservation records when leaving waiting or sleeping (scheduler.ts #woke).
+func (s *Scheduler) woke(rec *jv.Object) *jv.Object {
+	if getBool(rec, "abortRequested") {
+		return nil
+	}
+	state := getObj(rec, "state")
+	switch taskStatus(rec) {
+	case StatusWaiting:
+		on, _ := state.Get("on")
+		w := jv.NewObject()
+		w.Set("reason", "tasks")
+		w.Set("ended", on)
+		return w
+	case StatusSleeping:
+		until, hasUntil := getNum(state, "until")
+		if hasUntil && until <= s.env.Now() {
+			w := jv.NewObject()
+			w.Set("reason", "time")
+			return w
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+// reservedRecord is the record a reservation writes: running at the checkpoint, with the wake that ended its wait or sleep
+// and memos preserved/initialized (scheduler.ts reserved).
+func reservedRecord(rec *jv.Object, wake *jv.Object) *jv.Object {
+	state := getObj(rec, "state")
+	cp, _ := state.Get("checkpoint")
+	if wake != nil {
+		memos := jv.NewObject()
+		if m := getObj(rec, "memos"); m != nil {
+			memos = m.Shallow()
+		}
+		woken := with(rec, "memos", memos)
+		ns := jv.NewObject()
+		ns.Set("status", StatusRunning)
+		ns.Set("checkpoint", cp)
+		ns.Set("wake", wake)
+		return withState(woken, ns)
+	}
+	status := taskStatus(rec)
+	if status == StatusPending || status == StatusRunning {
+		next := state.Shallow()
+		next.Set("status", StatusRunning)
+		return withState(rec, next)
+	}
+	return withState(rec, obj("status", StatusRunning, "checkpoint", cp))
+}
+
+// pendingAgain is the record written back as pending on open, close, or handover: its checkpoint and wake preserved
+// (scheduler.ts pendingAgain).
+func pendingAgain(rec *jv.Object) *jv.Object {
+	next := getObj(rec, "state").Shallow()
+	next.Set("status", StatusPending)
+	return withState(rec, next)
 }

@@ -1,11 +1,9 @@
 package codingagent
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"maps"
-	"os/exec"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -14,42 +12,8 @@ import (
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
-	"github.com/MichaelKinsy/PiG/internal/coding/pigversion"
 	"github.com/MichaelKinsy/PiG/tui"
 )
-
-// The codemode tool card (codemode/renderer.ts codemodeRenderers: code preview, nested call rows, model-call cost total, output preview,
-// full-output path) through tool-execution.ts against pinned Pi, collapsed and expanded, pending and with results; rows are compared byte for byte.
-func TestCodemodeCardsMatchPi(t *testing.T) {
-	probes, names := codemodeCardProbes(t)
-	input, err := json.Marshal(probes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.CommandContext(t.Context(), "node", "testdata/codemode_cards.mjs", pigversion.UpstreamPackageVersion)
-	cmd.Stdin = bytes.NewReader(input)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	output, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("Pi oracle: %v\n%s", err, &stderr)
-	}
-	var expected [][]string
-	if err := json.Unmarshal(output, &expected); err != nil {
-		t.Fatal(err)
-	}
-	failures := 0
-	for i, got := range renderCodemodeCards(t, probes) {
-		if strings.Join(got, "\n") != strings.Join(expected[i], "\n") {
-			if failures++; failures <= 4 {
-				t.Errorf("%s:\n  Pig %q\n  Pi  %q", names[i], got, expected[i])
-			}
-		}
-	}
-	if failures > 4 {
-		t.Errorf("%d of %d probes differ from Pi", failures, len(probes))
-	}
-}
 
 // TestCodemodeCardsProbeDump prints the corpus for the Pi side of the tools/25 parity scenario.
 func TestCodemodeCardsProbeDump(t *testing.T) {
@@ -143,14 +107,22 @@ func codemodeCardProbes(t *testing.T) ([]toolCardProbe, []string) {
 	add("empty calls", "x", &toolCardResult{Content: cardText(header + "z"), Details: calls()})
 	add("error without header", "x", &toolCardResult{Content: cardText("Script rejected"), IsError: true})
 
+	probes, names = appendCodemodeBoundaryProbes(probes, names)
 	return rebindExpandCards(probes, names)
 }
 
 // renderCodemodeCards drives one card per probe through the interactive mode's tool events and returns its rows.
 func renderCodemodeCards(t *testing.T, probes []toolCardProbe) [][]string {
 	t.Helper()
-	previousCaps := tui.GetCapabilities()
-	t.Cleanup(func() { tui.SetCapabilities(previousCaps) })
+	out := make([][]string, len(probes))
+	driveCodemodeCards(t, probes, func(i int, f toolComponentFixture) { out[i] = f.card.Render(probes[i].Width) })
+	return out
+}
+
+// driveCodemodeCards hands observe each probe's card after its start and result events, with the probe's expansion applied.
+func driveCodemodeCards(t *testing.T, probes []toolCardProbe, observe func(i int, f toolComponentFixture)) {
+	t.Helper()
+	restoreStartupTheme(t)
 	tui.SetCapabilities(tui.TerminalCapabilities{TrueColor: true})
 	tui.SetTheme("dark")
 	t.Cleanup(func() { tui.SetAppKeyTextResolver(nil) })
@@ -160,8 +132,8 @@ func renderCodemodeCards(t *testing.T, probes []toolCardProbe) [][]string {
 	t.Cleanup(func() { toolTimerNow = previousNow })
 	toolTimerNow = func() time.Time { return time.UnixMilli(cardClock.Load()) }
 	definition := extension.ToolDefinition{Name: "codemode", RenderCall: CodemodeRenderers.RenderCall, RenderResult: CodemodeRenderers.RenderResult}
-	out := make([][]string, len(probes))
 	for i, probe := range probes {
+		tui.SetCapabilities(tui.TerminalCapabilities{TrueColor: true, Images: tui.ImageProtocol(probe.Images)})
 		installCardBindings(t, probe)
 		raw, _ := json.Marshal(probe.Args)
 		cardClock.Store(toolCardClockStart)
@@ -171,16 +143,33 @@ func renderCodemodeCards(t *testing.T, probes []toolCardProbe) [][]string {
 		if r := probe.Result; r != nil {
 			var content []ai.ToolResultMessageContent
 			for _, block := range r.Content {
+				if block["type"] == "image" {
+					content = append(content, ai.ImageContent{Data: block["data"].(string), MimeType: block["mimeType"].(string)})
+					continue
+				}
 				content = append(content, ai.TextContent{Text: block["text"].(string)})
 			}
 			var details any
 			if r.Details != nil {
 				details = r.Details
 			}
-			f.mode.handleAgentEvent(agent.ToolExecutionEndEvent{ToolCallID: f.id, ToolName: f.name, IsError: r.IsError, Result: agent.AgentToolResult{Content: content, Details: details, IsError: r.IsError}})
+			if probe.Partial {
+				f.mode.handleAgentEvent(agent.ToolExecutionUpdateEvent{ToolCallID: f.id, ToolName: f.name, PartialResult: agent.AgentToolResult{Content: content, Details: details}})
+			} else {
+				f.mode.handleAgentEvent(agent.ToolExecutionEndEvent{ToolCallID: f.id, ToolName: f.name, IsError: r.IsError, Result: agent.AgentToolResult{Content: content, Details: details, IsError: r.IsError}})
+			}
+		}
+		if probe.NoImages {
+			f.card.SetShowImages(false)
 		}
 		f.card.SetExpanded(probe.Expanded)
-		out[i] = f.card.Render(probe.Width)
+		observe(i, f)
+		if probe.Result == nil || probe.Partial {
+			// A running card ticks its elapsed time until a final result renders; finish it so the ticker does not outlive the test.
+			t.Cleanup(func() {
+				f.mode.handleAgentEvent(agent.ToolExecutionEndEvent{ToolCallID: f.id, ToolName: f.name, Result: agent.AgentToolResult{Content: []ai.ToolResultMessageContent{}}})
+				f.card.Render(probe.Width)
+			})
+		}
 	}
-	return out
 }

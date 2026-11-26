@@ -99,7 +99,7 @@ func everyEventEmit() map[string]func(context.Context, *harness) error {
 		"agent_start": genericEmit(extension.AgentStartEvent{Type: "agent_start"}),
 		"agent_end":   genericEmit(extension.AgentEndEvent{Type: "agent_end", Messages: []extension.AgentMessage{message}}),
 		"agent_before_settle": func(ctx context.Context, h *harness) error {
-			_, err := h.runner.EmitBoundary(ctx, &extension.AgentBeforeSettleEvent{Type: "agent_before_settle", BoundaryState: extension.BoundaryState{Outcome: extension.AgentActivityCompleted}},
+			_, err := h.runner.EmitBoundary(ctx, &extension.AgentBeforeSettleEvent{Type: "agent_before_settle", Outcome: extension.AgentActivityCompleted},
 				func(entries []extension.SessionBoundaryDraft) (extension.BoundaryContextPreview, error) {
 					return extension.BoundaryContextPreview{ContextEntries: make([]extension.ProjectedSessionEntry, len(entries))}, nil
 				})
@@ -125,13 +125,13 @@ func everyEventEmit() map[string]func(context.Context, *harness) error {
 		"thinking_level_select": genericEmit(extension.ThinkingLevelSelectEvent{Type: "thinking_level_select", Level: "high", PreviousLevel: "off"}),
 		"tool_call": func(ctx context.Context, h *harness) error {
 			return ignore(h.runner.EmitToolCall(ctx, extension.CustomToolCallEvent{
-				ToolCallEventBase: extension.ToolCallEventBase{Type: "tool_call", ToolCallID: "probe-call"}, ToolName: "probe", Input: map[string]any{},
+				Type: "tool_call", ToolCallID: "probe-call", ToolName: "probe", Input: map[string]any{},
 			}))
 		},
 		"tool_result": func(ctx context.Context, h *harness) error {
 			return ignore(h.runner.EmitToolResult(ctx, extension.CustomToolResultEvent{
-				ToolResultEventBase: extension.ToolResultEventBase{Type: "tool_result", ToolCallID: "probe-call", Input: map[string]any{}, Content: []any{}},
-				ToolName:            "probe",
+				Type: "tool_result", ToolCallID: "probe-call", Input: map[string]any{}, Content: []any{},
+				ToolName: "probe",
 			}))
 		},
 		"user_bash": func(ctx context.Context, h *harness) error {
@@ -178,7 +178,7 @@ func TestConformance_EventUnsubscribeEveryEvent(t *testing.T) {
 			for _, event := range subscribedEventNames {
 				delivered := func() int {
 					count := 0
-					for _, n := range *h.notify {
+					for _, n := range h.ui.Recorded() {
 						if strings.TrimSuffix(n, ":info") == "event_probe_on:"+event {
 							count++
 						}
@@ -191,7 +191,7 @@ func TestConformance_EventUnsubscribeEveryEvent(t *testing.T) {
 						t.Fatalf("emit %s: %v", event, err)
 					}
 				}
-				*h.notify = (*h.notify)[:0]
+				h.ui.ClearRecorded()
 				runConformanceCommandArgs(t, h, "event_probe_on", event)
 				emit()
 				pollUntilConformance(t, event+": the subscribed handler never ran", func() bool { return delivered() == 1 })

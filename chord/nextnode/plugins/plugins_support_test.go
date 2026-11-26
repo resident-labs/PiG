@@ -4,17 +4,16 @@ import (
 	"encoding/json"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-// Ports packages/chord/test/next-node/plugins/support.ts (FIXTURES, KINDS, tempRoot, writeFiles, writePlugin). The host
+// Ports packages/chord/test/node/plugins/support.ts (FIXTURES, KINDS, tempRoot, writeFiles, writePlugin, gitRepository). The host
 // packages (`HOST_PACKAGES`, `kindsOf`) and `writePackage` serve the esbuild and `vm` tests, which this package replaces
 // by the Builder and Evaluator seams (plugins_build.go, plugins_evaluate.go).
 
@@ -136,63 +135,44 @@ func eventually(t *testing.T, timeout time.Duration, what string, check func() b
 	}
 }
 
-// settler is the barrier of a component's watcher: a directory outside its roots that the watcher watches too, where a new
-// directory is made to learn that the events of everything written before it were handled.
-type settler struct {
-	dir   string
-	count int
+// gitRepo is a local bare git repository and the work tree it was made from.
+type gitRepo struct {
+	url, commit, work, bare string
 }
 
-var settlers sync.Map
-
-// settle returns once the component's watcher handled the events of every file operation made before the call: a watch event
-// of an edit arrives on its own time, and one that arrives after a build that followed the first event of the edit would leave
-// the plugin dirty. A write in place is two events, a removed directory many. The events of one file system arrive in order,
-// and a directory made in a watched one is watched when its event was handled: the watcher's own state (`watched`, read in a
-// section of its loop) says the barrier's directory was reached, so everything before it was. Nothing is waited for when the
-// component does not watch (no first use yet, or a watcher that failed).
-func settle(t *testing.T, plugins *Plugins) {
+// gitRepository is a local bare git repository `<name>.git` in a temporary directory with files committed (one commit),
+// tagged tag: its `file://` URL and the commit. A call with previous adds another commit on top of that repository. No
+// network.
+func gitRepository(t *testing.T, name string, files map[string]string, tag string, previous *gitRepo) gitRepo {
 	t.Helper()
-	found, _ := settlers.LoadOrStore(plugins, &settler{dir: t.TempDir()})
-	barrier := found.(*settler)
-	var watching bool
-	var directories []string
-	plugins.section(func() {
-		fs := plugins.watcher.fs
-		if fs == nil {
-			return
+	git := func(cwd string, args ...string) string {
+		t.Helper()
+		command := exec.Command("git", append([]string{"-c", "user.email=test@example.com", "-c", "user.name=test"}, args...)...)
+		command.Dir = cwd
+		out, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
 		}
-		watching = true
-		// A discovery drops the trees that are no root's, base's or linked plugin's: the barrier's is put back each time.
-		plugins.watcher.watchTree(barrier.dir)
-		directories = slices.Collect(maps.Keys(plugins.watcher.watched))
-	})
-	if !watching {
-		return
+		return strings.TrimSpace(string(out))
 	}
-	if runtime.GOOS == "windows" {
-		settleDirectoryStamps(directories)
+	var work string
+	if previous != nil {
+		work = previous.work
+	} else {
+		work = tempRoot(t)
+		git(work, "init", "--quiet")
 	}
-	barrier.count++
-	sentinel := filepath.Join(barrier.dir, "sentinel-"+strconv.Itoa(barrier.count))
-	if err := os.Mkdir(sentinel, 0o755); err != nil {
-		t.Fatal(err)
+	writeFiles(t, work, files)
+	git(work, "add", "--all")
+	git(work, "commit", "--quiet", "--message", tag)
+	git(work, "tag", tag)
+	var bare string
+	if previous != nil {
+		bare = previous.bare
+		git(work, "push", "--quiet", "--tags", bare, "HEAD:refs/heads/master")
+	} else {
+		bare = filepath.Join(tempRoot(t), name+".git")
+		git(work, "clone", "--quiet", "--bare", work, bare)
 	}
-	eventually(t, 15*time.Second, "the watcher to handle a directory made after the edits", func() bool {
-		var reached bool
-		plugins.section(func() { _, reached = plugins.watcher.watched[sentinel] })
-		return reached
-	})
-}
-
-// settleDirectoryStamps has Windows report, before the barrier's directory is made, the last-write time of the watched
-// directories whose entries changed. Windows reports it as a write of the directory to the watch of its parent (see
-// withoutDirectoryStamps), lazily, at a moment after the entry's own event that no barrier orders; opening and closing each
-// watched directory makes the report come then, so a case reads marks that already hold it.
-func settleDirectoryStamps(directories []string) {
-	for _, directory := range directories {
-		if file, err := os.Open(directory); err == nil {
-			_ = file.Close()
-		}
-	}
+	return gitRepo{url: "file://" + bare, commit: git(work, "rev-parse", "HEAD"), work: work, bare: bare}
 }

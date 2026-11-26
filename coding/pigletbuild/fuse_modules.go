@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"go/version"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"golang.org/x/mod/semver"
 
 	extsource "github.com/MichaelKinsy/PiG/coding/extension/source"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 )
 
 // fusedModuleGraph is the module graph fused members add to Pig's main module.
@@ -105,11 +107,21 @@ func mergeFusedModules(pig *modfile.File, fused []fusedEntry) (fusedModuleGraph,
 	want := map[string]string{}
 	wantFrom := map[string]string{}
 	replaces := map[module.Version]replacement{}
+	// A member whose module graph requires a newer language version than
+	// Pig's go directive records must raise the directive, or the merged
+	// go.mod fails -mod=readonly with "updates to go.mod needed" (go mod
+	// tidy would bump it for the member-raised module graph). Track the
+	// highest member go version here and raise Pig's directive after the
+	// merge.
+	memberGoVersion := ""
 	for _, root := range roots {
 		member := owner[root]
 		file, err := readModFile(root)
 		if err != nil {
 			return fusedModuleGraph{}, fmt.Errorf("fuse %q: %w", member, err)
+		}
+		if file.Go != nil && (memberGoVersion == "" || version.Compare("go"+file.Go.Version, "go"+memberGoVersion) > 0) {
+			memberGoVersion = file.Go.Version
 		}
 		for _, requirement := range file.Require {
 			path, version := requirement.Mod.Path, requirement.Mod.Version
@@ -119,7 +131,7 @@ func mergeFusedModules(pig *modfile.File, fused []fusedEntry) (fusedModuleGraph,
 				continue
 			case path == extsource.GoSDKModulePath:
 				if sdkPin != "" && semver.Compare(version, sdkPin) > 0 {
-					return fusedModuleGraph{}, fmt.Errorf("fuse %q: %s requires %s %s, newer than the %s this Pig source pins; a fused member links the SDK of the Pig it is fused into, so build with a Pig source at %s or later", member, filepath.Join(root, "go.mod"), path, version, sdkPin, version)
+					return fusedModuleGraph{}, fmt.Errorf("fuse %q: %s requires %s %s, newer than the %s this PiG source pins; a fused member links the SDK of the PiG it is fused into, so build with a PiG source at %s or later", member, filepath.Join(root, "go.mod"), path, version, sdkPin, version)
 				}
 				continue
 			case extsource.IsGoSDKModulePath(path):
@@ -145,6 +157,18 @@ func mergeFusedModules(pig *modfile.File, fused []fusedEntry) (fusedModuleGraph,
 				return fusedModuleGraph{}, fmt.Errorf("fuse %q: conflicting replacements for %s: %s replaces it with %s, %s with %s", member, formatModule(r.Old), filepath.Join(previous.root, "go.mod"), formatModule(previous.target), filepath.Join(root, "go.mod"), formatModule(target))
 			}
 			replaces[r.Old] = replacement{target: target, root: root}
+		}
+	}
+
+	if memberGoVersion != "" {
+		pigGoVersion := ""
+		if pig.Go != nil {
+			pigGoVersion = pig.Go.Version
+		}
+		if version.Compare("go"+memberGoVersion, "go"+pigGoVersion) > 0 {
+			if err := pig.AddGoStmt(memberGoVersion); err != nil {
+				return fusedModuleGraph{}, fmt.Errorf("raise pig go directive to %s: %w", memberGoVersion, err)
+			}
 		}
 	}
 
@@ -185,14 +209,14 @@ func mergeFusedModules(pig *modfile.File, fused []fusedEntry) (fusedModuleGraph,
 			if err := pig.AddRequire(path, version); err != nil {
 				return fusedModuleGraph{}, err
 			}
-			graph.raised = append(graph.raised, fmt.Sprintf("fused member %q raises Pig's %s %s to %s (minimum version selection)", wantFrom[path], path, current, version))
+			graph.raised = append(graph.raised, fmt.Sprintf("fused member %q raises PiG's %s %s to %s (minimum version selection)", wantFrom[path], path, current, version))
 		}
 	}
 	olds := make([]module.Version, 0, len(replaces))
 	for old := range replaces {
 		olds = append(olds, old)
 	}
-	slices.SortFunc(olds, func(a, b module.Version) int {
+	sortx.Func(olds, func(a, b module.Version) int {
 		if c := strings.Compare(a.Path, b.Path); c != 0 {
 			return c
 		}
@@ -202,7 +226,7 @@ func mergeFusedModules(pig *modfile.File, fused []fusedEntry) (fusedModuleGraph,
 		promoted := replaces[old]
 		if existing := pigReplacement(pig, old); existing != nil {
 			if existing.New != promoted.target {
-				return fusedModuleGraph{}, fmt.Errorf("fuse %q: %s replaces %s with %s, but Pig replaces it with %s", owner[promoted.root], filepath.Join(promoted.root, "go.mod"), formatModule(old), formatModule(promoted.target), formatModule(existing.New))
+				return fusedModuleGraph{}, fmt.Errorf("fuse %q: %s replaces %s with %s, but PiG replaces it with %s", owner[promoted.root], filepath.Join(promoted.root, "go.mod"), formatModule(old), formatModule(promoted.target), formatModule(existing.New))
 			}
 			continue
 		}

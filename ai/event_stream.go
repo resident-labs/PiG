@@ -127,8 +127,11 @@ func (s *AssistantMessageEventStream) push(event AssistantMessageEvent, replacem
 		s.queue = append(s.queue, event)
 	} else {
 		waiter := s.waiters[0]
-		s.waiters[0] = nil
-		s.waiters = s.waiters[1:]
+		// The waiter list is shifted down in place, so a consumer that registers again appends into the array it left and the list never reallocates per event.
+		last := len(s.waiters) - 1
+		copy(s.waiters, s.waiters[1:])
+		s.waiters[last] = nil
+		s.waiters = s.waiters[:last]
 		if continuation := waiter.deliver(eventDelivery{event: event}); continuation != nil {
 			continuations = append(continuations, continuation)
 		}
@@ -304,4 +307,16 @@ func eventPartial(event AssistantMessageEvent) *AssistantMessage {
 	default:
 		return nil
 	}
+}
+
+// SettledResult returns the stream's final message without waiting, and whether the stream has one: Pi's `await response.result()` of a result that is already resolved.
+func (s *AssistantMessageEventStream) SettledResult() (*AssistantMessage, bool) {
+	select {
+	case <-s.done:
+	default:
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.result, true
 }

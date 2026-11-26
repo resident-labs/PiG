@@ -3,6 +3,8 @@ package ai
 // Ports packages/ai/src/providers/all.ts (built-in model accessors and provider assembly), providers/typesafe.ts,
 // providers/cloudflare-workers-ai.ts and the classifier registrations of providers/{opencode,openrouter,
 // vercel-ai-gateway}.ts.
+//
+// Ports packages/ai/src/providers/github-copilot.ts (its classifier registration: builtinClassifiers, the typesafe-system-one entry).
 
 import (
 	"context"
@@ -70,6 +72,8 @@ func builtinClassifiers(provider string) ProviderClassifierMap {
 	switch provider {
 	case "typesafe", "opencode", "openrouter", "vercel-ai-gateway":
 		return ProviderClassifierMap{ClassifierAPITypesafeSystemOne: TypesafeSystemOneAPI()}
+	case "github-copilot": //portlint:allow providerliteral the built-in registry entry for providers/github-copilot.ts:48 `classifiers: { "typesafe-system-one": copilotSystemOne(...) }`
+		return ProviderClassifierMap{ClassifierAPITypesafeSystemOne: githubCopilotSystemOne(TypesafeSystemOneAPI())}
 	case "cloudflare-workers-ai":
 		return ProviderClassifierMap{ClassifierAPICloudflareWorkersAISystemOne: CloudflareClassifier(CloudflareWorkersAISystemOneAPI())}
 	case "openai": //portlint:allow providerliteral the built-in registry entry for providers/openai.ts:31 `classifiers: { "openai-decisions": ... }`
@@ -142,61 +146,66 @@ func CloudflareWorkersAIProvider() *ModelsProvider { return builtinProvider("clo
 
 // builtinProviderConstructors lists the per-provider constructors (providers/all.ts builtinModels): BuiltinProviders builds each provider through its own constructor.
 var builtinProviderConstructors = map[string]func() *ModelsProvider{
-	"all":                        BuiltinProvider,
-	"amazon-bedrock":             AmazonBedrockProvider,
-	"ant-ling":                   AntLingProvider,
-	"anthropic":                  AnthropicProvider,
-	"azure":                      AzureProvider,
-	"baseten":                    BasetenProvider,
-	"cerebras":                   CerebrasProvider,
-	"cloudflare-ai-gateway":      CloudflareAIGatewayProvider,
-	"deepseek":                   DeepseekProvider,
-	"fireworks":                  FireworksProvider,
-	"github-copilot":             GithubCopilotProvider,
-	"google":                     GoogleProvider,
-	"google-vertex":              GoogleVertexProvider,
-	"groq":                       GroqProvider,
-	"huggingface":                HuggingFaceProvider,
-	"kimi-coding":                KimiCodingProvider,
-	"meta":                       MetaProvider,
-	"minimax":                    MinimaxProvider,
-	"minimax-cn":                 MinimaxCnProvider,
-	"mistral":                    MistralProvider,
-	"moonshotai":                 MoonshotaiProvider,
-	"moonshotai-cn":              MoonshotaiCnProvider,
-	"nvidia":                     NvidiaProvider,
-	"openai":                     OpenaiProvider,
-	"openai-codex":               OpenaiCodexProvider,
-	"opencode":                   OpencodeProvider,
-	"opencode-go":                OpenCodeGoProvider,
-	"openrouter":                 OpenrouterProvider,
-	"qwen-token-plan":            QwenTokenPlanProvider,
-	"qwen-token-plan-cn":         QwenTokenPlanCnProvider,
-	"qwen-token-plan-individual": QwenTokenPlanIndividualProvider,
-	"radius":                     func() *ModelsProvider { return NewRadiusProvider() }, // all.ts:169 radiusProvider()
-	"together":                   TogetherProvider,
-	"vercel-ai-gateway":          VercelAIGatewayProvider,
-	"xai":                        XaiProvider,
-	"xiaomi":                     XiaomiProvider,
-	"xiaomi-token-plan-ams":      XiaomiTokenPlanAmsProvider,
-	"xiaomi-token-plan-cn":       XiaomiTokenPlanCnProvider,
-	"xiaomi-token-plan-sgp":      XiaomiTokenPlanSgpProvider,
-	"zai":                        ZaiProvider,
-	"zai-coding-cn":              ZaiCodingCnProvider,
-	"typesafe":                   TypesafeProvider,
-	"cloudflare-workers-ai":      CloudflareWorkersAIProvider,
+	"all":                           BuiltinProvider,
+	"amazon-bedrock":                AmazonBedrockProvider,
+	"ant-ling":                      AntLingProvider,
+	"anthropic":                     AnthropicProvider,
+	"azure":                         AzureProvider,
+	"baseten":                       BasetenProvider,
+	"cerebras":                      CerebrasProvider,
+	"cloudflare-ai-gateway":         CloudflareAIGatewayProvider,
+	"deepseek":                      DeepseekProvider,
+	"fireworks":                     FireworksProvider,
+	"github-copilot":                GithubCopilotProvider,
+	"google":                        GoogleProvider,
+	"google-vertex":                 GoogleVertexProvider,
+	"groq":                          GroqProvider,
+	"huggingface":                   HuggingFaceProvider,
+	"kimi-coding":                   KimiCodingProvider,
+	"meta":                          MetaProvider,
+	"minimax":                       MinimaxProvider,
+	"minimax-cn":                    MinimaxCnProvider,
+	"mistral":                       MistralProvider,
+	"moonshotai":                    MoonshotaiProvider,
+	"moonshotai-cn":                 MoonshotaiCnProvider,
+	"nvidia":                        NvidiaProvider,
+	"openai":                        OpenaiProvider,
+	"openai-codex":                  OpenaiCodexProvider,
+	"opencode":                      OpencodeProvider,
+	"opencode-go":                   OpenCodeGoProvider,
+	"openrouter":                    OpenrouterProvider,
+	"qwen-token-plan":               QwenTokenPlanProvider,
+	"qwen-token-plan-cn":            QwenTokenPlanCnProvider,
+	"qwen-token-plan-individual":    QwenTokenPlanIndividualProvider,
+	"qwen-token-plan-individual-cn": QwenTokenPlanIndividualCnProvider,
+	"radius":                        func() *ModelsProvider { return NewRadiusProvider() }, // all.ts:169 radiusProvider()
+	"together":                      TogetherProvider,
+	"vercel-ai-gateway":             VercelAIGatewayProvider,
+	"xai":                           XaiProvider,
+	"xiaomi":                        XiaomiProvider,
+	"xiaomi-token-plan-ams":         XiaomiTokenPlanAmsProvider,
+	"xiaomi-token-plan-cn":          XiaomiTokenPlanCnProvider,
+	"xiaomi-token-plan-sgp":         XiaomiTokenPlanSgpProvider,
+	"zai":                           ZaiProvider,
+	"zai-coding-cn":                 ZaiCodingCnProvider,
+	"typesafe":                      TypesafeProvider,
+	"cloudflare-workers-ai":         CloudflareWorkersAIProvider,
 }
 
 // BuiltinProviders returns every built-in provider, freshly constructed.
+// pig additive (D92): a provider whose catalog models are all on stripped APIs (ProviderStripped) is left out, so BuiltinModels and the collection the compat streams consult do not hold it. Stock PiG strips no API and returns every catalog provider.
 func BuiltinProviders() []*ModelsProvider {
 	ids := ListProviders()
-	providers := make([]*ModelsProvider, len(ids))
-	for i, id := range ids {
-		if construct, ok := builtinProviderConstructors[id]; ok {
-			providers[i] = construct()
+	providers := make([]*ModelsProvider, 0, len(ids))
+	for _, id := range ids {
+		if ProviderStripped(id) {
 			continue
 		}
-		providers[i] = builtinProvider(id)
+		if construct, ok := builtinProviderConstructors[id]; ok {
+			providers = append(providers, construct())
+			continue
+		}
+		providers = append(providers, builtinProvider(id))
 	}
 	return providers
 }

@@ -25,8 +25,9 @@ func TestStreamedHighlightEqualsAWholeRun(t *testing.T) {
 	}
 	theme := ActiveTheme()
 	steps, resumed := 0, 0
-	for _, c := range corpus {
-		if !SupportsLanguage(c.Lang) {
+	for i, c := range corpus {
+		// Under the race detector every fourth sample runs (race_on_test.go).
+		if !SupportsLanguage(c.Lang) || raceEnabled && i%4 != 0 {
 			continue
 		}
 		hlMu.Lock()
@@ -42,10 +43,10 @@ func TestStreamedHighlightEqualsAWholeRun(t *testing.T) {
 				end++
 			}
 			code := c.Code[:end]
-			if base, _ := hlFindResume(code, c.Lang, theme); base.prefix != "" {
+			if base, _ := hlFindResume(code, c.Lang, theme, false); base.prefix != "" {
 				resumed++
 				// A point follows at least one scan iteration; its count is where the resumed run continues counting.
-				if base.iterations == 0 {
+				if base.point.Iterations == 0 {
 					t.Fatalf("%s (%s): the resume state at %d bytes holds no iteration count", c.ID, c.Lang, len(base.prefix))
 				}
 			}

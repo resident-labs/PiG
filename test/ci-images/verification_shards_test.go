@@ -20,6 +20,14 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/testenv"
 )
 
+// linuxShardBudgetSeconds is the 60-minute shard budget that Linux shard plans must fit inside.
+// The linux job's timeout-minutes in ci.yml is the GitHub kill limit and is set from three times
+// the worst measured Linux matrix job by the rule in ci.yml, separate from this shard budget.
+const (
+	linuxShardBudgetSeconds = 3600
+	linuxKillLimitMinutes   = 125
+)
+
 type verificationJob struct {
 	Name     string
 	Needs    []string
@@ -70,10 +78,10 @@ func gateLeaves(t *testing.T) func(string) []string {
 	var leaves func(string) []string
 	leaves = func(name string) []string {
 		switch name {
-		case "check", "check-core", "check-contracts-fast":
+		case "check", "check-core", "check-contracts-fast", "vet":
 		case "test":
-			// CI runs test-fast and test-cli in halves (fast-parallel and fast-sharded; two cmd/pig shard ranges; two conformance shard ranges), which together are make test.
-			return []string{"test-fast-parallel", "test-fast-sharded", "test-cli-1", "test-cli-2", "test-subprocess", "test-conformance-1", "test-conformance-2"}
+			// CI runs test-fast and test-cli in halves (fast-parallel and fast-sharded; two cmd/pig shard ranges) and conformance in four shard ranges, which together are make test.
+			return []string{"test-fast-parallel", "test-fast-sharded-1", "test-fast-sharded-2", "test-cli-1", "test-cli-2", "test-subprocess", "test-conformance-1", "test-conformance-2", "test-conformance-3", "test-conformance-4"}
 		case "portmap-check":
 			// CI runs the PORT_MAP evidence check as PORTMAP_SHARDS shards (PORTMAP_SHARD=N/M), which together are portmap-check.
 			var halves []string
@@ -110,8 +118,8 @@ func TestLinuxShardsRetainEveryCheck(t *testing.T) {
 	if len(full.Matrix["linux"]) < 2 {
 		t.Fatal("Linux verification is not sharded")
 	}
-	if linux.Timeout > 60 || linux.Timeout <= 0 || linux.Strategy.FailFast == nil || *linux.Strategy.FailFast {
-		t.Fatal("Linux shards must retain the timeout ceiling and run every shard on failure")
+	if linux.Timeout*60 < linuxShardBudgetSeconds || linux.Timeout > linuxKillLimitMinutes || linux.Strategy.FailFast == nil || *linux.Strategy.FailFast {
+		t.Fatalf("Linux shards must keep timeout-minutes in %d..%d (got %d) and run every shard on failure", linuxShardBudgetSeconds/60, linuxKillLimitMinutes, linux.Timeout)
 	}
 	if linux.Strategy.Matrix.Include != "${{ fromJSON(needs.changes.outputs.linux) }}" {
 		t.Fatalf("the Linux matrix is %v, want the changes job's plan", linux.Strategy.Matrix.Include)
@@ -150,6 +158,20 @@ func TestLinuxShardsRetainEveryCheck(t *testing.T) {
 		t.Fatal("the preflight job does not run make ci-preflight")
 	}
 	got = append(got, leaves("ci-preflight")...)
+	preflightPlatforms, ok := jobs["preflight-platforms"]
+	if !ok {
+		t.Fatal("ci.yml has no preflight-platforms job")
+	}
+	runsPreflightPlatforms := false
+	for _, step := range preflightPlatforms.Steps {
+		if strings.TrimSpace(step.Run) == "make ci-preflight-platforms" {
+			runsPreflightPlatforms = true
+		}
+	}
+	if !runsPreflightPlatforms {
+		t.Fatal("the preflight-platforms job does not run make ci-preflight-platforms")
+	}
+	got = append(got, leaves("ci-preflight-platforms")...)
 	// The bookkeeping job runs the fail-fast gates every spending job waits for; they count once, there.
 	bookkeeping, ok := jobs["bookkeeping"]
 	if !ok {
@@ -165,14 +187,20 @@ func TestLinuxShardsRetainEveryCheck(t *testing.T) {
 		t.Fatal("the bookkeeping job does not run make ci-bookkeeping")
 	}
 	got = append(got, leaves("ci-bookkeeping")...)
-	for _, waiting := range []string{"preflight", "linux", "node-runtime", "durable-cf-host", "durable-contract", "android"} {
+	for _, waiting := range []string{"preflight", "linux", "node-runtime", "chord", "durable-cf-host", "durable-contract", "android"} {
 		if !slices.Contains(jobs[waiting].Needs, "bookkeeping") {
 			t.Errorf("%s does not wait for the bookkeeping job, so a bookkeeping failure would not stop it", waiting)
 		}
 	}
+	if !slices.Contains(jobs["preflight-platforms"].Needs, "verdict") {
+		t.Errorf("preflight-platforms does not wait for the verdict job")
+	}
 	for _, gated := range []string{"windows", "macos", "node-loader"} {
 		if !slices.Contains(jobs[gated].Needs, "preflight") {
 			t.Errorf("%s does not wait for the preflight job", gated)
+		}
+		if !slices.Contains(jobs[gated].Needs, "preflight-platforms") {
+			t.Errorf("%s does not wait for the preflight-platforms job", gated)
 		}
 	}
 	slices.Sort(want)
@@ -248,6 +276,127 @@ func TestPortmapShardsAreWiredEndToEnd(t *testing.T) {
 	}
 }
 
+// TestPortmapShardsFitTheirBudget guards against regressions like runs 44870314130 and 44880357753 where
+// Linux / portmap-1 (55.5 m, 92.5% of 60 m on southcentralus) and Linux / portmap-3 (51.8 m, 86.4% on westus)
+// exceeded the 70% slow-pool budget at PORTMAP_SHARDS=8. Scaling the worst observed 8-shard work linearly to
+// PORTMAP_SHARDS must keep every shard <= 60% of the 60-minute shard budget on the fast pool and <= 85% on the slow pool.
+func TestPortmapShardsFitTheirBudget(t *testing.T) {
+	killLimit := verificationJobs(t)["linux"].Timeout * 60
+	if killLimit < linuxShardBudgetSeconds || killLimit > linuxKillLimitMinutes*60 {
+		t.Fatalf("linux timeout = %d s, want %d..%d", killLimit, linuxShardBudgetSeconds, linuxKillLimitMinutes*60)
+	}
+	budget := linuxShardBudgetSeconds
+	total := portmapShards(t)
+	// Measured on run 44880357753 (portmap-1 at 8 shards): 3113 s shard work + 218 s setup on southcentralus (slow pool),
+	// and run 44870314130 (portmap-1 at 8 shards): 2430 s shard work + 216 s setup on us-west-2 (fast pool).
+	const (
+		baseShards      = 8
+		fastSetupSec    = 220
+		fastWork8Sec    = 2430
+		slowSetupSec    = 240
+		slowWork8Sec    = 3113
+		slowMarginRatio = 85 // <= 85% of shard budget (at least 15% margin)
+	)
+	fastProjected := fastSetupSec + (fastWork8Sec*baseShards+total-1)/total
+	slowProjected := slowSetupSec + (slowWork8Sec*baseShards+total-1)/total
+	if fastProjected*5 > budget*3 {
+		t.Errorf("PORTMAP_SHARDS=%d projects %d s fast-pool wall (> 60%% of %d s shard budget)", total, fastProjected, budget)
+	}
+	if slowProjected*100 > budget*slowMarginRatio {
+		t.Errorf("PORTMAP_SHARDS=%d projects %d s slow-pool wall (> %d%% of %d s shard budget)", total, slowProjected, slowMarginRatio, budget)
+	}
+}
+
+// TestBookkeepingKeepsAutofixGatesAndMovesHeavyNonAutofixToBuild guards against Bookkeeping (timeout-minutes: 15)
+// hitting 96.4% of its limit (14.5 m on westus3 in run 44880357753) while preserving every autofix gate in Bookkeeping
+// and pinning every one of the 25 pre-move ci-bookkeeping targets in exactly one job in both the full and light plans.
+func TestBookkeepingKeepsAutofixGatesAndMovesHeavyNonAutofixToBuild(t *testing.T) {
+	leaves := gateLeaves(t)
+	preMove := []string{
+		"autofix-check",
+		"divergences-drift",
+		"piglet-strip-ids-drift",
+		"sdk-bundles-drift",
+		"node-runtime-drift",
+		"vendor-pi-dist-drift",
+		"known-gaps-drift",
+		"custom-factory-ledger-drift",
+		"lint-scenarios",
+		"port-map-drift",
+		"coverage-drift",
+		"divergence-consistency",
+		"divergence-quality",
+		"divergence-guard",
+		"gui-import-guard",
+		"source-hygiene",
+		"fixture-guard",
+		"module-pins",
+		"test-provenance",
+		"docs-drift",
+		"bug-ledger-check",
+		"model-data-check",
+		"race-coverage",
+		"perf-scoreboard-check",
+		"go-fix-clean",
+	}
+	if len(preMove) != 25 {
+		t.Fatalf("preMove has %d targets, want 25", len(preMove))
+	}
+	moved := []string{
+		"go-fix-clean",
+		"race-coverage",
+		"model-data-check",
+		"fixture-guard",
+		"source-hygiene",
+		"node-runtime-drift",
+		"vendor-pi-dist-drift",
+	}
+	bk := leaves("ci-bookkeeping")
+	buildFull := leaves("ci-build")
+	buildPR := leaves("ci-build-pr")
+	for _, gate := range moved {
+		if slices.Contains(bk, gate) {
+			t.Errorf("ci-bookkeeping still contains heavy non-autofix gate %s; keep it in ci-build and ci-build-pr", gate)
+		}
+		if !slices.Contains(buildFull, gate) {
+			t.Errorf("ci-build is missing moved gate %s", gate)
+		}
+		if !slices.Contains(buildPR, gate) {
+			t.Errorf("ci-build-pr is missing moved gate %s (would disappear from the light PR run)", gate)
+		}
+	}
+	checkPlan := func(planName string, p ciPlan) {
+		jobTargets := map[string][]string{
+			"bookkeeping":         leaves("ci-bookkeeping"),
+			"preflight":           leaves("ci-preflight"),
+			"preflight-platforms": leaves("ci-preflight-platforms"),
+		}
+		for _, entry := range p.Matrix["linux"] {
+			jobTargets["linux/"+entry.Shard] = leaves(entry.Target)
+		}
+		for _, gate := range preMove {
+			var owners []string
+			for job, targets := range jobTargets {
+				for _, target := range targets {
+					if target == gate {
+						owners = append(owners, job)
+					}
+				}
+			}
+			slices.Sort(owners)
+			wantOwner := "bookkeeping"
+			if slices.Contains(moved, gate) {
+				wantOwner = "linux/build"
+			}
+			if len(owners) != 1 || owners[0] != wantOwner {
+				t.Errorf("%s plan: pre-move bookkeeping gate %s runs in %v (count %d), want exactly [%s]", planName, gate, owners, len(owners), wantOwner)
+			}
+		}
+	}
+	checkPlan("full", planFor(t, "merge_group", ""))
+	checkPlan("light", planFor(t, "pull_request", "queue"))
+}
+
 func TestLinuxAggregateRejectsUnsuccessfulShards(t *testing.T) {
 	job := verificationJobs(t)["verify"]
 	if !slices.Contains(job.Needs, "linux") || !strings.Contains(job.If, "always()") {
@@ -274,10 +423,10 @@ func TestLinuxAggregateRejectsUnsuccessfulShards(t *testing.T) {
 	}
 }
 
-// fakeTests are the top-level tests the fixture's fake go test -list prints for every package; it also prints a benchmark, which -run does not select. There are enough of them (100) that no shard of the largest shard count in test-grouped.sh (14) hashes empty.
+// fakeTests are the top-level tests the fixture's fake go test -list prints for every package; it also prints a benchmark, which -run does not select. Twenty conformance shards need enough names for the hash to place a test in every one: 64 does.
 var fakeTests = func() []string {
 	var names []string
-	for i := range 100 {
+	for i := range 64 {
 		names = append(names, fmt.Sprintf("TestFixture%02d", i))
 	}
 	return append(names, "ExampleFixture", "FuzzFixture")
@@ -297,6 +446,9 @@ func groupedTestFixture(t *testing.T) string {
 	copyCIFixture(t, root, "automation/ci/assert-clean-tmp.sh")
 	copyCIFixture(t, root, "automation/ci/agent-dir-guard.sh")
 	copyCIFixture(t, root, "automation/ci/reap-test-processes.sh")
+	for _, rel := range groupedSourcedScripts(t) {
+		copyCIFixture(t, root, rel)
+	}
 	// test-grouped.sh enters the in-repo Porter extension module to warm its dependency-module build cache.
 	writeCIFixture(t, root, "piglets/porter/extensions/pig-porter/.keep", "")
 	// The core-fault group runs exactly the tests that the pigfault-tagged test files of durable/core/driver declare; an untagged file's tests belong to the normal run.
@@ -329,6 +481,7 @@ case "$1" in
     while (($#)); do
       case "$1" in
         -run) run=$2; shift 2 ;;
+        -timeout) shift 2 ;;
         -*) shift ;;
         *) packages+=("$1"); shift ;;
       esac
@@ -406,6 +559,64 @@ func cliShards(t *testing.T) (int, string) {
 		t.Fatalf("CLI_SHARDS=%s: want two or more shards", count[1])
 	}
 	return shards, string(pkg[1])
+}
+
+// hostShards reads the shard count SHARDED_SPEC of test-grouped.sh declares for the extension host package, the one count that make test-subprocess, the Windows extension-host jobs, the macOS extension-host units and the package's pins in test-shard-weights.txt share, and the package.
+func hostShards(t *testing.T) (int, string) {
+	t.Helper()
+	const pkg = "./coding/extension/host/subprocess"
+	data, err := os.ReadFile(filepath.Join(repoRoot(t), "automation", "ci", "test-grouped.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := regexp.MustCompile(`(?m)^SHARDED_SPEC=\(\n((?:  \S+\n)+)\)$`).FindSubmatch(data)
+	if spec == nil {
+		t.Fatal("test-grouped.sh does not declare SHARDED_SPEC")
+	}
+	count := regexp.MustCompile(`(?m)^  ` + regexp.QuoteMeta(pkg) + `:([0-9]+)$`).FindSubmatch(spec[1])
+	if count == nil {
+		t.Fatalf("SHARDED_SPEC of test-grouped.sh does not shard %s", pkg)
+	}
+	shards, err := strconv.Atoi(string(count[1]))
+	if err != nil || shards < 2 {
+		t.Fatalf("SHARDED_SPEC runs %s in %s shards: want two or more", pkg, count[1])
+	}
+	return shards, pkg
+}
+
+// hostUnits names the extension-host units of a Windows or macOS matrix, one for each shard of the extension host package.
+func hostUnits(t *testing.T) []string {
+	t.Helper()
+	shards, _ := hostShards(t)
+	units := make([]string, 0, shards)
+	for shard := 1; shard <= shards; shard++ {
+		units = append(units, "extension-host-"+strconv.Itoa(shard))
+	}
+	return units
+}
+
+// The pins of the extension host package in test-shard-weights.txt apply only to the shard count their section declares, so the section must declare the count the package runs under: pins packed for another count place nothing, and every test falls back to its name hash.
+func TestExtensionHostPinsAreForTheShardCountItRuns(t *testing.T) {
+	shards, pkg := hostShards(t)
+	data, err := os.ReadFile(filepath.Join(repoRoot(t), "automation", "ci", "test-shard-weights.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sections := regexp.MustCompile(`(?m)^package `+regexp.QuoteMeta(pkg)+`\nshards ([0-9]+)\n((?:[0-9]+ \S+\n)*)`).FindAllSubmatch(data, -1)
+	if len(sections) != 1 {
+		t.Fatalf("test-shard-weights.txt has %d sections for %s, want one", len(sections), pkg)
+	}
+	if got := string(sections[0][1]); got != strconv.Itoa(shards) {
+		t.Fatalf("test-shard-weights.txt packs %s for %s shards, SHARDED_SPEC runs it in %d", pkg, got, shards)
+	}
+	pinned := map[string]bool{}
+	for line := range strings.Lines(string(sections[0][2])) {
+		shard, _, _ := strings.Cut(line, " ")
+		pinned[shard] = true
+	}
+	if len(pinned) != shards {
+		t.Errorf("test-shard-weights.txt pins tests of %s to %d of its %d shards", pkg, len(pinned), shards)
+	}
 }
 
 // requireShardPartition fails unless the -run patterns select every runnable fake test exactly once.
@@ -870,5 +1081,79 @@ func TestFastAndDefaultModesRunTheFaultGroupWithItsTag(t *testing.T) {
 				t.Fatalf("%s ran %d pigfault processes, want 1:\n%s", mode, tagged, argData)
 			}
 		})
+	}
+}
+
+// TestOSParallelJobsKeepTheCheapFirstOrderOnMain guards the job order of CI-QUALITY-PLAN item 2. The jobs that wait for Bookkeeping
+// or the compile gate run when it failed only where changes.os-parallel (release and integration branches) says so, so a main
+// pull request keeps the fail-fast order. They use !cancelled(), never always(): GitHub keeps running a job whose condition is
+// still true when concurrency cancels the run, so always() would let a superseded run spend its Windows and macOS minutes.
+func TestOSParallelJobsKeepTheCheapFirstOrderOnMain(t *testing.T) {
+	jobs := verificationJobs(t)
+	gate := map[string]string{
+		"preflight":        "bookkeeping",
+		"linux":            "bookkeeping",
+		"node-runtime":     "bookkeeping",
+		"chord":            "bookkeeping",
+		"durable-cf-host":  "bookkeeping",
+		"durable-contract": "bookkeeping",
+		"android":          "bookkeeping",
+		"windows":          "preflight",
+		"macos":            "preflight",
+		"node-loader":      "preflight",
+	}
+	for name, need := range gate {
+		job, ok := jobs[name]
+		if !ok {
+			t.Errorf("ci.yml has no job %s", name)
+			continue
+		}
+		if strings.Contains(job.If, "always()") {
+			t.Errorf("%s: if %q uses always(), which keeps a superseded run's job running; use !cancelled()", name, job.If)
+		}
+		// The Bookkeeping job publishes shards-blocked (automation/ci/bookkeeping_shards.py): a known-gaps-drift failure alone does not stop the shards, so its jobs wait on that output and not on the job's result.
+		passed := "needs." + need + ".result == 'success'"
+		if need == "bookkeeping" {
+			passed = "needs.bookkeeping.outputs.shards-blocked == 'false'"
+		}
+		for _, want := range []string{
+			"!cancelled()",
+			"needs.changes.result == 'success'",
+			passed,
+			"needs.changes.outputs.os-parallel == 'true'",
+		} {
+			if !strings.Contains(job.If, want) {
+				t.Errorf("%s: if %q lacks %q", name, job.If, want)
+			}
+		}
+	}
+}
+
+var groupedSourcedScriptPattern = regexp.MustCompile(`(?m)^\s*source\s+"\$ROOT/([^"]+)"`)
+
+// groupedSourcedScripts reads automation/ci/test-grouped.sh from the repository and returns every relative path it sources under $ROOT.
+func groupedSourcedScripts(t *testing.T) []string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(repoRoot(t), "automation", "ci", "test-grouped.sh"))
+	if err != nil {
+		t.Fatalf("read automation/ci/test-grouped.sh: %v", err)
+	}
+	matches := groupedSourcedScriptPattern.FindAllStringSubmatch(string(data), -1)
+	if len(matches) == 0 {
+		t.Fatal("automation/ci/test-grouped.sh sources no scripts under $ROOT")
+	}
+	var scripts []string
+	for _, m := range matches {
+		scripts = append(scripts, m[1])
+	}
+	return scripts
+}
+
+func TestGroupedTestFixtureCopiesEverySourcedScript(t *testing.T) {
+	root := groupedTestFixture(t)
+	for _, rel := range groupedSourcedScripts(t) {
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel))); err != nil {
+			t.Errorf("groupedTestFixture missing sourced script %s: %v", rel, err)
+		}
 	}
 }

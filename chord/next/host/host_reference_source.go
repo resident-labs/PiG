@@ -10,7 +10,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/state"
 )
 
-// Ports packages/chord/src/next/host/reference-source.ts
+// Ports packages/chord/src/host/reference-source.ts
 //
 // A reference's member as consumers follow it (decision "References are the only indirection", §7): a consumer's
 // watches and derives over `ref.member` (or a key of a keyed member) attach here, and this passes them straight through
@@ -92,6 +92,9 @@ type referenceSource struct {
 	framed *sourceFramed
 	// owner is its reference.
 	owner sourceOwner
+	// unseen_, while its reference has not seen the member (it joined a shared remote object and no value arrived since),
+	// tells whether it has now; the member's failure then shows no last value.
+	unseen_ func() bool
 }
 
 var (
@@ -104,6 +107,10 @@ func newReferenceSource(batch *state.Batch, scheduler *chord.DeliveryScheduler, 
 	s.Init(batch, s)
 	return s
 }
+
+// unseen: its reference has not seen the member until seen says so: until then a failure of the member it follows shows
+// no last value (as a fresh failed snapshot), in reads, watches, holds and vanishings alike.
+func (s *referenceSource) unseen(seen func() bool) { s.unseen_ = seen }
 
 // unbound is whether it never had a value (a watch waits for its reference's values first).
 func (s *referenceSource) unbound() bool { return s.state.kind == sourceUnbound }
@@ -128,14 +135,7 @@ func (s *referenceSource) Start() state.WatchStart {
 	current := s.state
 	switch current.kind {
 	case sourceBound:
-		if handle, ok := current.source.(state.SourceHandle); ok {
-			return handle.Start()
-		}
-		value, err := current.source.Value()
-		if err != nil {
-			return state.WatchStart{Kind: state.StartFailed, Error: err}
-		}
-		return state.WatchStart{Kind: state.StartValue, Value: value}
+		return s.startOf(current.source)
 	case sourceHeld:
 		if current.failure == nil {
 			return state.WatchStart{Kind: state.StartValue, Value: current.value}
@@ -280,6 +280,22 @@ func (s *referenceSource) vanish(err *data.ChordError, ctx context.Context) {
 	if s.state.kind != sourceUnbound {
 		last, hasLast = s.lastGood()
 	}
+	s.failWith(err, last, hasLast, ctx)
+}
+
+// deny: an admission refused its reference's caller (slice 14 §2.2), inside a batch: it keeps no value (reads throw err, a
+// watch opened now has nothing to start at); watches and subscribers get one failure call per denial and stay open, and
+// derives over it fail until the next allow brings a value (`[["r", value]]`). What application code already took from it
+// stays with that code.
+func (s *referenceSource) deny(err *data.ChordError, ctx context.Context) {
+	if s.state.kind == sourceEnded || (s.state.kind == sourceFailed && s.state.err == error(err)) { //nolint:errorlint // Pi compares by identity (reference-source.ts:235 `state.error === error`): a wrapping error is another denial
+		return
+	}
+	s.failWith(err, nil, false, ctx)
+}
+
+// failWith fails with err, keeping last as its last good value: one failure call, and its dependents marked.
+func (s *referenceSource) failWith(err *data.ChordError, last delta.JsonValue, hasLast bool, ctx context.Context) {
 	s.leave()
 	s.state = sourceState{kind: sourceFailed, err: state.HandedOut(err), last: last, hasLast: hasLast}
 	s.call(chord.WatchCall[delta.JsonValue]{Kind: chord.WatchCallFailed, Error: err}, ctx)
@@ -336,32 +352,37 @@ func (s *referenceSource) Deliver(ctx context.Context) error {
 // keep stops following the bound member and keeps its value (failure: the failure it is held with); a member whose
 // value throws becomes failed. It reports whether it holds a value.
 func (s *referenceSource) keep(failure error) bool {
-	bound := s.state
-	handle, isSource := bound.source.(state.SourceHandle)
-	var start state.WatchStart
-	var value delta.JsonValue
-	if isSource {
-		start = handle.Start()
-	} else {
-		var err error
-		value, err = bound.source.Value()
-		if err != nil {
-			// A source with no start of its own (a constant) never fails.
-			s.leave()
-			s.state = sourceState{kind: sourceFailed, err: state.HandedOut(err)}
-			return false
-		}
-	}
+	start := s.startOf(s.state.source)
 	s.leave()
-	if !isSource || start.Kind == state.StartValue {
-		if isSource {
-			value = start.Value
-		}
-		s.state = sourceState{kind: sourceHeld, value: value, failure: failure, told: failure != nil}
+	if start.Kind == state.StartValue {
+		s.state = sourceState{kind: sourceHeld, value: start.Value, failure: failure, told: failure != nil}
 		return true
 	}
 	s.state = sourceState{kind: sourceFailed, err: state.HandedOut(start.Error), last: start.Last, hasLast: start.HasLast}
 	return false
+}
+
+// startOf is what the member it follows starts at: its value, or its failure with its last good value, none while its
+// reference has not seen the member (unseen; seen once, it stays seen). A source with no start of its own (a constant)
+// starts at its value.
+func (s *referenceSource) startOf(source state.DeriveSource) state.WatchStart {
+	handle, isSource := source.(state.SourceHandle)
+	if !isSource {
+		value, err := source.Value()
+		if err != nil {
+			return state.WatchStart{Kind: state.StartFailed, Error: err}
+		}
+		return state.WatchStart{Kind: state.StartValue, Value: value}
+	}
+	start := handle.Start()
+	if start.Kind == state.StartValue || s.unseen_ == nil {
+		return start
+	}
+	if !s.unseen_() {
+		return state.WatchStart{Kind: state.StartFailed, Error: start.Error}
+	}
+	s.unseen_ = nil
+	return start
 }
 
 // call is a call of its own (a move's frame, a failure) to its watches and subscribers.

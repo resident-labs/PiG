@@ -99,12 +99,20 @@ def _content_text(content: Any, separator: str) -> str:
 
 
 def _truncate_for_summary(text: str, max_chars: int) -> str:
-    """Pi's truncateForSummary: text.length counts UTF-16 units, and the cut keeps the first max_chars of them."""
+    """Pi's truncateForSummary: text.length counts UTF-16 units, and the cut keeps the first max_chars of them through sliceHead (core/tools/truncate.ts), one
+    unit fewer when the cut would split a surrogate pair. The count in the marker is text.length - max_chars either way."""
     units = text.encode("utf-16-le", "surrogatepass")
     length = len(units) // 2
     if length <= max_chars:
         return text
-    return units[: 2 * max_chars].decode("utf-16-le", "surrogatepass") + "\n\n[... " + str(length - max_chars) + " more characters truncated]"
+    end = max_chars
+    if end > 0 and 0xD800 <= _unit(units, end - 1) <= 0xDBFF and 0xDC00 <= _unit(units, end) <= 0xDFFF:
+        end -= 1
+    return units[: 2 * end].decode("utf-16-le", "surrogatepass") + "\n\n[... " + str(length - max_chars) + " more characters truncated]"
+
+
+def _unit(units: bytes, index: int) -> int:
+    return units[2 * index] | units[2 * index + 1] << 8
 
 
 def _is_array_index(key: str) -> bool:
@@ -119,20 +127,42 @@ def _ordered_keys(obj: Mapping[str, Any]) -> list:
 
 
 def _json_stringify(value: Any) -> str:
-    """JSON.stringify for a decoded JSON value."""
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return _js_number_string(value)
-    if isinstance(value, str):
-        return _json_string(value)
-    if isinstance(value, (list, tuple)):
-        return "[" + ",".join(_json_stringify(element) for element in value) + "]"
-    if isinstance(value, Mapping):
-        return "{" + ",".join(_json_string(key) + ":" + _json_stringify(value[key]) for key in _ordered_keys(value)) + "}"
-    return "null"
+    """JSON.stringify for a decoded JSON value.
+
+    It walks with a stack of its own, not the interpreter's: a value nested thousands of levels deep (Pi stringifies 4000) is written, and no depth ends in a RecursionError."""
+    out: list[str] = []
+    stack: list[tuple[bool, Any]] = [(True, value)]
+    while stack:
+        is_value, item = stack.pop()
+        if not is_value:
+            out.append(item)
+        elif item is None:
+            out.append("null")
+        elif isinstance(item, bool):
+            out.append("true" if item else "false")
+        elif isinstance(item, (int, float)):
+            out.append(_js_number_string(item))
+        elif isinstance(item, str):
+            out.append(_json_string(item))
+        elif isinstance(item, (list, tuple)):
+            out.append("[")
+            stack.append((False, "]"))
+            for index in range(len(item) - 1, -1, -1):
+                stack.append((True, item[index]))
+                if index:
+                    stack.append((False, ","))
+        elif isinstance(item, Mapping):
+            out.append("{")
+            stack.append((False, "}"))
+            keys = _ordered_keys(item)
+            for index in range(len(keys) - 1, -1, -1):
+                stack.append((True, item[keys[index]]))
+                stack.append((False, _json_string(keys[index]) + ":"))
+                if index:
+                    stack.append((False, ","))
+        else:
+            out.append("null")
+    return "".join(out)
 
 
 _ESCAPES = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t"}

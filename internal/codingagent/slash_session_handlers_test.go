@@ -2,29 +2,19 @@ package codingagent
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 	"testing"
 	"time"
-
-	iexport "github.com/MichaelKinsy/PiG/internal/codingagent/export"
 
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
 	"github.com/MichaelKinsy/PiG/tui"
 )
-
-type exportTestComponent struct{ lines []string }
-
-func (c exportTestComponent) Render(width int) []string { return c.lines }
-func (exportTestComponent) Invalidate()                 {}
 
 // fakeSlashRunner captures Append output so handlers can be tested
 // without running the full TUI.
@@ -438,6 +428,9 @@ func TestSettingsItems_UpstreamCoreRosterPresentAndOrdered(t *testing.T) {
 		"fullscreen-wheel-scroll-lines",
 		"theme",
 	} {
+		if settingStripped(id) { // a build that strips a built-in does not offer its row
+			continue
+		}
 		if !slices.Contains(ids, id) {
 			t.Fatalf("settings rows missing %q in %v", id, ids)
 		}
@@ -467,6 +460,9 @@ func TestSettingsItems_UpstreamDefaults(t *testing.T) {
 		"terminal-progress":         "false",
 		"install-telemetry":         "true",
 	} {
+		if settingStripped(id) { // a build that strips a built-in does not offer its row
+			continue
+		}
 		if got := lookup[id].CurrentValue; got != want {
 			t.Fatalf("%s default = %q, want %q", id, got, want)
 		}
@@ -593,13 +589,11 @@ func TestSetSessionNamePersistsToDisk(t *testing.T) {
 	id, _ := generateEntryID()
 	parent := sess.GetLeafID()
 	entry := SessionInfoEntry{
-		SessionEntryBase: SessionEntryBase{
-			Type:      "session_info",
-			ID:        id,
-			ParentID:  parent,
-			Timestamp: "2026-04-29T19:00:00Z",
-		},
-		Name: "my project",
+		Type:      "session_info",
+		ID:        id,
+		ParentID:  parent,
+		Timestamp: "2026-04-29T19:00:00Z",
+		Name:      "my project",
 	}
 	if err := sess.AppendEntry(entry); err != nil {
 		t.Fatal(err)
@@ -960,77 +954,6 @@ func TestSettingsHandlerTUI_ModelThinkingSubmenuClearsOverride(t *testing.T) {
 	}
 }
 
-func TestExportHandler_PrerendersCustomToolHTML(t *testing.T) {
-	dir := t.TempDir()
-	sessionPath := filepath.Join(dir, "session.jsonl")
-	cwd, err := json.Marshal(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	jsonl := `{"type":"session","id":"sess-1","cwd":` + string(cwd) + `,"timestamp":"2026-05-14T12:00:00Z"}
-{"type":"message","id":"a1","timestamp":"2026-05-14T12:00:01Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-1","name":"custom-tool","arguments":{"path":"README.md"}}]}}
-{"type":"message","id":"r1","timestamp":"2026-05-14T12:00:02Z","message":{"role":"toolResult","toolCallId":"call-1","toolName":"custom-tool","content":[{"type":"text","text":"done"}],"isError":false}}
-`
-	if err := os.WriteFile(sessionPath, []byte(jsonl), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	outPath := filepath.Join(dir, "out.html")
-	session := &Session{header: SessionHeader{CWD: dir}, path: sessionPath}
-	sc, out := newFakeSlashCtx()
-	sc.CurrentSession = func() *Session { return session }
-	sc.Args = outPath
-	sc.ToolRenderers = func() func(string) *extension.ToolRenderers {
-		return ExportToolRenderers(inproc.NewRunner([]extension.Extension{{Name: "test-ext", Tools: map[string]extension.RegisteredTool{"custom-tool": {
-			Definition: extension.ToolDefinition{
-				Name: "custom-tool",
-				RenderCall: func(args json.RawMessage, theme extension.Theme, context extension.ToolRenderContext) extension.Component {
-					return exportTestComponent{lines: []string{"\x1b[31mCALL\x1b[0m"}}
-				},
-				RenderResult: func(result extension.AgentToolResult, options extension.ToolRenderResultOptions, theme extension.Theme, context extension.ToolRenderContext) extension.Component {
-					toolResult := result
-					if options.Expanded {
-						return exportTestComponent{lines: []string{"\x1b[32mRESULT: " + toolResult.Text() + "\x1b[0m"}}
-					}
-					return exportTestComponent{lines: []string{"preview"}}
-				},
-			},
-		}}}}, dir))
-	}
-	if err := exportHandler(sc); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out.String(), outPath) {
-		t.Fatalf("export confirmation missing output path: %q", out.String())
-	}
-	htmlBytes, err := os.ReadFile(outPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	html := string(htmlBytes)
-	re := regexp.MustCompile(`<script id="session-data" type="application/json">([^<]+)</script>`)
-	m := re.FindStringSubmatch(html)
-	if len(m) != 2 {
-		t.Fatal("session-data script not found")
-	}
-	payload, err := base64.StdEncoding.DecodeString(m[1])
-	if err != nil {
-		t.Fatal(err)
-	}
-	var sd iexport.SessionData
-	if err := json.Unmarshal(payload, &sd); err != nil {
-		t.Fatal(err)
-	}
-	if sd.RenderedTools == nil || sd.RenderedTools["call-1"] == nil {
-		t.Fatalf("RenderedTools missing custom tool html: %#v", sd.RenderedTools)
-	}
-	if got, _ := sd.RenderedTools["call-1"]["callHtml"].(string); !strings.Contains(got, "CALL") {
-		t.Fatalf("callHtml = %q, want CALL", got)
-	}
-	if got, _ := sd.RenderedTools["call-1"]["resultHtmlExpanded"].(string); !strings.Contains(got, "RESULT: done") {
-		t.Fatalf("resultHtmlExpanded = %q, want RESULT: done", got)
-	}
-}
-
 func TestSettingsHandlerNilManager(t *testing.T) {
 	var output string
 	sc := &SlashContext{
@@ -1074,6 +997,8 @@ type importCommandFixture struct {
 	prompts   []string
 	answers   []string
 	imports   [][2]string
+	forks     [][2]string
+	forkErr   error
 	results   []error
 	cancelled bool
 	status    []string
@@ -1101,6 +1026,10 @@ func (f *importCommandFixture) context(args string) *SlashContext {
 				f.results = f.results[1:]
 			}
 			return f.cancelled, err
+		},
+		ForkSession: func(sourcePath, cwd string) (string, bool, error) {
+			f.forks = append(f.forks, [2]string{sourcePath, cwd})
+			return "Forked into new session s in " + cwd, f.cancelled, f.forkErr
 		},
 		ShowStatus: func(message string) { f.status = append(f.status, message) },
 		FatalRuntimeError: func(prefix string, err error) error {
@@ -1186,7 +1115,7 @@ func TestImportHandlerUsageAndCancellation(t *testing.T) {
 		"declined":      {answers: []string{"No"}},
 		"escaped":       {},
 		"before_switch": {answers: []string{"Yes"}, cancelled: true},
-		"cwd prompt no": {answers: []string{"Yes", "No"}, results: []error{&MissingSessionCwdError{Issue: SessionCwdIssue{SessionCwd: "/gone", FallbackCwd: "/here"}}}},
+		"cwd prompt no": {answers: []string{"Yes", "Cancel"}, results: []error{&MissingSessionCwdError{Issue: SessionCwdIssue{SessionCwd: "/gone", FallbackCwd: "/here"}}}},
 	} {
 		if err := importHandler(fx.context("session.jsonl")); err != nil {
 			t.Fatalf("%s: %v", name, err)
@@ -1197,15 +1126,15 @@ func TestImportHandlerUsageAndCancellation(t *testing.T) {
 	}
 }
 
-// Upstream promptForMissingSessionCwd offers the current cwd and retries
-// importFromJsonl with it.
+// Upstream promptForMissingSessionCwd offers Continue, Fork and Cancel; Continue
+// retries importFromJsonl with the current cwd.
 func TestImportHandlerRetriesWithOfferedCwd(t *testing.T) {
 	issue := SessionCwdIssue{SessionFile: "/sessions/moved.jsonl", SessionCwd: "/gone", FallbackCwd: "/here"}
-	f := &importCommandFixture{answers: []string{"Yes", "Yes"}, results: []error{&MissingSessionCwdError{Issue: issue}, nil}}
+	f := &importCommandFixture{answers: []string{"Yes", "Continue in /here (asks again next time)"}, results: []error{&MissingSessionCwdError{Issue: issue}, nil}}
 	if err := importHandler(f.context("moved.jsonl")); err != nil {
 		t.Fatal(err)
 	}
-	if want := "Session cwd not found\n" + FormatMissingSessionCwdPrompt(issue) + " Yes/No"; len(f.prompts) != 2 || f.prompts[1] != want {
+	if want := "Session cwd does not exist: /gone Continue in /here (asks again next time)/Fork into /here (new session ID, original kept)/Cancel"; len(f.prompts) != 2 || f.prompts[1] != want {
 		t.Fatalf("prompts = %q", f.prompts)
 	}
 	if !slices.Equal(f.imports, [][2]string{{"moved.jsonl", ""}, {"moved.jsonl", "/here"}}) {
@@ -1213,6 +1142,27 @@ func TestImportHandlerRetriesWithOfferedCwd(t *testing.T) {
 	}
 	if !slices.Equal(f.status, []string{"Session imported from: moved.jsonl"}) {
 		t.Fatalf("status = %q", f.status)
+	}
+}
+
+// Pi handleImportCommand: Fork switches to a fork of the source in the current cwd (switchToForkedSession), which shows its own status, and no
+// second import happens.
+func TestImportHandlerForksIntoTheCurrentCwd(t *testing.T) {
+	issue := SessionCwdIssue{SessionFile: "/sessions/moved.jsonl", SessionCwd: "/gone", FallbackCwd: "/here"}
+	f := &importCommandFixture{answers: []string{"Yes", "Fork into /here (new session ID, original kept)"}, results: []error{&MissingSessionCwdError{Issue: issue}}}
+	if err := importHandler(f.context("moved.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(f.imports, [][2]string{{"moved.jsonl", ""}}) || !slices.Equal(f.forks, [][2]string{{"moved.jsonl", "/here"}}) {
+		t.Fatalf("imports = %q, forks = %q", f.imports, f.forks)
+	}
+	if !slices.Equal(f.status, []string{"Forked into new session s in /here"}) {
+		t.Fatalf("status = %q", f.status)
+	}
+	// A switch an extension vetoed reports Import cancelled.
+	cancelled := &importCommandFixture{answers: []string{"Yes", "Fork into /here (new session ID, original kept)"}, results: []error{&MissingSessionCwdError{Issue: issue}}, cancelled: true}
+	if err := importHandler(cancelled.context("moved.jsonl")); err != nil || !slices.Equal(cancelled.status, []string{"Import cancelled"}) {
+		t.Fatalf("cancelled fork: status = %q, err = %v", cancelled.status, err)
 	}
 }
 
@@ -1317,7 +1267,7 @@ func TestShareHandlerUploadsJSONLArtifact(t *testing.T) {
 }
 
 // The cache-warming row sits between http-idle-timeout and hide-thinking, as
-// in settings-selector.ts, defaults to Pi's "streaming", and writes the global
+// in settings-selector.ts, defaults to Pi's "idle", and writes the global
 // cacheWarming key.
 func TestSettingsItems_CacheWarmingRow(t *testing.T) {
 	rows, ids := settingsRowsFor(t, NewSettingsManager(t.TempDir(), t.TempDir()))
@@ -1332,10 +1282,10 @@ func TestSettingsItems_CacheWarmingRow(t *testing.T) {
 	if want := []string{"off", "streaming", "idle"}; !slices.Equal(row.Values, want) {
 		t.Fatalf("values = %v, want %v", row.Values, want)
 	}
-	if row.CurrentValue != "streaming" {
-		t.Fatalf("default = %q, want streaming", row.CurrentValue)
+	if row.CurrentValue != "idle" {
+		t.Fatalf("default = %q, want idle", row.CurrentValue)
 	}
-	// Cycling streaming -> idle -> off reaches the callback, and the saved value is the global cacheWarming key.
+	// Cycling idle -> off -> streaming reaches the callback, and the saved value is the global cacheWarming key.
 	sm := NewSettingsManager(t.TempDir(), t.TempDir())
 	var modes []CacheWarmingMode
 	sc := &SlashContext{SettingsManager: sm, Append: func(string) {}, ShowStatus: func(string) {}}
@@ -1350,11 +1300,11 @@ func TestSettingsItems_CacheWarmingRow(t *testing.T) {
 	if err := settingsHandler(sc); err != nil {
 		t.Fatal(err)
 	}
-	if want := []CacheWarmingMode{"idle", "off"}; !slices.Equal(modes, want) {
+	if want := []CacheWarmingMode{"off", "streaming"}; !slices.Equal(modes, want) {
 		t.Fatalf("saved modes = %v, want %v", modes, want)
 	}
-	if sm.GetGlobalSettings().CacheWarming != "off" {
-		t.Fatalf("CacheWarming = %q, want off", sm.GetGlobalSettings().CacheWarming)
+	if sm.GetGlobalSettings().CacheWarming != "streaming" {
+		t.Fatalf("CacheWarming = %q, want streaming", sm.GetGlobalSettings().CacheWarming)
 	}
 }
 

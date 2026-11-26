@@ -48,6 +48,7 @@ type scopedOracleResult struct {
 // is active), provider toggle, bounded reorder, unavailable IDs, save, and Ctrl+C/Escape; the enabled list after each key (Pi's
 // onChange payload), the save payload, cancellation and every frame's text must agree.
 func TestScopedModelsSelectorMatchesPi(t *testing.T) {
+	restoreStartupTheme(t)
 	restoreTUIKeybindings(t)
 	models := []scopedOracleModel{
 		{"claude-sonnet", "Claude Sonnet", "anthropic"}, {"claude-haiku", "Claude Haiku", "anthropic"},
@@ -91,6 +92,14 @@ func TestScopedModelsSelectorMatchesPi(t *testing.T) {
 			}
 		}
 	}
+	// Pi 37b74c546 (#12246) and 5bcf370a5 (#12334): a query after scrolling selects the first match, and a cursor key keeps the selection.
+	for _, keys := range [][]string{
+		{"\x1b[B", "\x1b[B", "\x1b[B", "g", "p", "t", "\r"},
+		{"g", "\x1b[B", "\x1b[D", "\x1b[H", "\x1b[C", "\x1b[F", "\r"},
+		{"g", "p", "\x1b[B", "\x1b[B", "\x1b[D", " "},
+	} {
+		probes = append(probes, scopedOracleProbe{Theme: "dark", Width: 100, Models: models, Enabled: enabledSets[0], Keys: keys})
+	}
 	// The Kitty keyboard protocol: the same sequences with the keys a Kitty terminal sends (CSI-u for control keys, enter, escape, space, backspace).
 	kitty := map[string]string{"\r": "\x1b[13u", " ": "\x1b[32u", "\x01": "\x1b[97;5u", "\x18": "\x1b[120;5u", "\x10": "\x1b[112;5u", "\x13": "\x1b[115;5u", "\x1b": "\x1b[27u", "\x03": "\x1b[99;5u", "\x7f": "\x1b[127u", "\x19": "\x1b[121;5u", "\x0b": "\x1b[107;5u", "\x05": "\x1b[101;5u", "\x15": "\x1b[117;5u", "\x14": "\x1b[116;5u", "\x04": "\x1b[100;5u"}
 	for _, base := range slices.Clone(probes) {
@@ -121,11 +130,10 @@ func TestScopedModelsSelectorMatchesPi(t *testing.T) {
 	if err := json.Unmarshal(output, &expected); err != nil {
 		t.Fatal(err)
 	}
-	previousTheme, previousCaps, previousKitty := tui.ActiveTheme(), tui.GetCapabilities(), tui.IsKittyProtocolActive()
+	restoreStartupTheme(t)
+	previousKitty := tui.IsKittyProtocolActive()
 	tui.SetKittyProtocolActive(false)
 	t.Cleanup(func() {
-		tui.SetCapabilities(previousCaps)
-		tui.SetTheme(previousTheme.Name)
 		tui.SetKittyProtocolActive(previousKitty)
 	})
 	reachedSave, reachedCancel, reachedChange, crashes := 0, 0, 0, 0

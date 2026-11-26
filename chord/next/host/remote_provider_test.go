@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"errors"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"weak"
 
 	"github.com/MichaelKinsy/PiG/chord"
+	chordctx "github.com/MichaelKinsy/PiG/chord/context"
 	"github.com/MichaelKinsy/PiG/chord/delta"
 	"github.com/MichaelKinsy/PiG/chord/next/contracts"
 	"github.com/MichaelKinsy/PiG/chord/next/data"
@@ -20,11 +22,12 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/link"
 	"github.com/MichaelKinsy/PiG/chord/next/state"
 	"github.com/MichaelKinsy/PiG/chord/nextnode"
+	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
-// pi: packages/chord/src/next/remote/provider.ts
+// pi: packages/chord/src/remote/provider.ts
 
-// Ports packages/chord/test/next/remote/provider.test.ts: the provider side of a link, driven by a raw consumer peer.
+// Ports packages/chord/test/remote/provider.test.ts: the provider side of a link, driven by a raw consumer peer.
 
 // holdSpec is what a `hold` message names of a type: its name, version and fingerprint (Pi spreads the contract and the
 // override).
@@ -217,12 +220,18 @@ type notesServerRaw struct {
 
 func notesServer(t testing.TB, child data.Principal, parent ...bool) *notesServerRaw {
 	t.Helper()
+	return notesServerOf(t, rawLinkedOptions{Child: child, Parent: len(parent) > 0 && parent[0]})
+}
+
+// notesServerOf is notesServer over options.
+func notesServerOf(t testing.TB, options rawLinkedOptions) *notesServerRaw {
+	t.Helper()
 	var probe *notesProbe
 	linkedHost := rawLinked(t, func(host FacetHost) error {
 		var err error
 		probe, err = serveNotes(host, nil)
 		return err
-	}, rawLinkedOptions{Child: child, Parent: len(parent) > 0 && parent[0]})
+	}, options)
 	return &notesServerRaw{rawLinkedHost: linkedHost, Probe: probe}
 }
 
@@ -494,6 +503,58 @@ func TestProviderOneMessagePerLinkPerCommit(t *testing.T) {
 			}
 		})
 
+		// Ports "a derive read between two changes of its source in one commit travels once: no protocol error, the link stays open"
+		// (Pi 36c709e720b6..f6600b58f347). Go forms: the commit is `server.batch.commit` run on the host's section loop; the
+		// contract's one variant is the helper's `v`.
+		t.Run("a derive read between two changes of its source in one commit travels once: no protocol error, the link stays open", func(t *testing.T) {
+			gauge := remoteOneVariant("test.gauge", contracts.Params{}, contracts.VariantDeclaration{
+				State: []contracts.Property{contracts.Prop("reading", contracts.Obj(contracts.Prop("n", contracts.Int())))},
+			})
+			var level state.Writable[any]
+			var reading chord.Watchable[delta.JsonValue]
+			l := linked(t, func(h FacetHost) error {
+				return h.Serve(gauge, func(_ *delta.JsonObject, _ data.Principal, self Self) (contracts.Implementation, error) {
+					source := self.Writable(float64(1))
+					derived := self.Derive([]any{source}, func(values []any) (delta.JsonValue, error) {
+						return jsonObject("n", values[0]), nil
+					})
+					level, reading = source, derived
+					return contracts.Implementation{Variant: "v", Members: contracts.VariantImplementation{
+						State: map[string]chord.Watchable[delta.JsonValue]{"reading": derived},
+					}}, nil
+				}, ServeOptions{})
+			}, linkedOptions{})
+			held := mustGet(t, l.Client, gauge, jsonObject())
+			if got, err := held.Member("reading").Value(); err != nil || !reflect.DeepEqual(got, any(jsonObject("n", float64(1)))) {
+				t.Fatalf("reading = %v, %v, want {n:1}", got, err)
+			}
+			// One commit of the server: its source changes, something reads the derive (as a reference of the host that keeps or
+			// binds the member in that commit does), its source changes again.
+			server := l.Server.(*chordHost)
+			server.events.Run(func() {
+				err := server.batch.Commit(func() error {
+					must(t, level.Set(float64(2)))
+					if got := reading.Value(); !reflect.DeepEqual(got, any(jsonObject("n", float64(2)))) {
+						t.Errorf("read in the commit = %v, want {n:2}", got)
+					}
+					must(t, level.Set(float64(3)))
+					return nil
+				}, background)
+				must(t, err)
+			})
+			transported(l.Links[0], l.Links[1])
+			if l.ServerErrors.Len() != 0 || l.ClientErrors.Len() != 0 {
+				t.Fatalf("errors = server %v, client %v; want none", l.ServerErrors.All(), l.ClientErrors.All())
+			}
+			if kind := stateOfRef(held).Kind; kind != RefStateLive {
+				t.Fatalf("state = %v, want live", kind)
+			}
+			if got, err := held.Member("reading").Value(); err != nil || !reflect.DeepEqual(got, any(jsonObject("n", float64(3)))) {
+				t.Fatalf("reading after = %v, %v, want {n:3}", got, err)
+			}
+			held.Release()
+		})
+
 		// Ports "a derive travels with its source in the same part".
 		t.Run("a derive travels with its source in the same part", func(t *testing.T) {
 			s := notesServer(t, nil)
@@ -647,9 +708,9 @@ func TestProviderRaces(t *testing.T) {
 					self.Open(func(context.Context) (any, error) {
 						events.add("open")
 						return nil, nil
-					}, func(any, NativeCloseReason, context.Context) error {
+					}, func(_ any, _ NativeCloseReason, ctx context.Context) error {
 						events.add("closing")
-						<-finish
+						_, _ = chordctx.Receive(context.WithoutCancel(ctx), finish)
 						events.add("closed")
 						return nil
 					})
@@ -1046,14 +1107,14 @@ func TestProviderOrigins(t *testing.T) {
 			nexttest.RequireJSONEqual(t, editor.NamedState(t, folded.Holds[0].Members)["count"], []any{[]any{"r", 4.0}})
 		})
 
-		// Ports "count calls per origin against N: 256 on each of two origins run, one more on one closes the link".
-		t.Run("count calls per origin against N: 256 on each of two origins run, one more on one closes the link", func(t *testing.T) {
-			s := notesServer(t, nil, true)
+		// Ports "count calls per origin against N: 8 on each of two origins run, one more on one closes the link".
+		t.Run("count calls per origin against N: 8 on each of two origins run, one more on one closes the link", func(t *testing.T) {
+			s := notesServerOf(t, rawLinkedOptions{Parent: true, CallWindow: new(8)})
 			provHold(t, s.Peer, 0, specOf(Notes), jsonObject("session", "S1"))
 			provHold(t, s.Peer, 0, specOf(Notes), jsonObject("session", "S1"), 1)
 			s.Peer.Next("bound")
 			s.Peer.Next("bound")
-			for id := range 256 {
+			for id := range 8 {
 				provCall(t, s.Peer, id, 0, wait, nil)
 				provCall(t, s.Peer, id, 0, wait, nil, 1)
 			}
@@ -1061,12 +1122,12 @@ func TestProviderOrigins(t *testing.T) {
 			if s.Peer.Closed() {
 				t.Fatal("the link closed within the limit")
 			}
-			provCall(t, s.Peer, 256, 0, wait, nil, 1)
+			provCall(t, s.Peer, 8, 0, wait, nil, 1)
 			settle(s.Peer)
 			if !s.Peer.Closed() {
 				t.Fatal("the link stayed open past the limit")
 			}
-			requireStrings(t, protocolErrors(s.Errors), []string{"call 256: more than 256 calls"})
+			requireStrings(t, protocolErrors(s.Errors), []string{"call 8: more than 8 calls"})
 		})
 
 		// Ports "ignore a call on a hold they do not know before counting it (Q1)".
@@ -1193,36 +1254,79 @@ var Halves = remoteOneVariant("app.halves", contracts.Params{}, contracts.Varian
 func TestProviderCallLimit(t *testing.T) {
 	forEachCodec(t, func(t *testing.T) {
 		wait := editorWire(t).Methods["wait"]
+		windowed := func(t testing.TB, window int, trusted bool, parent bool) *notesServerRaw {
+			return notesServerOf(t, rawLinkedOptions{Parent: parent, CallWindow: new(window), Trusted: trusted})
+		}
 
-		// Ports "the call limit › closes a link whose peer sends more calls than this side announced".
+		// Ports "the call limit (decision \"Call windows only for untrusted links\") › announces the host's callWindow on a link it was not given as trusted, 10,000 by default".
+		t.Run("announces the host's callWindow on a link it was not given as trusted, 10,000 by default", func(t *testing.T) {
+			if got := helloOf(t, notesServer(t, nil).Peer).Calls; got != 10_000 {
+				t.Fatalf("announced %d, want 10000", got)
+			}
+			if got := helloOf(t, windowed(t, 8, false, false).Peer).Calls; got != 8 {
+				t.Fatalf("announced %d, want 8", got)
+			}
+		})
+
+		// Ports "announces no window on a trusted link (accept and connect)".
+		t.Run("announces no window on a trusted link (accept and connect)", func(t *testing.T) {
+			for _, parent := range []bool{false, true} {
+				if got := helloOf(t, windowed(t, 8, true, parent).Peer).Calls; got != 0 {
+					t.Fatalf("parent=%v: announced %d, want none", parent, got)
+				}
+			}
+		})
+
+		// Ports "closes a link whose peer sends more calls than this side announced".
 		t.Run("closes a link whose peer sends more calls than this side announced", func(t *testing.T) {
-			s := notesServer(t, nil)
+			s := windowed(t, 8, false, false)
 			provHold(t, s.Peer, 0, specOf(Notes), jsonObject("session", "S1"))
 			s.Peer.Next("bound")
-			for id := range 257 {
+			for id := range 9 {
 				provCall(t, s.Peer, id, 0, wait, nil)
 			}
 			settle(s.Peer)
 			if !s.Peer.Closed() {
 				t.Fatal("the link stayed open")
 			}
-			requireStrings(t, protocolErrors(s.Errors), []string{"call 256: more than 256 calls"})
+			requireStrings(t, protocolErrors(s.Errors), []string{"call 8: more than 8 calls"})
+		})
+
+		// Ports "never closes a trusted link for running calls: 300 run where the window would be 8".
+		t.Run("never closes a trusted link for running calls: 300 run where the window would be 8", func(t *testing.T) {
+			s := windowed(t, 8, true, false)
+			provHold(t, s.Peer, 0, specOf(Notes), jsonObject("session", "S1"))
+			s.Peer.Next("bound")
+			for id := range 300 {
+				provCall(t, s.Peer, id, 0, wait, nil)
+			}
+			settle(s.Peer)
+			if s.Peer.Closed() {
+				t.Fatal("the trusted link closed")
+			}
+			s.Probe.AwaitWaits(t, 300)
+			if got := len(s.Probe.Waits()); got != 300 {
+				t.Fatalf("waits = %d, want 300", got)
+			}
+			if s.Errors.Len() != 0 {
+				t.Fatalf("errors = %v, want none", s.Errors.All())
+			}
 		})
 
 		// Ports "frees a slot per reply, cancel and release".
 		t.Run("frees a slot per reply, cancel and release", func(t *testing.T) {
-			s := notesServer(t, nil)
+			s := windowed(t, 8, false, false)
 			provHold(t, s.Peer, 0, specOf(Notes), jsonObject("session", "S1"))
 			s.Peer.Next("bound")
-			for id := range 256 {
+			for id := range 8 {
 				provCall(t, s.Peer, id, 0, wait, nil)
 			}
 			s.Peer.Send(&link.AbortMessage{Call: 0})
-			provCall(t, s.Peer, 256, 0, wait, nil)
+			provCall(t, s.Peer, 8, 0, wait, nil)
 			s.Peer.Send(&link.ReleaseMessage{Hold: 0})
 			provHold(t, s.Peer, 1, specOf(Notes), jsonObject("session", "S1"))
 			s.Peer.Next("bound")
-			for id := 300; id < 556; id++ {
+			for id := 300; id < 308; id++ {
 				provCall(t, s.Peer, id, 1, wait, nil)
 			}
 			settle(s.Peer)
@@ -1455,6 +1559,282 @@ func TestProviderGCOfTheWindowAClosedOriginDropsItsPendingQueuesOps(t *testing.T
 		nexttest.ExpectCollected(t, refs...)
 		if s.Peer.Closed() {
 			t.Fatal("the link closed")
+		}
+	})
+}
+
+// Ports the describe 'an answer after its state (decision "A call's answer follows its state")' of provider.test.ts.
+func TestProviderAnswerAfterItsState(t *testing.T) {
+	forEachCodec(t, func(t *testing.T) {
+		editor := editorWire(t)
+		add, fail := editor.Methods["add"], editor.Methods["fail"]
+
+		t.Run("sends the waiting state before a result when the window is full: one message, every hold, past the window", func(t *testing.T) {
+			s := slowConsumer(t)
+			provHold(t, s.Peer, 0, specOf(Notes), jsonObject("session", "S1"))
+			provHold(t, s.Peer, 1, specOf(Notes), jsonObject("session", "S2"))
+			s.Peer.Next("bound")
+			s.Peer.Next("bound")
+			addNote(t, s.Server, "S2", "a")
+			addNote(t, s.Server, "S2", "b")
+			provCall(t, s.Peer, 0, 0, add, jsonObject("text", "c"))
+			scopeEventually(t, "the result", func() bool { return slices.Contains(s.Peer.Kinds(), "result") })
+			settle(s.Peer)
+			// The two bindings fill the window: both commits and the call's own wait, then go before its result.
+			requireStrings(t, s.Peer.Kinds(), []string{"hello", "state", "result"})
+			holds := stateMessages(s.Peer)[0].Holds
+			if len(holds) != 2 || holds[0].Hold != 1 || holds[1].Hold != 0 {
+				t.Fatalf("state holds = %+v, want holds 1 then 0", holds)
+			}
+			nexttest.RequireJSONEqual(t, editor.NamedState(t, holds[0].Members)["count"], []any{[]any{"r", 2.0}})
+			nexttest.RequireJSONEqual(t, editor.NamedState(t, holds[1].Members)["count"], []any{[]any{"r", 1.0}})
+			nexttest.RequireJSONEqual(t, partValue(t, s.Peer.Next("result").(*link.ResultMessage).Value), 1.0)
+		})
+
+		t.Run("acknowledges every message once, in order, those past the window too: the window opens after their acks", func(t *testing.T) {
+			s := slowConsumer(t)
+			provHold(t, s.Peer, 0, specOf(Notes), jsonObject("session", "S1"))
+			s.Peer.Next("bound")
+			addNote(t, s.Server, "S1", "a")
+			addNote(t, s.Server, "S1", "b")
+			provCall(t, s.Peer, 0, 0, add, jsonObject("text", "c"))
+			s.Peer.Next("result")
+			addNote(t, s.Server, "S1", "d")
+			settle(s.Peer)
+			// Three in flight (the bound, a state, the state past the window): the first ack leaves the window full.
+			requireStrings(t, windowedKinds(s.Peer), []string{"state", "state"})
+			s.Peer.Ack(link.Optional[int]{})
+			settle(s.Peer)
+			requireStrings(t, windowedKinds(s.Peer), []string{"state", "state"})
+			s.Peer.Ack(link.Optional[int]{})
+			settle(s.Peer)
+			requireStrings(t, windowedKinds(s.Peer), []string{"state", "state", "state"})
+			for range 2 {
+				s.Peer.Ack(link.Optional[int]{})
+			}
+			settle(s.Peer)
+			// Acks crossing nothing are ignored: two slots, not more.
+			for range 2 {
+				s.Peer.Ack(link.Optional[int]{})
+			}
+			settle(s.Peer)
+			for _, text := range []string{"e", "f", "g"} {
+				addNote(t, s.Server, "S1", text)
+			}
+			settle(s.Peer)
+			requireStrings(t, windowedKinds(s.Peer), []string{"state", "state", "state", "state", "state"})
+		})
+
+		t.Run("sends nothing more when nothing waits: a full window, an answer of a call that changed nothing", func(t *testing.T) {
+			s := slowConsumer(t)
+			provHold(t, s.Peer, 0, specOf(Notes), jsonObject("session", "S1"))
+			s.Peer.Next("bound")
+			addNote(t, s.Server, "S1", "a")
+			provCall(t, s.Peer, 0, 0, fail, jsonObject("how", "chord"))
+			scopeEventually(t, "the error", func() bool { return slices.Contains(s.Peer.Kinds(), "error") })
+			settle(s.Peer)
+			requireStrings(t, s.Peer.Kinds(), []string{"hello", "state", "error"})
+		})
+
+		// The metric half of "costs nothing on the common path" (`chord.link.state_messages`) is T6's: the message kinds are the
+		// same claim.
+		t.Run("costs nothing on the common path: a call's commit goes out once, at its commit, never again with its answer", func(t *testing.T) {
+			l := rawLinked(t, func(h FacetHost) error { _, err := serveNotes(h, nil); return err }, rawLinkedOptions{})
+			provHold(t, l.Peer, 0, specOf(Notes), jsonObject("session", "S1"))
+			l.Peer.Next("bound")
+			for id, text := range []string{"a", "b", "c"} {
+				provCall(t, l.Peer, id, 0, add, jsonObject("text", text))
+				l.Peer.Next("result")
+			}
+			settle(l.Peer)
+			requireStrings(t, l.Peer.Kinds(), []string{"hello", "state", "state", "state"})
+		})
+	})
+}
+
+// Ports the describe 'old work from another host (decision "Reload restarts every affected object", `call.old`)' of provider.test.ts.
+func TestProviderOldWorkFromAnotherHost(t *testing.T) {
+	coded := mustContract(contracts.Remote("app.coded", contracts.RemoteDeclaration{
+		Version:     1,
+		Params:      contracts.Params{},
+		HostAddress: func(*delta.JsonObject) (contracts.Address, error) { return Server.Address(nil), nil },
+		Variants: []contracts.VariantEntry{contracts.Var("v", contracts.VariantDeclaration{Methods: []contracts.MethodEntry{
+			contracts.Meth("slow", contracts.NewMethod(contracts.Schema{}, contracts.Int())),
+			contracts.Meth("ping", contracts.NewMethod(contracts.Schema{}, contracts.Int())),
+		}})},
+	}))
+	names := wireNames(t, coded, "v")
+	serveCoded := func(h FacetHost, code float64, gate *reloadGate) error {
+		return h.Serve(coded, func(*delta.JsonObject, data.Principal, Self) (contracts.Implementation, error) {
+			return contracts.Implementation{Variant: "v", Members: contracts.VariantImplementation{Methods: map[string]contracts.MethodFunction{
+				"slow": func(_ delta.JsonValue, ctx context.Context) (delta.JsonValue, error) {
+					if gate != nil {
+						gate.entered.fire()
+						gate.open.await(t, ctx)
+					}
+					return code, nil
+				},
+				"ping": func(delta.JsonValue, context.Context) (delta.JsonValue, error) { return code, nil },
+			}}}, nil
+		}, ServeOptions{})
+	}
+	// pingDuringDrain holds `coded` on a server restarting it while its call `slow` drains, then sends `ping` (marked old when
+	// old) on a link trusted when trusted: the code that answered it and whether that came before the drain.
+	pingDuringDrain := func(t *testing.T, old, trusted bool) (float64, bool) {
+		gate := newReloadGate()
+		l := rawLinked(t, func(h FacetHost) error { return serveCoded(h, 1, gate) }, rawLinkedOptions{Trusted: trusted})
+		l.Peer.Next("hello")
+		provHold(t, l.Peer, 0, specOf(coded), jsonObject())
+		l.Peer.Next("bound")
+		provCall(t, l.Peer, 0, 0, names.Methods["slow"], nil)
+		gate.entered.wait(t)
+		reloadMust(t)(l.Server.Reload([]HostFacet{{Name: "@test/app", Facet: DefineFacet(func(h FacetHost, _ FacetSelf) error {
+			return serveCoded(h, 2, nil)
+		})}}, background, ReloadOptions{}))
+		l.Peer.Send(&link.CallMessage{Call: 1, Hold: 0, Method: names.Methods["ping"], Old: old})
+		settle(l.Peer)
+		early := false
+		for _, message := range l.Peer.Received() {
+			if result, ok := message.(*link.ResultMessage); ok && result.Call == 1 {
+				early = true
+			}
+		}
+		gate.open.fire()
+		first := l.Peer.Next("result").(*link.ResultMessage)
+		if first.Call != 1 {
+			first = l.Peer.Next("result").(*link.ResultMessage)
+		}
+		return partValue(t, first.Value).(float64), early
+	}
+	t.Run("runs a marked call from a trusted link on the open old attempt: answered by the old code, before the drain", func(t *testing.T) {
+		if code, early := pingDuringDrain(t, true, true); code != 1 || !early {
+			t.Fatalf("answered by %v (before the drain: %v), want 1, true", code, early)
+		}
+	})
+	t.Run("ignores the mark from a link that is not trusted: the call is new work and waits for the new code", func(t *testing.T) {
+		if code, early := pingDuringDrain(t, true, false); code != 2 || early {
+			t.Fatalf("answered by %v (before the drain: %v), want 2, false", code, early)
+		}
+	})
+	t.Run("runs an unmarked call from a trusted link as new work", func(t *testing.T) {
+		if code, early := pingDuringDrain(t, false, true); code != 2 || early {
+			t.Fatalf("answered by %v (before the drain: %v), want 2, false", code, early)
+		}
+	})
+}
+
+// --- telemetry at the provider (slice 9) --------------------------------------------------------------------------------
+
+// tracedNotes is `traced()`: a server recording on a fresh adapter and a raw peer holding session S1's notes.
+func tracedNotes(t *testing.T) (*telemetry.InMemoryTelemetryContext, *notesServerRaw) {
+	t.Helper()
+	recorder := telemetry.NewInMemoryTelemetryContext()
+	s := notesServerOf(t, rawLinkedOptions{Telemetry: recorder})
+	provHold(t, s.Peer, 0, specOf(Notes), jsonObject("session", "S1"))
+	s.Peer.Next("bound")
+	return recorder, s
+}
+
+// Ports provider.test.ts "telemetry at the provider (slice 9) › runs a call's method under its carrier, extracted with the
+// host's adapter; an absent or unknown one is a root".
+func TestProviderTelemetryRunsACallsMethodUnderItsCarrierExtractedWithTheHostsAdapterAnAbsentOrUnknownOneIsARoot(t *testing.T) {
+	forEachCodec(t, func(t *testing.T) {
+		recorder, s := tracedNotes(t)
+		var carrier telemetry.TelemetryCarrier
+		must(t, recorder.StartSpan(telemetry.SpanOptions{Name: "caller"}, func(span telemetry.TelemetrySpan) error {
+			carrier = recorder.Inject(span)
+			return nil
+		}))
+		add := editorWire(t).Methods["add"]
+		send := func(id int, text string, trace map[string]string) {
+			s.Peer.Send(&link.CallMessage{Call: id, Hold: 0, Method: add, Args: mustJSONPart(t, jsonObject("text", text)), Trace: trace})
+			s.Peer.Next("result")
+		}
+		send(0, "a", carrier)
+		provCall(t, s.Peer, 1, 0, add, jsonObject("text", "b"))
+		s.Peer.Next("result")
+		send(2, "c", map[string]string{"x": "y"})
+		caller := spanWhere(t, recorder, "caller", nil)
+		var methods []telemetry.RecordedTelemetrySpan
+		for _, span := range spansNamed(recorder, "chord.method") {
+			if typ, _ := span.Attributes.Get("type"); typ == "app.notes" {
+				methods = append(methods, span)
+			}
+		}
+		if len(methods) != 3 || !childOf(methods[0], caller) || methods[1].ParentID != nil || methods[2].ParentID != nil {
+			t.Fatalf("chord.method spans = %v, want [child of caller, root, root]", methods)
+		}
+		spanAttributesAre(t, methods[0], telemetry.SpanAttributes{
+			telemetry.Attr("chord.host", "server"), telemetry.Attr("type", "app.notes"), telemetry.Attr("member", "add"),
+			telemetry.Attr("object", "app.notes(S1)"), telemetry.Attr("principal.kind", "owner"),
+			telemetry.Attr("chord.principal", `{"kind":"owner"}`), telemetry.Attr("outcome", "ok"),
+		})
+	})
+}
+
+// Ports "counts holds placed here up and down, its own state messages, and the bytes of its link".
+func TestProviderTelemetryCountsHoldsPlacedHereUpAndDownItsOwnStateMessagesAndTheBytesOfItsLink(t *testing.T) {
+	forEachCodec(t, func(t *testing.T) {
+		recorder, s := tracedNotes(t)
+		addNote(t, s.Server, "S1", "a")
+		s.Peer.Next("state")
+		s.Peer.Send(&link.ReleaseMessage{Hold: 0})
+		settle(s.Peer)
+		sums := map[string]float64{}
+		var active []float64
+		directions := map[any]bool{}
+		for _, measurement := range recorder.GetMetrics() {
+			sums[measurement.Name] += measurement.Value
+			switch measurement.Name {
+			case "chord.holds.active":
+				active = append(active, measurement.Value)
+			case "chord.link.bytes":
+				direction, _ := measurement.Attributes.Get("direction")
+				directions[direction] = true
+			}
+		}
+		if sums["chord.holds.active"] != 0 || !slices.Equal(active, []float64{1, -1}) {
+			t.Errorf("chord.holds.active = %v (sum %v), want [1 -1]", active, sums["chord.holds.active"])
+		}
+		if sums["chord.link.state_messages"] != 1 || sums["chord.links.open"] != 1 {
+			t.Errorf("state_messages %v, links.open %v, want 1 and 1", sums["chord.link.state_messages"], sums["chord.links.open"])
+		}
+		if len(directions) != 2 || !directions["sent"] || !directions["received"] {
+			t.Errorf("chord.link.bytes directions = %v, want sent and received", directions)
+		}
+	})
+}
+
+// Ports "records how long state waited for a slot of the window".
+func TestProviderTelemetryRecordsHowLongStateWaitedForASlotOfTheWindow(t *testing.T) {
+	forEachCodec(t, func(t *testing.T) {
+		recorder := telemetry.NewInMemoryTelemetryContext()
+		s := notesServerOf(t, rawLinkedOptions{Telemetry: recorder})
+		a, b := link.MemoryLinkPair()
+		must(t, s.Server.Accept(a, LinkOptions{Principal: ownerPrincipal(), Codec: testCodec()}, background))
+		slow := newRawPeer(t, b, rawPeerOptions{NoAck: true})
+		provHold(t, slow, 0, specOf(Notes), jsonObject("session", "S1"))
+		slow.Next("bound")
+		addNote(t, s.Server, "S1", "a")
+		slow.Next("state")
+		waits := func() int {
+			count := 0
+			for _, measurement := range recorder.GetMetrics() {
+				if measurement.Name == "chord.backpressure.wait" {
+					count++
+				}
+			}
+			return count
+		}
+		// The window (two messages) is full: the next change waits for an ack.
+		addNote(t, s.Server, "S1", "b")
+		if got := waits(); got != 0 {
+			t.Fatalf("backpressure waits = %d before the ack, want 0", got)
+		}
+		slow.Ack(link.Optional[int]{})
+		slow.Next("state")
+		if got := waits(); got != 1 {
+			t.Fatalf("backpressure waits = %d after the ack, want 1", got)
 		}
 	})
 }

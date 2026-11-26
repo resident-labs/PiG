@@ -10,7 +10,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/sqlite"
 )
 
-// Ports packages/chord/src/next/store/adapter.ts
+// Ports packages/chord/src/store/adapter.ts
 //
 // The store for adapters (slice 6b §2.1, D1, D2): what an owner outside Chord's objects (Durable's `StoreStorage`)
 // uses to keep its data in the store as declared tables and engine documents: its tables declared and prepared under
@@ -60,7 +60,7 @@ func (owned *StoreOwnerTables) Prepare(ctx context.Context) error {
 	for index, table := range owned.tables {
 		tables[index] = DeclaredTable{Definition: table.Definition, Table: table.Sql.Table}
 	}
-	fence := CommitFence{Admit: func() bool { return true }, Adopt: func(int64, []int64) error { return nil }}
+	fence := CommitFence{Admit: func() bool { return true }, Adopt: func(int64, []int64, int) error { return nil }}
 	return PrepareTables(tables, owned.Store, fence, owned.Owner, ctx)
 }
 

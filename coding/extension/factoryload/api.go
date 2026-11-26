@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"runtime/debug"
 	"slices"
 	"sync"
 
 	"github.com/MichaelKinsy/PiG/ai"
 
 	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/internal/mcpshared"
 )
 
 type loadState int
@@ -296,9 +298,13 @@ func (a *api) RegisterToolRenderer(resolver extension.ToolRendererResolver) {
 	a.ext.ToolRenderers = append(a.ext.ToolRenderers, resolver)
 }
 
-func (a *api) RegisterMarkdownTransformer(transformer extension.MarkdownTransformer) {
+func (a *api) RegisterMarkdownTransformer(transformer extension.MarkdownTransformer, options ...extension.MarkdownTransformerOptions) {
 	a.assertActive()
-	a.ext.MarkdownTransformer = transformer
+	var messageTypes []extension.MarkdownMessageType
+	if len(options) > 0 {
+		messageTypes = options[0].MessageTypes
+	}
+	a.ext.MarkdownTransformer = extension.NewMarkdownTransformerRegistration(transformer, messageTypes)
 }
 
 // OwnThinkingRuns declares or withdraws this extension's ownership of thinking runs; it takes effect at once, also after loading.
@@ -361,18 +367,14 @@ func (a *api) GetSessionName() string {
 	return get()
 }
 
-// SetLabel sets the label of an entry; an empty label clears it, as upstream's `undefined` does.
+// SetLabel sets the label of an entry. The label is handed on as given: an empty one clears the label and its entry holds `"label":""`, as Pi's setLabel(entryId, "") does.
 func (a *api) SetLabel(entryID string, label string) {
 	a.assertActive()
 	set := a.runtime.SetLabel
 	if set == nil {
 		panic(notInitialized())
 	}
-	var value *string
-	if label != "" {
-		value = &label
-	}
-	if err := set(entryID, value); err != nil {
+	if err := set(entryID, &label); err != nil {
 		panic(err)
 	}
 }
@@ -488,7 +490,7 @@ func (a *api) RegisterMcpServer(name string, config extension.McpServerConfig) e
 	}
 	// Names that differ only in `-` and `_` would share a namespace.
 	for _, server := range a.runtime.McpServers().List() {
-		if server.Name != name && extension.McpNamespace(server.Name) == extension.McpNamespace(name) {
+		if server.Name != name && mcpshared.McpNamespace(server.Name) == mcpshared.McpNamespace(name) {
 			return fmt.Errorf(`MCP server "%s" conflicts with registered server "%s"`, name, server.Name)
 		}
 	}
@@ -537,7 +539,16 @@ func (e apiEvents) Emit(channel string, data any) {
 
 func (e apiEvents) On(channel string, handler func(data any)) func() {
 	e.a.assertActive()
-	unsubscribe := e.a.runtime.TrackEventBusSubscription(e.a.bus.On(channel, handler))
+	// Report a panicking handler like other extension errors: the event bus would print it on stderr, which draws over the interactive TUI (Pi #11264).
+	reporting := func(data any) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				e.a.reportEventsError(channel, recovered)
+			}
+		}()
+		handler(data)
+	}
+	unsubscribe := e.a.runtime.TrackEventBusSubscription(e.a.bus.On(channel, reporting))
 	e.a.mu.Lock()
 	e.a.nextSubscription++
 	id := e.a.nextSubscription
@@ -555,4 +566,19 @@ func (e apiEvents) On(channel string, handler func(data any)) func() {
 		delete(e.a.subscriptions, id)
 		e.a.mu.Unlock()
 	}
+}
+
+// reportEventsError sends a pi.events handler's failure to the runtime's error reporter with the extension's path and `events:<channel>`, as Pi's wrapped handler does; the report is dropped before a runner exists or once it is stale. The stack is the panicking goroutine's, after the message line, as upstream formats `err.stack`.
+// upstream: loader.ts:537-549 (on)
+func (a *api) reportEventsError(channel string, recovered any) {
+	message := fmt.Sprint(recovered)
+	if err, ok := recovered.(error); ok {
+		message = err.Error()
+	}
+	a.runtime.ReportRuntimeError(&extension.ExtensionError{
+		ExtensionPath: a.ext.Path,
+		Event:         "events:" + channel,
+		Error:         message,
+		Stack:         message + "\n" + string(debug.Stack()),
+	})
 }

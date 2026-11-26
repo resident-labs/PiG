@@ -17,11 +17,13 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/jsloop"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/jsstring/localecompare"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/internal/nodepath"
 	"github.com/MichaelKinsy/PiG/mcp"
+	"github.com/MichaelKinsy/PiG/mcp/oauth"
 )
 
 // Ports packages/coding-agent/src/extensions/mcp/index.ts.
@@ -88,6 +90,16 @@ type EventContext struct {
 	IsProjectTrusted func() bool
 	// Notify shows a message to the user. Level is "info", "warning", or "error".
 	Notify func(message, level string)
+}
+
+// yield reports that the handler stops running synchronously, as Pi's handler reaches an await (handleryield), and returns the channel
+// that closes when the handler's context ends: nil for an EventContext without one.
+func (c EventContext) yield() <-chan struct{} {
+	if c.Context == nil {
+		return nil
+	}
+	handleryield.Report(c.Context)
+	return c.Context.Done()
 }
 
 // notify shows a message. A panic in Notify propagates, as a throw from ctx.ui.notify does in upstream.
@@ -271,17 +283,7 @@ func truncateChars(text string, max int) string {
 	if max <= 1 {
 		return ""
 	}
-	return strings.TrimRightFunc(jsstring.Slice(text, 0, max-1), isJSWhitespace) + "…"
-}
-
-// serverSummary is the first line of the configured description, or of the server instructions once connected.
-func serverSummary(server McpServerListing) string {
-	text := strings.TrimFunc(server.Entry.Config.Description, isJSWhitespace)
-	if text == "" {
-		text = server.Instructions
-	}
-	first, _, _ := strings.Cut(text, "\n")
-	return strings.TrimFunc(first, isJSWhitespace)
+	return strings.TrimRightFunc(jsstring.SliceHead(text, max-1), isJSWhitespace) + "…"
 }
 
 // RenderServersSection is the `mcp_servers` section: every enabled server with codemode or deferred tools, with how its
@@ -301,7 +303,7 @@ func RenderServersSection(servers []McpServerListing) (string, bool) {
 	if len(listed) == 0 {
 		return "", false
 	}
-	slices.SortStableFunc(listed, func(a, b McpServerListing) int { return localecompare.Compare(a.Entry.Name, b.Entry.Name) })
+	sortx.Stable(listed, func(a, b McpServerListing) int { return localecompare.Compare(a.Entry.Name, b.Entry.Name) })
 	heads := make([]string, len(listed))
 	reaches := map[string]bool{}
 	for i, server := range listed {
@@ -310,7 +312,7 @@ func RenderServersSection(servers []McpServerListing) (string, bool) {
 			reach = "codemode"
 		}
 		reaches[reach] = true
-		heads[i] = fmt.Sprintf("- %s (%s)", extension.McpNamespace(server.Entry.Name), reach)
+		heads[i] = fmt.Sprintf("- %s (%s)", mcp.McpNamespace(server.Entry.Name), reach)
 	}
 	intro := serversSectionIntro(reaches)
 	omitted := func(count int) []string {
@@ -336,7 +338,7 @@ func RenderServersSection(servers []McpServerListing) (string, bool) {
 	for i, server := range listed[:kept] {
 		summary := ""
 		if perServer > 0 {
-			summary = truncateChars(serverSummary(server), perServer)
+			summary = truncateChars(mcp.McpServerSummary(server.Entry.Config.Description, server.Instructions), perServer)
 		}
 		lines[i] = heads[i]
 		if summary != "" {
@@ -480,7 +482,7 @@ func (e *Extension) registeredServers() (registered []*server, overriddenNames [
 	e.mu.Unlock()
 	for _, reg := range e.host.GetMcpServers() {
 		if i := slices.IndexFunc(configured, func(entry McpServerEntry) bool {
-			return extension.McpNamespace(entry.Name) == extension.McpNamespace(reg.Name)
+			return mcp.McpNamespace(entry.Name) == mcp.McpNamespace(reg.Name)
 		}); i >= 0 {
 			overriddenNames = append(overriddenNames, fmt.Sprintf(`"%s" registered by %s is overridden by "%s" in %s`, reg.Name, reg.ExtensionPath, configured[i].Name, configured[i].Source))
 			continue
@@ -557,7 +559,7 @@ func (e *Extension) registerTools(connection *Connection) {
 	name := connection.Entry.Name
 	entry := e.currentEntry(connection)
 	namespace := extension.ToolNamespace{
-		Name: extension.McpNamespace(name),
+		Name: mcp.McpNamespace(name),
 		// `describeNamespace("docs")` finds `mcp__docs` (Pi 1.2.0 extensions/mcp/index.ts:392-394, 24382bed).
 		Aliases:      []string{name},
 		Description:  strings.TrimFunc(entry.Config.Description, isJSWhitespace),
@@ -574,11 +576,11 @@ func (e *Extension) registerTools(connection *Connection) {
 	for _, tool := range connection.Tools() {
 		if !seen[tool.Name] {
 			seen[tool.Name] = true
-			plainCount[CreateMcpToolName(name, tool.Name, nil)]++
+			plainCount[mcp.CreateMcpToolName(name, tool.Name, nil)]++
 		}
 	}
 	assignName := func(tool, owner string) string {
-		toolName := CreateMcpToolName(name, tool, func(candidate string) bool {
+		toolName := mcp.CreateMcpToolName(name, tool, func(candidate string) bool {
 			existing, taken := e.toolOwners[candidate]
 			return (taken && existing != owner) || current.has(candidate) ||
 				plainCount[candidate] > 1
@@ -1239,7 +1241,7 @@ func (e *Extension) SignIn(ctx context.Context, name string, prompt McpSignInPro
 	})
 	exit()
 	if err != nil {
-		if _, cancelled := errors.AsType[*McpSignInCancelledError](err); cancelled {
+		if _, cancelled := errors.AsType[*oauth.McpSignInCancelledError](err); cancelled {
 			return "Sign-in cancelled."
 		}
 		return "Sign-in failed: " + err.Error()
@@ -1702,7 +1704,7 @@ func reachesServer(reach extension.ToolReach, server string) bool {
 	if reach.All {
 		return true
 	}
-	namespace := extension.McpNamespace(server)
+	namespace := mcp.McpNamespace(server)
 	return slices.ContainsFunc(reach.Words, func(word string) bool { return strings.Contains(word, namespace) })
 }
 
@@ -1821,6 +1823,9 @@ func (e *Extension) McpServersChange(ctx EventContext) {
 	e.mu.Unlock()
 	e.emitChange()
 	e.ensureDiscoveryActive(ctx)
+	// Pi's handler awaits here for the first time (index.ts:1236): what precedes ran inside the registration that fired the event
+	// (runner.ts:465-468), and the Runner's listener goes on at this report.
+	done := ctx.yield()
 	var closing sync.WaitGroup
 	for _, s := range removed {
 		e.mu.Lock()
@@ -1845,7 +1850,13 @@ func (e *Extension) McpServersChange(ctx EventContext) {
 		readies[i] = e.startConnection(ctx, s, nil)
 	}
 	for _, ready := range readies {
-		<-ready
+		select {
+		case <-ready:
+		case <-done:
+			// The Runner that dispatched the event was invalidated, which makes ctx stale: the connections stay under the session,
+			// which closes them when it ends.
+			return
+		}
 	}
 	if session.Err() != nil {
 		// The session ended meanwhile: close what connected.

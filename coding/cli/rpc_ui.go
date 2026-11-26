@@ -14,6 +14,7 @@ import (
 
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
 // rpcUIResponse is an extension_ui_response as Pi reads it: `value` and `confirmed` are whatever JSON the client sent (rpc-mode.ts:137-150 `"value" in r ? r.value : undefined`,
@@ -63,7 +64,7 @@ func (r rpcUIResponse) stringValue() (string, error) {
 		return "", err
 	}
 	var text string
-	if json.Unmarshal(raw, &text) != nil {
+	if jsstring.UnmarshalKeepingSurrogates(raw, &text) != nil {
 		return "", context.Canceled
 	}
 	return text, nil
@@ -126,6 +127,10 @@ func newRPCUIContext(output func(any)) *rpcUIContext {
 func (u *rpcUIContext) request(ctx context.Context, request rpcUIRequest, opts extension.ExtensionUIDialogOptions) (rpcUIResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	// rpc-mode.ts:101: a dialog whose signal is already aborted resolves its default before any request is written.
+	if err := ctx.Err(); err != nil {
+		return rpcUIResponse{}, err
 	}
 	id := uuid.NewString()
 	request.Type = "extension_ui_request"

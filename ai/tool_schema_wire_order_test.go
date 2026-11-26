@@ -91,7 +91,7 @@ var providerToolsWire = []struct {
 	api, provider, model, member, want string
 }{
 	{"anthropic-messages", "anthropic", "claude-sonnet-4-5", "tools",
-		`[{"name":"enum_probe","description":"probe","eager_input_streaming":true,"input_schema":{"type":"object","properties":{"zeta":{"type":"string","description":"z"},"mode":{"type":"string","enum":["fast","slow"],"description":"how","default":"fast"},"alpha":{"type":"number"}},"required":["zeta","mode"]},"cache_control":{"type":"ephemeral"}}]`},
+		`[{"name":"enum_probe","description":"probe","eager_input_streaming":true,"input_schema":{"type":"object","properties":{"zeta":{"type":"string","description":"z"},"mode":{"type":"string","enum":["fast","slow"],"description":"how","default":"fast"},"alpha":{"type":"number"}},"required":["zeta","mode"],"additionalProperties":false},"cache_control":{"type":"ephemeral"}}]`},
 	{"openai-responses", "openai", "gpt-5", "tools",
 		`[{"type":"function","name":"enum_probe","description":"probe","parameters":{"type":"object","properties":{"zeta":{"type":"string","description":"z"},"mode":{"type":"string","enum":["fast","slow"],"description":"how","default":"fast"},"alpha":{"type":"number"}},"required":["zeta","mode"],"additionalProperties":false},"strict":false}]`},
 	{"azure-openai-responses", "azure", "gpt-4.1", "tools",
@@ -108,6 +108,10 @@ var providerToolsWire = []struct {
 // insertion order; before StringEnum was an ordered object the schema was a Go map, and every provider wrote it with its members sorted by name.
 func TestToolSchemaKeepsAuthoredOrderInProviderRequests(t *testing.T) {
 	for _, c := range providerToolsWire {
+		if !BuiltAPI(API(c.api)) {
+			// A build with this API's pig_strip tag has no provider for the row.
+			continue
+		}
 		t.Run(c.api, func(t *testing.T) {
 			body := captureToolsBody(t, c.provider, c.model, []ToolSchema{orderedProbeSchema(t)})
 			if got := toolsMember(t, body, c.member); got != c.want {

@@ -105,8 +105,9 @@ func newJobGate() *jobGate { return &jobGate{done: make(chan struct{})} }
 // Open is `resolve()`.
 func (g *jobGate) Open() { g.once.Do(func() { close(g.done) }) }
 
-// Wait is `await gate.promise`.
-func (g *jobGate) Wait() { <-g.done }
+// Wait is `await gate.promise`: a run that waits for it waits parked, as a promise pending on something outside the host
+// (the join of the host's loop does not wait for it, as Pi's `delivered()` does not).
+func (g *jobGate) Wait() { parkedOn(g.done) }
 
 // Done is the channel of the promise.
 func (g *jobGate) Done() <-chan struct{} { return g.done }
@@ -142,6 +143,9 @@ type virtualLoop struct {
 
 func newVirtualLoop() *virtualLoop { return &virtualLoop{Loop: NewLoop(), fake: newFakeLoop()} }
 
+// counted: the virtual-time loop has nothing to join (the embedded Loop's count is not the host's join).
+func (l *virtualLoop) counted() *Loop { return nil }
+
 // nextDue is the time of the earliest pending timer.
 func (l *virtualLoop) nextDue() int64 {
 	l.fake.mu.Lock()
@@ -172,7 +176,7 @@ func jobsLoaded(t testing.TB, setup func(host FacetHost) error, options jobHostO
 	t.Helper()
 	errs := &hostErrors{}
 	hostOptions := HostOptions{
-		Telemetry: options.Telemetry, CloseTimeout: options.CloseTimeout, ReadyTimeout: options.ReadyTimeout,
+		Telemetry: telemetryOf(options.Telemetry), CloseTimeout: options.CloseTimeout, ReadyTimeout: options.ReadyTimeout,
 		Store: options.Store, OnError: errs.push,
 	}
 	if options.Loop != nil {

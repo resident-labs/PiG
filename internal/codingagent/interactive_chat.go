@@ -46,6 +46,15 @@ func (m *InteractiveMode) markdownThemeWithSettings() *tui.MarkdownTheme {
 // context's messageId and timestamp (Pi #11270 messageMeta). It is the zero value for a live message.
 type messageMeta struct{ ID, Timestamp string }
 
+// entryMeta is the messageMeta of a message drawn from a persisted session entry of a restored transcript, as Pi's renderSessionEntries
+// fills it. An entry without an id gives the zero value.
+func entryMeta(base SessionEntryBase) messageMeta {
+	if base.ID == "" {
+		return messageMeta{}
+	}
+	return messageMeta{ID: base.ID, Timestamp: base.Timestamp}
+}
+
 func (m *InteractiveMode) newUserMessageBlock(text string, meta messageMeta) *tui.UserMessageComponent {
 	block := tui.NewUserMessageComponent(text, m.markdownThemeWithSettings(), m.outputPad, nil, meta.ID, meta.Timestamp)
 	retry := &markdownRetry{m: m}
@@ -122,9 +131,14 @@ func (r *markdownRetry) state() string {
 	return ""
 }
 
+// hasExtensionMarkdownTransformers reports whether an extension registered a Markdown transformer.
+func (m *InteractiveMode) hasExtensionMarkdownTransformers() bool {
+	return m.newRunner != nil && len(m.newRunner.GetMarkdownTransformers()) > 0
+}
+
 // hasAsyncMarkdownTransformers reports whether asyncMarkdownTransform yields a transform; callers skip building its arguments when it does not.
 func (m *InteractiveMode) hasAsyncMarkdownTransformers() bool {
-	return m.backgroundCtx != nil && m.newRunner != nil && len(m.newRunner.GetMarkdownTransformers()) > 0
+	return m.backgroundCtx != nil && m.hasExtensionMarkdownTransformers()
 }
 
 // Ports packages/coding-agent/src/modes/interactive/components/markdown-transform.ts.
@@ -141,7 +155,7 @@ func (m *InteractiveMode) asyncMarkdownTransform(block *tui.AssistantMessageComp
 		Invalidate: m.requestRender,
 		Prepare: func(markdown string, width int) func(context.Context) string {
 			mode, theme := m.mermaidRenderingMode(), tui.ActiveTheme()
-			transformers := []extension.MarkdownTransformer{createMermaidMarkdownTransformer(func() string { return mode }, theme)}
+			transformers := []extension.MarkdownTransformer{createCountedMermaidMarkdownTransformer(func() string { return mode }, theme, &m.mermaidFoldScanned)}
 			transformers = append(transformers, m.newRunner.GetMarkdownTransformers()...)
 			streaming := block != nil && m.evCurrentBlock == block && m.hasActiveAgentTurn()
 			// Logical replacement revokes publication, not admitted chain execution. The captured Mode context owns invocation cancellation; subprocess inactivity and disconnect remain independent exit conditions.
@@ -212,13 +226,65 @@ func (m *InteractiveMode) markdownTransformers() []extension.MarkdownTransformer
 		return m.markdownTransformerList
 	}
 	transformers := []extension.MarkdownTransformer{
-		createMermaidMarkdownTransformer(m.mermaidRenderingMode, theme),
+		createCountedMermaidMarkdownTransformer(m.mermaidRenderingMode, theme, &m.mermaidFoldScanned),
 	}
 	if m.newRunner != nil {
 		transformers = append(transformers, m.newRunner.GetMarkdownTransformers()...)
 	}
 	m.markdownTransformerList, m.markdownTransformerTheme, m.markdownTransformerRunner = transformers, theme, m.newRunner
 	return transformers
+}
+
+// surfaceMarkdownTransform is the display-only transform of a Markdown surface that is not a transcript message: custom messages and skill blocks
+// ("custom"), branch and compaction summaries ("summary"), the changelog notices ("changelog"). It is Pi's createMarkdownTransform(messageType, () => false,
+// getMarkdownTransformers(), messageId, timestamp); meta is the zero value for a message that is not rendered from a restored session entry.
+//
+// Pi only re-renders a Markdown when its text or width changes, so a surface is static unless an extension registered a transformer: only then does it
+// carry the state its chain reads, which makes the component polled every frame, and run the chain off the render loop (asyncMarkdownTransform, D19) as the
+// user and assistant messages do.
+func (m *InteractiveMode) surfaceMarkdownTransform(messageType extension.MarkdownMessageType, meta messageMeta) tui.MarkdownSurface {
+	retry := &markdownRetry{m: m}
+	surface := tui.MarkdownSurface{Transform: func(markdown string, width int) string {
+		return markdowntransform.ApplyMarkdownTransformers(markdown, extension.MarkdownTransformContext{MessageType: messageType, AvailableWidth: width, MessageID: meta.ID, Timestamp: meta.Timestamp, Retry: retry.requester()}, m.markdownTransformers())
+	}}
+	if m.hasExtensionMarkdownTransformers() {
+		surface.State = m.surfaceMarkdownTransformState(retry)
+		surface.Async = m.asyncMarkdownTransform(nil, messageType, retry, meta)
+	}
+	return surface
+}
+
+// surfaceMarkdownTransformState is the state a surface's chain reads for the render cache key: the Mermaid mode, the retry count and the theme. The
+// string is rebuilt only when one of them changes, so a frame that reads it allocates nothing.
+func (m *InteractiveMode) surfaceMarkdownTransformState(retry *markdownRetry) func() string {
+	var (
+		state string
+		mode  string
+		count uint64
+		theme *tui.Theme
+		built bool
+	)
+	return func() string {
+		currentMode, currentCount, currentTheme := m.mermaidRenderingMode(), retry.count.Load(), tui.ActiveTheme()
+		if !built || mode != currentMode || count != currentCount || theme != currentTheme {
+			state = currentMode + retry.state()
+			if currentTheme != nil {
+				state += " " + currentTheme.Name
+			}
+			mode, count, theme, built = currentMode, currentCount, currentTheme, true
+		}
+		return state
+	}
+}
+
+// newChangelogMarkdown is InteractiveMode.createChangelogMarkdown: the Markdown of a changelog or release note, which runs the transformers of the
+// "changelog" type.
+func (m *InteractiveMode) newChangelogMarkdown(markdown string, paddingX, paddingY int, style *tui.DefaultTextStyle) *tui.Markdown {
+	surface := m.surfaceMarkdownTransform(extension.MarkdownMessageChangelog, messageMeta{})
+	block := tui.NewMarkdownWithOptions(markdown, paddingX, paddingY, m.markdownThemeWithSettings(), style, &tui.MarkdownOptions{Transform: surface.Transform})
+	block.TransformState = surface.State
+	block.AsyncTransform = surface.Async
+	return block
 }
 
 // assistantMarkdownTransformState fingerprints the live state
@@ -292,7 +358,7 @@ func (m *InteractiveMode) showNewVersionNotification(release LatestPiRelease) {
 	blocks := []tui.Component{tui.NewThemedText(func() string { return binaryUpdateNoticeBody(tui.ActiveTheme(), release.Version, AppName+" update") }, 1, 0)}
 	if note != "" {
 		muted := func(text string) string { return noticeFg(t.Muted, text) }
-		noteBody := tui.NewMarkdownWithOptions(note, 1, 0, m.markdownThemeWithSettings(), &tui.DefaultTextStyle{Color: muted}, nil)
+		noteBody := m.newChangelogMarkdown(note, 1, 0, &tui.DefaultTextStyle{Color: muted})
 		noteBody.FinishStreaming()
 		blocks = append(blocks,
 			tui.NewSpacer(1),
@@ -363,11 +429,35 @@ func (m *InteractiveMode) finishPackageUpdateCheck(goos string, updates []string
 // updateTerminalTitle sets the title from the session name and the cwd.
 // Mirrors upstream updateTerminalTitle (interactive-mode.ts).
 func (m *InteractiveMode) updateTerminalTitle() {
-	setTerminalTitle(tui.BuildTerminalTitle(m.currentSession().GetSessionName(), m.opts.CWD))
+	name := ""
+	if session := m.currentSession(); session != nil {
+		name = session.GetSessionName()
+	}
+	m.setTerminalTitle(tui.BuildTerminalTitle(name, m.opts.CWD))
 }
 
-// setTerminalTitle writes the terminal title; tests replace it.
-var setTerminalTitle = tui.SetTerminalTitle
+// setTerminalTitle writes title on the terminal the renderer draws on, as every title write of Pi's interactive mode does
+// (interactive-mode.ts `this.ui.terminal.setTitle`): the session's title and an extension's title. The
+// process terminal is that terminal only when the mode was given no other, so the title never goes past the renderer to the process's
+// stdout.
+func (m *InteractiveMode) setTerminalTitle(title string) {
+	m.writeBetweenFrames(func() {
+		// The terminal is read from where createInteractiveTui kept it: this write may run on a goroutine that is not the owner loop, once the exit's stop began.
+		if terminal := m.drawTerminal.Load(); terminal != nil {
+			(*terminal).SetTitle(title)
+		} else if m.tuiInst != nil {
+			m.tuiInst.Terminal().SetTitle(title)
+		}
+	})
+}
+
+// setTerminalProgress turns the OSC 9;4 progress indicator of the terminal the renderer draws on on or off (interactive-mode.ts
+// `this.ui.terminal.setProgress`).
+func (m *InteractiveMode) setTerminalProgress(active bool) {
+	if m.tuiInst != nil {
+		m.tuiInst.Terminal().SetProgress(active)
+	}
+}
 
 // appendBorderedNotice wraps the supplied body components between two
 // warning-colored DynamicBorders, mirroring upstream's
@@ -381,7 +471,7 @@ func (m *InteractiveMode) appendBorderedNotice(blocks ...tui.Component) {
 		m.chatContainer.Add(b)
 	}
 	m.chatContainer.Add(tui.NewDynamicBorderToken("warning"))
-	m.tuiInst.Render()
+	m.requestRenderPastHold()
 }
 
 // lastAssistantMessageText is session.getLastAssistantText(), which /copy reads (interactive-mode.ts handleCopyCommand): empty when the Session has no assistant text.
@@ -486,7 +576,7 @@ func (m *InteractiveMode) showManagedToolStatus(status tools.ToolStatus) {
 	m.lastStatusSpacer = nil
 	m.lastStatusText = nil
 	if m.tuiInst != nil {
-		m.tuiInst.Render()
+		m.requestRenderPastHold()
 	}
 }
 
@@ -507,13 +597,9 @@ func (m *InteractiveMode) showStatus(msg string) {
 		m.lastStatusSpacer = spacer
 		m.lastStatusText = text
 	}
-	// Mirror upstream's `this.ui.requestRender()` (interactive-mode.ts:2918,2927).
-	// Without this, status messages added inside synchronous handlers
-	// (e.g. /tree empty-session, /branch-summarize cancelled) never make
-	// it to the screen because nothing else triggers a render before the
-	// The handler requests a render before it returns.
+	// Mirror upstream's `this.ui.requestRender()` (interactive-mode.ts:3972,3983): a request, painted by the next frame, never a render of its own (D270: while a /tree hold lasts, the paint is by name).
 	if m.tuiInst != nil {
-		m.tuiInst.Render()
+		m.requestRenderPastHold()
 	}
 }
 

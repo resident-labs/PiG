@@ -234,11 +234,11 @@ func (r *withSessionRoute) ready() *ReadyPayload {
 	if r.target == nil {
 		return nil
 	}
-	ready := &ReadyPayload{Cwd: r.target.cwd, Mode: r.target.mode}
+	ready := &ReadyPayload{Group: r.target.Group(), Cwd: r.target.cwd, Mode: r.target.mode}
 	if r.target.uiBridge != nil {
 		var flags []string
 		if r.member != nil {
-			flags = r.member.flagNames
+			flags = r.member.registration().flagNames
 		}
 		ready.State = r.target.uiBridge.Snapshot(flags, 0, false)
 	}

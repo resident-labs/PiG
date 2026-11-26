@@ -12,7 +12,7 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/chord/chordjson"
 )
 
-// Ports packages/chord/src/next/link/text.ts. The text codec (2b): one JSON tuple per message, Delta style (a short kind
+// Ports packages/chord/src/link/text.ts. The text codec (2b): one JSON tuple per message, Delta style (a short kind
 // tag, positional fields, no field names), and DescribeMessage, which prints any message in that form. A part's JSON
 // text is spliced into the tuple as it is; decoding parses the tuple and writes each part back as text (one parse per
 // part per hop: a debugging codec). Byte segments of a payload marked as carrying bytes follow the tuple after a
@@ -129,13 +129,16 @@ func idList(ids []string) []any {
 func ownTuple(message Message) string {
 	switch typed := message.(type) {
 	case *HelloMessage:
+		if typed.Calls == 0 {
+			return jsonText([]any{"h", float64(typed.Protocol), typed.Incarnation})
+		}
 		return jsonText([]any{"h", float64(typed.Protocol), typed.Incarnation, float64(typed.Calls)})
 	case *HoldMessage:
 		head := jsonText([]any{"H", float64(typed.Hold), typed.Type, float64(typed.Version), typed.Fingerprint})
 		//portlint:allow utf16units head is jsonText's output, ending in the one-byte ASCII ']' that is also one code unit; dropped as .slice(0, -1) at text.ts:77
 		head = head[:len(head)-1]
 		// Optional trailing fields: an absent one in the middle is null, absent ones at the end are left out.
-		optional := []any{nil, nil, nil, nil}
+		optional := []any{nil, nil, nil, nil, nil}
 		if typed.Principal != nil {
 			optional[0] = typed.Principal
 		}
@@ -148,6 +151,9 @@ func ownTuple(message Message) string {
 		if typed.Limit.Ok {
 			optional[3] = float64(typed.Limit.Value)
 		}
+		if typed.Trace != nil {
+			optional[4] = carrierValue(typed.Trace, typed.TraceOrder)
+		}
 		for len(optional) > 0 && optional[len(optional)-1] == nil {
 			optional = optional[:len(optional)-1]
 		}
@@ -159,7 +165,33 @@ func ownTuple(message Message) string {
 	case *ReleaseMessage:
 		return jsonText([]any{"R", float64(typed.Hold)})
 	case *CallMessage:
-		return withPayload(jsonText([]any{"c", float64(typed.Call), float64(typed.Hold), float64(typed.Method)}), typed.Args, typed.Segments)
+		head := jsonText([]any{"c", float64(typed.Call), float64(typed.Hold), float64(typed.Method)})
+		if typed.Trace == nil && !typed.Old {
+			return withPayload(head, typed.Args, typed.Segments)
+		}
+		// With a trace or the old-work flag the payload's fields are positional (null when absent), the carrier next
+		// (null when absent before the flag), the flag last.
+		lengths := "null"
+		if typed.Segments != nil {
+			sizes := make([]any, len(typed.Segments))
+			for index, segment := range typed.Segments {
+				sizes[index] = float64(len(segment))
+			}
+			lengths = jsonText(sizes)
+		}
+		part := "null"
+		if typed.Args != nil {
+			part = mustPartText(typed.Args)
+		}
+		tail := "null"
+		if typed.Trace != nil {
+			tail = jsonText(carrierValue(typed.Trace, typed.TraceOrder))
+		}
+		if typed.Old {
+			tail += ",true"
+		}
+		//portlint:allow utf16units head is a closed JSON tuple ending in the one-byte ASCII ']' that is also one code unit; dropped as head.slice(0, -1) at text.ts:96
+		return head[:len(head)-1] + "," + part + "," + lengths + "," + tail + "]"
 	case *AbortMessage:
 		return jsonText([]any{"x", float64(typed.Call)})
 	case *BoundMessage:
@@ -193,7 +225,16 @@ func ownTuple(message Message) string {
 	case *LoadingMessage:
 		return jsonText([]any{"l", float64(typed.Hold)})
 	case *AckMessage:
+		if typed.Events.Ok {
+			return jsonText([]any{"a", float64(typed.Events.Value)})
+		}
 		return `["a"]`
+	case *EventMessage:
+		entries := make([]string, len(typed.Events))
+		for index, entry := range typed.Events {
+			entries[index] = "[" + strconv.Itoa(entry.Hold) + "," + strconv.Itoa(entry.Member) + "," + strconv.Itoa(entry.At) + "," + mustPartText(entry.Value) + "]"
+		}
+		return `["E",[` + strings.Join(entries, ",") + "]]"
 	case *ClosedMessage:
 		return `["C"]`
 	case *PingMessage:
@@ -339,10 +380,17 @@ func fromFields(fields []any, rest []byte) Message {
 	}
 	switch tag {
 	case "h":
-		arity(3)
-		return &HelloMessage{Protocol: asInt(f[0]), Incarnation: asString(f[1]), Calls: asInt(f[2])}
+		arity(2, 3)
+		message := &HelloMessage{Protocol: asInt(f[0]), Incarnation: asString(f[1])}
+		if len(f) == 3 {
+			// A window is at least 1: the message schema refuses an explicit 0 (Go's 0 is "absent").
+			if message.Calls = asInt(f[2]); message.Calls == 0 {
+				failWith(errSchema)
+			}
+		}
+		return message
 	case "H":
-		arity(6, 7, 8, 9, 10)
+		arity(6, 7, 8, 9, 10, 11)
 		address := list(f[5])
 		if len(address) != 2 {
 			fail("text: an address is a pair")
@@ -368,14 +416,49 @@ func fromFields(fields []any, rest []byte) Message {
 		if limit := optional(9); limit != nil {
 			message.Limit = Some(asInt(limit))
 		}
+		if trace := optional(10); trace != nil {
+			// The message schema refuses another shape of carrier.
+			carrier, order, ok := carrierOf(trace)
+			if !ok {
+				failWith(errSchema)
+			}
+			message.Trace, message.TraceOrder = carrier, order
+		}
 		return message
 	case "R":
 		arity(1)
 		return &ReleaseMessage{Hold: asInt(f[0])}
 	case "c":
-		arity(3, 4, 5)
+		arity(3, 4, 5, 6, 7)
 		message := &CallMessage{Call: asInt(f[0]), Hold: asInt(f[1]), Method: asInt(f[2])}
-		message.Args, message.Segments = payloadFields(f[3:], rest)
+		if len(f) < 6 {
+			message.Args, message.Segments = payloadFields(f[3:], rest)
+			return message
+		}
+		// With a trace or the old-work flag: the payload's fields positional, null when absent.
+		fields := []any{}
+		switch {
+		case f[3] == nil:
+		case f[4] == nil:
+			fields = f[3:4]
+		default:
+			fields = f[3:5]
+		}
+		message.Args, message.Segments = payloadFields(fields, rest)
+		if f[5] != nil {
+			carrier, order, ok := carrierOf(f[5])
+			if !ok {
+				failWith(errSchema)
+			}
+			message.Trace, message.TraceOrder = carrier, order
+		}
+		if len(f) == 7 {
+			// The message schema checks the flag (`true` only).
+			if f[6] != true {
+				failWith(errSchema)
+			}
+			message.Old = true
+		}
 		return message
 	case "x":
 		arity(1)
@@ -462,8 +545,23 @@ func fromFields(fields []any, rest []byte) Message {
 		arity(1)
 		return &LoadingMessage{Hold: asInt(f[0])}
 	case "a":
-		arity(0)
-		return &AckMessage{}
+		arity(0, 1)
+		if len(f) == 0 {
+			return &AckMessage{}
+		}
+		return &AckMessage{Events: Some(asInt(f[0]))}
+	case "E":
+		arity(1)
+		entries := list(f[0])
+		events := make([]WireEvent, len(entries))
+		for index, item := range entries {
+			entry := list(item)
+			if len(entry) != 4 {
+				fail("text: an event entry with %d fields", len(entry))
+			}
+			events[index] = WireEvent{Hold: asInt(entry[0]), Member: asInt(entry[1]), At: asInt(entry[2]), Value: mustTextPart(entry[3])}
+		}
+		return &EventMessage{Events: events}
 	case "C":
 		arity(0)
 		// Its origin is the wrapper's; 0 without one, which the message schema refuses.

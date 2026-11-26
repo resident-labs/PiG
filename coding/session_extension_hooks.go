@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"maps"
 	"reflect"
 	"time"
 
@@ -15,8 +14,10 @@ import (
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
+	"github.com/MichaelKinsy/PiG/internal/boundarywire"
 	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
 	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
 // installExtensionHooks installs the Session's extension hooks on its agent,
@@ -57,9 +58,11 @@ func (s *Session) toolCallHook(ctx context.Context, toolCallID, parentToolCallID
 	if runner == nil || !runner.HasHandlers(icodingagent.EventToolCall) {
 		return agent.ToolCallHookResult{}
 	}
+	s.endEventTask()
 	var input map[string]any
 	if len(args) > 0 {
-		_ = json.Unmarshal(args, &input) // invalid JSON yields a nil input, as validation already ran
+		// A lone UTF-16 surrogate in the model's arguments stays that unit, as JSON.parse reads it: the handler, the before/after comparison and InputJSON all see it.
+		_ = jsstring.UnmarshalKeepingSurrogates(args, &input) // invalid JSON yields a nil input, as validation already ran
 	}
 	// The event carries the members in the order the model wrote them (JSON.stringify of Pi's input), and a subprocess handler's edit replaces these bytes. The agent loop runs the tool with whatever order they hold afterwards.
 	var wireInput *json.RawMessage
@@ -71,18 +74,18 @@ func (s *Session) toolCallHook(ctx context.Context, toolCallID, parentToolCallID
 	if wireInput != nil {
 		before = string(*wireInput)
 	}
-	beforeValues, _ := json.Marshal(input)
+	beforeValues, _ := jsstring.MarshalKeepingSurrogates(input)
 	event := extension.CustomToolCallEvent{
-		ToolCallEventBase: extension.ToolCallEventBase{Type: icodingagent.EventToolCall, ToolCallID: toolCallID, ParentToolCallID: parentToolCallID, WireInput: wireInput},
-		ToolName:          toolName,
-		Input:             input,
+		Type: icodingagent.EventToolCall, ToolCallID: toolCallID, ParentToolCallID: parentToolCallID, WireInput: wireInput,
+		ToolName: toolName,
+		Input:    input,
 	}
 	result, err := runner.EmitToolCall(ctx, event)
 	if err != nil {
 		return agent.ToolCallHookResult{Err: err}
 	}
 	var hook agent.ToolCallHookResult
-	if afterValues, err := json.Marshal(input); err == nil && (!bytes.Equal(beforeValues, afterValues) || (wireInput != nil && string(*wireInput) != before)) {
+	if afterValues, err := jsstring.MarshalKeepingSurrogates(input); err == nil && (!bytes.Equal(beforeValues, afterValues) || (wireInput != nil && string(*wireInput) != before)) {
 		if after, err := event.InputJSON(); err == nil {
 			hook.Args = after
 		}
@@ -117,7 +120,7 @@ func (s *Session) toolResultHook(ctx context.Context, toolCallID, parentToolCall
 	}
 	var input map[string]any
 	if len(args) > 0 {
-		_ = json.Unmarshal(args, &input)
+		_ = jsstring.UnmarshalKeepingSurrogates(args, &input)
 	}
 	if started := agent.ToolHookStartedFromContext(ctx); started != nil {
 		// A parallel batch starts the tool_result hooks of its calls in the order their tools settled (agent-loop.ts:619-647); the dispatch reports when the first handler started.
@@ -129,19 +132,17 @@ func (s *Session) toolResultHook(ctx context.Context, toolCallID, parentToolCall
 		details = json.RawMessage("null")
 	}
 	hookResult, err := runner.EmitToolResult(ctx, extension.CustomToolResultEvent{
-		ToolResultEventBase: extension.ToolResultEventBase{
-			Type:              icodingagent.EventToolResult,
-			ToolCallID:        toolCallID,
-			ParentToolCallID:  parentToolCallID,
-			Input:             input,
-			WireInput:         args,
-			Content:           icodingagent.ToolResultEventContent(result),
-			StructuredContent: result.StructuredContent,
-			IsError:           result.IsError,
-			Usage:             toolResultEventUsage(result.Usage),
-		},
-		ToolName: toolName,
-		Details:  details,
+		Type:              icodingagent.EventToolResult,
+		ToolCallID:        toolCallID,
+		ParentToolCallID:  parentToolCallID,
+		Input:             input,
+		WireInput:         args,
+		Content:           icodingagent.ToolResultEventContent(result),
+		StructuredContent: result.StructuredContent,
+		IsError:           result.IsError,
+		Usage:             toolResultEventUsage(result.Usage),
+		ToolName:          toolName,
+		Details:           details,
 	})
 	if err != nil || hookResult == nil {
 		return agent.AfterToolCallResult{}
@@ -172,7 +173,7 @@ func (s *Session) contextWithSystemPhase(ctx context.Context, runner *inproc.Run
 	if !runner.HasHandlers(icodingagent.EventContextWithSystem) {
 		return messages, nil
 	}
-	return runner.EmitContextWithSystem(ctx, messages)
+	return runner.EmitContextWithSystem(boundarywire.WithContextEncodings(ctx, &s.contextWithSystemEncodings), messages)
 }
 
 func (s *Session) contextPhase(ctx context.Context, runner *inproc.Runner, messages []agent.AgentMessage) ([]agent.AgentMessage, error) {
@@ -188,7 +189,7 @@ func (s *Session) contextPhase(ctx context.Context, runner *inproc.Runner, messa
 		}
 		visible = append(visible, message)
 	}
-	returned, replaced, err := runner.EmitContextTracked(ctx, visible)
+	returned, replaced, err := runner.EmitContextTracked(boundarywire.WithContextEncodings(ctx, &s.contextEncodings), visible)
 	if err != nil {
 		return nil, err
 	}
@@ -239,8 +240,9 @@ func sameContextMessages(returned, visible []extension.AgentMessage) bool {
 		if reflect.DeepEqual(returned[i], visible[i]) {
 			continue
 		}
-		left, errLeft := json.Marshal(returned[i])
-		right, errRight := json.Marshal(visible[i])
+		// A handler that turns one lone surrogate into another changed the message: json.Marshal writes both as U+FFFD.
+		left, errLeft := jsstring.MarshalKeepingSurrogates(returned[i])
+		right, errRight := jsstring.MarshalKeepingSurrogates(visible[i])
 		if errLeft != nil || errRight != nil {
 			return false
 		}
@@ -248,7 +250,7 @@ func sameContextMessages(returned, visible []extension.AgentMessage) bool {
 			continue
 		}
 		var leftValue, rightValue any
-		if json.Unmarshal(left, &leftValue) != nil || json.Unmarshal(right, &rightValue) != nil || !reflect.DeepEqual(leftValue, rightValue) {
+		if jsstring.UnmarshalKeepingSurrogates(left, &leftValue) != nil || jsstring.UnmarshalKeepingSurrogates(right, &rightValue) != nil || !reflect.DeepEqual(leftValue, rightValue) {
 			return false
 		}
 	}
@@ -329,54 +331,44 @@ func (s *Session) extensionEventHook(ev agent.AgentEvent) {
 	if runner == nil {
 		return
 	}
+	// One look at the handlers serves the dispatch and the task: an event no handler takes is dispatched to nobody (every emit helper of DispatchAgentLoopEvent returns at once), and only an event a handler takes ends the task.
+	if eventType := icodingagent.AgentLoopEventType(ev); eventType == "" || !runner.HasHandlers(eventType) {
+		if start, ok := ev.(agent.MessageStartEvent); ok {
+			// The dispatch records the message of a message_start whether or not a handler takes it.
+			s.extCurrentMessage = start.Message
+		}
+		return
+	}
+	// Pi's loop turns while a handler awaits, so what precedes the handler is drawn while it runs: the task ends before the dispatch.
+	s.eventRegions.task.End()
 	end, ok := ev.(agent.MessageEndEvent)
 	if !ok {
-		icodingagent.DispatchAgentLoopEvent(runner, ev, &s.extCurrentMessage)
+		icodingagent.DispatchAgentLoopEvent(runner, ev, &s.extCurrentMessage, &s.messageSeqs)
 		return
 	}
 	if !runner.HasHandlers(icodingagent.EventMessageEnd) {
 		return
 	}
-	replacement, err := runner.EmitMessageEnd(icodingagent.AgentEventContext(ev), extension.MessageEndEvent{Type: "message_end", Message: end.Message})
+	ctx := extension.WithMessageSequences(icodingagent.AgentEventContext(ev), func() []uint64 { return []uint64{s.messageSeqs.Sequence(end.Message)} })
+	replacement, err := runner.EmitMessageEnd(ctx, extension.MessageEndEvent{Type: "message_end", Message: end.Message})
 	if err != nil || replacement == nil {
 		return
 	}
-	replaceMessageInPlace(end.Message, normalizeReplacementContent(*replacement))
+	agent.ReplaceMessageInPlace(end.Message, normalizeReplacementContent(*replacement))
 }
 
-// normalizeReplacementContent gives a replacement with missing content an
-// empty content list, as upstream normalizes untyped handler results before
-// they enter agent state or session history.
+// normalizeReplacementContent gives a user, assistant, toolResult or custom
+// replacement with missing content an empty content list, as upstream
+// normalizes untyped handler results before they enter agent state or session
+// history. A system replacement keeps the content it has, as upstream's role
+// check leaves it.
 func normalizeReplacementContent(message agent.AgentMessage) agent.AgentMessage {
 	switch {
-	case message.NullContent(),
+	case message.System == nil && message.NullContent(),
 		message.Custom != nil && message.Custom["role"] == agent.RoleCustom && message.Custom["content"] == nil:
 		return message.WithEmptyContent()
 	}
 	return message
-}
-
-// replaceMessageInPlace overwrites target with replacement through the
-// pointers the agent's transcript, the event and persistence share
-// (agent-session.ts _replaceMessageInPlace). A replacement of another shape is
-// ignored.
-func replaceMessageInPlace(target, replacement agent.AgentMessage) {
-	switch {
-	case target.System != nil && replacement.System != nil:
-		*target.System = *replacement.System
-	case target.User != nil && replacement.User != nil:
-		*target.User = *replacement.User
-	case target.Assistant != nil && replacement.Assistant != nil:
-		*target.Assistant = *replacement.Assistant
-	case target.ToolResult != nil && replacement.ToolResult != nil:
-		*target.ToolResult = *replacement.ToolResult
-	case target.Custom != nil && replacement.Custom != nil:
-		// A handler may return the event's own message: snapshot it first,
-		// as upstream returns early when target === replacement.
-		fields := maps.Clone(replacement.Custom)
-		clear(target.Custom)
-		maps.Copy(target.Custom, fields)
-	}
 }
 
 // QueueAgentStartMessages holds the messages a before_agent_start dispatch
@@ -405,7 +397,7 @@ func (s *Session) QueueAgentStartMessages(messages []extension.CustomMessageRef)
 		if message.Details != nil {
 			fields["details"] = message.Details
 		}
-		custom = append(custom, agent.AgentMessage{Custom: fields})
+		custom = append(custom, agent.AgentMessage{Custom: fields}.WithOrderRecord())
 	}
 	s.agentStartMu.Lock()
 	s.agentStartMessages = append(s.agentStartMessages, custom...)
@@ -458,16 +450,16 @@ func (s *Session) ExtensionCommandActions() extension.CommandActions {
 	}
 }
 
-// bindExtensionCommandActions binds the Session's views, message delivery, abort and command actions without replacing mode-owned callbacks. Abort requests cancellation without awaiting the handler's own run.
+// bindExtensionCommandActions binds the Session's views, message delivery, abort and command actions without replacing mode-owned callbacks. Abort is extensionAbort: the mode's abort handler when it stored one, else a cancellation request; neither awaits the handler's own run.
 func (s *Session) bindExtensionCommandActions(runner *inproc.Runner) {
 	if runner != nil {
-		runner.BindAbort(s.RequestAbort)
+		runner.BindAbort(s.extensionAbort)
 		runner.BindScopedModels(s.ScopedModels)
 		runner.BindSystemPromptOptions(s.GetSystemPromptOptions)
 		runner.BindTools(extension.ContextActions{
 			GetAllTools: s.GetAllTools, GetActiveTools: s.ActiveToolNames,
 			SetActiveTools: s.SetActiveToolsByName, RefreshTools: s.RefreshTools, GetSystemPrompt: s.systemPrompt,
-			GetModel: func() extension.Model { return s.Model() }, SessionManager: s.inner,
+			GetModel: func() extension.Model { return s.Model() }, SessionManager: s.inner.Load(),
 			ModelRegistry: s.ModelRegistry(), IsIdle: s.IsIdle, HasPendingMessages: s.HasPendingMessages, GetSignal: s.Signal,
 			SendUserMessage: s.SendExtensionUserMessage,
 			ToolActions:     s.ToolActions(),
@@ -491,7 +483,7 @@ func (s *Session) ReloadExtensions(extensions []extension.Extension, runtime ...
 	if len(runtime) > 0 {
 		extensionRuntime = runtime[0]
 	}
-	runner := NewExtensionRunner(extensions, extensionRuntime, s.services.CWD(), s.inner, s.services.Registry())
+	runner := NewExtensionRunner(extensions, extensionRuntime, s.services.CWD(), s.inner.Load(), s.services.Registry())
 	s.bindExtensionCore(runner)
 	s.ReplaceRunner(runner)
 	if previous != nil {

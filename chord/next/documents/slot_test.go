@@ -13,8 +13,8 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/store"
 )
 
-// Ports packages/chord/test/next/documents/slot.test.ts
-// pi: packages/chord/src/next/documents/slot.ts
+// Ports packages/chord/test/documents/slot.test.ts
+// pi: packages/chord/src/documents/slot.ts
 //
 // Pi's `restartable(objects, factory)` host is the harness's object + attempt: `restart()` is the failed attempt
 // failing (attempt.Fail) and the next attempt running its factory and activating (object.restart); `retry()` after a
@@ -127,7 +127,7 @@ func slotErrorCode(err error) data.ChordErrorCode {
 }
 
 // TestRetirementReachesWatchesAsInitialWithRetiredTrue runs `it("reaches watches as initial() with retired: true")` of
-// packages/chord/test/next/documents/slot.test.ts:34 (`list.watch`, `list.change`, `list.retire` at slot.test.ts:40-42),
+// packages/chord/test/documents/slot.test.ts:34 (`list.watch`, `list.change`, `list.retire` at slot.test.ts:40-42),
 // on the list held as the SingletonHandle interface `self.state` hands out: Watch, Change and Retire.
 func TestRetirementReachesWatchesAsInitialWithRetiredTrue(t *testing.T) {
 	ListV1 := slotListV1(t)
@@ -375,12 +375,18 @@ func TestAcrossAttemptsFailTheAttemptBrokenForAFlippedKeyedAnOlderVersionOrASche
 		Schema: slotListSchema(), Version: 2, Initial: slotEmptyList,
 		Migrate: func(old *JsonObject, _ int) (*JsonObject, error) { return old, nil },
 	})
+	user, err := contracts.NewHostKind("user", contracts.Prop("id", contracts.Str()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ByUser := slotDefine(t, "list", StateOptions{Schema: slotListSchema(), Version: 1, Initial: slotEmptyList, Keyed: user})
 	cases := []struct {
 		name         string
 		first, later *StateDefinition
 		message      string
 	}{
 		{"flipped keyed", ListV1, KeyedList, "list: declared keyed, its documents are not"},
+		{"another key kind", KeyedList, ByUser, "list: declared with addresses of user, its documents have string keys"},
 		{"schema changed without a bump", ListV1, Changed, "list: the schema changed without a version bump (version 1)"},
 		{"older version", Newer, ListV1, "list: version 1 is older than its documents' (2)"},
 	}

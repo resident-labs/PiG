@@ -51,14 +51,12 @@ func TestExample32TestsAfterEdits(t *testing.T) {
 	}
 
 	edit := &durable.ToolRegistration{
-		ToolSchema: ai.ToolSchema{
-			Name:        "edit",
-			Description: "Replace a file's content",
-			Parameters: map[string]any{
-				"type":       "object",
-				"properties": map[string]any{"path": map[string]any{"type": "string"}, "content": map[string]any{"type": "string"}},
-				"required":   []any{"path", "content"},
-			},
+		Name:        "edit",
+		Description: "Replace a file's content",
+		Parameters: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"path": map[string]any{"type": "string"}, "content": map[string]any{"type": "string"}},
+			"required":   []any{"path", "content"},
 		},
 		Execute: func(_ context.Context, args any, _ durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			input := args.(map[string]any)
@@ -129,7 +127,7 @@ func TestExample32TestsAfterEdits(t *testing.T) {
 		Tools: []*durable.ToolRegistration{edit},
 		Tasks: []durable.AnyTask{runTestsTask.Erased()},
 		Hooks: []durable.HookRegistration{harness.Hook(harness.GenerationTask, &harness.GenerationHooks{
-			AfterRun: func(ctx context.Context, run harness.RunSummary, api harness.HookApi) (*harness.RunEndTasks, error) {
+			AfterRun: func(ctx context.Context, run harness.RunSummary, api harness.HookApi) (*harness.HookTasks, error) {
 				// The run's own entries, from its first input to its answer; a compaction never removes them.
 				ascending := durable.ScanAscending
 				page, err := api.Entries(ctx, durable.EntryQuery{MinEntryId: &run.First, MaxEntryId: &run.Last, Order: &ascending}, 1000, nil)
@@ -149,7 +147,7 @@ func TestExample32TestsAfterEdits(t *testing.T) {
 					return nil, nil
 				}
 				// Each fix run asks again with a fresh turn budget: the extension caps the loop itself.
-				return &harness.RunEndTasks{Tasks: []harness.RunEndTask{harness.RunEndTaskOf(runTestsTask, testsInput{Attempt: int(attempts.Add(1))})}}, nil
+				return &harness.HookTasks{Tasks: []harness.HookTask{harness.HookTaskOf(runTestsTask, testsInput{Attempt: int(attempts.Add(1))})}}, nil
 			},
 		})},
 	}

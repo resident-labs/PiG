@@ -20,12 +20,13 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/data"
 	"github.com/MichaelKinsy/PiG/chord/next/documents"
 	"github.com/MichaelKinsy/PiG/chord/next/internal/nexttest"
+	"github.com/MichaelKinsy/PiG/chord/next/link"
 	"github.com/MichaelKinsy/PiG/chord/next/state"
 	"github.com/MichaelKinsy/PiG/chord/next/store"
 	"github.com/MichaelKinsy/PiG/chord/sqlite"
 )
 
-// Ports packages/chord/test/next/host/reference.test.ts: references (§7): hydrated when got, released once, cycles (Q5),
+// Ports packages/chord/test/host/reference.test.ts: references (§7): hydrated when got, released once, cycles (Q5),
 // GC, release, remote references and keyed state members (slice 6a §12). The type-level cases (`expectTypeOf`) are
 // designed out to Go tests that name the mechanism: Reference.Variant reports bound and the variant.
 
@@ -411,10 +412,11 @@ func TestGCAReleasedReferenceWhoseStateWasReadAfterAFailureKeepsNeitherTheFailur
 	}
 }
 
-// reference.test.ts › GC › a hold released before load keeps nothing: the reference and its contract go while the host
-// waits.
-func TestGCAHoldReleasedBeforeLoadKeepsNothingTheReferenceAndItsContractGoWhileTheHostWaits(t *testing.T) {
+// reference.test.ts › GC › a hold released while it waits unbound keeps nothing: the reference and its contract leave the
+// index and its clock.
+func TestGCAHoldReleasedWhileItWaitsUnboundKeepsNothingTheReferenceAndItsContractLeaveTheIndexAndItsClock(t *testing.T) {
 	host := newHost(t, HostOptions{OnError: func(HostError) {}})
+	mustLoad(t)(host.Load(nil, background))
 	var references []weak.Pointer[Reference]
 	var contractRefs []weak.Pointer[contracts.Contract]
 	func() {
@@ -445,7 +447,11 @@ func TestGCAReleasedHoldKeepsNeitherItsObjectNorItsStatesWatchesNorARemoteObject
 			mu.Lock()
 			objects = append(objects, weak.Make(self.(*attempt)))
 			mu.Unlock()
-			self.Open(func(ctx context.Context) (any, error) { <-ctx.Done(); return nil, context.Cause(ctx) },
+			self.Open(func(ctx context.Context) (any, error) {
+				// Never opens: the wait for the end of ctx is the host's (a join does not wait for the open's task).
+				_, err := chordctx.Receive(ctx, (<-chan struct{})(nil))
+				return nil, err
+			},
 				func(any, NativeCloseReason, context.Context) error { return nil })
 			return contracts.Implementation{Members: contracts.VariantImplementation{
 				State: map[string]chord.Watchable[delta.JsonValue]{"n": refConstant(params.Value("id"))},
@@ -643,8 +649,9 @@ func TestRemoteReferenceTypesNarrowOnVariantRefInPicksVariants(t *testing.T) {
 // reference.test.ts › remote reference types › a held reference's variant may be undefined (before its first binding) and
 // still narrows. Type-level in Pi: Held is Reference, and Variant reports bound false before the first binding.
 func TestRemoteReferenceTypesAHeldReferencesVariantMayBeUndefinedBeforeItsFirstBindingAndStillNarrows(t *testing.T) {
-	// A host that is not loaded has no publication: a held reference waits unbound.
+	// A type nobody serves: a held reference waits unbound.
 	host := newHost(t, HostOptions{Address: new(Server.Address(nil)), Principal: ownerPrincipal(), OnError: func(HostError) {}})
+	mustLoad(t)(host.Load(nil, background))
 	var held *Held
 	var err error
 	held, err = host.Hold(background, refTwo, jsonObject(), GetOptions{})
@@ -652,8 +659,8 @@ func TestRemoteReferenceTypesAHeldReferencesVariantMayBeUndefinedBeforeItsFirstB
 	if variant, bound, err := held.Variant(); err != nil || bound || variant != "" {
 		t.Fatalf("variant before the first binding = %q, %v, %v, want none", variant, bound, err)
 	}
-	if kind := refKind(held); kind != RefStateLoading {
-		t.Fatalf("held state = %s, want loading", kind)
+	if kind := refKind(held); kind != RefStateFailed {
+		t.Fatalf("held state = %s, want failed (waiting)", kind)
 	}
 	held.Retry()
 	held.Release()
@@ -1116,7 +1123,7 @@ func TestABindingReleasedWhileItBindsFixRound5EndsCleanlyWhenItsObjectsHoldRelea
 	h := host.(*chordHost)
 	var released weak.Pointer[Reference]
 	func() {
-		b := newBinding(refCounter, h, h.batch, nil, caller{}, time.Second)
+		b := newBinding(refCounter, h, h.batch, nil, caller{}, time.Second, h.eventFlow)
 		ref := b.reference
 		fake := &releasingTarget{release: ref.Release}
 		var failure any
@@ -1134,4 +1141,57 @@ func TestABindingReleasedWhileItBindsFixRound5EndsCleanlyWhenItsObjectsHoldRelea
 	}()
 	expectCollectedEventually(t, released)
 	must(t, host.Close(background))
+}
+
+// reference.test.ts › a binding moved by a retry alone (decision "References share one wire hold") › keeps its reference,
+// member handles, state watch and member watch; the sibling it leaves stays failed
+func TestABindingMovedByARetryAloneKeepsItsReferenceMemberHandlesStateWatchAndMemberWatchTheSiblingItLeavesStaysFailed(t *testing.T) {
+	rig := rawProvider(t, rawLinkedOptions{Limits: link.PartLimits{Part: new(64.0)}})
+	a := mustHold(t, rig.Client, Notes, jsonObject("session", "S1"))
+	b := mustHold(t, rig.Client, Notes, jsonObject("session", "S1"))
+	hold := bindNext(t, rig.Peer)
+	waitLive(t, a)
+	member := a.Member("count")
+	stateWatch, err := a.State().Watch(background)
+	must(t, err)
+	states := statesOf(t, stateWatch)
+	countWatch, err := a.Member("count").Watch(background)
+	must(t, err)
+	counts := nexttest.ChangesOf(countWatch)
+	ops, err := link.JsonPart([]any{[]any{"r", []any{jsonObject("text", strings.Repeat("x", 100))}}})
+	must(t, err)
+	rig.Peer.Send(&link.StateMessage{Holds: []link.StateEntry{{
+		Hold: hold, Members: []link.StateMember{{Member: editorWire(t).State["notes"], Ops: ops}},
+		Failed: []link.FailedMember{}, Retired: link.NoRetired,
+	}}})
+	rhSync(t, rig.Peer)
+	a.Retry()
+	own := rig.Peer.Next("hold").(*link.HoldMessage).Hold
+	bindHold(t, rig.Peer, own, jsonObject("text", "a"))
+	waitLive(t, a)
+	rhWaitFor(t, func() bool { return len(states.All()) >= 3 && counts.Len() >= 2 })
+	if a.Member("count") != member {
+		t.Fatalf("the member handle changed across the retry")
+	}
+	if value := memberValue(t, a, "count"); value != float64(1) {
+		t.Fatalf("count = %v, want 1", value)
+	}
+	if kind := refStateKind(b); kind != RefStateFailed {
+		t.Fatalf("the sibling's state = %v, want failed", kind)
+	}
+	kinds := []string{}
+	for _, state := range states.All() {
+		kind, _, _ := strings.Cut(state, ":")
+		kinds = append(kinds, kind)
+	}
+	if !slices.Equal(kinds, []string{"failed", "loading", "live"}) {
+		t.Fatalf("states = %v, want [failed loading live]", kinds)
+	}
+	values := nexttest.ValuesOf(counts.Items())
+	failed, is := values[0].(nexttest.FailedValue)
+	if len(values) != 2 || !is || !strings.Contains(failed.Failed, "over the wire limit") || values[1] != float64(1) {
+		t.Fatalf("count's calls = %v, want [{failed: ...over the wire limit...} 1]", values)
+	}
+	a.Release()
+	b.Release()
 }

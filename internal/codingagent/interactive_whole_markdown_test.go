@@ -1,8 +1,11 @@
+//go:build !pig_strip_syntax_highlight
+
 package codingagent
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -12,14 +15,15 @@ import (
 // /hotkeys and a slash command's Append add a Markdown to the chat that is whole when it is built and stays in the
 // transcript. They finish it, so it keeps no memo for a next streamed delta; the rows must be what they were with the
 // memos. The hash covers both blocks at several widths and themes, and was taken on the tree before the change.
+// It was taken again on the tree that carries Pi 562da75f9, which sets default: (s) => t.fg("text", s) in
+// buildCliHighlightTheme (packages/coding-agent/src/modes/interactive/theme/theme.ts:894), wrapping unscoped code tokens
+// in the theme text foreground escape.
 func TestWholeMarkdownBlocksRenderBytes(t *testing.T) {
+	restoreStartupTheme(t)
 	previous := tui.GetTUIKeybindings()
 	DefaultKeybindingsManager().syncToTUI()
-	prevTheme := tui.ActiveTheme()
-	t.Cleanup(func() { tui.SetKeybindings(previous); tui.SetTheme(prevTheme.Name) })
+	t.Cleanup(func() { tui.SetKeybindings(previous) })
 	// The hash was taken on a terminal that is not truecolor; detection reports truecolor for a Windows host or COLORTERM=truecolor.
-	previousCaps := tui.GetCapabilities()
-	t.Cleanup(func() { tui.SetCapabilities(previousCaps) })
 	tui.SetCapabilities(tui.TerminalCapabilities{})
 	text := "# Heading\n\nSome **bold**, *italic* and `code` with a [link](https://example.com).\n\n- one\n- two\n\n```go\nfmt.Println(1)\n```\n\n" + strings.Repeat("A long line that wraps at every width tested. ", 6) + "\n"
 	hash, appended := sha256.New(), sha256.New()
@@ -42,23 +46,31 @@ func TestWholeMarkdownBlocksRenderBytes(t *testing.T) {
 			}
 		}
 	}
-	const wantAppended = "0f08cbaba866abe3dd27bed5695bc18ab62de0177df41aec2c7ca4994c75ea48"
+	const wantAppended = "66447a6926008181da7a5892d125fc76ab18b7b8c817f4c4c4a553688ba6227e"
 	if got := hex.EncodeToString(appended.Sum(nil)); got != wantAppended {
 		t.Errorf("appended rows hash %s, want %s", got, wantAppended)
 	}
-	// The /hotkeys text is the host's: upstream's handleHotkeysCommand adds " (Ctrl+Enter on Windows Terminal)" to a row on win32, Windows
-	// keybindings change the keys, and macOS has its own default keys and shows alt as "option" (tui.FormatKeyText), so its rows
-	// have one hash per keybinding platform. Linux's was taken on Linux and macOS's on a macos-15 runner (the nightly's race job, which is the
-	// only run of this package on macOS); Windows and WSL are not hashed.
-	hotkeysRowsHash := map[tui.KeybindingPlatform]string{
-		tui.KeybindingPlatformLinux:  "6c6e446dd091ddae67cc390a41ffa268a9c7418088c7a9c5274abd08eb345e76",
-		tui.KeybindingPlatformDarwin: "ab2af2a15656f36e688c7975b31fdf80fd6c781d76ab4bf3b96223340b4cee88",
-	}
-	want, hashed := hotkeysRowsHash[tui.HostKeybindingPlatform()]
-	if !hashed {
+	// The /hotkeys text is the host's: upstream's handleHotkeysCommand adds " (Ctrl+Enter on Windows Terminal)" to a row on win32 only, and Windows
+	// keybindings (native Windows and WSL) change the keys, so its rows have one hash on Windows (not taken here), one on WSL, with the Windows keys and no
+	// Ctrl+Enter row, one on macOS, where keys display Alt as Option (formatKeyText, keybinding-hints.ts), and one elsewhere; the Linux one was taken on Linux
+	// and the WSL one on Linux with WSL_DISTRO_NAME set. The macOS one is what the macOS runner printed; it is also what Linux computes with the Option
+	// display forced.
+	if runtime.GOOS == "windows" {
 		return
+	}
+	want := "d9c6e895cd305624413664c65a05c5047fbdd78e855091255b65ebc6fb3e47f8"
+	switch {
+	case tui.HostKeybindingPlatform() == tui.KeybindingPlatformLinuxWSL:
+		want = "047296e1d0123674d97056e9c10b8c82edbe07f25a5fe7b7801aba7120e75a24"
+	case runtime.GOOS == "darwin":
+		want = "effc3dcd89578854a2f7dcd0bd4b2d240bb39ebc245f36939bdfadb7a5e22452"
 	}
 	if got := hex.EncodeToString(hash.Sum(nil)); got != want {
 		t.Errorf("rows hash %s, want %s", got, want)
 	}
+}
+
+// These tests select a theme, so TestThemeTestsRestoreTheProcessTheme runs them too; a build that strips what they need does not link them, and neither does it have the entries.
+func init() {
+	themeRestoringTests["TestWholeMarkdownBlocksRenderBytes"] = TestWholeMarkdownBlocksRenderBytes
 }

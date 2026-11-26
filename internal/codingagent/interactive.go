@@ -28,6 +28,7 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/codingagent/prompts"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
 	"github.com/MichaelKinsy/PiG/internal/installchange"
+	"github.com/MichaelKinsy/PiG/internal/viewendpoint"
 	"github.com/MichaelKinsy/PiG/tui"
 )
 
@@ -59,6 +60,9 @@ type SubprocessUIBridge interface {
 	SetWidgetClearFunc(fn func(key string))
 	// RemoveWidget drops the extension processes' widget under key, which a host-process extension replaced.
 	RemoveWidget(key string)
+	// ResetExtensionUI drops what the extension processes put on screen that Pi's resetExtensionUI resets, when a /reload begins and
+	// before a Session replacement.
+	ResetExtensionUI()
 	// SetFrontend tells extensions whether a frontend session draws
 	// (StatePayload.frontend, D107).
 	SetFrontend(on bool)
@@ -135,8 +139,8 @@ type InteractiveMode struct {
 	newRunner     *inproc.Runner
 	// detachModelRegistry detaches the model operations wired to the current build's bridge.
 	detachModelRegistry func()
-	// runEnded is set once Stop finished and the owner loop no longer runs.
-	runEnded atomic.Bool
+	// runEnded records that Stop finished and the owner loop no longer runs, and releases a post that waits for the loop to take it (see postToMain).
+	runEnded loopLife
 	// isInitialized is upstream's isInitialized: Init completed and Stop has not run since.
 	isInitialized bool
 	// teardowns are the releases Stop runs, last registered first; stopMu guards them.
@@ -174,8 +178,19 @@ type InteractiveMode struct {
 	editorFactory   extension.EditorFactory
 	widgetContainer *tui.Container
 	// widgetMu guards the widget state below: the extension processes' widgets (bridgeWidgets) and the host-process ones (inprocessWidgets).
-	widgetMu         sync.Mutex
-	bridgeWidgets    map[string]*subprocess.PushProxy
+	widgetMu      sync.Mutex
+	bridgeWidgets map[string]*subprocess.PushProxy
+	// viewMounts is the plugin mounts the terminal view client draws (D614), in mount order; widgetMu guards it. It is empty unless a Piglet selected the client and an extension mounted a view.
+	viewMounts []*viewMount
+	// viewTabRow is the tab row the view client draws above the panel mounts, nil while it draws none; widgetMu guards it.
+	viewTabRow *viewTabs
+	// viewWaitRow is the row that stands for the dialogs while none holds the keyboard, nil while the view client draws
+	// none; widgetMu guards it.
+	viewWaitRow *viewWaiting
+	// viewClient is the terminal's attachment to the bound build's view registry, nil unless a Piglet selected it.
+	viewClient atomic.Pointer[viewClient]
+	// viewEndpoint is the socket that serves the bound build's view registry to clients outside the process, nil unless a Piglet selected it.
+	viewEndpoint     atomic.Pointer[viewendpoint.Endpoint]
 	inprocessWidgets []inprocessWidget
 	// widgetSeq counts widget sets across both hosts; bridgeWidgetSeqs is the sequence each extension-process widget got when it was set, by its
 	// bridge insertion order, so the layout interleaves the hosts in the order Pi's one Map per side keeps.
@@ -224,8 +239,14 @@ type InteractiveMode struct {
 	// turnSettled is closed when the active run settles; waitForIdle waits
 	// on it. Guarded by queueMu; nil while no run is active.
 	turnSettled chan struct{}
-	// turnEnded is closed when the goroutine of the run that turnSettled belongs to has returned, which is after the run's agent_settled handlers. The quit by keys waits for it (settleRunAtQuit). Guarded by queueMu.
+	// turnEnded is closed when the goroutine of the run that turnSettled belongs to has returned, which is after the run's agent_settled handlers. The quit by keys joins it only for a run still active when the quit begins (settleRunAtQuit); a quit in the settle tail does not. Guarded by queueMu.
 	turnEnded chan struct{}
+	// promptCommand is closed when the extension command the prompt loop submitted returns: Pi's run() awaits `session.prompt(text)`, and prompt()
+	// awaits an extension command's handler, so the loop takes no further prompt until then. Guarded by queueMu; nil until the loop submits a command.
+	promptCommand <-chan struct{}
+	// startedCommand is closed when the extension command that startExtensionCommand started last returns; the caller that awaits the command takes it
+	// (takeStartedCommand). Guarded by queueMu.
+	startedCommand chan struct{}
 
 	// agent_settled handlers finish as one awaited dispatch before an action
 	// they start may begin another run. The mutex covers subprocess host-call
@@ -242,8 +263,14 @@ type InteractiveMode struct {
 	ownerOverflowActive atomic.Bool
 	// ownerForwarder joins the overflow forwarder alone, so a caller can wait for ownerOverflowActive to clear without waiting on the session's long-lived background tasks.
 	ownerForwarder sync.WaitGroup
-	requestExit    atomic.Bool // /quit / /exit sets this; input loop notices and returns. Atomic: extension shutdown may set it off the owner loop.
-	fatalRuntime   atomic.Bool // fatal session replacement errors exit 1 after the input loop restores the terminal.
+	// shutdownRequested records an extension's ctx.shutdown() while a run streams; agent_settled then ends the session (interactive-mode.ts shutdownRequested).
+	shutdownRequested atomic.Bool
+	// entriesRenderedByBoundaryCompaction holds the ids of entries after a boundary compaction that its rebuild of the transcript already drew.
+	entriesRenderedByBoundaryCompaction map[string]struct{}
+	// exitingTui marks the renderer stops of the process exit (stopInteractiveTui), which write terminal.stop()'s mode resets; a renderer swap does not.
+	exitingTui   bool
+	requestExit  atomic.Bool // /quit / /exit sets this; input loop notices and returns. Atomic: extension shutdown may set it off the owner loop.
+	fatalRuntime atomic.Bool // fatal session replacement errors exit 1 after the input loop restores the terminal.
 
 	// suspended is true while the session is parked by SIGTSTP. SIGINT is
 	// ignored then, mirroring upstream's ignoreSigint listener.
@@ -252,6 +279,12 @@ type InteractiveMode struct {
 	// Shutdown paths share an emission guard and join in-flight cleanup before owner-loop terminal teardown.
 	signalShutdownDone atomic.Bool
 	shutdownMu         sync.Mutex
+	// quitEntered closes when the owner loop enters finishInteractiveShutdown, before it takes shutdownMu: from then on it serves no posted task while it waits for that lock, which a signal's dispose may hold while it waits for the loop (resetExtensionUIForReplacement).
+	quitEntered          chan struct{}
+	quitEnteredOnce      sync.Once
+	quitEnteredCloseOnce sync.Once
+	// signalDisposing is set while a signal's shutdown emits and disposes; the hook's wait for the owner loop is then bounded.
+	signalDisposing atomic.Bool
 	// reloadIssues collects extension/tool reload failures from the most recent
 	// /reload so ReloadDiagnostics can surface them in-session as "Extension
 	// issues" instead of dropping them to a TUI-clobbered stderr. Reset at the
@@ -279,7 +312,9 @@ type InteractiveMode struct {
 	markdownTheme       *tui.MarkdownTheme
 	markdownThemeIndent string
 	// markdownTransformerList is the list markdownTransformers last built, valid while the active theme and the extension runner still equal markdownTransformerTheme and markdownTransformerRunner. markdownTransformerMu guards the three: Markdown renders may run on more than one goroutine.
-	markdownTransformerMu     sync.Mutex
+	markdownTransformerMu sync.Mutex
+	// mermaidFoldScanned counts the bytes the Mermaid pre-check of this mode's transformers has read (containsFoldMermaid).
+	mermaidFoldScanned        atomic.Int64
 	markdownTransformerList   []extension.MarkdownTransformer
 	markdownTransformerTheme  *tui.Theme
 	markdownTransformerRunner *inproc.Runner
@@ -353,7 +388,14 @@ type InteractiveMode struct {
 	activeWorkingIndicatorEmbedded bool
 	workingIndicatorOptions        *extension.WorkingIndicatorOptions
 	statusLastFrame                time.Time
-	spinnerIntervalCh              chan time.Duration
+	// pig divergence (D652): compactionStartedAt, compactionLabel, compactionHint and compactionShown* are the compaction line's state: the compaction's start and the label and hint around the elapsed time and streamed size, which the status tick rewrites when the seconds, the size or the room for the line changed.
+	compactionStartedAt   time.Time
+	compactionLabel       string
+	compactionHint        string
+	compactionShownSecs   int
+	compactionShownTokens int
+	compactionShownRoom   int
+	spinnerIntervalCh     chan time.Duration
 	// spinnerTickQueued is set while a spinner tick waits in uiTaskCh.
 	spinnerTickQueued atomic.Bool
 	// spinnerWakeCh resumes a parked spinner ticker; spinnerWakeGen counts
@@ -374,6 +416,17 @@ type InteractiveMode struct {
 	switchHeapReleases atomic.Int64
 
 	branchSummaryCancel context.CancelFunc
+	// frameHold is true while a tree navigation holds the frames its selection requested (holdFrames). Owner loop only.
+	frameHold bool
+	// eventRegionOpen is true between the Session's markers that open and close a task of Pi's event loop (eventRegionMarker), and eventRegion holds, in order, the events that arrived meanwhile: they are applied together when the task closes. eventRegionUpdate says which part of the message the message_update collected last reports (collectEvent), and is eventRegionNoUpdate whenever eventRegion is empty. Owner loop only.
+	eventRegionOpen   bool
+	eventRegion       []agent.AgentEvent
+	eventRegionUpdate int
+	// framePacingInstalled is whether the renderer has the adaptive frame pacing policy (installFramePacing); framePacingAllowed is the policy's gate, stored by the owner loop before each throttled frame (allowFramePacing) and loaded by the renderer.
+	framePacingInstalled bool
+	framePacingAllowed   atomic.Bool
+	// extensionRendersTranscript is whether the transcript holds a tool card, a custom message or a custom entry drawn by an extension's renderer; the adaptive policy's gate is closed while it is (extensionRenderersMounted, transcriptEmptied). Owner loop only.
+	extensionRendersTranscript bool
 
 	// Bash-prefix execution state.
 	// bashCancel cancels the currently-running `!cmd` (Esc routes
@@ -407,6 +460,10 @@ type InteractiveMode struct {
 	// Called on AutoRetryEndEvent or when a new retry starts.
 	retryCountdownStop func()
 
+	// retryEscapeHandler is set while Escape cancels the automatic-retry delay (interactive-mode.ts retryEscapeHandler): auto_retry_start sets it,
+	// agent_start and auto_retry_end restore the main handler.
+	retryEscapeHandler bool
+
 	// Slash-command registry. Owns 14 builtins + the dynamic
 	// extension-registered set. Constructed in Run().
 	slashRegistry *SlashRegistry
@@ -437,6 +494,9 @@ type InteractiveMode struct {
 	// headerBox is the header container every layout mount shares. startupHeaderPending is true from the first paint until startup has the terminal's colors, and keeps the container empty. Owner loop only.
 	headerBox            *tui.Container
 	startupHeaderPending bool
+	// changelogEntries and extensionChangelogUpdates are the startup notices init() prepares before the UI starts (interactive-mode.ts changelogMarkdown and extensionChangelogUpdates); the bind shows them.
+	changelogEntries          []ChangelogEntry
+	extensionChangelogUpdates []extensionChangelogUpdate
 	// spriteOwners names the extensions whose sprites the bound build registered in piglogin's catalogue (D2). Binding
 	// another build's bridge removes them first, since the outgoing bridge no longer reaches the UI when its host shuts
 	// down. Guarded by spriteOwnersMu.
@@ -485,6 +545,10 @@ type InteractiveMode struct {
 	heldPrompts []heldPrompt
 	heldWaiting bool
 
+	// unsubscribeSession removes the mode's synchronous Session listener (handleSessionEvent); the owner loop sets and calls it.
+	unsubscribeSession func()
+	// sessionStreaming is Pi's `this.streamingComponent` as the Session listener needs it: set by an assistant message_start, cleared by that message's message_end and by agent_end. The listener runs on the goroutine that executes the Session's events, so it keeps this itself instead of reading evCurrentBlock, which the owner loop sets when the event reaches it.
+	sessionStreaming atomic.Bool
 	// eventCh is the agent's live event stream (m.opts.SessionHandle.Events()).
 	// The inputLoop select drains it and calls handleAgentEvent on the main
 	// goroutine. evCurrentBlock/evTurnIndex are that handler's
@@ -505,8 +569,11 @@ type InteractiveMode struct {
 
 	// anthropicSubWarningShown gates the one-time Anthropic subscription
 	// auth warning. Mirrors upstream anthropicSubscriptionWarningShown.
-	anthropicSubWarningShown     bool
-	previousThinkingDroppedCount int
+	anthropicSubWarningShown bool
+	// cacheWarmingNotice is the last cache-warming notice, extended in place
+	// while it is the last chat line. Mirrors upstream cacheWarmingNotice.
+	cacheWarmingNotice       *cacheWarmingNotice
+	previousDroppedReasoning droppedReasoningState
 
 	// inputLoopErr, owned by the input loop, ends it with the error of a
 	// keystroke handled after a subprocess listener's verdict.
@@ -534,8 +601,19 @@ type InteractiveMode struct {
 	remoteEditorEvents remoteEventQueue
 	// tuiStopped is set once the TUI stopped, for writers off the owner loop.
 	tuiStopped atomic.Bool
+	// terminalWrites keeps the terminal writes of goroutines other than the owner loop in the order they were made, for the loop to run between frames; the exit's stop writes what the loop never took before its own bytes and closes it (owner_loop.go).
+	terminalWrites terminalWriteQueue
+	// drawTerminal is the terminal the renderer draws on and terminalGate its stop gate, kept by createInteractiveTui for writers that run on goroutines other than the owner loop; terminalGate is unset when that terminal has none.
+	drawTerminal atomic.Pointer[tui.Terminal]
+	terminalGate atomic.Pointer[tui.StopGate]
 	// interruptExiting is set once a SIGINT's exit has begun to end the extension processes (handleInterruptSignal): a quit that the owner loop still serves prints no resume hint beside that exit.
 	interruptExiting atomic.Bool
+	// quitDisposing is set once a quit by keys hands the terminal back (stopInteractiveTui) or has stopped the TUI and begun its dispose (finishInteractiveShutdown), which holds shutdownMu until it returns. A SIGINT, SIGTERM or SIGHUP that arrives then has no shutdown event left to give: interruptShutdown does not wait for that lock, and ExitIfQuitting ends the process.
+	quitDisposing atomic.Bool
+	// quitByKeys is set by finishInteractiveShutdown for a quit by keys, before it stops the TUI. stopInteractiveTui reads it, on the same goroutine, to mark the quit disposing as the terminal is handed back.
+	quitByKeys bool
+	// signalShutdownWait is how long shutdownExtensionsBriefly waits for the handlers; zero is the second it has always waited. A test that must tell the wait for the lock of a pending quit from the lack of that wait sets it beyond its own budget, so that the wait can end only by the lock.
+	signalShutdownWait time.Duration
 	// extensionKeybindings is the keybinding table extension state
 	// snapshots carry, republished when the keybindings reload.
 	extensionKeybindings atomic.Pointer[map[string]any]
@@ -554,6 +632,11 @@ type InteractiveMode struct {
 	// extensionDialogs is the stack of dialogs shown in the editor slot (select, confirm, input, editor and an editor-slot
 	// custom component); the last entry is visible. Only the owner loop touches it (interactive-mode.ts extensionDialogs).
 	extensionDialogs []*extensionDialog
+	// nextBlockingOverlayID numbers the program status sources of blocking overlays, so closing one keeps the others.
+	nextBlockingOverlayID int
+	// extensionOverlays are the open extension overlays (ui.custom with overlay: true), in opening order. Reset removes only these, not
+	// pi's own overlays.
+	extensionOverlays []*extensionOverlay
 	// awaitedDialogs are the dialogs an owner-loop caller waits on (awaitOwnerDialog), by the cancel that dismisses each one.
 	// Only the owner loop touches it.
 	awaitedDialogs map[*awaitedDialog]struct{}
@@ -578,7 +661,10 @@ type InteractiveMode struct {
 
 	// rawDrain consumes late protocol input before renderer teardown and reports a failed read; temporary handoffs restore
 	// without draining.
-	rawDrain             func() error
+	rawDrain func() error
+	// inputHold keeps the terminal reader from reading until Init's synchronous start has written its last bytes; nil reads at once.
+	inputHold            chan struct{}
+	inputHoldOnce        sync.Once
 	rawRestore           func()
 	inputReader          *interactiveTerminalReader
 	externalEditorActive bool
@@ -595,6 +681,8 @@ type InteractiveMode struct {
 	themeDiagnostics []extension.ResourceDiagnostic
 	// extensionConflicts are the tool and flag conflicts the last reload found; Pi lists them with the extension load errors.
 	extensionConflicts []ExtensionConflict
+	// extensionWarnings are the install failures and package warnings of the last load; Pi lists them after the extension load errors.
+	extensionWarnings []ExtensionWarning
 	// slashCatalog is the resource side of pi.getCommands() (templates,
 	// skills, provenance), republished whole whenever the owner loop changes
 	// one, because extension host calls read it off the owner loop.
@@ -645,10 +733,18 @@ type InteractiveMode struct {
 	managedToolStatusStarted bool
 
 	// frameTimer keeps the renderer's throttled-frame deadline for the owner
-	// loop (installRenderDispatcher); renderWakeCh is its channel, which every
-	// owner loop selects to run the due frame.
-	frameTimer   *time.Timer
-	renderWakeCh <-chan time.Time
+	// loop (installRenderDispatcher): the runtime's timer, or a kernel timer
+	// (kernelFrameTimer is set) for a run that asked for one and draws on the
+	// process terminal. renderWakeCh is its channel, which every owner loop
+	// selects to run the due frame.
+	frameTimer       atomic.Pointer[frameTimer]
+	kernelFrameTimer bool
+	renderWakeCh     <-chan time.Time
+	// frameDue is the deadline of the throttled frame the renderer armed and the loop has not run yet, in Unix nanoseconds, and 0 when there is none (armFrameTimer, runScheduledRender).
+	frameDue atomic.Int64
+	// grammarLoadPending is true from the start of the startup grammar load until its continuation has run on the owner loop, and the loop leaves a due frame
+	// until then (runScheduledRender, loadRemainingHighlightLanguages). One mode's flag; no other mode and no non-interactive start sets it.
+	grammarLoadPending atomic.Bool
 
 	// Extension errors reported from any goroutine wait here until the main
 	// loop shows them; extensionErrorWakeCh (capacity 1) wakes the loop.
@@ -661,28 +757,68 @@ type InteractiveMode struct {
 	autocompleteEpoch       context.Context
 	autocompleteEpochCancel context.CancelFunc
 	autocompletePending     <-chan struct{}
-	currentInputTicket      *inputTicket
-	pendingUserInputs       []string
-	onInputCallback         func(string)
-	initialMessagesDone     <-chan struct{}
+	// autocompleteSetUp is Pi's `this.autocompleteProvider !== undefined`: false until the first setupAutocompleteProvider, which is the one that follows the first bind.
+	autocompleteSetUp bool
+	// autocompleteRebuildResult is the channel the next provider rebuild answers on instead of reporting its failure (setAutocompleteAwaiting); the callback takes it.
+	autocompleteRebuildResult chan<- error
+	currentInputTicket        *inputTicket
+	pendingUserInputs         []string
+	onInputCallback           func(string)
+	initialMessagesDone       <-chan struct{}
 	// activeSelectorToken identifies the model selector still shown while its change settles, and activeSelectorDispose closes it (interactive-mode.ts:469-470).
 	activeSelectorToken   *int
 	activeSelectorDispose func()
+	// reloadTailInput holds the keys the owner loop took after the last awaited step of a /reload had completed (awaitReloadStep). The input loop dispatches them to the editor in order before any chunk routed later. Owner loop only.
+	reloadTailInput [][]byte
 }
 
-// loadRemainingHighlightLanguages registers every syntax language on a task the mode owns (a grammar is decoded when its language is first used), then repaints on the owner loop, so code highlighted with the startup grammars picks up the rest. A mode that has stopped repaints nothing.
+// loadHighlightLanguages registers every syntax language. It is a variable so that a test can hold the load while the frames around it run; no other code sets it.
+var loadHighlightLanguages = tui.LoadAllHighlightLanguages
+
+// startupWindowPauseHook, when set by a test, runs in Init right after the TUI starts (between tui-started and interactive-ready); no production code sets it.
+var startupWindowPauseHook func()
+
+// startupTerminalArmedHook, when set by a test, runs in Init right after startTerminal arms the terminal and before openFrontend and startInteractiveTui; no production code sets it.
+var startupTerminalArmedHook func()
+
+// loadRemainingHighlightLanguages registers every syntax language on a task the mode owns (a grammar is decoded when its language is first used), then, on the owner loop, invalidates the cached lines and requests a render, so code highlighted with the startup grammars picks up the rest. A mode that has stopped requests nothing.
+//
+// Pi's import runs on its one event loop, so a frame that the start requests meanwhile (a timer) runs after the continuation that invalidates and requests a render, and the requests are one frame. The task runs beside the owner loop, so the loop leaves a due frame until the continuation has run (grammarLoadPending, runScheduledRender): the grammar load is finite CPU work with no wait on the loop, so the hold ends with it, as Pi's blocked loop ends with the import. Every end of the task lifts it: the continuation, a stopped mode whose continuation cannot be posted, and a load that panics.
 // upstream: packages/coding-agent/src/modes/interactive/interactive-mode.ts:init
 func (m *InteractiveMode) loadRemainingHighlightLanguages() {
 	ctx := m.backgroundCtx
+	m.grammarLoadPending.Store(true)
 	m.backgroundTasks.Go(func() {
-		tui.LoadAllHighlightLanguages()
-		_ = m.postToMain(ctx, func() {
+		loaded := false
+		defer func() {
+			// The load did not return: the uncaught handler runs, and the frame it held is the owner loop's again.
+			if !loaded && m.postToMain(ctx, m.releaseGrammarLoadHold) != nil {
+				m.grammarLoadPending.Store(false)
+			}
+		}()
+		loadHighlightLanguages()
+		loaded = true
+		if m.postToMain(ctx, func() {
 			m.tuiInst.Invalidate()
 			m.tuiInst.RequestRender()
-		})
+			// The start's last repaint request: a startup profile, and a pty child that must not be ready before it, wait for this label.
+			m.startupMark()("highlight-repaint-requested")
+			m.releaseGrammarLoadHold()
+		}) != nil {
+			// A stopped mode has no loop to hold.
+			m.grammarLoadPending.Store(false)
+		}
 		// After the repaint is queued, so the collection never delays it.
-		releaseStartupHeap()
+		m.releaseStartupHeapWhenIdle(ctx)
 	})
+}
+
+// releaseGrammarLoadHold ends the hold the grammar load put on the due frame and runs the frame that waited. Owner loop only.
+func (m *InteractiveMode) releaseGrammarLoadHold() {
+	m.grammarLoadPending.Store(false)
+	if m.frameDue.Load() != 0 {
+		m.runScheduledRender()
+	}
 }
 
 // startVersionCheck starts run()'s unawaited version check. A newer release posts its notice to the UI loop.
@@ -741,31 +877,99 @@ func (m *InteractiveMode) postUITaskQuiet(fn func()) bool {
 // frame's deadline on one reusable timer, as upstream's requestRender arms one
 // setTimeout on the single event loop.
 func (m *InteractiveMode) installRenderDispatcher() {
-	if m.frameTimer == nil {
-		m.frameTimer = time.NewTimer(time.Hour)
-		m.frameTimer.Stop()
-		m.renderWakeCh = m.frameTimer.C
+	if m.frameTimer.Load() == nil {
+		m.useFrameTimer(newRuntimeFrameTimer())
+	}
+	if !m.kernelFrameTimer && m.drawsOnProcessTerminal() {
+		if timer := newKernelFrameTimer(); timer != nil {
+			m.kernelFrameTimer = true
+			m.useFrameTimer(timer)
+			// Stop releases the kernel timer; the runtime's keeps the deadline of a frame asked for afterwards.
+			m.onStop(func() error {
+				m.kernelFrameTimer = false
+				m.useFrameTimer(newRuntimeFrameTimer())
+				return nil
+			})
+		}
 	}
 	m.tuiInst.SetRenderDeadline(m.armFrameTimer)
 	m.tuiInst.SetOwnerDispatcher(m.postToMain)
+	m.installFramePacing()
 }
+
+// useFrameTimer makes timer the one that keeps the owner loop's frame deadline and releases the one it replaces. The goroutine of the owner loop
+// calls it, or Stop once the loop has ended.
+func (m *InteractiveMode) useFrameTimer(timer frameTimer) {
+	m.renderWakeCh = timer.C()
+	if replaced := m.frameTimer.Swap(&timer); replaced != nil {
+		(*replaced).Close()
+	}
+}
+
+// drawsOnProcessTerminal reports whether the frames go to the terminal the process runs in and the run asked for a frame's deadline on a kernel
+// timer (InteractiveModeOptions.KernelFrameDeadline). A terminal handed in through the options and a standard output that is not a terminal keep
+// the runtime's timer.
+func (m *InteractiveMode) drawsOnProcessTerminal() bool {
+	return m.opts.KernelFrameDeadline && m.opts.Terminal == nil && frameOutputIsTerminal()
+}
+
+// frameOutputIsTerminal reports whether standard output is a terminal; a test replaces it.
+var frameOutputIsTerminal = func() bool { return term.IsTerminal(int(os.Stdout.Fd())) }
 
 // armFrameTimer moves the owner loop's frame deadline to due; the zero time
 // disarms it. The renderer calls it under its lock, so calls arrive in order.
 func (m *InteractiveMode) armFrameTimer(due time.Time) {
+	timer := *m.frameTimer.Load()
 	if due.IsZero() {
-		m.frameTimer.Stop()
+		m.frameDue.Store(0)
+		timer.Stop()
 		return
 	}
-	m.frameTimer.Reset(max(time.Until(due), 0))
+	m.frameDue.Store(due.UnixNano())
+	timer.Reset(time.Until(due))
 }
 
 // runScheduledRender runs the renderer's due throttled frame, if any, on the
 // main loop. A frame wakes a parked spinner ticker, whose next tick re-checks
-// whether the session still animates (D172).
+// whether the session still animates (D172). While the startup grammar load runs the frame waits for the load's continuation, which runs it
+// (releaseGrammarLoadHold), as a timer waits for Pi's blocked loop.
 func (m *InteractiveMode) runScheduledRender() {
+	if m.frameHold || m.grammarLoadPending.Load() {
+		return
+	}
+	m.allowFramePacing()
 	m.tuiInst.RunDueRender()
+	if due := m.frameDue.Load(); due != 0 && time.Until(time.Unix(0, due)) <= 0 {
+		// RunDueRender ran the frame of that deadline; a frame requested while it ran has a later one.
+		m.frameDue.CompareAndSwap(due, 0)
+	}
 	m.wakeSpinner()
+}
+
+// pig divergence (D270): a /tree choice holds the owner loop's frames until the navigation returns.
+// holdFrames stops the owner loop from painting until releaseFrames. The frames requested meanwhile stay requested: releaseFrames
+// replaces them with one that follows whatever changed. A paint a component asks for by name (Render) is not held.
+func (m *InteractiveMode) holdFrames() { m.frameHold = true }
+
+// releaseFrames ends holdFrames and requests the frame that shows what changed during it.
+func (m *InteractiveMode) releaseFrames() {
+	if !m.frameHold {
+		return
+	}
+	m.frameHold = false
+	m.tuiInst.CancelPendingRender()
+	m.tuiInst.RequestRender()
+}
+
+// requestRenderPastHold is the frame a status, a warning or a notice asks for. Pi requests it (ui.requestRender()), and the frame follows at the next turn of the
+// event loop. D270 holds the frames a /tree choice requested, but a status, a warning or a notice is not held: while the hold lasts it paints by name (Render),
+// outside the hold it only requests the frame. Owner loop only, as frameHold is.
+func (m *InteractiveMode) requestRenderPastHold() {
+	if m.frameHold {
+		m.tuiInst.Render()
+		return
+	}
+	m.tuiInst.RequestRender()
 }
 
 // runOnMain hands fn to the main input loop and blocks until the loop accepts
@@ -786,7 +990,7 @@ var errOwnerLoopUnavailable = errors.New("interactive mode is not accepting work
 
 // postToMain is runOnMain for callers that must report a task the loop never
 // accepted, such as an extension's sendUserMessage: it never drops fn, and
-// returns an error only when ctx ends first. The owner loop posting to itself
+// returns an error only when ctx ends or the owner loop ends first. The owner loop posting to itself
 // never blocks and never runs fn inline: see postFromOwner.
 func (m *InteractiveMode) postToMain(ctx context.Context, fn func()) error {
 	if fn == nil {
@@ -814,6 +1018,9 @@ func (m *InteractiveMode) postToMain(ctx context.Context, fn func()) error {
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("%w: %w", errOwnerLoopUnavailable, context.Cause(ctx))
+	case <-m.runEnded.endedCh():
+		// The loop that would take the task ended while the queue was full, and nothing drains it again until a later Run: ctx may outlive the loop for the whole process, as when a quit by keys ends the loop and the host shutdown waits for this post.
+		return fmt.Errorf("%w: the owner loop ended", errOwnerLoopUnavailable)
 	}
 }
 
@@ -1000,6 +1207,10 @@ type InteractiveModeOptions struct {
 	Frontend frontend.Frontend
 	// Terminal is the terminal the renderer drives (interactive-mode.ts:447 `terminal?: Terminal`, passed to createInteractiveTui at :626). Nil selects the process terminal.
 	Terminal tui.Terminal
+	// KernelFrameDeadline lets the owner loop keep a frame's deadline on a kernel timer where the runtime's timer is coarser than a frame needs
+	// (kernelFrameTimer; Linux). The pig command sets it. Left unset, the runtime's timer keeps the deadline, whose time a testing/synctest bubble
+	// controls; a kernel timer's is the machine's.
+	KernelFrameDeadline bool
 	// SettingsManager provides read/write access to global settings.
 	// Wired by main.go via coding.AgentSessionServices.
 	SettingsManager *SettingsManager
@@ -1096,6 +1307,8 @@ type InteractiveModeOptions struct {
 	// DefaultModelPerProvider shares the startup resolver's provider defaults with /login.
 	DefaultModelPerProvider map[string]string
 
+	// ModelBinder gives a model object an extension passed to setModel over the wire the Session runtime's backend (coding.ModelRuntime.BindModelObject).
+	ModelBinder func(*ai.Model) *ai.Model
 	// ModelLookup resolves a provider/model identity through the Session-owned runtime.
 	ModelLookup  func(providerID, modelID string) *ai.Model
 	ModelCatalog func(providerID ...string) []*ai.Model
@@ -1178,6 +1391,9 @@ type InteractiveModeOptions struct {
 	// context-file inputs on /reload so the interactive session mirrors
 	// upstream resourceLoader.reload() instead of reusing startup snapshots.
 	ReloadResourceProvider func() ReloadResourceSnapshot
+	// ExtensionWarnings are the install failures and package warnings of the startup load, which the loaded-resources listing shows under [Extension issues]
+	// (resource-loader.ts getExtensions().warnings).
+	ExtensionWarnings []ExtensionWarning
 
 	// Verbose forces verbose startup output (overrides quietStartup).
 	// Mirrors upstream InteractiveModeOptions.verbose (interactive-mode.ts:184).
@@ -1219,6 +1435,19 @@ type InteractiveModeOptions struct {
 
 	// ReplacementResources returns the cwd-bound options of the build that owns session.
 	ReplacementResources func(session InteractiveSessionHandle) InteractiveReplacement
+
+	// TerminalViewClient attaches the TUI as a client of the plugin view registry of SubprocessUIBridge, so the views
+	// extensions mount (ui.view) are drawn in the terminal. A Piglet's viewClient: terminal sets it.
+	//
+	// pig additive (D614).
+	TerminalViewClient bool
+
+	// ViewEndpoint serves the view carrier of SubprocessUIBridge's registry on a Unix socket in AgentDir/view-endpoint,
+	// so a client outside the process attaches to the session beside the terminal. A Piglet's viewEndpoint: socket
+	// sets it.
+	//
+	// pig additive (D614).
+	ViewEndpoint bool
 
 	// SubprocessUIBridge, when non-nil, is the UI bridge for subprocess
 	// extensions. Run() wires it to the TUI after creation via
@@ -1313,7 +1542,10 @@ func (m *InteractiveMode) rebuildToolSystemPrompt() {
 	if m.structuredSystemPrompt() {
 		text := prompts.BuildDefaultPrompt(prompts.FromExtensionOptions(*opts))
 		m.turnSystemPromptMu.Lock()
-		m.opts.SystemPrompt = text
+		// Init rebuilds the prompt the caller built from the same options: an equal text keeps the caller's string, so the live heap holds one copy of it.
+		if text != m.opts.SystemPrompt {
+			m.opts.SystemPrompt = text
+		}
 		m.turnSystemPromptMu.Unlock()
 	}
 }
@@ -1369,6 +1601,8 @@ func NewInteractiveMode(runtimeHost InteractiveRuntime, options InteractiveModeO
 	// Mirrors the upstream InteractiveMode constructor's
 	// setCapabilityOverrides(settingsManager.getTerminalCapabilityOverrides()).
 	tui.SetCapabilityOverrides(opts.Settings.GetTerminalCapabilityOverrides())
+	// pig divergence (D624): terminal.screenWriter is applied here, once, before a renderer exists and so before the alternate screen is entered; a settings change or a reload acts at the next start. The merged settings carry the global file's value, because a project file cannot set the key.
+	tui.SetScreenWriter(opts.Settings.GetTerminalScreenWriter() == TerminalScreenWriterWriter)
 	ensurePngTranscoder(nil)
 	// Pi's constructor uses options.tuiMode ?? settingsManager.getTuiMode().
 	if opts.TuiMode == "" {
@@ -1381,6 +1615,7 @@ func NewInteractiveMode(runtimeHost InteractiveRuntime, options InteractiveModeO
 		opts:                 opts,
 		isIdle:               true,
 		resourceSourceInfo:   map[string]ResourceSourceInfo{},
+		extensionWarnings:    opts.ExtensionWarnings,
 		toolByID:             make(map[string]*tui.ToolExecutionComponent),
 		toolStarts:           make(map[string]time.Time),
 		uiTaskCh:             make(chan func(), 64),
@@ -1475,22 +1710,28 @@ func (m *InteractiveMode) printResumeHint() {
 	if m.interruptExiting.Load() {
 		return
 	}
+	// pig additive (D91): Pi has no frontend member. A frontend that drew this run owns its exit screen, and the
+	// frontend contract has no exit text path, so the host writes nothing after it. leaveFrontend clears surface,
+	// so a run that fell back to the ANSI renderer prints the hint as Pi does.
+	if m.surface != nil {
+		return
+	}
 	cmd := m.resumeHintCommand()
 	if cmd == "" {
 		return
 	}
-	// upstream: interactive-mode.ts:4326 `${chalk.dim("To resume this session:")} ${resumeCommand}`, dim only at a nonzero chalk level.
+	// upstream: interactive-mode.ts `${chalk.dim("To resume this session:")}\n${resumeCommand}\n`: the command on its own line (#12237), dim only at a nonzero chalk level.
 	label := "To resume this session:"
 	if chalkModifiersEnabled() {
 		label = ChalkApply("\x1b[2m", "\x1b[22m", label)
 	}
-	_, _ = fmt.Printf("%s %s\n", label, cmd)
+	_, _ = fmt.Printf("%s\n%s\n", label, cmd)
 }
 
 // Run renders the initial editor and footer even with quiet startup, then blocks in the interactive loop until the user exits.
 func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 	// After Run returns nothing services owner tasks, so a runtime closed later resets the UI in place.
-	defer m.runEnded.Store(true)
+	defer m.runEnded.end()
 	// pig additive (D102): Pi leaves no trace when input ends or fails. Registered before the crash handler below so it
 	// sees the error that handler returns; a crash has its own record.
 	defer func() {
@@ -1509,10 +1750,22 @@ func (m *InteractiveMode) Run(ctx context.Context) (err error) {
 	defer SetUncaughtGoroutineHandler(m.uncaughtOffLoop)()
 	// Runs first on return, before the handlers above: Stop is upstream's stop(), which run() reaches through shutdown() or handleFatalRuntimeError.
 	defer func() { err = errors.Join(err, m.stopRun()) }()
+	defer m.closeViewEndpoint()
 	if err := m.Init(ctx); err != nil {
-		return err
+		return m.startupEndError(ctx, err)
 	}
 	return m.run(ctx)
+}
+
+// startupEndError is the result of a Run whose startup failed with err. A SIGTERM or SIGHUP that arrives while startup runs is disposed by the signal's
+// goroutine (ShutdownFromSignal) before main cancels the root context, and the startup step it interrupts (the terminal colors, an awaited handler, an
+// owner-loop step of the bind) then reports the cancellation. That is the end of a session that shut down, which Pi's shutdown({ fromSignal }) ends with
+// process.exit(0) whatever init() is awaiting (interactive-mode.ts:4483-4494); main reports an error from Run as "Error: ..." with status 1.
+func (m *InteractiveMode) startupEndError(ctx context.Context, err error) error {
+	if errors.Is(err, context.Canceled) && ctx.Err() != nil && m.signalShutdownDone.Load() {
+		return nil
+	}
+	return err
 }
 
 // startupMark is the optional startup timing hook, a no-op when unset.
@@ -1529,7 +1782,7 @@ func (m *InteractiveMode) Init(ctx context.Context) (err error) {
 	if m.isInitialized {
 		return nil
 	}
-	m.runEnded.Store(false)
+	m.runEnded.begin()
 	m.runCtx = ctx
 	// SIGINT is taken before anything draws, as Pi's init() registers its signal handlers first (interactive-mode.ts:974-977): a screen on the
 	// terminal means the handler is in place. Installed after the first render, a SIGINT sent to a session that had already drawn got Go's
@@ -1557,6 +1810,8 @@ func (m *InteractiveMode) Init(ctx context.Context) (err error) {
 
 	removeWriteErrorHandler := m.exitOnDeadTerminalWrite()
 	m.onStop(func() error { removeWriteErrorHandler(); return nil })
+	removeClipboardOrder := m.orderClipboardWrites()
+	m.onStop(func() error { removeClipboardOrder(); return nil })
 	m.backgroundCtx, m.backgroundCancel = context.WithCancel(ctx)
 	m.onStop(func() error {
 		m.backgroundCancel()
@@ -1568,6 +1823,10 @@ func (m *InteractiveMode) Init(ctx context.Context) (err error) {
 		m.backgroundCtx = nil
 		return nil
 	})
+	// Pi's init() prepares the changelog data right after registering the signal handlers, so a first start or an update records the version before the
+	// model scope notice, the UI and the extensions (interactive-mode.ts:976-981).
+	m.changelogEntries = m.getChangelogForDisplay()
+	m.extensionChangelogUpdates = m.getExtensionChangelogUpdates()
 	mark := m.startupMark()
 	m.initStartupTheme()
 	mark("theme-detected")
@@ -1594,9 +1853,15 @@ func (m *InteractiveMode) Init(ctx context.Context) (err error) {
 	m.tuiInst.SetOverlayCommandDispatcher(func(command func()) {
 		m.runOnMain(m.runCtx, command)
 	})
+	// Install the SIGCONT handler before the renderer takes the terminal, as Pi's
+	// setSuspendSignalHandler runs immediately before ui.start() (interactive-mode.ts:1041-1043).
+	// tui activates the OS listener only once the renderer starts (ownsTerminal) and clears it at stop.
+	stopContinue := m.installContinueHandler(m.backgroundCtx)
+	m.onStop(func() error { stopContinue(); return nil })
 	mark("pre-raw-mode")
 	m.holdProgramStatusForFrontend()
-	restore, drain, err := tui.EnterRawModeWithDrain()
+	// A frontend may draw instead of the fullscreen renderer, on its own terminal: the alternate screen is entered once it declined (below).
+	restore, drain, err := m.startTerminal(m.altScreen != nil && m.opts.Frontend == nil)
 	if err != nil {
 		// Entering raw mode on a terminal that went away (setRawMode EIO or ENOTTY) is not a crash.
 		m.exitIfDeadTerminal(err)
@@ -1611,10 +1876,17 @@ func (m *InteractiveMode) Init(ctx context.Context) (err error) {
 	mark("raw-mode-entered")
 	m.rawRestore = restore
 	m.rawDrain = drain
+	if startupTerminalArmedHook != nil {
+		startupTerminalArmedHook()
+	}
 	m.openFrontend()
+	if m.opts.Frontend != nil && m.surface == nil && m.altScreen != nil {
+		// The frontend declined: the fullscreen renderer draws, and the terminal starts again on its screen.
+		if err := m.restartTerminal(); err != nil {
+			return fmt.Errorf("interactive: raw mode: %w", err)
+		}
+	}
 	m.tuiInst.HideCursor()
-	cursorTUI := m.tuiInst
-	m.onStop(func() error { cursorTUI.ShowCursor(); return nil })
 	// Centralized, idempotent renderer teardown runs before the deferred cursor and cooked-mode restoration on normal quit or graceful signal shutdown. A dead-terminal emergency exits without unwinding these terminal writes.
 	m.onStop(func() error { m.stopInteractiveTui(); return nil })
 
@@ -1645,12 +1917,11 @@ func (m *InteractiveMode) Init(ctx context.Context) (err error) {
 	editorPaddingX, autocompleteMaxVisible := m.opts.Settings.GetEditorPaddingX(), m.opts.Settings.GetAutocompleteMaxVisible()
 	m.editor = NewEditorWithOptions(CustomEditorOptions{UI: m.tuiInst, PaddingX: &editorPaddingX, AutocompleteMaxVisible: &autocompleteMaxVisible, EmbedWorkingStatus: true})
 	m.bindEditorSnapshot()
-	m.defaultCustomEditor()
-	m.bindEditorSnapshot()
 	m.onStop(func() error { m.clearStatusIndicator(""); return nil })
 	m.editorContainer = tui.NewContainer()
 	m.editorContainer.Add(m.editor)
 	m.tuiInst.SetFocus(m.editor)
+	m.inputHold = make(chan struct{})
 	m.startTerminalInput(ctx, os.Stdin)
 	m.programStatusReporter().Report()
 	m.onStop(m.stopTerminalInput)
@@ -1664,7 +1935,7 @@ func (m *InteractiveMode) Init(ctx context.Context) (err error) {
 		m.postUITask(func() { apply(); m.tuiInst.RequestRender() })
 	})
 	m.editor.SetAutocompleteTaskOwner(m.backgroundCtx, m.backgroundTasks.Go, m.reportAutocompleteError)
-	m.editor.SetAutocomplete(m.buildAutocompleteProvider())
+	// No provider yet: Pi's editor has none until bindCurrentSessionExtensions calls setupAutocompleteProvider (interactive-mode.ts:2167); rebindSession installs it.
 	m.applyEditorMaxVisible()
 	m.statusLine = m.newFooter() // timings rebound after agent constructed
 	m.thinkingLevel = m.sessionThinkingLevel()
@@ -1690,11 +1961,15 @@ func (m *InteractiveMode) Init(ctx context.Context) (err error) {
 	m.mountInteractiveTui(false)
 	m.startInteractiveTui()
 	mark("tui-started")
+	if startupWindowPauseHook != nil {
+		startupWindowPauseHook()
+	}
 	// Pi sets isInitialized once the TUI started (interactive-mode.ts:998-999): a later failure leaves init() done, and stop() tears the TUI down.
 	m.isInitialized = true
 	m.programStatusReporter().Report()
 	// Pi's ui.start() only requests the first frame, and init() writes the terminal color query (applyFromSettings()) before the deferred frame runs at `await waitForTerminalColors()`. The header, which bakes theme colors into its text, is built once the query completed or timed out (interactive-mode.ts init(): ui.start(), applyFromSettings(), waitForTerminalColors(), header). The color wait serves the owner loop, so it paints the requested frame: a terminal that answers nothing shows the editor and footer at once and the header after the timeout.
 	m.applyThemeFromSettings(ctx)
+	m.inputHoldOnce.Do(func() { close(m.inputHold) })
 	if err := m.waitForTerminalColors(ctx); err != nil {
 		return err
 	}
@@ -1703,6 +1978,10 @@ func (m *InteractiveMode) Init(ctx context.Context) (err error) {
 	// Pi sets up managed tools after the startup header and before extensions, still under handleStartupSubmit; setupEditorSubmitHandler follows (interactive-mode.ts:1017-1028).
 	m.ensureManagedTools(ctx, tools.NewToolsManager(m.opts.AgentDir))
 	m.endStartupSubmitWindow()
+	// A quit the startup keys requested ends init() here; run() then takes the exit before any startup work.
+	if m.requestExit.Load() {
+		return nil
+	}
 
 	// Build slash registry up front so any extension's RegisterCommand
 	// can mirror its registration into the registry as it loads.
@@ -1776,6 +2055,7 @@ func (m *InteractiveMode) Init(ctx context.Context) (err error) {
 	m.installRunPromptTurnRefresh()
 	m.rebuildToolSystemPrompt()
 	m.eventCh = m.opts.SessionHandle.Events()
+	m.subscribeSessionListener()
 	extCtx.Session = m.currentSession()
 
 	m.reconfigureRemoteEditor()
@@ -1800,11 +2080,6 @@ func (m *InteractiveMode) Init(ctx context.Context) (err error) {
 	// summary does.
 	m.statusLine.timings = m.agent.Timings()
 
-	// Set terminal title. Mirrors upstream
-	// interactive-mode.ts:634-642 (updateTerminalTitle). Deferred clear
-	// restores the shell's own title on exit.
-	m.onStop(func() error { tui.SetTerminalTitle(""); return nil })
-	m.onStop(func() error { tui.SetTerminalProgress(false); return nil })
 	// Pre-populate status-line name from session on resume.
 	if n := m.currentSession().GetSessionName(); n != "" {
 		m.statusLine.SetName(n)
@@ -1816,68 +2091,85 @@ func (m *InteractiveMode) Init(ctx context.Context) (err error) {
 	m.initScopedModels()
 
 	// Dispatch session_start through the extension runner. The bridge performs
-	// the typed event conversion.
+	// the typed event conversion. Terminal input is served during the bind only while a handler runs (bindStartupSession).
 	mark("pre-emit-session-start")
-	if err := m.awaitExtensionUI(ctx, func(ctx context.Context) error {
-		return m.rebindCurrentSession(ctx, false)
-	}); err != nil {
+	if err := m.bindStartupSession(ctx); err != nil {
 		if errors.Is(err, errInteractiveShutdown) {
 			return nil
+		}
+		// Pi's init() awaits the bind, and nothing catches what its setupAutocompleteProvider throws: it is the uncaughtException that ends the process.
+		if rejection, ok := errors.AsType[uncaughtError](err); ok {
+			panic(rejection)
 		}
 		return err
 	}
 	mark("post-emit-session-start")
 
-	// Loaded resources follow the built-in or extension-supplied header.
-	m.showLoadedResources(false, true)
-	// Quiet startup suppresses help and resource listings, not the initial editor and footer.
-	m.tuiInst.Render()
-	mark("first-render-done")
+	// Pi's init() has no render between the bind and renderInitialMessages (interactive-mode.ts:1141-1162): everything the bind changed is asked for with
+	// requestRender and painted by the one renderNow at the end of init(). A render here wrote a frame and, with nothing changed since, a bare cursor
+	// placement after the next one.
+	// Upstream's rebindCurrentSession shows the startup changelog notice after the loaded resources (showStartupNoticesIfNeeded, interactive-mode.ts
+	// bindCurrentSessionExtensions), before init() renders the initial messages.
+	m.showStartupChangelog(m.changelogEntries, m.extensionChangelogUpdates)
 
+	m.renderInitialMessages()
+	// Pi's init() ends with `this.ui.renderNow()` (interactive-mode.ts:1162) after renderInitialMessages and the provider count: the one frame of the
+	// startup state. renderNow clears a render a request asked for before it (tui.ts:1025-1031), so the requests the bind made fall into it.
+	m.tuiInst.RenderNow()
+	m.loadRemainingHighlightLanguages()
+	// upstream: interactive-mode.ts run() shows the startup diagnostics, migrated credentials, the models.json error, the model fallback message and the
+	// crash notice once init() has returned (:1230-1262): each asks for a render, and the frame that follows is a second one after the startup frame.
 	m.showInitNotices()
 	m.showCrashNotice()
 	if m.frontendStartupWarning != "" {
 		m.showWarning(m.frontendStartupWarning)
 	}
 
-	m.renderInitialMessages()
-	m.tuiInst.Render()
-	m.loadRemainingHighlightLanguages()
-
-	// Show "what's new" on fresh sessions (no prior messages) when the
-	// binary version differs from the last recorded version, and send the
-	// install-telemetry ping on the same two occasions upstream does: a
-	// fresh install and an update with new changelog entries.
-	// Mirrors upstream getChangelogForDisplay + showStartupNoticesIfNeeded
-	// (interactive-mode.ts:816-843, 487-522, 1265-1307).
-	if m.opts.SettingsManager != nil && m.opts.ResumePath == "" {
-		var newEntries []ChangelogEntry
-		if m.opts.AppVersion != "" {
-			newEntries = startupChangelog(m.opts.SettingsManager, m.opts.AppVersion)
-		}
-		if extensionUpdates := m.getExtensionChangelogUpdates(); len(newEntries) > 0 || len(extensionUpdates) > 0 {
-			m.showStartupChangelog(newEntries, extensionUpdates)
-			m.tuiInst.Render()
-		}
-	}
-
 	return nil
 }
 
 // startupChangelog records the changelog version and returns the What's New entries of a fresh session (recordChangelogVersionAndMaybeReportInstall).
-// Only a recorded version other than appVersion reads the entries, so the bundled changelog is parsed only then; the first start and a start of the recorded version parse nothing.
-// pig additive (D92): a Piglet that strips the changelog parses an empty bundle; see changelog_bundle.go.
+// Only a recorded version other than appVersion reads the entries, and then only as far as the entries newer than it extend (parseChangelogNewerThan):
+// the first start and a start of the recorded version read nothing, and a recorded version ahead of this build's decodes a few kilobytes.
+// pig additive (D92): a Piglet that strips the changelog reads an empty bundle; see changelog_bundle.go.
 func startupChangelog(sm *SettingsManager, appVersion string) []ChangelogEntry {
-	var allEntries []ChangelogEntry
+	var newer []ChangelogEntry
 	if lastSeen := sm.GetLastChangelogVersion(); lastSeen != "" && lastSeen != appVersion {
-		allEntries = ParseChangelog(bundledChangelog())
+		// An unreadable recorded version has nothing to compare with: recordChangelogVersionAndMaybeReportInstall records the current one and shows nothing.
+		if last, ok := parseLastSeenVersion(lastSeen); ok {
+			var err error
+			if newer, err = parseChangelogNewerThan(bundledChangelogReader(), last); err != nil {
+				panic("pig: embedded CHANGELOG.md.gz: " + err.Error())
+			}
+		}
 	}
-	return recordChangelogVersionAndMaybeReportInstall(sm, appVersion, allEntries)
+	return recordChangelogVersionAndMaybeReportInstall(sm, appVersion, newer)
+}
+
+// startInitialMessages is run()'s processing of the initial message and initialMessages once the TUI is up: the message is fed through the same handleSubmit
+// path the user's keystrokes hit, so transcript rendering, session writes and extension hooks all see it identically, and the positional messages follow it
+// one prompt at a time (cli/initial-message.ts; interactive-mode.ts run()).
+func (m *InteractiveMode) startInitialMessages(ctx context.Context) {
+	if strings.TrimSpace(m.opts.InitialMessage) != "" || len(m.opts.InitialImages) > 0 {
+		m.promptLoopSubmit(ctx, m.opts.InitialMessage, m.opts.InitialImages)
+	}
+	if len(m.opts.InitialMessages) > 0 {
+		done := make(chan struct{})
+		m.initialMessagesDone = done
+		m.backgroundTasks.Go(func() {
+			defer close(done)
+			m.submitInitialMessages(ctx, m.opts.InitialMessages)
+		})
+	}
 }
 
 // run is upstream's run() after init(): the startup checks, the background refreshes, the signal and resize handlers, the initial messages and
 // the input loop.
 func (m *InteractiveMode) run(ctx context.Context) error {
+	// A quit the startup keys requested ended Init before the session was bound. None of the startup work below may run on it, and the input loop takes the exit.
+	if m.requestExit.Load() {
+		return m.inputLoop(ctx, os.Stdin)
+	}
 	mark := m.startupMark()
 	// Check tmux keyboard setup asynchronously (mirrors upstream
 	// checkTmuxKeyboardSetup, interactive-mode.ts:667-675, 768-818).
@@ -1933,23 +2225,7 @@ func (m *InteractiveMode) run(ctx context.Context) error {
 	stopResize := m.installResizeHandler(ctx)
 	m.onStop(func() error { stopResize(); return nil })
 
-	// Auto-submit initial message (positional arg / piped
-	// stdin) once the TUI is up. Mirrors upstream's initial-message
-	// dispatch in coding-agent/cli/initial-message.ts: the message
-	// is fed through the same handleSubmit path the user's keystrokes
-	// hit, so transcript rendering / session writes / extension
-	// hooks all see it identically.
-	if strings.TrimSpace(m.opts.InitialMessage) != "" || len(m.opts.InitialImages) > 0 {
-		m.handleSubmitWithImages(ctx, m.opts.InitialMessage, m.opts.InitialImages)
-	}
-	if len(m.opts.InitialMessages) > 0 {
-		done := make(chan struct{})
-		m.initialMessagesDone = done
-		m.backgroundTasks.Go(func() {
-			defer close(done)
-			m.submitInitialMessages(ctx, m.opts.InitialMessages)
-		})
-	}
+	m.startInitialMessages(ctx)
 	mark("interactive-ready")
 	m.frontendInputReady()
 	return m.inputLoop(ctx, os.Stdin)

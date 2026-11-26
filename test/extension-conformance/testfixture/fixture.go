@@ -8,6 +8,7 @@
 package testfixture
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/hex"
@@ -20,6 +21,7 @@ import (
 	"io"
 	"maps"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"reflect"
@@ -37,6 +39,23 @@ import (
 	"github.com/MichaelKinsy/PiG/extensions/sdk/kit"
 	"github.com/MichaelKinsy/PiG/extensions/sdk/tui"
 )
+
+// ioWait dials addr ("host:port"), writes "waiting\n" and returns when the peer writes a line.
+func ioWait(addr string) error {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := fmt.Fprintln(conn, "waiting"); err != nil {
+		return err
+	}
+	_, err = bufio.NewReader(conn).ReadString('\n')
+	return err
+}
+
+// nameWaitAddr is the address the session_info_changed handler waits on first; empty when the handler is not armed (io_wait_name).
+var nameWaitAddr atomic.Value
 
 // kitProbe is the component kit's conformance view (D107,
 // docs/plan/extension-component-kit.md §10). It logs every HandleInput and
@@ -162,6 +181,9 @@ func kitImagePNG(n int) []byte {
 // kitKindsPNG is kit-kinds' image, a 1×1 PNG every SDK fixture embeds byte
 // for byte.
 const kitKindsPNG = "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c48900000010494441547801010500faff002a005fff026a01892888e8cd0000000049454e44ae426082"
+
+// viewCancelledTag is the tag of the last ui.view.intent whose handler saw its request cancelled.
+var viewCancelledTag atomic.Value
 
 type focusedList struct {
 	items    []string
@@ -324,10 +346,14 @@ func modelConformanceOptions() map[string]any {
 	}
 }
 
+// processFactoryCalls is a package-level counter the factory increments (D232): every generation in one Go process shares it.
+var processFactoryCalls atomic.Int64
+
 // Extension returns the canonical Go SDK fixture shared by subprocess and
 // fused conformance harnesses.
 func Extension() *sdk.Extension {
 	ext := sdk.New("sdk-fixture")
+	processFactoryCalls.Add(1)
 	// factoryAgentDir is getAgentDir() while the factory runs, where Pi's extensions call it (TestConformance_HostConfigurationAgreesAcrossSDKs).
 	factoryAgentDir, factoryAgentDirErr := sdk.AgentDir()
 	if factoryAgentDirErr != nil {
@@ -454,7 +480,7 @@ func Extension() *sdk.Extension {
 			return err
 		}
 		ctx.SetThinkingLevel("high")
-		ok, err := ctx.SetModel("probe/model")
+		ok, err := ctx.SetModelNamed("probe/model")
 		if err != nil {
 			return err
 		}
@@ -468,6 +494,15 @@ func Extension() *sdk.Extension {
 	ext.Command("replicated-accessors", "Read the replicated accessors after each write", replicatedAccessorsProbe)
 	ext.Command("active_tools_set", "Set the active tools to the comma-separated names", func(ctx sdk.Context, args string) error {
 		ctx.SetActiveTools(strings.Split(strings.TrimSpace(args), ","))
+		return nil
+	})
+	// host_error_probe makes the host fail navigateTree (a call Pi rejects) and reports what the extension sees: the error's text, then `|`, then its typed code ("-" where the SDK has none).
+	ext.Command("host_error_probe", "Report what a host error on navigateTree looks like to the extension", func(ctx sdk.Context, _ string) error {
+		text := "no error"
+		if _, err := ctx.NavigateTree("entry", nil); err != nil {
+			text = err.Error()
+		}
+		ctx.Notify("host_error:"+text+"|-", "info")
 		return nil
 	})
 	// session_actions_unbound drives the session actions of a command context the host never bound; Pi answers { cancelled: false } and a no-op reload (runner.ts:383-387).
@@ -496,6 +531,93 @@ func Extension() *sdk.Extension {
 		ctx.Notify("unbound:"+strings.Join(parts, ","), "info")
 		return nil
 	})
+	// event_session_actions_on subscribes to the event named by the argument with a handler that calls every command-only session action, and keeps the handler's
+	// context. Pi's ExtensionContext has none of them (runner.ts createContext), so each must be refused with Pi's "is not a function" error and none may reach the host.
+	// event_session_actions_stored makes the same calls through the kept context after the handler's request ended: Pi's context never gains the members.
+	var keptEventCtx sdk.Context
+	var keptEventCtxSet bool
+	var keptEventCtxMu sync.Mutex
+	reportSessionActions := func(hctx sdk.Context) string {
+		var parts []string
+		report := func(name string, err error) {
+			switch {
+			case err == nil:
+				parts = append(parts, name+"=allowed")
+			case strings.Contains(err.Error(), "is not a function"):
+				parts = append(parts, name+"=rejected")
+			default:
+				parts = append(parts, name+"=error:"+err.Error())
+			}
+		}
+		report("wait", hctx.WaitForIdle())
+		_, err := hctx.NewSession(nil)
+		report("new", err)
+		_, err = hctx.Fork("entry", nil)
+		report("fork", err)
+		_, err = hctx.NavigateTree("entry", nil)
+		report("navigate", err)
+		_, err = hctx.SwitchSession("/s.jsonl", nil)
+		report("switch", err)
+		report("reload", hctx.Reload())
+		return strings.Join(parts, ",")
+	}
+	ext.Command("event_session_actions_on", "Subscribe to the event named by the argument with a handler that calls the session actions", func(ctx sdk.Context, args string) error {
+		ext.OnEvent(strings.TrimSpace(args), func(hctx sdk.Context, _ map[string]any) (any, error) {
+			keptEventCtxMu.Lock()
+			keptEventCtx, keptEventCtxSet = hctx, true
+			keptEventCtxMu.Unlock()
+			hctx.Notify("event_actions:"+reportSessionActions(hctx), "info")
+			return nil, nil
+		})
+		return nil
+	})
+	ext.Command("event_session_actions_stored", "Call the session actions through the context an event handler kept", func(ctx sdk.Context, _ string) error {
+		keptEventCtxMu.Lock()
+		kept, ok := keptEventCtx, keptEventCtxSet
+		keptEventCtxMu.Unlock()
+		if !ok {
+			return fmt.Errorf("no event context was kept")
+		}
+		ctx.Notify("stored_actions:"+reportSessionActions(kept), "info")
+		return nil
+	})
+	// tool_call_cancel_on subscribes to tool_call with a handler that waits for the run's cancel signal and then answers (D650 claim 6: a handler that honours ctx.Done returns after the abort).
+	ext.Command("tool_call_cancel_on", "Subscribe to tool_call with a handler that waits for the cancel signal", func(ctx sdk.Context, _ string) error {
+		ext.OnEvent("tool_call", func(hctx sdk.Context, _ map[string]any) (any, error) {
+			hctx.Notify("cancel_wait", "info")
+			<-hctx.Done()
+			hctx.Notify("cancel_seen", "info")
+			return map[string]any{"block": true, "reason": "answered after the abort"}, nil
+		})
+		return nil
+	})
+	// session_actions_tool makes the same calls, and the wait, through the context of a tool's execute: Pi's createContext() object, so every one is refused.
+	ext.Tool("session_actions_tool", "Call the session actions through the tool's context", sdk.Schema{"type": "object", "properties": map[string]any{}}, func(tctx sdk.Context, _ map[string]any) (any, error) {
+		return map[string]string{"content": "tool_actions:" + reportSessionActions(tctx)}, nil
+	})
+	// wait_idle_command waits for the run from a command context, which Pi gives waitForIdle (runner.ts createCommandContext); the call returns when the host's wait does.
+	ext.Command("wait_idle_command", "Wait for the run from a command", func(ctx sdk.Context, _ string) error {
+		text := "done"
+		if err := ctx.WaitForIdle(); err != nil {
+			text = "error:" + err.Error()
+		}
+		ctx.Notify("wait_idle:"+text, "info")
+		return nil
+	})
+	// wait_idle_with_session waits for the run from a withSession callback, whose context is the command context of the replacement Session.
+	ext.Command("wait_idle_with_session", "Wait for the run from a withSession callback", func(ctx sdk.Context, _ string) error {
+		// The callback runs while this command's switchSession call is in flight, so the notice is sent once the call returned.
+		text := "never ran"
+		_, err := ctx.SwitchSession("/s.jsonl", map[string]any{"withSession": sdk.WithSessionFunc(func(replaced sdk.ReplacedSessionContext) error {
+			text = "done"
+			if err := replaced.WaitForIdle(); err != nil {
+				text = "error:" + err.Error()
+			}
+			return nil
+		})})
+		ctx.Notify("with_session_wait:"+text, "info")
+		return err
+	})
 	ext.Command("active_tools_get", "Report the active tools", func(ctx sdk.Context, _ string) error {
 		names, err := ctx.GetActiveTools()
 		if err != nil {
@@ -504,10 +626,26 @@ func Extension() *sdk.Extension {
 		ctx.Notify("active_tools:"+strings.Join(names, ","), "info")
 		return nil
 	})
+	// mcp_register_run registers two MCP servers in one synchronous run and reads the active tools after each call (TestConformance_McpServerRegisteredAtRunTimeIsHandledInsideTheCall).
+	ext.Command("mcp_register_run", "Register two MCP servers and report the active tools after each", func(ctx sdk.Context, _ string) error {
+		var reads []string
+		for _, name := range []string{"conformance-run-a", "conformance-run-b"} {
+			if err := ctx.RegisterMcpServer(name, sdk.McpServerConfig{URL: "https://" + name + ".invalid/mcp"}); err != nil {
+				return err
+			}
+			names, err := ctx.GetActiveTools()
+			if err != nil {
+				return err
+			}
+			reads = append(reads, strings.Join(names, ","))
+		}
+		ctx.Notify("mcp_register_run:"+strings.Join(reads, "|"), "info")
+		return nil
+	})
 	// provider_probe_register and provider_probe_unregister register and unregister a plain provider after the extension connected.
 	ext.Command("provider_probe_register", "Register a provider with one model", func(ctx sdk.Context, _ string) error {
 		var config sdk.ProviderConfig
-		if err := json.Unmarshal([]byte(`{"baseUrl":"https://probe.invalid/v1","api":"openai-completions","apiKey":"probe-key","models":[{"id":"probe-model","name":"Probe Model","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1000,"maxTokens":100}]}`), &config); err != nil {
+		if err := json.Unmarshal([]byte(`{"baseUrl":"https://probe.invalid/v1","api":"openai-completions","apiKey":"probe-key","models":[{"id":"probe-model","name":"Probe Model","reasoning":true,"input":["text","image"],"cost":{"input":3.5,"output":4.5,"cacheRead":0.35,"cacheWrite":0.45},"contextWindow":54321,"maxTokens":4321}]}`), &config); err != nil {
 			return err
 		}
 		ext.RegisterProvider("conformance-probe", config)
@@ -515,6 +653,28 @@ func Extension() *sdk.Extension {
 	})
 	ext.Command("provider_probe_unregister", "Unregister the provider", func(ctx sdk.Context, _ string) error {
 		ext.UnregisterProvider("conformance-probe")
+		return nil
+	})
+	// registry-model-probe registers the provider of the active model again with the argument as the model's name, then reads the model (TestARegistryWriteIsVisibleToTheNextModelReadAcrossSDKs).
+	ext.Command("registry-model-probe", "Register the active model's provider with a new name, then read the model", func(ctx sdk.Context, name string) error {
+		encoded, err := json.Marshal(name)
+		if err != nil {
+			return err
+		}
+		var config sdk.ProviderConfig
+		if err := json.Unmarshal([]byte(`{"baseUrl":"https://probe.invalid/v1","api":"openai-completions","apiKey":"probe-key","models":[{"id":"m","name":`+string(encoded)+`,"reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1000,"maxTokens":100}]}`), &config); err != nil {
+			return err
+		}
+		ext.RegisterProvider("replica-reg", config)
+		info, err := ctx.GetModelInfo()
+		if err != nil {
+			return err
+		}
+		read := ""
+		if info != nil {
+			read = info.Name
+		}
+		ctx.Notify("regname="+read, "info")
 		return nil
 	})
 	ext.Command("commands-probe", "Read the host's slash commands", func(ctx sdk.Context, _ string) error {
@@ -584,12 +744,28 @@ func Extension() *sdk.Extension {
 	ext.EntryViewRenderer("kit-entry", func(sdk.Context, map[string]any, sdk.EntryRenderOptions, int) (kit.View, error) {
 		return (&kitProbe{}).View(0), nil
 	})
+	// The click cards: a message and an entry that keep per-message state (the clicks and where the last one landed) the way Pi's renderer keeps it in a
+	// WeakMap keyed by the message, and count the click a mouse region of their view reports.
+	ext.MessageViewRenderer("conformance-click-message", func(_ sdk.Context, message map[string]any, options sdk.MessageRenderOptions, _ int) (kit.View, error) {
+		return clickCardView("clickcard", message["content"], options.State, options.Expanded), nil
+	})
+	ext.MessageViewEvent("conformance-click-message", func(_ sdk.Context, _ map[string]any, options sdk.MessageRenderOptions, event kit.Event) error {
+		countClick(options.State, event)
+		return nil
+	})
+	ext.EntryViewRenderer("conformance-click-entry", func(_ sdk.Context, entry map[string]any, options sdk.EntryRenderOptions, _ int) (kit.View, error) {
+		return clickCardView("clickentry", entry["data"], options.State, options.Expanded), nil
+	})
+	ext.EntryViewEvent("conformance-click-entry", func(_ sdk.Context, _ map[string]any, options sdk.EntryRenderOptions, event kit.Event) error {
+		countClick(options.State, event)
+		return nil
+	})
 	ext.EntryRenderer("conformance-entry", func(_ sdk.Context, entry map[string]any, options sdk.EntryRenderOptions, width int) ([]string, error) {
 		return []string{fmt.Sprintf("entryrenderer:%v:expanded=%t:width=%d", entry["data"], options.Expanded, width)}, nil
 	})
 	ext.MarkdownTransformer(func(markdown string, context sdk.MarkdownTransformContext) string {
 		return fmt.Sprintf("md:%s:%s:streaming=%t:width=%d", markdown, context.MessageType, context.IsStreaming, context.AvailableWidth)
-	})
+	}, sdk.MarkdownTransformerOptions{MessageTypes: []string{"user", "assistant", "assistant-thinking", "custom", "summary", "changelog"}})
 	resolvedLine := func(prefix, tool string) sdk.ToolRenderCallFunc {
 		return func(_ sdk.Context, args map[string]any, _ sdk.ToolRenderContext, _ int) ([]string, error) {
 			return []string{fmt.Sprintf("%s:%s:%v", prefix, tool, args["q"])}, nil
@@ -609,6 +785,18 @@ func Extension() *sdk.Extension {
 				return (&kitProbe{}).View(0), nil
 			}
 			return &renderers
+		case "last_view_probe":
+			// A view renderer that reads the view form of ToolRenderContext.LastComponent: the kind of what its previous run returned, and the run's own n.
+			return &sdk.ToolRenderers{CallView: func(_ sdk.Context, args map[string]any, render sdk.ToolRenderContext, _ int) (kit.View, error) {
+				kind := "none"
+				if last := render.LastComponent; last != nil {
+					kind = "lines"
+					if last.View != nil {
+						kind = "view"
+					}
+				}
+				return kit.View{Root: kit.NewText(fmt.Sprintf("lastview:%s:n=%v", kind, args["n"]), 0, 0)}, nil
+			}}
 		case "conformance_keyhints":
 			return &sdk.ToolRenderers{Call: func(_ sdk.Context, args map[string]any, render sdk.ToolRenderContext, _ int) ([]string, error) {
 				id, _ := args["q"].(string)
@@ -645,7 +833,7 @@ func Extension() *sdk.Extension {
 		Call: func(_ sdk.Context, args map[string]any, render sdk.ToolRenderContext, width int) ([]string, error) {
 			calls, _ := render.State["calls"].(int)
 			render.State["calls"] = calls + 1
-			return []string{fmt.Sprintf("toolrender:call:%v:partial=%t:calls=%d:width=%d", args["topic"], render.IsPartial, calls+1, width)}, nil
+			return []string{fmt.Sprintf("toolrender:call:%v:partial=%t:calls=%d:width=%d:last=%s", args["topic"], render.IsPartial, calls+1, width, lastRenderLine(render))}, nil
 		},
 		Result: func(_ sdk.Context, result sdk.ToolRenderResult, options sdk.ToolRenderResultOptions, render sdk.ToolRenderContext, width int) ([]string, error) {
 			details, _ := result.Details.(map[string]any)
@@ -653,7 +841,7 @@ func Extension() *sdk.Extension {
 			if render.DurationMs != nil {
 				duration = fmt.Sprint(*render.DurationMs)
 			}
-			return []string{fmt.Sprintf("toolrender:result:%v:%v:expanded=%t:calls=%v:width=%d:duration=%s", result.Content[0]["text"], details["k"], options.Expanded, render.State["calls"], width, duration)}, nil
+			return []string{fmt.Sprintf("toolrender:result:%v:%v:expanded=%t:calls=%v:width=%d:duration=%s:last=%s", result.Content[0]["text"], details["k"], options.Expanded, render.State["calls"], width, duration, lastRenderLine(render))}, nil
 		},
 	})
 
@@ -672,6 +860,44 @@ func Extension() *sdk.Extension {
 		return map[string]string{"content": "echo: " + text}, nil
 	})
 
+	// D232 shared-cells rows: instance-local state, the process's event bus, and what this instance heard (the same three tools in every SDK fixture).
+	var sharedMu sync.Mutex
+	sharedCalls := 0
+	var sharedHeard []string
+	if _, err := ext.Events().On("shared-cells", func(_ sdk.Context, data any) error {
+		from, _ := data.(map[string]any)["from"].(string)
+		sharedMu.Lock()
+		sharedHeard = append(sharedHeard, from)
+		sharedMu.Unlock()
+		return nil
+	}); err != nil {
+		panic(err)
+	}
+	ext.Tool("counter", "This instance's call count", sdk.Schema{"type": "object", "properties": map[string]any{}}, func(sdk.Context, map[string]any) (any, error) {
+		sharedMu.Lock()
+		defer sharedMu.Unlock()
+		sharedCalls++
+		return map[string]string{"content": strconv.Itoa(sharedCalls)}, nil
+	})
+	// Registered only for the module-state row, so the other conformance comparisons see the tool set every SDK fixture shares.
+	if os.Getenv("PIG_FIXTURE_MODULE_STATE") != "" {
+		ext.Tool("module_state", "The factory calls this process's package has seen", sdk.Schema{"type": "object", "properties": map[string]any{}}, func(sdk.Context, map[string]any) (any, error) {
+			return map[string]string{"content": "factoryCalls=" + strconv.FormatInt(processFactoryCalls.Load(), 10)}, nil
+		})
+	}
+	ext.Tool("ping", "Emit on the shared-cells channel", sdk.Schema{"type": "object", "required": []string{"name"}, "properties": map[string]any{"name": map[string]any{"type": "string"}}}, func(ctx sdk.Context, params map[string]any) (any, error) {
+		name, _ := params["name"].(string)
+		if err := ctx.Events().Emit("shared-cells", map[string]any{"from": name}); err != nil {
+			return nil, err
+		}
+		return map[string]string{"content": "pinged"}, nil
+	})
+	ext.Tool("received", "What this instance heard on shared-cells", sdk.Schema{"type": "object", "properties": map[string]any{}}, func(sdk.Context, map[string]any) (any, error) {
+		sharedMu.Lock()
+		defer sharedMu.Unlock()
+		return map[string]string{"content": "received=" + strings.Join(sharedHeard, ",")}, nil
+	})
+
 	ext.Tool("update_tool", "Stream two partial results", sdk.Schema{"type": "object", "properties": map[string]any{}}, func(ctx sdk.Context, _ map[string]any) (any, error) {
 		if err := ctx.OnUpdate("step 1"); err != nil {
 			return nil, err
@@ -685,6 +911,11 @@ func Extension() *sdk.Extension {
 	ext.Tool("big_out", "Return text of the size in the argument", sdk.Schema{"type": "object", "properties": map[string]any{}}, func(ctx sdk.Context, params map[string]any) (any, error) {
 		n, _ := params["n"].(float64)
 		return sdk.ToolResult{Content: strings.Repeat("a", int(n))}, nil
+	})
+	// lone_decl: a description, a parameter name and a parameter's text hold a lone UTF-16 surrogate, each in the three-byte form a Go string holds
+	// one in (TestConformance_ToolDeclarationLoneSurrogatesAgreeAcrossSDKs).
+	ext.Tool("lone_decl", "D[\xed\xa0\xbd]", sdk.Schema{"type": "object", "properties": map[string]any{"K[\xed\xb8\x80\xed\xa0\xbd]": map[string]any{"type": "string", "description": "PD[\xed\xa0\xbd]", "enum": []any{"E[\xed\xb8\x80]"}, "default": "DF[\xed\xa0\xbd]"}}}, func(ctx sdk.Context, params map[string]any) (any, error) {
+		return sdk.ToolResult{Content: "lone"}, nil
 	})
 	// echo_params returns the arguments it received as its details (TestConformance_ToolArgumentNumbersAgreeAcrossSDKs).
 	ext.Tool("echo_params", "Return the arguments as the result details", sdk.Schema{"type": "object", "properties": map[string]any{}}, func(ctx sdk.Context, params map[string]any) (any, error) {
@@ -728,6 +959,37 @@ func Extension() *sdk.Extension {
 		}
 		time.Sleep(8 * time.Second)
 		return "late", nil
+	})
+	// signal_host_probe awaits two host dialogs across the abort of its run: Pi's abort fires the tool's signal and nothing else, so the dialog pending at the abort and the one opened after it are answered (TestToolAbortKeepsTheToolsHostCalls).
+	ext.Tool("signal_host_probe", "Await host dialogs across the abort", sdk.Schema{"type": "object", "properties": map[string]any{}}, func(ctx sdk.Context, _ map[string]any) (any, error) {
+		ask := func(title string) string {
+			answer, _, err := ctx.Input(title, "p")
+			if err != nil {
+				return "failed: " + err.Error()
+			}
+			return fmt.Sprint(answer)
+		}
+		first := ask("tool_signal:first")
+		aborted := ctx.Err() != nil
+		second := ask("tool_signal:later")
+		return fmt.Sprintf("tool_signal:%t:%s:%s", aborted, first, second), nil
+	})
+	// aborted_entry_probe is called with its run already aborted (TestConformance_ToolCalledAbortedEntersWithItsSignalAborted): Pi runs tool.execute with an aborted signal. It echoes the nonce it was given, reports whether its signal was aborted on its first line, and makes a host call after that, which the host answers.
+	ext.Tool("aborted_entry_probe", "Report the signal a tool starts with", sdk.Schema{"type": "object", "properties": map[string]any{}}, func(ctx sdk.Context, params map[string]any) (any, error) {
+		aborted := ctx.Err() != nil
+		answer, _, err := ctx.Input(fmt.Sprintf("aborted_entry:%v", params["nonce"]), "p")
+		if err != nil {
+			return fmt.Sprintf("aborted_entry:%v:%t:failed: %v", params["nonce"], aborted, err), nil
+		}
+		return fmt.Sprintf("aborted_entry:%v:%t:%v", params["nonce"], aborted, answer), nil
+	})
+	// signal_nested_probe runs abort_tool as a nested call without a signal of its own: it gets the calling tool's signal (runner.ts:979-981 `options.signal ?? signal`), so the run's abort reaches it.
+	ext.Tool("signal_nested_probe", "Run abort_tool as a nested tool call", sdk.Schema{"type": "object", "properties": map[string]any{}}, func(ctx sdk.Context, _ map[string]any) (any, error) {
+		outcome, err := ctx.ExecuteTool("abort_tool", map[string]any{}, nil)
+		if err != nil {
+			return "tool_signal_nested:failed: " + err.Error(), nil
+		}
+		return "tool_signal_nested:" + outcome.Result.Text(), nil
 	})
 	ext.Command("abort_probe", "Report whether abort_tool saw its abort signal", func(ctx sdk.Context, args string) error {
 		ctx.Notify(fmt.Sprintf("abort:%t", abortObserved.Load()), "info")
@@ -833,6 +1095,26 @@ func Extension() *sdk.Extension {
 		return map[string]string{"content": "mutated " + tag}, nil
 	})
 
+	// mutation_order_ctx_probe makes `calls` getter calls (a host round trip each in the native SDKs, none that returns a Promise in Pi), then takes the file mutation
+	// queue through its Context and appends its tag to the file (TestFileMutationOrderOfTheContextFormAcrossSDKs): the shape of two tools of one batch that reach the
+	// queue after different numbers of round trips.
+	ext.Tool("mutation_order_ctx_probe", "Make getter calls, take the file mutation queue through the context and append a tag to the file", sdk.Schema{"type": "object", "properties": map[string]any{"file": map[string]any{"type": "string"}, "tag": map[string]any{"type": "string"}, "calls": map[string]any{"type": "number"}}}, func(ctx sdk.Context, params map[string]any) (any, error) {
+		file, _ := params["file"].(string)
+		tag, _ := params["tag"].(string)
+		calls, _ := params["calls"].(float64)
+		for range int(calls) {
+			_, _ = ctx.GetContextUsage()
+		}
+		err := ctx.WithFileMutationQueue(file, func() error {
+			before, _ := os.ReadFile(file)
+			return os.WriteFile(file, append(before, tag+"\n"...), 0o600)
+		})
+		if err != nil {
+			return nil, err
+		}
+		return map[string]string{"content": "mutated " + tag}, nil
+	})
+
 	ext.Tool("throw_probe", "Throw a value of the requested kind", sdk.Schema{"type": "object", "properties": map[string]any{"kind": map[string]any{"type": "string"}}}, func(ctx sdk.Context, params map[string]any) (any, error) {
 		switch params["kind"] {
 		case "unicode":
@@ -904,6 +1186,39 @@ func Extension() *sdk.Extension {
 		ctx.SetTitle("Conformance title")
 		return nil
 	})
+	// io_wait and io_wait_settled wait on a plain TCP read: they dial the address they get, announce themselves with a "waiting" line and return when the peer writes a line.
+	ext.Command("io_wait", "Wait on a socket read", func(_ sdk.Context, addr string) error {
+		return ioWait(addr)
+	})
+	ext.Command("io_wait_settled", "Make agent_settled wait on a socket read", func(_ sdk.Context, addr string) error {
+		ext.OnEvent("agent_settled", func(sdk.Context, map[string]any) (any, error) { return nil, ioWait(addr) })
+		return nil
+	})
+	ext.Command("io_wait_name", "Make the session_info_changed handler wait on a socket read", func(_ sdk.Context, addr string) error {
+		nameWaitAddr.Store(addr)
+		return nil
+	})
+	// io_wait_input and io_wait_start subscribe an input / before_agent_start handler that waits on a socket read first and then notifies "<event>:<text or prompt>" (TestConformance_InputAndBeforeAgentStartDoNotHoldTheCallerWhileTheyWait).
+	ext.Command("io_wait_input", "Make an input handler wait on a socket read", func(_ sdk.Context, addr string) error {
+		ext.OnEvent("input", func(hctx sdk.Context, data map[string]any) (any, error) {
+			if err := ioWait(addr); err != nil {
+				return nil, err
+			}
+			hctx.Notify("input:"+fmt.Sprint(data["text"]), "info")
+			return nil, nil
+		})
+		return nil
+	})
+	ext.Command("io_wait_start", "Make a before_agent_start handler wait on a socket read", func(_ sdk.Context, addr string) error {
+		ext.OnEvent("before_agent_start", func(hctx sdk.Context, data map[string]any) (any, error) {
+			if err := ioWait(addr); err != nil {
+				return nil, err
+			}
+			hctx.Notify("before_agent_start:"+fmt.Sprint(data["prompt"]), "info")
+			return nil, nil
+		})
+		return nil
+	})
 
 	ext.Command("command_error", "Return a command error", func(ctx sdk.Context, args string) error {
 		return fmt.Errorf("command exploded")
@@ -968,6 +1283,575 @@ func Extension() *sdk.Extension {
 			eventProbeOff = nil
 		}
 		return nil
+	})
+	// D614 plugin UI mounts: the conformance probe every SDK fixture implements the same way. Every number and name it
+	// reports comes from the host, so an SDK that never makes the call cannot produce it (conformance TestConformance_UIViewMounts).
+	viewText := func(ctx sdk.Context, suffix string) kit.View {
+		ab := ctx.ViewAbilities()
+		n := 0
+		if ab != nil {
+			n = ab.Limits.IntentArgBytes
+		}
+		return kit.View{Root: &kit.Text{Text: fmt.Sprintf("fixture-view-%d%s", n, suffix)}}
+	}
+	ext.Command("ui_view_abilities", "Report the replicated client abilities", func(ctx sdk.Context, args string) error {
+		ab := ctx.ViewAbilities()
+		if ab == nil {
+			ctx.Notify("view-abilities:none", "info")
+			return nil
+		}
+		slots := make([]string, len(ab.Slots))
+		for i, s := range ab.Slots {
+			slots[i] = string(s)
+		}
+		ctx.Notify(fmt.Sprintf("view-abilities:mounts=%d,argbytes=%d,slots=%s,nodes=%s,markdown=%t", ab.Limits.Mounts, ab.Limits.IntentArgBytes, strings.Join(slots, "+"), strings.Join(ab.Nodes, "+"), ab.Markdown), "info")
+		return nil
+	})
+	ext.Command("ui_view_probe", "Mount, update, hide, show, finish and remove a view", func(ctx sdk.Context, args string) error {
+		code := func(err error) string {
+			if ve, ok := errors.AsType[*sdk.ViewError](err); ok {
+				return string(ve.Code)
+			}
+			return "none"
+		}
+		st, err := ctx.MountView(sdk.ViewMount{Key: "probe", Slot: sdk.ViewSlotPanel, View: viewText(ctx, "")})
+		if err != nil {
+			return err
+		}
+		ctx.Notify(fmt.Sprintf("view-mounted:epoch=%d,rev=%d,state=%s", st.Mount.Epoch, st.Mount.Rev, st.State), "info")
+		first := st.Mount
+		st, err = ctx.UpdateView(sdk.ViewUpdate{Mount: first, View: viewText(ctx, "-2")})
+		if err != nil {
+			return err
+		}
+		ctx.Notify(fmt.Sprintf("view-updated:rev=%d", st.Mount.Rev), "info")
+		_, err = ctx.UpdateView(sdk.ViewUpdate{Mount: first, View: viewText(ctx, "-stale")})
+		ctx.Notify("view-stale:"+code(err), "info")
+		cur := st.Mount
+		if st, err = ctx.HideView(cur); err != nil {
+			return err
+		}
+		ctx.Notify("view-hidden:"+string(st.State), "info")
+		if st, err = ctx.ShowView(cur); err != nil {
+			return err
+		}
+		ctx.Notify("view-shown:"+string(st.State), "info")
+		if st, err = ctx.FinishView(cur); err != nil {
+			return err
+		}
+		ctx.Notify("view-finished:"+string(st.State), "info")
+		_, err = ctx.RemoveView(cur)
+		ctx.Notify("view-terminal:"+code(err), "info")
+		st, err = ctx.ViewState("probe")
+		if err != nil {
+			return err
+		}
+		ctx.Notify("view-final:"+string(st.State), "info")
+		intents := []sdk.ViewIntent{
+			{Name: "fx.add", Arg: sdk.ViewShape{Type: "object", Properties: map[string]sdk.ViewShape{"n": {Type: "integer"}}, Required: []string{"n"}}, Answer: &sdk.ViewShape{Type: "object", Properties: map[string]sdk.ViewShape{"sum": {Type: "integer"}}, Required: []string{"sum"}}},
+			{Name: "fx.wait", Arg: sdk.ViewShape{Type: "object", Properties: map[string]sdk.ViewShape{"tag": {Type: "string"}}, Required: []string{"tag"}}, Cancellable: true, TimeoutMs: 5000},
+		}
+		st, err = ctx.MountView(sdk.ViewMount{Key: "probe2", Slot: sdk.ViewSlotPanel, View: viewText(ctx, "-live"), Intents: intents})
+		if err != nil {
+			return err
+		}
+		ctx.Notify(fmt.Sprintf("view-second:epoch=%d,rev=%d", st.Mount.Epoch, st.Mount.Rev), "info")
+		return nil
+	})
+	ext.Command("ui_view_cancelled", "Report the intent whose handler was cancelled", func(ctx sdk.Context, args string) error {
+		tag, _ := viewCancelledTag.Load().(string)
+		ctx.Notify("intent-cancelled:"+tag, "info")
+		return nil
+	})
+	ext.Command("ui_view_state", "Report the state of the second mount", func(ctx sdk.Context, args string) error {
+		st, err := ctx.ViewState("probe2")
+		if err != nil {
+			return err
+		}
+		ctx.Notify(fmt.Sprintf("view-state:%s:%s", st.State, st.Reason), "info")
+		return nil
+	})
+	// D614 amendment: claims and alternatives, drawing, a11y and focus, diagnostics and the finish result, the same way
+	// in every SDK fixture (conformance TestConformance_UIViewExtras). The alternative's predicate, the shape counts and
+	// the result are built from what the host replicated, so an SDK that drops a member or answers from a constant fails.
+	viewClaim := func(claims []sdk.ViewClaim, name string) any {
+		for _, c := range claims {
+			if c.Name == name {
+				return c.Value
+			}
+		}
+		return nil
+	}
+	viewPicked := func(ab *sdk.ViewAbilities) int64 {
+		for _, sc := range ab.SlotClaims {
+			if sc.Slot == sdk.ViewSlotPanel {
+				n, _ := viewClaim(sc.Claims, "display.colors").(int64)
+				return n
+			}
+		}
+		return 0
+	}
+	viewList := func(id, label string) kit.View {
+		return kit.View{Root: kit.NewSelectList(id, []kit.SelectItem{{Value: id, Label: label}}, 5)}
+	}
+	ext.Command("ui_view_extras", "Mount a view with alternatives, a drawing, a11y and focus, and probe the bounds", func(ctx sdk.Context, args string) error {
+		code := func(err error) string {
+			if ve, ok := errors.AsType[*sdk.ViewError](err); ok {
+				return string(ve.Code)
+			}
+			return "none"
+		}
+		ab := ctx.ViewAbilities()
+		if ab == nil || ab.Drawing == nil {
+			return errors.New("ui_view_extras: the client states no drawing abilities")
+		}
+		picked := viewPicked(ab)
+		gestures, _ := viewClaim(ab.Claims, "input.gestures").([]string)
+		ctx.Notify(fmt.Sprintf("view-x-claims:colors=%v,kind=%v,gestures=%s,hover=%v,panel.colors=%d,profiles=%s,shapes=%d,pixels=%d",
+			viewClaim(ab.Claims, "display.colors"), viewClaim(ab.Claims, "display.kind"), strings.Join(gestures, "+"), viewClaim(ab.Claims, "display.hover"),
+			picked, strings.Join(ab.Drawing.Profiles, "+"), ab.Drawing.Shapes, ab.Drawing.Pixels), "info")
+		rects := func(n int) []sdk.ViewDrawShape {
+			out := make([]sdk.ViewDrawShape, n)
+			for i := range out {
+				out[i] = sdk.ViewDrawShape{Kind: "rect", Width: 1, Height: 1}
+			}
+			return out
+		}
+		scene := func(shapes []sdk.ViewDrawShape) *sdk.ViewDrawing {
+			return &sdk.ViewDrawing{Profile: "scene", Shapes: shapes}
+		}
+		base := func() kit.View { return viewList("base", "fixture-x-base") }
+		drawing := scene(rects(ab.Drawing.Shapes - 1))
+		drawing.Regions = []sdk.ViewRegion{{Key: "r", Shape: sdk.ViewDrawShape{Kind: "rect", Width: 4, Height: 4}, Gestures: []string{"activate"}, Intent: "fx.tap", Name: "Tap"}}
+		yes := true
+		st, err := ctx.MountView(sdk.ViewMount{Key: "extras", Slot: sdk.ViewSlotPanel,
+			View:    base(),
+			Intents: []sdk.ViewIntent{{Name: "fx.tap", Arg: sdk.ViewShape{Type: "object"}}},
+			Alternatives: []sdk.ViewAlternative{{
+				When:    sdk.ViewWhen{Any: []sdk.ViewWhenAll{{All: []sdk.ViewClause{{Claim: "display.colors", Op: "equals", Value: picked}}}}},
+				View:    viewList("alt", fmt.Sprintf("fixture-x-alt-%d", picked)),
+				Drawing: drawing,
+			}},
+			A11y: []sdk.ViewA11y{
+				{Node: "alt", Name: fmt.Sprintf("Extras %d", picked), Role: "button", Checked: &yes, Relations: []sdk.ViewRelation{{Kind: "describedBy", Target: "base"}}},
+				{Node: "base", Name: "Base"},
+			},
+			Focus: []sdk.ViewFocus{{Node: "alt", Request: "mount", Restore: "previous"}}})
+		if err != nil {
+			return err
+		}
+		ctx.Notify("view-x-mounted:"+string(st.State), "info")
+		attempt := func(label string, c sdk.ViewContent) {
+			c.View = base()
+			_, err := ctx.UpdateView(sdk.ViewUpdate{Mount: st.Mount, ViewContent: c})
+			ctx.Notify("view-x-"+label+":"+code(err), "info")
+		}
+		alts := make([]sdk.ViewAlternative, 9)
+		for i := range alts {
+			alts[i] = sdk.ViewAlternative{When: sdk.ViewWhen{Any: []sdk.ViewWhenAll{{All: []sdk.ViewClause{{Claim: "display.hover", Op: "present"}}}}}, View: base()}
+		}
+		attempt("alts", sdk.ViewContent{Alternatives: alts})
+		nested := sdk.ViewDrawShape{Kind: "rect", Width: 1, Height: 1}
+		for range 8 {
+			nested = sdk.ViewDrawShape{Kind: "group", Children: []sdk.ViewDrawShape{nested}}
+		}
+		attempt("nest", sdk.ViewContent{Drawing: scene([]sdk.ViewDrawShape{nested})})
+		points := make([]sdk.ViewPoint, 1025)
+		for i := range points {
+			points[i] = sdk.ViewPoint{X: float64(i), Y: float64(i)}
+		}
+		attempt("points", sdk.ViewContent{Drawing: scene([]sdk.ViewDrawShape{{Kind: "polyline", Points: points}})})
+		attempt("shapes", sdk.ViewContent{Drawing: scene(rects(4097))})
+		a11y := make([]sdk.ViewA11y, 257)
+		for i := range a11y {
+			a11y[i] = sdk.ViewA11y{Node: fmt.Sprintf("n%d", i)}
+		}
+		attempt("a11y", sdk.ViewContent{A11y: a11y})
+		attempt("over", sdk.ViewContent{Drawing: scene(rects(ab.Drawing.Shapes + 1))})
+		attempt("pixels", sdk.ViewContent{
+			Drawing: &sdk.ViewDrawing{Profile: "pixels", Pixels: &sdk.ViewPixels{Width: 2, Height: 2, Asset: "img", Scaling: "nearest"}},
+			Assets:  []sdk.ViewAsset{{ID: "img", MIME: "image/png", Size: 4, SHA256: strings.Repeat("a", 64), Delivery: "inline"}},
+		})
+		old := st.Mount
+		old.Rev += 50
+		stale := "none"
+		for range 3 {
+			_, err := ctx.UpdateView(sdk.ViewUpdate{Mount: old, View: base()})
+			stale = code(err)
+		}
+		ctx.Notify("view-x-stale:"+stale, "info")
+		notices, err := ctx.ViewDiagnostics("extras")
+		if err != nil {
+			return err
+		}
+		count := map[string]int{}
+		for _, n := range notices {
+			if n.Path == "update" {
+				count[n.Code] += n.Count
+			}
+		}
+		ctx.Notify(fmt.Sprintf("view-x-diag:invalid=%d,limit=%d,unsupported=%d,stale=%d", count["invalid"], count["limit"], count["unsupported"], count["stale"]), "info")
+		_, err = ctx.FinishViewWith(st.Mount, strings.Repeat("r", 65536))
+		ctx.Notify("view-x-bigresult:"+code(err), "info")
+		return nil
+	})
+	ext.Command("ui_view_extras_end", "Read the notices of the extras mount and finish it with a result", func(ctx sdk.Context, args string) error {
+		ab := ctx.ViewAbilities()
+		if ab == nil {
+			return errors.New("ui_view_extras_end: no client")
+		}
+		st, err := ctx.ViewState("extras")
+		if err != nil {
+			return err
+		}
+		notices, err := ctx.ViewDiagnostics("extras")
+		if err != nil {
+			return err
+		}
+		last := ""
+		if len(notices) > 0 {
+			last = notices[len(notices)-1].Path
+		}
+		ctx.Notify(fmt.Sprintf("view-x-diag2:n=%d,last=%s", len(notices), last), "info")
+		picked := func(st sdk.ViewStatus) int64 {
+			var res struct {
+				Picked int64 `json:"picked"`
+			}
+			_ = json.Unmarshal(st.Result, &res)
+			return res.Picked
+		}
+		done, err := ctx.FinishViewWith(st.Mount, map[string]any{"picked": viewPicked(ab)})
+		if err != nil {
+			return err
+		}
+		ctx.Notify(fmt.Sprintf("view-x-finished:%s,picked=%d", done.State, picked(done)), "info")
+		cur, err := ctx.ViewState("extras")
+		if err != nil {
+			return err
+		}
+		ctx.Notify(fmt.Sprintf("view-x-state:%s,picked=%d", cur.State, picked(cur)), "info")
+		return nil
+	})
+	redrawIntent := registerViewRows(ext)
+	// D521: bigint_tool registers a tool whose schema declares a bigint parameter and answers the kind of value it receives for it and the value (the same in every SDK fixture).
+	ext.Command("bigint_tool", "Register the tool that reports what a bigint argument arrives as", func(ctx sdk.Context, _ string) error {
+		ctx.RegisterTool(sdk.ToolDefinition{Name: "bigint_arg", Label: "bigint_arg", Description: "Report the kind and value of n", Parameters: sdk.Schema{"type": "object", "required": []string{"n"}, "properties": map[string]any{"n": map[string]any{"type": "bigint"}}}, Execute: func(_ sdk.Context, params map[string]any) (any, error) {
+			kind := "other"
+			if _, ok := params["n"].(string); ok {
+				kind = "string"
+			}
+			return map[string]string{"content": fmt.Sprintf("%s:%v", kind, params["n"])}, nil
+		}})
+		return nil
+	})
+	// D614: a view an agent's tool shows. The command registers the tool; the tool mounts a titled panel, hides it,
+	// shows it and updates it with a focus request, the same way in every SDK fixture (conformance
+	// TestConformance_UIViewToolShowsAndFocuses). The title and the node are the caller's.
+	ext.Command("ui_view_tool", "Register the tool that shows a titled view", func(ctx sdk.Context, args string) error {
+		ctx.RegisterTool(sdk.ToolDefinition{Name: "view_show", Label: "view_show", Description: "Mount, show and focus a titled view", Parameters: sdk.Schema{"type": "object"}, Execute: func(ctx sdk.Context, params map[string]any) (any, error) {
+			title, _ := params["title"].(string)
+			node, _ := params["node"].(string)
+			if op, _ := params["op"].(string); op == "hide" {
+				st, err := ctx.ViewState("shown")
+				if err == nil {
+					st, err = ctx.HideView(st.Mount)
+				}
+				if err != nil {
+					return nil, err
+				}
+				return "view-tool:" + string(st.State), nil
+			}
+			content := func(title, request string) sdk.ViewContent {
+				return sdk.ViewContent{Title: title, View: viewList(node, "fixture-shown"),
+					Intents: []sdk.ViewIntent{{Name: "fx.reopen", Arg: sdk.ViewShape{Type: "object"}, WhenHidden: true}, {Name: "fx.tap", Arg: sdk.ViewShape{Type: "object"}}},
+					Focus:   []sdk.ViewFocus{{Node: node, Request: request}}}
+			}
+			st, err := ctx.MountView(sdk.ViewMount{Key: "shown", Slot: sdk.ViewSlotPanel, ViewContent: content(title, "")})
+			if err == nil {
+				st, err = ctx.HideView(st.Mount)
+			}
+			if err == nil {
+				st, err = ctx.ShowView(st.Mount)
+			}
+			if err == nil {
+				st, err = ctx.UpdateView(sdk.ViewUpdate{Mount: st.Mount, ViewContent: content(title+"/2", "update")})
+			}
+			if err != nil {
+				return nil, err
+			}
+			return fmt.Sprintf("view-tool:%s,rev=%d", st.State, st.Mount.Rev), nil
+		}})
+		return nil
+	})
+	// D614 grid node: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewGrid). The
+	// argument is the row's token: the cell values, the selection and one chip text are built from it.
+	ext.Command("ui_view_grid", "Mount a month as a grid and probe the bounds of the grid", func(ctx sdk.Context, args string) error {
+		tok := strings.TrimSpace(args)
+		code := func(err error) string {
+			if ve, ok := errors.AsType[*sdk.ViewError](err); ok {
+				return string(ve.Code)
+			}
+			return "none"
+		}
+		cells := []kit.GridCell{{Label: "30", Dim: true}, {Label: "31", Dim: true}}
+		for d := 1; d <= 28; d++ {
+			cell := kit.GridCell{Value: fmt.Sprintf("%s-%d", tok, d), Label: strconv.Itoa(d)}
+			switch d {
+			case 1:
+				cell.Chips = []kit.GridChip{{Text: tok + " standup", Color: "#3366cc"}, {Text: "lunch", Color: "accent"}}
+				cell.More = 2
+			case 2:
+				cell.Mark, cell.Color = "current", "#ff000080"
+			case 3:
+				cell.Chips = []kit.GridChip{{Text: "plain"}}
+			case 28:
+				cell.Label = ""
+			}
+			cells = append(cells, cell)
+		}
+		month := kit.NewGrid("month", 7, cells)
+		month.Head = []string{"Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"}
+		month.ChipRows = new(2)
+		month.Selected = tok + "-2"
+		content := func(grid *kit.Grid) sdk.ViewContent {
+			return sdk.ViewContent{
+				View:     kit.View{Root: kit.NewContainer(kit.NewText("Month "+tok, 0, 0), grid)},
+				Intents:  []sdk.ViewIntent{{Name: "fx.pick", NodeKey: "month", Arg: sdk.ViewShape{Type: "object", Properties: map[string]sdk.ViewShape{"value": {Type: "string"}}, Required: []string{"value"}}}},
+				Fallback: kit.NewText("grid-fallback "+tok, 0, 0),
+			}
+		}
+		st, err := ctx.MountView(sdk.ViewMount{Key: "grid", Slot: sdk.ViewSlotPanel, ViewContent: content(month)})
+		if err != nil {
+			return err
+		}
+		ctx.Notify("view-g-mounted:"+string(st.State), "info")
+		attempt := func(label string, columns int, cells []kit.GridCell) {
+			_, err := ctx.UpdateView(sdk.ViewUpdate{Mount: st.Mount, ViewContent: content(kit.NewGrid("month", columns, cells))})
+			ctx.Notify("view-g-"+label+":"+code(err), "info")
+		}
+		many := make([]kit.GridCell, 129)
+		for i := range many {
+			many[i] = kit.GridCell{Label: "x"}
+		}
+		attempt("cells", 7, many)
+		chips := make([]kit.GridChip, 9)
+		for i := range chips {
+			chips[i] = kit.GridChip{Text: "c"}
+		}
+		attempt("chips", 7, []kit.GridCell{{Value: "a", Chips: chips}})
+		attempt("columns", 17, []kit.GridCell{{Value: "a"}})
+		attempt("mark", 7, []kit.GridCell{{Value: "a", Mark: tok}})
+		cur, err := ctx.ViewState("grid")
+		if err != nil {
+			return err
+		}
+		ctx.Notify(fmt.Sprintf("view-g-state:%s,rev=%d", cur.State, cur.Mount.Rev), "info")
+		return nil
+	})
+	// D614 node ids: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewNodeIds). The
+	// argument is the row's token: the ids of the container, the text and the box are built from it.
+	ext.Command("ui_view_node_ids", "Mount a view whose container, text and box carry an id", func(ctx sdk.Context, args string) error {
+		tok := strings.TrimSpace(args)
+		label := kit.NewText("Label "+tok, 0, 0)
+		label.ID, label.Bg = tok+"-label", "selectedBg"
+		frame := kit.NewBox(1, 0, kit.NewText("inside", 0, 0))
+		frame.ID, frame.Bg = tok+"-frame", "toolPendingBg"
+		root := kit.NewContainer(label, frame)
+		root.ID = tok + "-root"
+		st, err := ctx.MountView(sdk.ViewMount{
+			Key:  "ids",
+			Slot: sdk.ViewSlotPanel,
+			View: kit.View{Root: root},
+			A11y: []sdk.ViewA11y{{Node: tok + "-label", Name: "Label " + tok}},
+		})
+		if err != nil {
+			return err
+		}
+		ctx.Notify("view-i-mounted:"+string(st.State), "info")
+		return nil
+	})
+	// D614 image id: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewImageID). The argument is the row's token and a Kitty image id only that row uses: the image node carries both, its bytes are the token's.
+	ext.Command("ui_view_image_id", "Mount a view whose image node carries a Kitty image id", func(ctx sdk.Context, args string) error {
+		tok, number, _ := strings.Cut(strings.TrimSpace(args), " ")
+		n, err := strconv.Atoi(number)
+		if err != nil {
+			return err
+		}
+		img := kit.NewImage([]byte("pig-image-"+tok), "image/png")
+		img.ID, img.ImageID, img.Filename = tok+"-photo", &n, tok+".png"
+		st, err := ctx.MountView(sdk.ViewMount{Key: "image-id", Slot: sdk.ViewSlotPanel, View: kit.View{Root: img}})
+		if err != nil {
+			return err
+		}
+		ctx.Notify("view-m-mounted:"+string(st.State), "info")
+		return nil
+	})
+	// D614 bindings: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewBindings).
+	// The key and the number come from the test, so a binding the SDK dropped, or one it made up, is not what the host holds.
+	ext.Command("ui_view_bindings", "Mount a view with bindings and probe what the host refuses", func(ctx sdk.Context, args string) error {
+		key, number, _ := strings.Cut(args, " ")
+		n, err := strconv.Atoi(number)
+		if err != nil {
+			return err
+		}
+		content := func(bindings ...sdk.ViewBinding) sdk.ViewContent {
+			return sdk.ViewContent{View: viewText(ctx, "-bind"), Bindings: bindings, Intents: []sdk.ViewIntent{
+				{Name: "fx.go", Arg: sdk.ViewShape{Type: "object", Properties: map[string]sdk.ViewShape{"n": {Type: "integer"}}, Required: []string{"n"}}},
+				{Name: "fx.tap", Arg: sdk.ViewShape{Type: "object"}},
+			}}
+		}
+		goTo := func(key string, n any) sdk.ViewBinding {
+			return sdk.ViewBinding{Key: key, Intent: "fx.go", Arg: map[string]any{"n": n}}
+		}
+		tap := func(key string) sdk.ViewBinding { return sdk.ViewBinding{Key: key, Intent: "fx.tap"} }
+		first := goTo(key, n)
+		first.Name = fmt.Sprintf("Go %d", n)
+		st, err := ctx.MountView(sdk.ViewMount{Key: "bind", Slot: sdk.ViewSlotPanel,
+			ViewContent: content(first, goTo("w", n+1), sdk.ViewBinding{Gesture: "swipe-left", Intent: "fx.tap"})})
+		if err != nil {
+			return err
+		}
+		ctx.Notify("view-b-mounted:"+string(st.State), "info")
+		attempt := func(label string, bindings ...sdk.ViewBinding) {
+			code := "none"
+			if _, err := ctx.UpdateView(sdk.ViewUpdate{Mount: st.Mount, ViewContent: content(bindings...)}); err != nil {
+				code = "error"
+				if ve, ok := errors.AsType[*sdk.ViewError](err); ok {
+					code = string(ve.Code)
+				}
+			}
+			ctx.Notify("view-b-"+label+":"+code, "info")
+		}
+		var many []sdk.ViewBinding
+		for _, c := range "abcdefghijklmnopqrstuvwxyz0123456" {
+			many = append(many, tap(string(c)))
+		}
+		attempt("many", many...)
+		attempt("reserved", tap("shift+tab"))
+		attempt("order", tap("ctrl+shift+p"), tap("shift+ctrl+p"))
+		attempt("gesture", sdk.ViewBinding{Gesture: "pinch", Intent: "fx.tap"})
+		attempt("arg", goTo("a", "x"))
+		attempt("ok", goTo("ctrl+shift+p", n), goTo("shift+ctrl+q", n+1))
+		return nil
+	})
+	// D614 slot dialog: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewDialog).
+	// The key and the number come from the test: the title is built from the number and the key is bound to fx.add with it.
+	ext.Command("ui_view_dialog", "Mount a titled view with a bound key in the dialog slot, hide it and show it", func(ctx sdk.Context, args string) error {
+		key, number, _ := strings.Cut(args, " ")
+		n, err := strconv.Atoi(number)
+		if err != nil {
+			return err
+		}
+		integer := map[string]sdk.ViewShape{"n": {Type: "integer"}}
+		st, err := ctx.MountView(sdk.ViewMount{Key: "dlg", Slot: sdk.ViewSlotDialog,
+			Title: fmt.Sprintf("Chart %d", n), View: viewText(ctx, "-dlg"),
+			Intents: []sdk.ViewIntent{{Name: "fx.add", Arg: sdk.ViewShape{Type: "object", Properties: integer, Required: []string{"n"}},
+				Answer: &sdk.ViewShape{Type: "object", Properties: map[string]sdk.ViewShape{"sum": {Type: "integer"}}, Required: []string{"sum"}}}},
+			Bindings: []sdk.ViewBinding{{Key: key, Intent: "fx.add", Arg: map[string]any{"n": n}}}})
+		if err != nil {
+			ve, ok := errors.AsType[*sdk.ViewError](err)
+			if !ok {
+				return err
+			}
+			ctx.Notify("view-d-mounted:"+string(ve.Code), "info")
+			return nil
+		}
+		ctx.Notify("view-d-mounted:"+string(st.State), "info")
+		hidden, err := ctx.HideView(st.Mount)
+		if err != nil {
+			return err
+		}
+		ctx.Notify("view-d-hidden:"+string(hidden.State), "info")
+		shown, err := ctx.ShowView(st.Mount)
+		if err != nil {
+			return err
+		}
+		ctx.Notify("view-d-shown:"+string(shown.State), "info")
+		return nil
+	})
+	// D614 dismiss: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewDismiss).
+	// The name of the dismiss intent comes from the test, so a flag the SDK dropped, or one it made up, is not what the host holds.
+	ext.Command("ui_view_dismiss", "Mount a dialog with a dismiss intent and probe what the host refuses", func(ctx sdk.Context, args string) error {
+		object := sdk.ViewShape{Type: "object"}
+		tap := sdk.ViewIntent{Name: "fx.tap", Arg: object}
+		closing := func(name string) sdk.ViewIntent { return sdk.ViewIntent{Name: name, Arg: object, Dismiss: true} }
+		content := func(intents ...sdk.ViewIntent) sdk.ViewContent {
+			return sdk.ViewContent{View: viewText(ctx, "-dismiss"), Intents: intents}
+		}
+		st, err := ctx.MountView(sdk.ViewMount{Key: "dismiss", Slot: sdk.ViewSlotDialog, ViewContent: content(tap, closing(args))})
+		if err != nil {
+			return err
+		}
+		ctx.Notify("view-d-mounted:"+string(st.State), "info")
+		attempt := func(label string, intents ...sdk.ViewIntent) {
+			code := "none"
+			if _, err := ctx.UpdateView(sdk.ViewUpdate{Mount: st.Mount, ViewContent: content(intents...)}); err != nil {
+				code = "error"
+				if ve, ok := errors.AsType[*sdk.ViewError](err); ok {
+					code = string(ve.Code)
+				}
+			}
+			ctx.Notify("view-d-"+label+":"+code, "info")
+		}
+		attempt("two", tap, closing(args), closing(args+"2"))
+		onNode := closing(args)
+		onNode.NodeKey = "n"
+		attempt("node", tap, onNode)
+		needsValue := closing(args)
+		needsValue.Arg = sdk.ViewShape{Type: "object", Properties: map[string]sdk.ViewShape{"value": {Type: "string"}}, Required: []string{"value"}}
+		attempt("arg", tap, needsValue)
+		attempt("ok", closing(args), tap)
+		return nil
+	})
+	ext.OnViewIntent(func(in sdk.ViewIntentInvocation) sdk.ViewIntentResult {
+		if strings.HasPrefix(in.Intent, "fx.close-") {
+			// The user dismissed the dialog: the client raised the intent with {}, and its handler removes the mount.
+			if strings.TrimSpace(string(in.Arg)) != "{}" {
+				return sdk.ViewIntentResult{Outcome: "refused", Error: "dismiss takes {}"}
+			}
+			if _, err := in.Context.RemoveView(sdk.ViewRef{Key: in.Mount.Key, Epoch: in.Mount.Epoch, Rev: in.Rev}); err != nil {
+				return sdk.ViewIntentResult{Outcome: "failed", Error: err.Error()}
+			}
+			return sdk.ViewIntentResult{Outcome: "done"}
+		}
+		switch in.Intent {
+		case "fx.redraw", "fx.foreign":
+			return redrawIntent(in)
+		case "fx.reopen":
+			// The user opened the hidden view: its handler shows it.
+			if _, err := in.Context.ShowView(sdk.ViewRef{Key: in.Mount.Key, Epoch: in.Mount.Epoch, Rev: in.Rev}); err != nil {
+				return sdk.ViewIntentResult{Outcome: "failed", Error: err.Error()}
+			}
+			return sdk.ViewIntentResult{Outcome: "done"}
+		case "fx.pick":
+			var arg struct {
+				Value string `json:"value"`
+			}
+			_ = json.Unmarshal(in.Arg, &arg)
+			answer, _ := json.Marshal(map[string]string{"node": in.NodeKey, "picked": arg.Value})
+			return sdk.ViewIntentResult{Outcome: "done", Answer: answer}
+		case "fx.add":
+			var arg struct {
+				N int `json:"n"`
+			}
+			_ = json.Unmarshal(in.Arg, &arg)
+			sum := arg.N * 2
+			if ab := in.Context.ViewAbilities(); ab != nil {
+				sum += ab.Limits.IntentArgBytes
+			}
+			return sdk.ViewIntentResult{Outcome: "done", Answer: json.RawMessage(fmt.Sprintf(`{"sum":%d}`, sum))}
+		case "fx.wait":
+			var arg struct {
+				Tag string `json:"tag"`
+			}
+			_ = json.Unmarshal(in.Arg, &arg)
+			in.Context.Notify("intent-started:"+arg.Tag, "info")
+			<-in.Context.Done()
+			// A call made after the cancel is cancelled with its request, so the tag is kept for ui_view_cancelled.
+			viewCancelledTag.Store(arg.Tag)
+			return sdk.ViewIntentResult{Outcome: "done", Answer: json.RawMessage(`{}`)}
+		}
+		return sdk.ViewIntentResult{Outcome: "refused", Error: "unknown intent"}
 	})
 	ext.Command("report_geometry", "Report observed terminal geometry", func(ctx sdk.Context, args string) error {
 		ctx.Notify(fmt.Sprintf("geometry:%dx%d", ctx.Width(), ctx.Height()), "info")
@@ -1035,6 +1919,73 @@ func Extension() *sdk.Extension {
 		return ctx.SendUserMessage(content, "followUp")
 	})
 
+	// send_user_message_delivery sends "delivery-<arg>" with the delivery the argument names: absent (no mode given), steer or followUp.
+	ext.Command("send_user_message_delivery", "Send a user message with the delivery named by the argument", func(ctx sdk.Context, args string) error {
+		deliverAs := args
+		if args == "absent" {
+			deliverAs = ""
+		}
+		return ctx.SendUserMessage("delivery-"+args, deliverAs)
+	})
+
+	// send_refusal_order makes the sends the argument names in one run of the handler, the one with no delivery (refused while the agent streams) among them,
+	// for TestSendRefusalReportedAfterSyncRunAcrossSDKs: first (refused, steer, followUp), between (refused, steer, refused), yielded (a yield, then first),
+	// throws (first, then the handler fails), blocked (first, then the handler blocks without yielding), detached (first from a goroutine after the handler
+	// returned) and detached_alone (the refused message alone, the same way).
+	ext.Command("send_refusal_order", "Send a refused user message and others in one run, as the argument names", func(ctx sdk.Context, args string) error {
+		sendFirst := func() error {
+			for _, send := range [][2]string{{"order-absent", ""}, {"order-steer", "steer"}, {"order-followUp", "followUp"}} {
+				if err := ctx.SendUserMessage(send[0], send[1]); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		switch args {
+		case "first":
+			return sendFirst()
+		case "between":
+			for _, send := range [][2]string{{"order-absent", ""}, {"order-steer", "steer"}, {"order-absent-2", ""}} {
+				if err := ctx.SendUserMessage(send[0], send[1]); err != nil {
+					return err
+				}
+			}
+		case "yielded":
+			if err := ctx.Yield(); err != nil {
+				return err
+			}
+			return sendFirst()
+		case "throws":
+			if err := sendFirst(); err != nil {
+				return err
+			}
+			return errors.New("order-throws")
+		case "blocked":
+			if err := sendFirst(); err != nil {
+				return err
+			}
+			time.Sleep(30 * time.Second)
+		case "detached":
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				_ = sendFirst()
+			}()
+		case "detached_alone":
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				_ = ctx.SendUserMessage("order-absent", "")
+			}()
+		default:
+			return fmt.Errorf("send_refusal_order: unknown case %q", args)
+		}
+		return nil
+	})
+
+	ext.Command("send_user_message_expand", "Send a user message with expandPromptTemplates set to the argument", func(ctx sdk.Context, args string) error {
+		expand := args == "true"
+		return ctx.SendUserMessageWith("expand-user", sdk.SendUserMessageOptions{DeliverAs: "followUp", ExpandPromptTemplates: &expand})
+	})
+
 	ext.Command("set_session_name", "Set the session name", func(ctx sdk.Context, args string) error {
 		return ctx.SetSessionName("conformance-session")
 	})
@@ -1051,6 +2002,76 @@ func Extension() *sdk.Extension {
 				reported = string(encoded)
 			}
 			hctx.Notify("event_field:"+name+"."+field+"="+reported, "info")
+			return nil, nil
+		})
+		return nil
+	})
+	// event_level_edit_probe subscribes to the event named by the argument (`<event> <top|deep>`) with a handler that edits it in place and returns nothing: `top` assigns a
+	// member of the event itself (probeTop), `deep` edits inside the message the event carries (the first user message of a `messages` list): the text of its first text
+	// block, else a string content, else a `probe` member. Every edit writes `other-event-edit` (TestInPlaceMessageEventEditsMatchPi).
+	ext.Command("event_level_edit_probe", "Subscribe to the event named by the argument `<event> <top|deep>` with a handler that edits the event itself or the message inside it in place", func(ctx sdk.Context, args string) error {
+		name, level, _ := strings.Cut(strings.TrimSpace(args), " ")
+		const edited = "other-event-edit"
+		ext.OnEvent(name, func(_ sdk.Context, data map[string]any) (any, error) {
+			if level == "top" {
+				data["probeTop"] = edited
+				return nil, nil
+			}
+			target, _ := data["message"].(map[string]any)
+			if list, ok := data["messages"].([]any); ok && target == nil && len(list) > 0 {
+				target, _ = list[0].(map[string]any)
+				for _, item := range list {
+					if m, ok := item.(map[string]any); ok && m["role"] == "user" {
+						target = m
+						break
+					}
+				}
+			}
+			if target == nil {
+				return nil, nil
+			}
+			blocks, _ := target["content"].([]any)
+			var first map[string]any
+			if len(blocks) > 0 {
+				first, _ = blocks[0].(map[string]any)
+			}
+			switch {
+			case first != nil && first["type"] == "text":
+				first["text"] = edited
+			case isStringContent(target):
+				target["content"] = edited
+			default:
+				target["probe"] = edited
+			}
+			return nil, nil
+		})
+		return nil
+	})
+	// event_member_probe `<event> <set|delete|once> <member> [json]` subscribes to the event with a handler that assigns the member the JSON, deletes it, or (once) assigns it in its
+	// first call only and reports `member_probe_stale:<event>:<bool>` whether a later call found it already there (TestInPlaceMessageEventEditsMatchPi).
+	ext.Command("event_member_probe", "Subscribe to the event named by the argument `<event> <set|delete|once> <member> [json]` with a handler that assigns, deletes or once assigns a member of the event", func(ctx sdk.Context, args string) error {
+		fields := strings.SplitN(strings.TrimSpace(args), " ", 4)
+		if len(fields) < 3 {
+			return fmt.Errorf("event_member_probe wants <event> <op> <member> [json]")
+		}
+		name, op, member := fields[0], fields[1], fields[2]
+		var value any
+		if len(fields) == 4 {
+			if err := json.Unmarshal([]byte(fields[3]), &value); err != nil {
+				return err
+			}
+		}
+		calls := 0
+		ext.OnEvent(name, func(hctx sdk.Context, data map[string]any) (any, error) {
+			calls++
+			switch {
+			case op == "delete":
+				delete(data, member)
+			case op == "once" && calls > 1:
+				hctx.Notify(fmt.Sprintf("member_probe_stale:%s:%t", name, reflect.DeepEqual(data[member], value)), "info")
+			default:
+				data[member] = value
+			}
 			return nil, nil
 		})
 		return nil
@@ -1299,11 +2320,41 @@ func Extension() *sdk.Extension {
 		return nil
 	})
 	ext.Command("set_model", "Switch to the model in the arguments", func(ctx sdk.Context, args string) error {
-		ok, err := ctx.SetModel(args)
+		ok, err := ctx.SetModelNamed(args)
 		if err != nil {
 			return err
 		}
 		ctx.Notify(fmt.Sprintf("setModel=%t", ok), "info")
+		return nil
+	})
+	// set_model_object (TestSetModelTakesTheObjectAcrossSDKs) passes the model object its argument is the JSON of to SetModel and reports the answer, or the error. Every SDK fixture has it.
+	ext.Command("set_model_object", "Switch to the model object in the arguments", func(ctx sdk.Context, args string) error {
+		var model map[string]any
+		if err := json.Unmarshal([]byte(args), &model); err != nil {
+			return err
+		}
+		ok, err := ctx.SetModel(model)
+		if err != nil {
+			ctx.Notify("setModelObject=error:"+err.Error(), "info")
+			return nil
+		}
+		ctx.Notify(fmt.Sprintf("setModelObject=%t", ok), "info")
+		return nil
+	})
+	// set_model_object_before_agent_start (TestSetModelObjectFromBeforeAgentStartAcrossSDKs) subscribes a before_agent_start handler that passes the model object its argument is the JSON of to SetModel, as the extension of Pi's issue 9631 does. Every SDK fixture has it.
+	ext.Command("set_model_object_before_agent_start", "Switch to the model object in the arguments before each agent start", func(_ sdk.Context, args string) error {
+		var model map[string]any
+		if err := json.Unmarshal([]byte(args), &model); err != nil {
+			return err
+		}
+		ext.OnEvent("before_agent_start", func(hctx sdk.Context, _ map[string]any) (any, error) {
+			ok, err := hctx.SetModel(model)
+			if err != nil {
+				return nil, err
+			}
+			hctx.Notify(fmt.Sprintf("beforeAgentSetModel=%t", ok), "info")
+			return nil, nil
+		})
 		return nil
 	})
 	// event_probe_off runs every unsubscribe event_probe_on returned for the event named by the argument (TestConformance_EventUnsubscribeEveryEvent).
@@ -1351,9 +2402,38 @@ func Extension() *sdk.Extension {
 				return nil, nil
 			}
 			eventProbeResults[name] = queued[1:]
+			// Pi ignores what a before_provider_headers handler returns and sends the headers object the handlers edited (runner.ts emitBeforeProviderHeaders), so the queued result becomes the headers by editing event.headers in place, as the Node fixture does.
+			if name == "before_provider_headers" {
+				headers, _ := data["headers"].(map[string]any)
+				replacement, _ := queued[0].(map[string]any)
+				for key := range headers {
+					delete(headers, key)
+				}
+				maps.Copy(headers, replacement)
+				return nil, nil
+			}
 			return queued[0], nil
 		})
 		eventProbeOn[name] = append(eventProbeOn[name], off)
+		return nil
+	})
+	// event_probe_fail subscribes to the event named by the argument with a handler that reads the active tools from the host, reports the servers of the event and then fails (TestConformance_McpServersChangeFirstHandlerInAnotherProcessIsSentAndItsFailureReported).
+	ext.Command("event_probe_fail", "Subscribe to the event named by the argument with a handler that fails", func(ctx sdk.Context, args string) error {
+		name := strings.TrimSpace(args)
+		ext.OnEvent(name, func(hctx sdk.Context, data map[string]any) (any, error) {
+			servers, _ := data["servers"].([]any)
+			names := make([]string, 0, len(servers))
+			for _, server := range servers {
+				entry, _ := server.(map[string]any)
+				names = append(names, fmt.Sprint(entry["name"]))
+			}
+			// The read is the handler's first host call: nothing of the handler reaches the host before it.
+			if _, err := hctx.GetActiveTools(); err != nil {
+				return nil, err
+			}
+			hctx.Notify("event_probe_fail:"+name+":"+strings.Join(names, ","), "info")
+			return nil, fmt.Errorf("event_probe_fail: %s handler failed", name)
+		})
 		return nil
 	})
 	ext.Command("event_probe_off", "Unsubscribe the event_probe_on handlers of the event named by the argument", func(ctx sdk.Context, args string) error {
@@ -1364,6 +2444,80 @@ func Extension() *sdk.Extension {
 		delete(eventProbeOn, name)
 		return nil
 	})
+	// lone_passthrough subscribes to the event named by the argument with a handler that returns the value it received, and lone_send sends the
+	// argument's text back through sendUserMessage, sendMessage or registerProvider (TestConformance_LoneSurrogatePassThroughAcrossSDKs).
+	loneUnits := func(value any) string {
+		text, ok := value.(string)
+		if !ok {
+			return "none"
+		}
+		units := make([]string, len(text))
+		for i := range len(text) {
+			units[i] = fmt.Sprintf("%x", text[i])
+		}
+		return strings.Join(units, ".")
+	}
+	loneFirst := func(list any) map[string]any {
+		items, _ := list.([]any)
+		if len(items) == 0 {
+			return nil
+		}
+		first, _ := items[0].(map[string]any)
+		return first
+	}
+	ext.Command("lone_passthrough", "Subscribe to the event named by the argument with a handler that returns the value it received", func(ctx sdk.Context, args string) error {
+		name := strings.TrimSpace(args)
+		event := name
+		if name == "context_edit" {
+			event = "context"
+		}
+		ext.OnEvent(event, func(hctx sdk.Context, data map[string]any) (any, error) {
+			var seen any
+			var result map[string]any
+			switch name {
+			case "input":
+				seen, result = data["text"], map[string]any{"action": "transform", "text": data["text"]}
+			case "before_agent_start":
+				// The Go SDK reads the event's systemPrompt through the context (Context.GetSystemPrompt) when the event map has no string for it.
+				prompt, held := data["systemPrompt"].(string)
+				if !held {
+					var err error
+					if prompt, err = hctx.GetSystemPrompt(); err != nil {
+						return nil, err
+					}
+				}
+				seen, result = prompt, map[string]any{"systemPrompt": prompt}
+			case "tool_result":
+				seen, result = loneFirst(data["content"])["text"], map[string]any{"content": data["content"]}
+			default:
+				seen = loneFirst(data["messages"])["content"]
+				if _, text := seen.(string); !text {
+					seen = loneFirst(seen)["text"]
+				}
+				result = map[string]any{"messages": data["messages"]}
+				if name == "context_edit" {
+					result = map[string]any{"messages": []any{loneFirst(data["messages"]), map[string]any{"role": "user", "content": "edited", "timestamp": 2}}}
+				}
+			}
+			hctx.Notify("lone_seen:"+name+":"+loneUnits(seen), "info")
+			return result, nil
+		})
+		return nil
+	})
+	ext.Command("lone_send", "Send the argument's text back through sendUserMessage, sendMessage or registerProvider", func(ctx sdk.Context, args string) error {
+		kind, value, _ := strings.Cut(args, " ")
+		ctx.Notify("lone_seen:"+kind+":"+loneUnits(value), "info")
+		switch kind {
+		case "user":
+			return ctx.SendUserMessage(value, "followUp")
+		case "custom":
+			return ctx.SendMessage("lone", value, true, sdk.SendMessageOptions{})
+		}
+		ext.RegisterProvider("lone-compat", sdk.ProviderConfig{"baseUrl": "https://probe.invalid/v1", "api": "openai-completions", "apiKey": "probe-key", "models": []any{map[string]any{
+			"id": "m", "name": value, "reasoning": false, "input": []any{"text"}, "cost": map[string]any{"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+			"contextWindow": 1000, "maxTokens": 100, "compat": map[string]any{"openRouterRouting": map[string]any{"sort": value}}}}})
+		return nil
+	})
 	// event_result_probe subscribes to the event named first with a handler that returns the JSON that follows: the result an SDK extension gives the host.
 	ext.Command("event_result_probe", "Subscribe to an event with a handler that returns the given JSON", func(ctx sdk.Context, args string) error {
 		name, raw, _ := strings.Cut(strings.TrimSpace(args), " ")
@@ -1372,6 +2526,204 @@ func Extension() *sdk.Extension {
 			return err
 		}
 		ext.OnEvent(name, func(sdk.Context, map[string]any) (any, error) { return result, nil })
+		return nil
+	})
+	// event_signal_probe subscribes to session_before_compact or session_before_tree with a handler that reports, in the result it returns, the state of the event's signal (the handler request's cancellation) on its first line and after a dialog it opened answered, and the dialog's answer (the mode is the event's customInstructions): the signal aborts while the dialog is pending (mode "wait") or before the handler runs (mode "first"), and Pi's in-process host call still returns its answer. The answer is no SDK's fallback: a cancelled call yields an error. TestSessionBeforeSignalReachesEverySDKWhenAbortedDuringDispatch.
+	ext.Command("event_signal_probe", "Subscribe to session_before_compact or session_before_tree with a handler that returns the state of its event signal", func(ctx sdk.Context, args string) error {
+		name := strings.TrimSpace(args)
+		ext.OnEvent(name, func(hctx sdk.Context, data map[string]any) (any, error) {
+			source := data
+			if name == "session_before_tree" {
+				source, _ = data["preparation"].(map[string]any)
+			}
+			mode, _ := source["customInstructions"].(string)
+			before := hctx.Err() != nil
+			// Pi's handler runs ordinary host calls with the signal aborted or aborting (custom-compaction.ts notifies first): the call returns the user's answer.
+			answer, _, err := hctx.Input("event_signal:"+name+":"+mode+":pending", "p")
+			if err != nil {
+				answer = "failed: " + err.Error()
+			}
+			state := fmt.Sprintf("event_signal:%s:%t:%t:%s", mode, before, hctx.Err() != nil, answer)
+			if name == "session_before_compact" {
+				return map[string]any{"compaction": map[string]any{"summary": state, "firstKeptEntryId": "k", "tokensBefore": 1}}, nil
+			}
+			return map[string]any{"label": state}, nil
+		})
+		return nil
+	})
+	// tool_call_abort_probe subscribes to tool_call with a handler that opens a dialog and answers it from the dialog's answer: a run's abort while the dialog is open ("wait"), or before the handler's dispatch ("first"), must neither skip the handler nor cancel its dialog nor drop its reply, as Pi awaits tool_call handlers (runner.ts:1256-1274; TestConformance_ToolCallHandlerIsAwaitedThroughTheAbort). The mode is the event's input.mode.
+	ext.Command("tool_call_abort_probe", "Subscribe to tool_call with a handler that answers from a dialog it opened", func(ctx sdk.Context, args string) error {
+		ext.OnEvent("tool_call", func(hctx sdk.Context, data map[string]any) (any, error) {
+			input, _ := data["input"].(map[string]any)
+			mode, _ := input["mode"].(string)
+			answer, _, err := hctx.Input("tool_call_abort:"+mode+":pending", "p")
+			if err != nil {
+				answer = "failed: " + err.Error()
+			}
+			return map[string]any{"block": true, "reason": "tool_call_abort:" + mode + ":" + fmt.Sprint(answer)}, nil
+		})
+		return nil
+	})
+	// event_ordered_result_probe is event_result_probe whose result keeps its members in the order they are written: a Go handler authors an object with
+	// member order as a json.RawMessage (TestConformance_HandedBackEventObjectsKeepTheirMemberOrder proposes a draft this way).
+	ext.Command("event_ordered_result_probe", "Subscribe to an event with a handler that returns the given JSON, members in written order", func(ctx sdk.Context, args string) error {
+		name, raw, _ := strings.Cut(strings.TrimSpace(args), " ")
+		if !json.Valid([]byte(raw)) {
+			return fmt.Errorf("event_ordered_result_probe: %q is not JSON", raw)
+		}
+		result := json.RawMessage(raw)
+		ext.OnEvent(name, func(sdk.Context, map[string]any) (any, error) { return result, nil })
+		return nil
+	})
+	// event_keys_probe subscribes to the event named by the argument with a handler that reports, as JSON, the keys of its payload member and of that
+	// object's zeta member in the order Object.keys gives them (TestConformance_HandedBackEventObjectsKeepTheirMemberOrder/object_keys).
+	ext.Command("event_keys_probe", "Subscribe to the event named by the argument with a handler that reports the key order of its payload", func(ctx sdk.Context, args string) error {
+		name := strings.TrimSpace(args)
+		ext.OnEvent(name, func(hctx sdk.Context, data map[string]any) (any, error) {
+			payload, _ := data["payload"].(map[string]any)
+			zeta, _ := payload["zeta"].(map[string]any)
+			wire, err := json.Marshal([][]string{hctx.ObjectKeys(payload), hctx.ObjectKeys(zeta)})
+			if err != nil {
+				return nil, err
+			}
+			hctx.Notify("event_keys:"+name+":"+string(wire), "info")
+			return nil, nil
+		})
+		return nil
+	})
+	// event_echo_probe subscribes to the event named by the argument with a handler that hands back, unchanged, the objects it was sent: the entries of a
+	// turn boundary, the context's messages but the first, the provider request's payload, a tool result's content and details, a message_end message
+	// (TestConformance_HandedBackEventObjectsKeepTheirMemberOrder).
+	ext.Command("event_echo_probe", "Subscribe to the event named by the argument with a handler that hands back the objects it was sent", func(ctx sdk.Context, args string) error {
+		name := strings.TrimSpace(args)
+		ext.OnEvent(name, func(_ sdk.Context, data map[string]any) (any, error) {
+			switch name {
+			case "turn_end":
+				return map[string]any{"entries": data["entries"]}, nil
+			case "context":
+				messages, _ := data["messages"].([]any)
+				return map[string]any{"messages": messages[1:]}, nil
+			case "before_provider_request":
+				return data["payload"], nil
+			case "tool_result":
+				return map[string]any{"content": data["content"], "details": data["details"]}, nil
+			case "message_end":
+				return map[string]any{"message": data["message"]}, nil
+			}
+			return nil, fmt.Errorf("event_echo_probe has no echo for %s", name)
+		})
+		return nil
+	})
+	// event_mutate_probe subscribes to the event named by the argument (`<event> [mode]`) with a handler that works on the event's payload (before_provider_request) or
+	// headers (before_provider_headers) as the mode says (TestConformance_InPlaceProviderHookEditsReachTheRequest, TestConformance_ProviderHookEditsAndResultsCombine):
+	// no mode edits it in place and returns nothing, fail edits it in place and fails after the edit, replace edits nothing and returns a replacement, both edits it in
+	// place under a key of its own and returns the replacement, delete (headers) sets the header the first edit wrote to null.
+	ext.Command("event_mutate_probe", "Subscribe to the event named by the argument with a handler that edits its payload or headers in place and returns nothing", func(ctx sdk.Context, args string) error {
+		name, mode, _ := strings.Cut(strings.TrimSpace(args), " ")
+		mode = strings.TrimSpace(mode)
+		ext.OnEvent(name, func(_ sdk.Context, data map[string]any) (any, error) {
+			key := "inPlace"
+			switch mode {
+			case "fail":
+				key = "inPlaceBeforeError"
+			case "both":
+				key = "inPlaceAlongside"
+			}
+			if name == "before_provider_headers" {
+				headers := data["headers"].(map[string]any)
+				switch mode {
+				case "replace":
+				case "delete":
+					headers["x-pig-inPlace"] = nil
+				default:
+					headers["x-pig-"+key] = "in-place-edit"
+				}
+				if mode == "replace" || mode == "both" {
+					return map[string]any{"x-pig-replaced": "returned"}, nil
+				}
+			} else {
+				payload := data["payload"].(map[string]any)
+				if mode != "replace" {
+					payload[key] = "in-place-edit"
+					if zeta, ok := payload["zeta"].(map[string]any); ok {
+						zeta[key] = "in-place-edit"
+					}
+				}
+				if mode == "replace" || mode == "both" {
+					return map[string]any{"replaced": "returned"}, nil
+				}
+			}
+			if mode == "fail" {
+				return nil, fmt.Errorf("failed after the edit")
+			}
+			return nil, nil
+		})
+		return nil
+	})
+	// event_assign_probe subscribes to the event named by the argument with a handler that ASSIGNS a new value to the event's input (tool_call), messages (context) or
+	// entries (turn_end) instead of editing the old value in place, and returns nothing (TestAssignedEventMembersFollowPi). `context bad` assigns a string and `context badmsg` a list holding a number (TestAssignedContextListIsValidatedLikeAReturnedOne).
+	ext.Command("event_assign_probe", "Subscribe to the event named by the argument with a handler that assigns a new value to the event's input, messages or entries", func(ctx sdk.Context, args string) error {
+		name, variant, _ := strings.Cut(strings.TrimSpace(args), " ")
+		const edited = "other-event-edit"
+		ext.OnEvent(name, func(_ sdk.Context, data map[string]any) (any, error) {
+			switch name {
+			case "tool_call":
+				data["input"] = map[string]any{"command": edited}
+			case "context":
+				switch variant {
+				case "bad":
+					data["messages"] = "oops"
+				case "badmsg":
+					data["messages"] = []any{float64(42)}
+				default:
+					data["messages"] = []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": edited}}, "timestamp": 1}}
+				}
+			case "turn_end":
+				data["entries"] = []any{map[string]any{"type": "custom", "customType": edited}}
+			default:
+				return nil, fmt.Errorf("event_assign_probe has no event %s", name)
+			}
+			return nil, nil
+		})
+		return nil
+	})
+	// event_edit_probe subscribes to the event named by the argument (`<event> <edit> [fail]`) with a handler that makes one edit of the event's content, details,
+	// isError, message or messages (tool_result, message_end, context), returns nothing and, with fail, fails after the edit
+	// (TestConformance_InPlaceEventEditsFollowPi). Every edit writes the value `other-event-edit`, which no other test uses.
+	ext.Command("event_edit_probe", "Subscribe to the event named by the argument with a handler that edits the event in place and returns nothing", func(ctx sdk.Context, args string) error {
+		words := strings.Fields(args)
+		name, edit, failing := words[0], words[1], len(words) > 2 && words[2] == "fail"
+		const edited = "other-event-edit"
+		text := func() []any { return []any{map[string]any{"type": "text", "text": edited}} }
+		first := func(blocks any) map[string]any { return blocks.([]any)[0].(map[string]any) }
+		ext.OnEvent(name, func(_ sdk.Context, data map[string]any) (any, error) {
+			switch name + "/" + edit {
+			case "tool_result/content-assign":
+				data["content"] = text()
+			case "tool_result/details-assign":
+				data["details"] = map[string]any{"k": edited}
+			case "tool_result/iserror-assign":
+				data["isError"] = true
+			case "tool_result/content-deep":
+				first(data["content"])["text"] = edited
+			case "tool_result/details-deep":
+				data["details"].(map[string]any)["k"] = edited
+			case "message_end/deep":
+				first(data["message"].(map[string]any)["content"])["text"] = edited
+			case "message_end/content-assign":
+				data["message"].(map[string]any)["content"] = text()
+			case "message_end/message-assign":
+				data["message"] = map[string]any{"role": "user", "content": text(), "timestamp": 1}
+			case "context/deep":
+				first(data["messages"].([]any)[0].(map[string]any)["content"])["text"] = edited
+			default:
+				return nil, fmt.Errorf("event_edit_probe has no edit %s", name+"/"+edit)
+			}
+			if failing {
+				return nil, fmt.Errorf("failed after the edit")
+			}
+			return nil, nil
+		})
 		return nil
 	})
 	// event_payload_probe reports the JSON of the event the named handler received, so a conformance test compares what every SDK was sent
@@ -1389,10 +2741,14 @@ func Extension() *sdk.Extension {
 		return nil
 	})
 	// event_isolation_probe subscribes two handlers to the event named by the argument (TestConformance_EventHandlersDoNotShareTheirPayload). The first
-	// reports the marker it received, writes a sentinel into data["context"]["contextEntries"][0]["sourceEntry"]["id"], keeps that container and changes it again from
-	// another goroutine after the handler returned; the second handler of the same dispatch reports what it received. Each handler owns its payload, so no report carries a sentinel.
+	// reports the marker it received, writes a sentinel into the payload's container, keeps that container and changes it again from another goroutine
+	// after the handler returned; the second handler of the same dispatch reports what it received. Each handler owns its payload, so no report carries a sentinel.
+	// For a boundary event the marker is data["context"]["contextEntries"][0]["sourceEntry"]["id"], the container that one and the first message in each of
+	// the three places its text lives; for a context or context_with_system event it is the length of data["messages"], the container that list, and the
+	// first three messages.
 	ext.Command("event_isolation_probe", "Subscribe two handlers that report the nested marker they received and then write sentinels into it", func(ctx sdk.Context, args string) error {
 		name := strings.TrimSpace(args)
+		conversation := name == "context" || name == "context_with_system"
 		source := func(data map[string]any) map[string]any {
 			context, _ := data["context"].(map[string]any)
 			entries, _ := context["contextEntries"].([]any)
@@ -1403,18 +2759,86 @@ func Extension() *sdk.Extension {
 			container, _ := entry["sourceEntry"].(map[string]any)
 			return container
 		}
+		marker := func(data map[string]any) any {
+			if conversation {
+				list, _ := data["messages"].([]any)
+				return len(list)
+			}
+			return source(data)["id"]
+		}
+		// scribble writes value into the payload's container: a sentinel id into the source entry, or a message appended to the list.
+		scribble := func(data map[string]any, value string) {
+			if conversation {
+				list, _ := data["messages"].([]any)
+				data["messages"] = append(list, map[string]any{"role": "user", "content": value, "timestamp": float64(0)})
+				return
+			}
+			source(data)["id"] = value
+		}
+		// messages are, for a boundary event, the first context message, the first llm message and the first message of the first context entry: the same text lives in three places of the payload, and a decode that shared one value between them or between handlers would show a sentinel written into one in another. For a conversation event they are the first three messages.
+		messages := func(data map[string]any) (found [3]map[string]any) {
+			if conversation {
+				list, _ := data["messages"].([]any)
+				for i := range found {
+					if i < len(list) {
+						found[i], _ = list[i].(map[string]any)
+					}
+				}
+				return found
+			}
+			context, _ := data["context"].(map[string]any)
+			if list, _ := context["contextMessages"].([]any); len(list) > 0 {
+				found[0], _ = list[0].(map[string]any)
+			}
+			if list, _ := context["llmMessages"].([]any); len(list) > 0 {
+				found[1], _ = list[0].(map[string]any)
+			}
+			if entries, _ := context["contextEntries"].([]any); len(entries) > 0 {
+				first, _ := entries[0].(map[string]any)
+				if list, _ := first["messages"].([]any); len(list) > 0 {
+					found[2], _ = list[0].(map[string]any)
+				}
+			}
+			return found
+		}
+		report := func(found [3]map[string]any) string {
+			parts := make([]string, len(found))
+			for i, object := range found {
+				parts[i] = fmt.Sprint(object["content"])
+			}
+			return strings.Join(parts, "|")
+		}
+		// The runner awaits a handler before it starts the next, so the second handler of a dispatch starts after the first handler's reply was sent, and the SDK
+		// reads the first handler's payload (the reply carries what the handler left in it) before that reply. The late writer waits for the second handler's start,
+		// so its write follows the SDK's last read of the payload through the reply and the second handler's request: a write that waited only for the clock
+		// would be a data race with that read.
+		secondStarted := make(chan struct{}, 4)
 		ext.OnEvent(name, func(hctx sdk.Context, data map[string]any) (any, error) {
-			container := source(data)
-			hctx.Notify(fmt.Sprintf("event_isolation:A:%v:end", container["id"]), "info")
-			container["id"] = "SENTINEL-HANDLER-A"
+			hctx.Notify(fmt.Sprintf("event_isolation:A:%v:end", marker(data)), "info")
+			scribble(data, "SENTINEL-HANDLER-A")
+			found := messages(data)
+			hctx.Notify("event_isolation_msgs:A:"+report(found), "info")
+			for _, object := range found {
+				if object != nil {
+					object["content"] = "SENTINEL-HANDLER-A"
+				}
+			}
 			go func() {
+				<-secondStarted
 				time.Sleep(100 * time.Millisecond)
-				container["id"] = "SENTINEL-LATE-WRITER"
+				scribble(data, "SENTINEL-LATE-WRITER")
+				for _, object := range found {
+					if object != nil {
+						object["content"] = "SENTINEL-LATE-WRITER"
+					}
+				}
 			}()
 			return nil, nil
 		})
 		ext.OnEvent(name, func(hctx sdk.Context, data map[string]any) (any, error) {
-			hctx.Notify(fmt.Sprintf("event_isolation:B:%v:end", source(data)["id"]), "info")
+			secondStarted <- struct{}{}
+			hctx.Notify(fmt.Sprintf("event_isolation:B:%v:end", marker(data)), "info")
+			hctx.Notify("event_isolation_msgs:B:"+report(messages(data)), "info")
 			return nil, nil
 		})
 		return nil
@@ -1448,7 +2872,7 @@ func Extension() *sdk.Extension {
 		return nil
 	})
 	ext.Command("model_set", "Switch the model", func(ctx sdk.Context, args string) error {
-		ok, err := ctx.SetModel(strings.TrimSpace(args))
+		ok, err := ctx.SetModelNamed(strings.TrimSpace(args))
 		if err != nil {
 			return err
 		}
@@ -1479,6 +2903,50 @@ func Extension() *sdk.Extension {
 
 	ext.Command("append_entry", "Append a custom entry", func(ctx sdk.Context, args string) error {
 		return ctx.AppendEntry("conformance-entry", "hello-entry")
+	})
+	// entry_null_members appends an entry and sends a message with the optional member left out, then with it written as null: Go's nil is Pi's omitted
+	// argument and json.RawMessage("null") is its null.
+	ext.Command("entry_null_members", "Append entries and send messages with an omitted and a null member", func(ctx sdk.Context, args string) error {
+		if err := ctx.AppendEntry("conformance-null-omitted", nil); err != nil {
+			return err
+		}
+		if err := ctx.AppendEntry("conformance-null-explicit", json.RawMessage("null")); err != nil {
+			return err
+		}
+		if err := ctx.SendMessage("conformance-null-omitted", "x", false, sdk.SendMessageOptions{}); err != nil {
+			return err
+		}
+		return ctx.SendMessage("conformance-null-explicit", "x", false, sdk.SendMessageOptions{Details: json.RawMessage("null")})
+	})
+	// label_members calls setLabel on the entry in the arguments without a label, with a null one and with an empty one: Pi writes a different entry for
+	// each. Go's nil is the call without a label and json.RawMessage("null") is its null.
+	ext.Command("label_members", "Set a label that is omitted, null and empty", func(ctx sdk.Context, args string) error {
+		if err := ctx.SetLabelValue(args, nil); err != nil {
+			return err
+		}
+		if err := ctx.SetLabelValue(args, json.RawMessage("null")); err != nil {
+			return err
+		}
+		return ctx.SetLabel(args, "")
+	})
+	// setup_null_members seeds a new session through the SessionManager of the setup callback: an entry and a message with the optional member left out,
+	// then with it written as null, under the types and display values of the pinned Pi package's rows "api custom data ..." and
+	// "api custom_message details ...". Go's nil is Pi's omitted argument and json.RawMessage("null") is its null.
+	ext.Command("setup_null_members", "Seed a new session with an omitted and a null member", func(ctx sdk.Context, args string) error {
+		_, err := ctx.NewSession(map[string]any{"setup": sdk.SetupFunc(func(manager sdk.SetupSessionManager) error {
+			if _, err := manager.AppendCustomEntry("api-custom", nil); err != nil {
+				return err
+			}
+			if _, err := manager.AppendCustomEntry("api-custom", json.RawMessage("null")); err != nil {
+				return err
+			}
+			if _, err := manager.AppendCustomMessageEntry("api-message", "x", false, nil); err != nil {
+				return err
+			}
+			_, err := manager.AppendCustomMessageEntry("api-message", "x", true, json.RawMessage("null"))
+			return err
+		})})
+		return err
 	})
 	// append-entries-probe appends one custom entry for each comma-separated type in order. Pi's appendEntry returns nothing and never fails, so a refusal the SDK reports is dropped here; the row reads the session afterwards.
 	ext.Command("append-entries-probe", "Append a custom entry for each comma-separated type", func(ctx sdk.Context, args string) error {
@@ -1582,6 +3050,48 @@ func Extension() *sdk.Extension {
 		ctx.Notify(fmt.Sprintf("stale:%s|%s|%t|%s", ctx.Cwd(), ctx.Mode(), ctx.HasUI(), ctx.Model()), "info")
 		return nil
 	})
+	// stale-members calls the members that answer a context kept past its Session in every SDK: each outcome is one line, and the command fails with
+	// every line when one of them carries the stale message (Pi guards every context member: runner.ts:883-1037), else it reports them.
+	staleMembers := func(ctx sdk.Context) error {
+		var lines []string
+		stale := false
+		member := func(name string, call func() (string, error)) {
+			outcome := func() (out string) {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						out = fmt.Sprintf("panics:%v", recovered)
+					}
+				}()
+				value, err := call()
+				if err != nil {
+					return "error:" + err.Error()
+				}
+				return "ok:" + value
+			}()
+			stale = stale || strings.Contains(outcome, "This extension ctx is stale")
+			lines = append(lines, name+"="+outcome)
+		}
+		member("theme", func() (string, error) { return fmt.Sprintf("%T", ctx.UITheme()), nil })
+		member("width", func() (string, error) { return fmt.Sprint(ctx.Width()), nil })
+		member("height", func() (string, error) { return fmt.Sprint(ctx.Height()), nil })
+		member("sessionName", func() (string, error) { return ctx.SessionName(), nil })
+		member("setWidgetLines", func() (string, error) { return "", ctx.SetWidget("stale-members", []string{"x"}) })
+		member("setWidgetView", func() (string, error) {
+			return "", ctx.SetWidget("stale-members-view", kit.View{Root: kit.NewText("x", 0, 0)})
+		})
+		member("setWidgetRenderer", func() (string, error) {
+			return "", ctx.SetWidgetRenderer("stale-members-renderer", func(int) []string { return []string{"x"} })
+		})
+		member("onUpdate", func() (string, error) { return "", ctx.OnUpdate("x") })
+		if stale {
+			return errors.New("stale-members\n" + strings.Join(lines, "\n"))
+		}
+		ctx.Notify("members\n"+strings.Join(lines, "\n"), "info")
+		return nil
+	}
+	ext.Command("stale-members", "Call the members that fail with the stale message", func(ctx sdk.Context, _ string) error {
+		return staleMembers(ctx)
+	})
 	ext.Command("signal-wait", "Wait for ctx.signal to abort", func(ctx sdk.Context, _ string) error {
 		signal := ctx.Signal()
 		if signal == nil {
@@ -1617,6 +3127,84 @@ func Extension() *sdk.Extension {
 			return err
 		}
 		data, err := json.Marshal(usage)
+		if err != nil {
+			return err
+		}
+		ctx.Notify(string(data), "info")
+		return nil
+	})
+
+	// console-probe writes four lines a console would: stdout (Pi's console.log) and stderr (console.error) alternately, so the row sees where the host puts each and
+	// in which order (TestConformance_ExtensionConsoleReachesTheTerminalInEverySDK). A fused extension shares PiG's own stdout, which it must not write, so the
+	// argument "stderr" writes only the error lines.
+	ext.Command("console-probe", "Write console lines to stdout and stderr", func(ctx sdk.Context, args string) error {
+		for n := 1; n <= 2; n++ {
+			if args != "stderr" {
+				_, _ = fmt.Fprintf(os.Stdout, "probe-out-%d\n", n)
+			}
+			_, _ = fmt.Fprintf(os.Stderr, "probe-err-%d\n", n)
+		}
+		return nil
+	})
+	// panic-probe and the OnLoaded handler panic after a deliberate stderr line the extension itself writes
+	// (TestConformance_SDKDiagnosticsReachOnlyTheExtensionLog). The OnLoaded handler panics only when the row asks for it, so no other row meets it.
+	ext.OnLoaded(func(ctx sdk.Context) {
+		if os.Getenv("PIG_FIXTURE_PANIC_PROBE") != "" {
+			_, _ = fmt.Fprintln(os.Stderr, "probe-err-loaded")
+			panic("probe-panic-boom")
+		}
+	})
+	ext.Command("panic-probe", "Panic after an stderr line of the extension's own", func(ctx sdk.Context, args string) error {
+		_, _ = fmt.Fprintln(os.Stderr, "probe-err-command")
+		panic("probe-panic-boom")
+	})
+	// replica-probe (TestReplicatedReadsAreLocalAcrossSDKs) reads the model object, the session id, name and file (from the context and from the session manager) and the context usage, and reports them as one JSON object. Its argument is empty, or "set-model:<provider>/<id>" to call SetModel before it reads. Every SDK fixture reports the same shape.
+	ext.Command("replica-probe", "Report the replicated model object, session ids and context usage", func(ctx sdk.Context, args string) error {
+		if model, ok := strings.CutPrefix(args, "set-model:"); ok {
+			if _, err := ctx.SetModelNamed(model); err != nil {
+				return err
+			}
+		}
+		info, err := ctx.GetModelInfo()
+		if err != nil {
+			return err
+		}
+		sessionID, err := ctx.GetSessionID()
+		if err != nil {
+			return err
+		}
+		managerID, err := ctx.SessionManager().GetSessionID()
+		if err != nil {
+			return err
+		}
+		usage, err := ctx.GetContextUsage()
+		if err != nil {
+			return err
+		}
+		var model any
+		if info != nil {
+			model = map[string]any{
+				"id": info.ID, "name": info.Name, "provider": info.Provider, "contextWindow": info.ContextWindow, "maxOutputTokens": info.MaxOutputTokens, "reasoning": info.Reasoning,
+				"inputCostPer1M": info.InputCostPer1M, "outputCostPer1M": info.OutputCostPer1M, "cacheReadCostPer1M": info.CacheReadCostPer1M, "cacheWriteCostPer1M": info.CacheWriteCostPer1M,
+			}
+		}
+		name, err := ctx.GetSessionName()
+		if err != nil {
+			return err
+		}
+		file, err := ctx.GetSessionFile()
+		if err != nil {
+			return err
+		}
+		managerName, err := ctx.SessionManager().GetSessionName()
+		if err != nil {
+			return err
+		}
+		managerFile, err := ctx.SessionManager().GetSessionFile()
+		if err != nil {
+			return err
+		}
+		data, err := json.Marshal(map[string]any{"model": model, "sessionId": sessionID, "managerSessionId": managerID, "usage": usage, "sessionName": name, "sessionFile": file, "managerSessionName": managerName, "managerSessionFile": managerFile})
 		if err != nil {
 			return err
 		}
@@ -2161,6 +3749,26 @@ func Extension() *sdk.Extension {
 		return nil
 	})
 
+	ext.Command("overlay-invalidate-probe", "Count the host's invalidations of a mounted overlay and draw the theme", func(ctx sdk.Context, args string) error {
+		options := sdk.RemoteOverlayOptions{Overlay: true}
+		var err error
+		if strings.TrimSpace(args) == "plain" {
+			_, err = ctx.Custom(&plainThemeProbeComponent{ctx: ctx}, options)
+		} else {
+			_, err = ctx.Custom(&invalidateProbeComponent{ctx: ctx, kept: themeProbeRow(ctx)}, options)
+		}
+		if err != nil {
+			return err
+		}
+		ctx.Notify("overlay-invalidate=ok", "info")
+		return nil
+	})
+
+	ext.Command("theme-read-probe", "Report the theme the extension holds, with no component mounted", func(ctx sdk.Context, _ string) error {
+		ctx.Notify("theme-read="+themeProbeRow(ctx), "info")
+		return nil
+	})
+
 	ext.Command("overlay-focus-probe", "Render the focus the host publishes to a mounted overlay", func(ctx sdk.Context, _ string) error {
 		component := &focusProbeComponent{}
 		onHandle := func(handle *sdk.OverlayHandle) { component.handle.Store(handle) }
@@ -2493,7 +4101,7 @@ func Extension() *sdk.Extension {
 			Window   int                    `json:"window"`
 			Settings sdk.CompactionSettings `json:"settings"`
 			Entries  []map[string]any       `json:"entries"`
-			Message  map[string]any         `json:"message"`
+			Message  json.RawMessage        `json:"message"`
 			Start    int                    `json:"start"`
 			End      int                    `json:"end"`
 			Keep     int                    `json:"keep"`
@@ -2519,7 +4127,12 @@ func Extension() *sdk.Extension {
 		case "turn":
 			result = map[string]any{"index": sdk.FindTurnStartIndex(c.Entries, c.Index, c.Start)}
 		case "estimate":
-			result = map[string]any{"tokens": sdk.EstimateTokens(c.Message)}
+			// The message is decoded the way an extension decodes wire text: with the SDK's decoder, which keeps an unpaired surrogate (WTF-8).
+			var message map[string]any
+			if err := jsjson.Unmarshal(c.Message, &message); err != nil {
+				return err
+			}
+			result = map[string]any{"tokens": sdk.EstimateTokens(message)}
 		case "defaults":
 			result = sdk.DefaultCompactionSettings
 		default:
@@ -2925,7 +4538,7 @@ func Extension() *sdk.Extension {
 	})
 	ext.Command("editor-install-viewport", "Install a custom editor that captures viewport input until it receives t", func(ctx sdk.Context, args string) error {
 		return ctx.SetEditorComponent(func(base *sdk.Editor) sdk.EditorComponent {
-			return &viewportEditor{conformanceEditor: conformanceEditor{Editor: base}}
+			return &viewportEditor{Editor: base}
 		})
 	})
 	ext.Command("select-page-probe", "Report getSelectPageIndex for a key under the default keybindings", func(ctx sdk.Context, args string) error {
@@ -3050,10 +4663,41 @@ func Extension() *sdk.Extension {
 		if len(entries) != 2 || len(preview["contextEntries"].([]any)) != 2 || entries[0].(map[string]any)["customType"] != "kept" || entries[1].(map[string]any)["customType"] != "before-error" {
 			return nil, errors.New("lost boundary mutation or preview")
 		}
+		// One draft with a null replacement, one without the member, and a compaction that keeps nothing: Pi omits the target of the first, rejects the second
+		// (session-manager.ts appendContextEdit) and keeps no entry before the third (appendCompaction).
 		return map[string]any{
-			"entries":  []any{map[string]any{"type": "custom", "customType": "conformance-boundary"}},
+			"entries": []any{
+				map[string]any{"type": "custom", "customType": "conformance-boundary"},
+				map[string]any{"type": "context_edit", "targetId": "conformance-failed-attempt", "replacement": nil},
+				map[string]any{"type": "context_edit", "targetId": "conformance-omitted-member"},
+				map[string]any{"type": "compaction", "summary": "conformance-summary", "firstKeptEntryId": nil, "details": map[string]any{"format": "conformance-checkpoint"}, "usage": nil},
+				// A data, a details and (above) a usage member written as null: Pi's file holds each as null.
+				map[string]any{"type": "custom", "customType": "conformance-null-data", "data": nil},
+				map[string]any{"type": "custom_message", "customType": "conformance-null-details", "content": "x", "display": false, "details": nil},
+			},
 			"continue": true,
 		}, nil
+	})
+	ext.OnEvent("agent_before_settle", func(ctx sdk.Context, data map[string]any) (any, error) {
+		entries, _ := data["entries"].([]any)
+		if len(entries) != 6 {
+			return nil, fmt.Errorf("boundary result reached the next handler as %d entries", len(entries))
+		}
+		member := func(index int, key string) string {
+			entry, _ := entries[index].(map[string]any)
+			value, present := entry[key]
+			switch {
+			case !present:
+				return "absent"
+			case value == nil:
+				return "null"
+			}
+			return "value"
+		}
+		compaction, _ := entries[3].(map[string]any)
+		details, _ := compaction["details"].(map[string]any)
+		ctx.Notify(fmt.Sprintf("agent_before_settle_drafts:%d:%s:%s:%s:%v:%s:%s:%s:%s", len(entries), member(1, "replacement"), member(2, "replacement"), member(3, "firstKeptEntryId"), details["format"], member(0, "data"), member(3, "usage"), member(4, "data"), member(5, "details")), "info")
+		return nil, nil
 	})
 	ext.OnSessionStart(func(ctx sdk.Context, data map[string]any) (any, error) {
 		ctx.Notify("session_start:"+fmt.Sprint(data["reason"]), "info")
@@ -3064,12 +4708,24 @@ func Extension() *sdk.Extension {
 	})
 	ext.OnSessionShutdown(func(ctx sdk.Context, data map[string]any) (any, error) {
 		ctx.Notify("session_shutdown:"+fmt.Sprint(data["reason"]), "info")
+		// The handler's own context is still active (Pi invalidates after the handlers ran): the stale-members test reads every member from here.
+		if data["reason"] == "stale-members-test" {
+			if err := staleMembers(ctx); err != nil {
+				return nil, err
+			}
+		}
 		if path, ok := data["targetSessionFile"].(string); ok && path != "" {
 			ctx.Notify("target:"+path, "info")
 		}
 		return nil, nil
 	})
 	ext.OnEvent("session_info_changed", func(ctx sdk.Context, data map[string]any) (any, error) {
+		// io_wait_name arms the handler to wait on a socket read first, as a handler that awaits does in Pi.
+		if addr, _ := nameWaitAddr.Load().(string); addr != "" {
+			if err := ioWait(addr); err != nil {
+				return nil, err
+			}
+		}
 		ctx.Notify("session_info_changed:"+fmt.Sprint(data["name"]), "info")
 		return nil, nil
 	})
@@ -3431,6 +5087,8 @@ type conformanceEditor struct{ *sdk.Editor }
 
 func (e *conformanceEditor) HandleInput(data string) error {
 	switch data {
+	case "!":
+		panic("bad key")
 	case "q":
 		return nil
 	case "a":
@@ -3575,6 +5233,44 @@ func (*focusProbeComponent) HandleInput(data string) (sdk.RemoteComponentResult,
 	return sdk.RemoteComponentResult{Done: data == "q", Value: "closed"}, nil
 }
 
+// themeProbeRow is the active theme's name and its accent foreground, as the extension holds them now.
+func themeProbeRow(ctx sdk.Context) string {
+	theme := ctx.UITheme()
+	return theme.Name + "|" + theme.Fg("accent", "x")
+}
+
+// invalidateProbeComponent keeps a themed row until the host invalidates it, as a Pi component that caches its rows does: the row
+// names the theme the component saw at its Invalidate, and each frame the theme it sees at its render.
+type invalidateProbeComponent struct {
+	ctx           sdk.Context
+	invalidations int
+	kept          string
+}
+
+func (c *invalidateProbeComponent) Render(int) []string {
+	return []string{fmt.Sprintf("inv=%d kept=%s live=%s", c.invalidations, c.kept, c.ctx.UITheme().Name)}
+}
+
+func (c *invalidateProbeComponent) Invalidate() {
+	c.invalidations++
+	c.kept = themeProbeRow(c.ctx)
+}
+
+func (*invalidateProbeComponent) HandleInput(data string) (sdk.RemoteComponentResult, error) {
+	return sdk.RemoteComponentResult{Done: data == "q", Value: "closed"}, nil
+}
+
+// plainThemeProbeComponent has no Invalidate: the host's invalidation renders it again all the same.
+type plainThemeProbeComponent struct{ ctx sdk.Context }
+
+func (c *plainThemeProbeComponent) Render(int) []string {
+	return []string{"plain live=" + themeProbeRow(c.ctx)}
+}
+
+func (*plainThemeProbeComponent) HandleInput(data string) (sdk.RemoteComponentResult, error) {
+	return sdk.RemoteComponentResult{Done: data == "q", Value: "closed"}, nil
+}
+
 // objectKeyLists is the depth-first list of every object's keys, joined with commas, in the order the JSON gives them: what Object.keys returns for each
 // object of the value, which a Go map would lose.
 func objectKeyLists(raw json.RawMessage) ([]string, error) {
@@ -3685,4 +5381,41 @@ func registerSignalAbort(ext *sdk.Extension) {
 func dialogText(value any) string {
 	text, _ := value.(string)
 	return text
+}
+
+// clickCardView is the view of a click card: its text under a mouse region named "card" that answers click only.
+func clickCardView(prefix string, subject any, state map[string]any, expanded bool) kit.View {
+	clicks, _ := state["clicks"].(int)
+	last, ok := state["last"].(string)
+	if !ok {
+		last = "none"
+	}
+	region := kit.NewMouseRegion("card", kit.NewText(fmt.Sprintf("%s:%v:clicks=%d:last=%s:expanded=%t", prefix, subject, clicks, last, expanded), 0, 0))
+	region.Types = []string{"click"}
+	return kit.View{Root: region}
+}
+
+// countClick counts a click the "card" region reported and remembers where it landed, in the region's own coordinates.
+func countClick(state map[string]any, event kit.Event) {
+	if event.Type != kit.EventMouse || event.Node != "card" || event.Mouse == nil {
+		return
+	}
+	clicks, _ := state["clicks"].(int)
+	state["clicks"] = clicks + 1
+	state["last"] = fmt.Sprintf("%d,%d", event.Mouse.X, event.Mouse.Y)
+}
+
+// lastRenderLine is the first line the card's renderer of the same phase returned on its previous run, or "none" on the first run: the value
+// ToolRenderContext.LastComponent carries (the render_probe rows of the conformance suite bind to it).
+func lastRenderLine(render sdk.ToolRenderContext) string {
+	if render.LastComponent == nil || len(render.LastComponent.Lines) == 0 {
+		return "none"
+	}
+	return render.LastComponent.Lines[0]
+}
+
+// isStringContent reports whether the message's content is a string.
+func isStringContent(message map[string]any) bool {
+	_, ok := message["content"].(string)
+	return ok
 }

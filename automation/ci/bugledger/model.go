@@ -2,6 +2,8 @@
 
 package main
 
+import "time"
+
 // Source classes. Every entry has exactly one.
 const (
 	// ClassOwn is a defect PiG introduced: it differed from Pi, or failed where Pi does not.
@@ -18,6 +20,8 @@ type Commit struct {
 	Date string `json:"date"`
 	// PR is the pull request number named in the subject, when there is one.
 	PR string `json:"pr,omitempty"`
+	// at is the instant of the commit's author date. It is not part of the document: the committed ledger records only Date, which is the author's own calendar date, and fillInstants reads the instant from the history.
+	at time.Time
 }
 
 // Entry is one fixed bug.
@@ -40,6 +44,17 @@ type Entry struct {
 	// CommitsFrom is "release note" when the listed commit wrote the release note and no commit of its work was identified as the fix.
 	CommitsFrom string   `json:"commitsFrom,omitempty"`
 	Tests       []string `json:"tests"`
+	Evidence    string   `json:"evidence,omitempty"`
+	// stated is what the changelog bullet of the entry states outright. It is read from the tree on every run and is not part of the document.
+	stated stated
+}
+
+// stated records the file that holds the changelog bullet of an entry and which of the entry's fields the bullet states with a marker. A stated field is the entry's as written: no committed entry and no commit message overrides it.
+type stated struct {
+	file     string
+	cause    bool
+	tests    bool
+	evidence bool
 }
 
 // DivergenceRef accounts for one divergence record added since the baseline release: the ledger entry of a Pi defect it fixes ahead of Pi, or the statement that it is a deliberate difference and no bug fix.
@@ -59,4 +74,6 @@ type Ledger struct {
 	Divergences []DivergenceRef `json:"divergences"`
 	// Exempt counts fix-titled commits that are not product bugs, by reason category.
 	Exempt map[string]int `json:"exemptCommits"`
+	// reach is the history the ledger was built from; it is not part of the document.
+	reach history
 }

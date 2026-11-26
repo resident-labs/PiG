@@ -18,17 +18,19 @@ CLI_PKG=./coding/cli
 SUBPROCESS_PKG=./coding/extension/host/subprocess
 CONFORMANCE_PKG=./test/extension-conformance
 # Heavy packages that run as several go test processes, each under its own package timeout and each warm from the shared Go and Cargo caches, like cmd/pig: <package>:<shards>. test-shard-pattern.sh partitions each package's tests by name hash, with the slowest pinned to shards by automation/ci/test-shard-weights.txt for the shard count declared here, and run_sharded_pkg refuses to run a package unless its shard patterns select every listed test exactly once. changed mode runs these packages whole.
+# A count bounds two things: a shard's time, and the length of its -run pattern, which lists every test of the shard by name and which test-shard-pattern.sh refuses past 24000 characters (the Windows command line). A package whose tests fit its time can still outgrow its pattern: in November 2026 the third extension host shard needed 24209 characters and make test-subprocess ran no test, with ./internal/codingagent at 23863, ./coding at 22892, ./tui at 21158 and ./ai at 21008. So each count here keeps the longest pattern at or under 70% of the limit (16800 characters) as measured then (./internal/codingagent 16796, ./tui 16059, ./coding 15116, the extension host 15034, ./ai 14599); raise a count when a pattern of its package passes 80% (19200), before test-shard-pattern.sh stops the run. The extension host count is also the Windows extension-host jobs' (.github/workflows/ci.yml, automation/ci/ci-tiers.txt), the macOS units' (automation/ci/macos-units.sh) and its pins' (automation/ci/test-shard-weights.txt); test/ci-images checks that they agree.
 SHARDED_SPEC=(
-  ./ai:7
-  ./coding:4
-  ./internal/codingagent:8
+  ./ai:10
+  ./coding:6
+  ./internal/codingagent:13
   ./test/parity/interface-closure/autobind:4
-  ./chord/host:2
+  ./test/parity/cmd/portmapcheck:4
   ./codemode:2
   ./durable/codemode:2
-  ./coding/extension/host/subprocess:3
-  ./test/extension-conformance:14
+  ./coding/extension/host/subprocess:5
+  ./test/extension-conformance:20
   ./tui/internal/hljs:2
+  ./tui:8
 )
 # Under -race a package runs several times slower, so make test-changed multiplies the shard count of an edited sharded package by this factor (the shard patterns partition the package for any count; the weights apply only to the count CI uses).
 RACE_SHARD_FACTOR=${TEST_CHANGED_RACE_SHARDS:-3}
@@ -40,6 +42,11 @@ if [[ -n "${CI:-}" ]]; then
 fi
 RUN_FLAG=()
 RACE_FLAG=()
+# A run under -race takes the nightly race gate's timeout (race-timeout.sh, PIG_RACE_TIMEOUT); a plain run takes plain-timeout.sh (PIG_PLAIN_TIMEOUT) so no whole-package go test falls back to go test's 10-minute default.
+# shellcheck source=automation/ci/race-timeout.sh
+source "$ROOT/automation/ci/race-timeout.sh"
+# shellcheck source=automation/ci/plain-timeout.sh
+source "$ROOT/automation/ci/plain-timeout.sh"
 # changed mode streams go test -json into test-json-report.py and keeps each group's raw events under JSON_DIR.
 JSON_DIR=
 JSON_LABEL=
@@ -53,6 +60,12 @@ HEAVY_PKGS=(
 # Packages that start real processes and gate what those use, and need the machine to themselves: they run after the parallel groups, one package at a time, each with every CPU. test/perfgate runs pig under a pseudo-terminal and cross-builds the release binaries in one go test process under the default 10-minute package timeout. Beside the 12-way pool of the fast group on a 4-CPU runner it took 390-494 s, 96 s with the machine to itself; a run that cold-built more of the binaries took 597 s, and the hang bounds that testbudget.Wait derives from the package deadline then cut its last tests short and killed their pig children.
 SERIAL_PKGS=(
   ./test/perfgate
+)
+# Tree-wide invariant guard packages that the light PR run (TEST_CHANGED_FOR=fast-parallel) always runs, even when the diff did not touch them directly.
+GUARD_PKGS=(
+  ./internal/testenv
+  ./test/ci-images
+  ./test/docs-drift
 )
 
 all_pkgs=$(go list ./...)
@@ -68,6 +81,11 @@ if [[ ${#SERIAL_PKGS[@]} -gt 0 ]]; then
   serial_pkgs=$(go list "${SERIAL_PKGS[@]}")
   SERIAL_PKGS=()
   while IFS= read -r pkg; do SERIAL_PKGS+=("$pkg"); done <<<"$serial_pkgs"
+fi
+if [[ ${#GUARD_PKGS[@]} -gt 0 ]]; then
+  guard_pkgs=$(go list "${GUARD_PKGS[@]}")
+  GUARD_PKGS=()
+  while IFS= read -r pkg; do GUARD_PKGS+=("$pkg"); done <<<"$guard_pkgs"
 fi
 exclude_pkg() {
   local pkg="$1"
@@ -130,7 +148,11 @@ if [[ "$MODE" == changed ]]; then
       *) echo "TEST_CHANGED_RACE must be direct, affected or none" >&2; exit 2 ;;
     esac
     kept=()
-    for pkg in "${FAST_PKGS[@]}"; do in_list "$pkg" "${AFFECTED[@]}" && kept+=("$pkg"); done
+    for pkg in "${FAST_PKGS[@]}"; do
+      if in_list "$pkg" "${AFFECTED[@]}" || { [[ -n "${TEST_CHANGED_FOR:-}" ]] && in_list "$pkg" "${GUARD_PKGS[@]}"; }; then
+        kept+=("$pkg")
+      fi
+    done
     FAST_PKGS=("${kept[@]}")
     kept=()
     for pkg in "${HEAVY_PKGS[@]}"; do [[ -z "${TEST_CHANGED_FOR:-}" ]] && in_list "$pkg" "${AFFECTED[@]}" && kept+=("$pkg"); done
@@ -189,7 +211,8 @@ fi
 # Warm with go list -export: it compiles every package into the build cache and links nothing, where go build ./... links every command and discards it on each run.
 # Tests that build Pig, a packed extension cell or a Piglet run their own `go build` in a child process. Those builds share no work with the `go test` action graph, so on a cold Go build cache (the first run after go.mod or go.sum changes) each one recompiles the whole dependency graph while the 12-way package pool competes for the same cores, and a build bounded by the 2-minute extension-validation deadline is killed. Compile each flag set once here so every child build links from the cache: -trimpath changes every package's action ID, and CGO_ENABLED changes every package that reaches net or os/user. The default set serves go test itself, the default-CGO -trimpath set serves `pig build` and native Piglet Binary builds (coding/cli/build_command.go, coding/pigletbuild/native_build.go), and the CGO_ENABLED=0 -trimpath set serves extension and packed-cell builds (coding/extension/host/subprocess/builder.go, coding/extension/host/runtimecell/go_packed.go). An extension or packed-cell build compiles PiG as a dependency module, and -trimpath then maps its source directories to github.com/MichaelKinsy/PiG@<version>/... where the main-module builds above map them to github.com/MichaelKinsy/PiG/..., so those builds share no compiled PiG package with them (about 60 packages for the Porter extension). Building the in-repo Porter extension module with GOWORK=off (the packed build's setting) compiles that dependency-module set once.
 # Only the heavy packages run those child builds, so changed mode warms the cache only when it tests one of them.
-if [[ "$MODE" != "report" && ( "$MODE" != changed || ${#HEAVY_PKGS[@]} -gt 0 ) ]]; then
+# Callers that already warmed every flag set (for example CI after `make test-warm`) set PIG_GO_WARMED=1 to skip repeating the four `go list -export` passes.
+if [[ "${PIG_GO_WARMED:-0}" != 1 && "$MODE" != "report" && ( "$MODE" != changed || ${#HEAVY_PKGS[@]} -gt 0 ) ]]; then
   echo "[test-grouped] warming the Go build cache"
   go list -export -f '' ./... >/dev/null
   go list -trimpath -export -f '' ./... >/dev/null
@@ -226,6 +249,8 @@ run_group() {
   shift 2
   local pkgs=("$@")
   [[ ${#pkgs[@]} -gt 0 ]] || return 0
+  local test_timeout=(-timeout "$PIG_PLAIN_TIMEOUT")
+  [[ ${#RACE_FLAG[@]} -eq 0 ]] || test_timeout=(-timeout "$PIG_RACE_TIMEOUT")
   if [[ ${#pkgs[@]} -eq 0 ]]; then
     return 0
   fi
@@ -258,9 +283,9 @@ run_group() {
   if [[ -n "$JSON_DIR" ]]; then
     JSON_LABEL=$((JSON_LABEL + 1))
     # The tests get no copy of the checkout lock: a process they leak would otherwise hold it and block every later run here.
-    TMPDIR="$SCRATCH" go test -json -p "$parallel" ${TAG_FLAG[@]+"${TAG_FLAG[@]}"} ${COUNT_FLAG[@]+"${COUNT_FLAG[@]}"} ${RACE_FLAG[@]+"${RACE_FLAG[@]}"} ${RUN_FLAG[@]+"${RUN_FLAG[@]}"} "${pkgs[@]}" 9>&- | python3 "$ROOT/automation/ci/test-json-report.py" --out "$JSON_DIR/$JSON_LABEL-${label//[^A-Za-z0-9]/-}.json" || status=$?
+    TMPDIR="$SCRATCH" go test -json -p "$parallel" ${TAG_FLAG[@]+"${TAG_FLAG[@]}"} ${COUNT_FLAG[@]+"${COUNT_FLAG[@]}"} ${RACE_FLAG[@]+"${RACE_FLAG[@]}"} ${test_timeout[@]+"${test_timeout[@]}"} ${RUN_FLAG[@]+"${RUN_FLAG[@]}"} "${pkgs[@]}" 9>&- | python3 "$ROOT/automation/ci/test-json-report.py" --out "$JSON_DIR/$JSON_LABEL-${label//[^A-Za-z0-9]/-}.json" || status=$?
   else
-    TMPDIR="$SCRATCH" go test -p "$parallel" ${TAG_FLAG[@]+"${TAG_FLAG[@]}"} ${COUNT_FLAG[@]+"${COUNT_FLAG[@]}"} ${RACE_FLAG[@]+"${RACE_FLAG[@]}"} ${RUN_FLAG[@]+"${RUN_FLAG[@]}"} "${pkgs[@]}" 9>&- || status=$?
+    TMPDIR="$SCRATCH" go test -p "$parallel" ${TAG_FLAG[@]+"${TAG_FLAG[@]}"} ${COUNT_FLAG[@]+"${COUNT_FLAG[@]}"} ${RACE_FLAG[@]+"${RACE_FLAG[@]}"} ${test_timeout[@]+"${test_timeout[@]}"} ${RUN_FLAG[@]+"${RUN_FLAG[@]}"} "${pkgs[@]}" 9>&- || status=$?
   fi
   "$ROOT/automation/ci/reap-test-processes.sh" "$SCRATCH" || status=$?
   "$ROOT/automation/ci/agent-dir-guard.sh" check "$AGENT_GUARD" || status=$?
@@ -357,8 +382,9 @@ case "$MODE" in
     run_group serial-exclusive "$SERIAL_PARALLEL" ${SERIAL_PKGS[@]+"${SERIAL_PKGS[@]}"}
     ;;
   fast|fast-parallel|fast-sharded)
-    # fast is fast-parallel and fast-sharded in one run. CI runs the two halves on separate jobs, because together they
-    # were the run's longest job.
+    # fast is fast-parallel and fast-sharded in one run. CI runs fast-parallel on one job and splits fast-sharded
+    # into two halves (fast-sharded 1 2 and fast-sharded 2 2) so each stays within 60% of the 60-minute limit fast
+    # and under 85% on the slow pool. make test-fast-sharded runs all fast-sharded packages (no range).
     # Every group runs even when an earlier one failed, so one run reports all the failing groups: a failure in the parallel group must not hide one in the serial packages.
     status=0
     if [[ "$MODE" != fast-sharded ]]; then
@@ -368,6 +394,28 @@ case "$MODE" in
       # Every sharded package but the extension host and the conformance suite, which test-subprocess and test-conformance run.
       fast_sharded=()
       for pkg in ${SHARD_COUNT_PKGS[@]+"${SHARD_COUNT_PKGS[@]}"}; do [[ "$pkg" == "$SUBPROCESS_PKG" || "$pkg" == "$CONFORMANCE_PKG" ]] || fast_sharded+=("$pkg"); done
+      if [[ "$MODE" == fast-sharded && $# -gt 1 ]]; then
+        half_idx="${2:-}"
+        half_total="${3:-}"
+        if ! [[ "$half_idx" =~ ^[0-9]+$ && "$half_total" =~ ^[0-9]+$ ]] || (( half_total != 2 || half_idx < 1 || half_idx > half_total )); then
+          echo "[test-grouped] fast-sharded: slice $half_idx/$half_total is not 1/2 or 2/2" >&2
+          exit 2
+        fi
+        # Partition the fast-sharded packages into two balanced halves by measured CI wall time (run 44880357753):
+        # half 1: ./ai, ./tui, ./tui/internal/hljs (~17.7 m tests); half 2: every other fast-sharded package (~15.5 m tests).
+        # Any newly added SHARDED_SPEC package lands in half 2 automatically so the union always equals fast_sharded.
+        selected_sharded=()
+        for pkg in ${fast_sharded[@]+"${fast_sharded[@]}"}; do
+          case "$pkg" in
+            */ai|*/tui|*/tui/internal/hljs) pkg_half=1 ;;
+            *) pkg_half=2 ;;
+          esac
+          if (( pkg_half == half_idx )); then
+            selected_sharded+=("$pkg")
+          fi
+        done
+        fast_sharded=("${selected_sharded[@]}")
+      fi
       [[ ${#fast_sharded[@]} -eq 0 ]] || run_sharded "$SUBPROCESS_PARALLEL" "${fast_sharded[@]}" || status=$?
     fi
     if [[ "$MODE" != fast-sharded ]]; then
@@ -386,7 +434,7 @@ case "$MODE" in
       conformance) selected=./test/extension-conformance ;;
     esac
     selected=$(go list "$selected")
-    # subprocess|conformance [<first> <last>]: CI runs the conformance shards in two jobs; make test-conformance runs all of them.
+    # subprocess|conformance [<first> <last>]: CI runs the conformance shards in four jobs; make test-conformance runs all of them.
     if shard_count_get "$selected" >/dev/null; then
       run_sharded_pkg sharded "$SUBPROCESS_PARALLEL" "$selected" "$(shard_count_get "$selected")" "${2:-1}" "${3:-$(shard_count_get "$selected")}"
     elif [[ $# -gt 1 ]]; then
@@ -466,7 +514,7 @@ case "$MODE" in
     if [[ ${#SERIAL_PKGS[@]} -eq 0 ]]; then echo '  (none)'; else printf '  %s\n' "${SERIAL_PKGS[@]}"; fi
     ;;
   *)
-    echo "usage: $0 [default|fast|fast-parallel|fast-sharded|cli [<first> <last>]|subprocess [<first> <last>]|conformance [<first> <last>]|changed|stress|report]" >&2
+    echo "usage: $0 [default|fast|fast-parallel|fast-sharded [<part> <total>]|cli [<first> <last>]|subprocess [<first> <last>]|conformance [<first> <last>]|changed|stress|report]" >&2
     exit 2
     ;;
 esac

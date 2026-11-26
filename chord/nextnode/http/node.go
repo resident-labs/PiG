@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-// Ports packages/chord/src/next-node/http/node.ts. Chord's own listener (decision "The HTTP server is a native object"; "The
+// Ports packages/chord/src/node/http/node.ts. Chord's own listener (decision "The HTTP server is a native object"; "The
 // HTTP core is a fetch handler; Chord's own Node server is the easy path"): the listener's native, a net/http server that
 // hands each request to the component as it reads requests (origin-form targets only), and writes its answer: whole, or
 // pulled piece by piece as the socket drains. A body the route left unread is drained after the response when small, else
@@ -31,6 +31,8 @@ import (
 //     answers 403), as is a `Host` with userinfo (server.go "malformed Host header": `@` is no host byte; Node's component
 //     answers 403) and a malformed `Host`; `Fetch` and `NodeRequestOf` still refuse them as Pi does for a server that hands
 //     the component the headers it read. No `http.Server` option reaches these checks.
+//   - net/http answers a target with a malformed percent-escape (`/%zz`) 400 itself, where the component answers it 400 with its
+//     default headers; and the request line `GET /  HTTP/1.1` (two spaces), which Node's parser reads as target `/`, is 400.
 //   - A Web `Request` is made only when something asks for it in Pi; Go's request exists already (incoming.go).
 //   - The reason phrase of the status line is Go's (the answers' own text is Node's table, statuscodes.go); header names are
 //     written in canonical case; an HTTP/1.0 request's answer has an `HTTP/1.0` status line (Node writes `HTTP/1.1`); an
@@ -142,13 +144,20 @@ func (l *NodeListener) Closed() {
 
 // serveNode is the server's handler: an upgrade, or one request served and its answer written.
 func serveNode(handler Handler, w nethttp.ResponseWriter, r *nethttp.Request) {
+	if !wireTarget(r.RequestURI) {
+		// Node's parser answers a request whose target has a byte it does not take with its own 400, the connection closed,
+		// before any `request` or `upgrade` event (like net/http's own refusals, D218: no default headers).
+		w.Header().Set("Connection", "close")
+		w.WriteHeader(nethttp.StatusBadRequest)
+		return
+	}
 	if isUpgrade(r) {
 		handler.Upgrade(w, r)
 		return
 	}
 	incoming, refusal := nodeIncomingOf(r)
 	if refusal != nil {
-		write(r, w, Served{Answer: handler.Refusal(refusal.Status), Finished: func() {}})
+		write(r, w, Served{Answer: handler.Refusal(int(refusal.Status)), Finished: func() {}})
 		return
 	}
 	if r.Body != nil && r.Body != nethttp.NoBody {
@@ -161,6 +170,17 @@ func serveNode(handler Handler, w nethttp.ResponseWriter, r *nethttp.Request) {
 		finished()
 	}
 	write(r, w, served)
+}
+
+// wireTarget is whether Node's HTTP parser takes target: the printable ASCII bytes 0x21 to 0x7e only (net/http itself refuses
+// the controls, DEL and a space, and takes the bytes from 0x80 up).
+func wireTarget(target string) bool {
+	for i := 0; i < len(target); i++ {
+		if target[i] < 0x21 || target[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 // isUpgrade is whether r asks for an upgrade (Node emits `upgrade` for a request with an `Upgrade` header and the
@@ -206,8 +226,20 @@ func (n *nodeIncoming) Cancelled(abort func(reason error)) {
 	context.AfterFunc(ctx, gone)
 }
 
+// WireStatus is the status that refuses a request at the wire: Pi's closed union `400 | 403 | 501`.
+type WireStatus int
+
+const (
+	// WireBadRequest is a target that does not parse (or a malformed `Host`).
+	WireBadRequest WireStatus = 400
+	// WireForbidden is an absolute-form target or a `Host` with userinfo.
+	WireForbidden WireStatus = 403
+	// WireNotImplemented is a method a Web `Request` cannot carry (`CONNECT`, `TRACE`, `TRACK`).
+	WireNotImplemented WireStatus = 501
+)
+
 // WireRefusal is what refuses a request at the wire, with its status (400, 403 or 501).
-type WireRefusal struct{ Status int }
+type WireRefusal struct{ Status WireStatus }
 
 // nodeIncomingOf is request as the component reads it, or what refuses it at the wire (the listener and `NodeRequest`
 // alike): an absolute-form target 403, a target that does not parse 400, a `Host` with userinfo 403 (never a loopback or
@@ -216,10 +248,10 @@ func nodeIncomingOf(r *nethttp.Request) (*nodeIncoming, *WireRefusal) {
 	target := r.RequestURI
 	// Only origin-form targets: an absolute-form one names an authority of its own, `*` none.
 	if !strings.HasPrefix(target, "/") {
-		return nil, &WireRefusal{Status: 403}
+		return nil, &WireRefusal{Status: WireForbidden}
 	}
 	if UNCARRIED[r.Method] {
-		return nil, &WireRefusal{Status: 501}
+		return nil, &WireRefusal{Status: WireNotImplemented}
 	}
 	// The authority is the `Host` the client sent; admission checks it, so a strange one parses but is refused.
 	host, ok := requestHeader(r, "host")
@@ -228,27 +260,40 @@ func nodeIncomingOf(r *nethttp.Request) (*nodeIncoming, *WireRefusal) {
 	}
 	href, status := parseWireURL(host, target)
 	if status != 0 {
-		return nil, &WireRefusal{Status: status}
+		return nil, &WireRefusal{Status: WireStatus(status)}
 	}
-	return &nodeIncoming{webIncoming: webIncoming{request: r, url: href}}, nil
+	return &nodeIncoming{request: r, url: href}, nil
 }
 
-// NodeRequest is a request as an app mounting `Fetch` on its own server gets it: a request, or refused.
+// NodeRequestKind tells what a NodeRequest is.
+type NodeRequestKind string
+
+const (
+	// NodeRequestRequest is a request to give `Fetch` (Pi's `"request"`).
+	NodeRequestRequest NodeRequestKind = "request"
+	// NodeRequestRefused is a request refused at the wire (Pi's `"refused"`, a WireRefusal).
+	NodeRequestRefused NodeRequestKind = "refused"
+)
+
+// NodeRequest is a request as an app mounting `Fetch` on its own server gets it: a request, or refused. Pi's union of
+// `{ kind: "request"; request; connection }` and `WireRefusal` (`{ kind: "refused"; status }`) is one struct tagged by Kind:
+// Request and Connection are set for a request, Status for a refusal.
 type NodeRequest struct {
-	// Refused is set when the request is refused at the wire.
-	Refused *WireRefusal
+	Kind NodeRequestKind
 	// Request is the request to give `Fetch`, with Connection.
 	Request    *nethttp.Request
 	Connection Connection
+	// Status is why the request is refused at the wire.
+	Status WireStatus
 }
 
-// NodeRequestOf converts r for `Fetch` on an app's own server, the whole conversion being the wire boundary: what the
+// NodeRequestOf is Pi's `nodeRequest` (a Go function cannot share its name with the type NodeRequest): it converts r for `Fetch` on an app's own server, the whole conversion being the wire boundary: what the
 // listener refuses is refused with the same status (nodeIncomingOf), never a panic. The request's `Host` is in its headers
 // and its URL is the serialized target.
 func NodeRequestOf(r *nethttp.Request) NodeRequest {
 	incoming, refusal := nodeIncomingOf(r)
 	if refusal != nil {
-		return NodeRequest{Refused: refusal}
+		return NodeRequest{Kind: NodeRequestRefused, Status: refusal.Status}
 	}
 	converted := r.Clone(r.Context())
 	converted.Header = requestHeaders(r)
@@ -259,7 +304,7 @@ func NodeRequestOf(r *nethttp.Request) NodeRequest {
 	if parsed, err := neturl.Parse(incoming.url); err == nil {
 		converted.URL = parsed
 	}
-	return NodeRequest{Request: converted, Connection: connectionOf(r)}
+	return NodeRequest{Kind: NodeRequestRequest, Request: converted, Connection: connectionOf(r)}
 }
 
 // connectionOf is what a connection knows of itself.

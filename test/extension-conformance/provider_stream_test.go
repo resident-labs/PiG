@@ -98,8 +98,8 @@ func TestProviderProducersAcrossSDKs(t *testing.T) {
 			}
 			cancel()
 			result := pending.Result()
-			// api/lazy.ts:4-22 reports a throwing/cancelled setup or iterator as error; only an explicit provider aborted event has stopReason aborted.
-			if result.StopReason != ai.StopReasonError || result.ErrorMessage == "" {
+			// api/lazy.ts lazyStream's catch reports a throwing setup or iterator as stopReason `signal?.aborted ? "aborted" : "error"` (Pi f3a64af07, PR #8635, issue #8409): a request cancelled while the provider callback runs ends as aborted, with the error's message.
+			if result.StopReason != ai.StopReasonAborted || result.ErrorMessage == "" {
 				t.Fatalf("cancel result=%+v", result)
 			}
 			other, createErr := coding.CreateAgentSessionServices(coding.CreateAgentSessionServicesOptions{CWD: t.TempDir(), AgentDir: t.TempDir()})
@@ -136,11 +136,11 @@ func loadProviderFixture(t *testing.T, host *subprocess.Host, caseName, source s
 	}
 	absoluteSource, err := filepath.Abs(source)
 	if err != nil {
-		return err
+		t.Fatal(err)
 	}
 	cfg, _, err := subprocess.ResolveExtConfigWithIdentity(absoluteSource, name)
 	if err != nil {
-		return err
+		t.Fatal(err)
 	}
 	cfgs := []subprocess.ExtConfig{cfg}
 	if packed {
@@ -150,11 +150,11 @@ func loadProviderFixture(t *testing.T, host *subprocess.Host, caseName, source s
 		}
 		absoluteSibling, err := filepath.Abs(siblingPath)
 		if err != nil {
-			return err
+			t.Fatal(err)
 		}
 		sibling, _, err := subprocess.ResolveExtConfigWithIdentity(absoluteSibling, "provider-sibling")
 		if err != nil {
-			return err
+			t.Fatal(err)
 		}
 		cfgs = append(cfgs, sibling)
 	} else {

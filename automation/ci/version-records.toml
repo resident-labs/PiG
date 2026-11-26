@@ -15,6 +15,7 @@ reason = "Investigation reports, performance measurements, release integration l
 paths = [
   "docs/design/rpc33-observation.md",
   "docs/findings/0.3.0-known-gaps.md",
+  "docs/parity/KNOWN-GAPS-0.3.x.md",
   "docs/findings/d35-easter-eggs.md",
   "docs/findings/exit-latency.md",
   "docs/findings/fix-drift-rpc.md",
@@ -44,7 +45,6 @@ paths = [
   "docs/parity/compaction-suite-closure.md",
   "docs/parity/extension-callback-state.md",
   "docs/parity/failed-factory-api.md",
-  "docs/parity/KNOWN-GAPS-0.3.x.md",
   "docs/parity/markdown-autolink-scaling.md",
   "docs/parity/markdown-discovery.md",
   "docs/parity/model-availability-task-ownership.md",
@@ -144,10 +144,9 @@ paths = [
 
 [[record]]
 version = "1.1.0"
-reason = "Observations recorded against Pi 1.1.0: the Node event-loop probe of the print and JSON prompt-end contract and the pi-subagents compatibility run in the extension API parity ledger, the example outputs that Pi 1.1.0 printed the same way, the /session screen compared with Pi 1.1.0, and the sdk-surface exception row that dates the tool render context's durationMs member to Pi 1.1.0."
+reason = "Observations recorded against Pi 1.1.0: the Node event-loop probe of the print and JSON prompt-end contract and the pi-subagents compatibility run in the extension API parity ledger, the example outputs that Pi 1.1.0 printed the same way, and the /session screen compared with Pi 1.1.0."
 paths = [
   "docs/extension-api-parity.md",
-  "docs/extension-sdk-surface.md",
   "docs/site/docs/json.md",
   "docs/site/docs/slash-commands.md",
 ]
@@ -264,4 +263,53 @@ paths = [
   "docs/site/docs/cli.md",
   "docs/site/docs/keybindings.md",
   "docs/site/docs/themes.md",
+]
+
+[[record]]
+version = "1.5.0"
+reason = "Entries that record the release a change was fixed or measured against. A bug-ledger release note (generated from the fix commits) names the Pi release the fix was written against, and the extension-api-parity oracle row quotes the output the pinned Pi 1.5.0 printed; it was not re-measured at 1.5.1, and the code behind it is unchanged between the tags."
+paths = [
+  "docs/site/docs/bug-ledger.md",
+  "docs/extension-api-parity.md",
+]
+
+[[record]]
+version = "1.5.1"
+reason = "A bug-ledger release note and a changelog fragment (generated from or written with the fix commit) name the Pi release the SDK local bash fix of D243 was written against; the fix is the SDK wire reply carrying Pi 06aa6563e's shellExit, which Pi 1.5.2 keeps unchanged."
+paths = [
+  "docs/site/docs/bug-ledger.md",
+]
+
+[[record]]
+version = "1.5.2"
+reason = "Historical release records, changelog fragments, bug-ledger entries, divergence probes, and parity design notes written and measured against Pi 1.5.2 before the pin advanced to Pi 1.6.0."
+paths = [
+  "docs/additive-features.md",
+  "docs/extension-api-parity.md",
+  "docs/parity/DIVERGENCES.md",
+  "docs/parity/PORT_MAP.md",
+  "docs/parity/divergences/D146.md",
+  "docs/parity/divergences/D151.md",
+  "docs/parity/divergences/D186.md",
+  "docs/parity/divergences/D198.md",
+  "docs/parity/divergences/D226.md",
+  "docs/parity/divergences/D228.md",
+  "docs/parity/divergences/D230.md",
+  "docs/parity/divergences/D266.md",
+  "docs/parity/divergences/D462.md",
+  "docs/parity/divergences/D615.md",
+  "docs/parity/divergences/D619.md",
+  "docs/parity/divergences/D629.md",
+  "docs/parity/divergences/D630.md",
+  "docs/parity/divergences/D631.md",
+  "docs/parity/divergences/D645.md",
+  "docs/parity/divergences/D647.md",
+  "docs/parity/divergences/D649.md",
+  "docs/parity/divergences/D650.md",
+  "docs/parity/divergences/D651.md",
+  "docs/parity/divergences/D93.md",
+  "docs/parity/gap-closure/ledger-coding-agent-pi-issue-drafts.md",
+  "docs/parity/session-runtime-helper.md",
+  "docs/release/0.8.0-release-notes-draft.md",
+  "docs/site/docs/bug-ledger.md",
 ]

@@ -5,14 +5,62 @@
 (defun core-bool (value) (if (and value (not (eq value :false)) (not (eq value :null))) "true" "false"))
 (defun core-text-content (text) (pig:obj "content" (vector (pig:obj "type" "text" "text" text))))
 (defun core-str (value) (cond ((stringp value) value) ((null value) "") (t (princ-to-string value))))
+(defun core-stale-members (ctx)
+  "Call the members that fail with the stale message: each outcome is one line, and the call fails with every line when one carries the message, else it reports them."
+  (let ((lines nil) (stale nil))
+    (flet ((member-outcome (name call)
+             (let ((outcome (handler-case (format nil "ok:~A" (funcall call))
+                              (error (e) (format nil "signals:~A" e)))))
+               (when (search "This extension ctx is stale" outcome) (setf stale t))
+               (push (format nil "~A=~A" name outcome) lines))))
+      (member-outcome "theme" (lambda () (type-of (pig:ctx-theme ctx))))
+      (member-outcome "width" (lambda () (pig:ctx-width ctx)))
+      (member-outcome "height" (lambda () (pig:ctx-height ctx)))
+      (member-outcome "sessionName" (lambda () (pig:ctx-session-name ctx)))
+      (member-outcome "setWidgetLines" (lambda () (pig:ctx-set-widget ctx "stale-members" (list "x"))))
+      (member-outcome "setWidgetView" (lambda () (pig:ctx-set-widget ctx "stale-members-view" (pig:kit-view (pig:kit-text "x" 0 0)))))
+      (member-outcome "setWidgetRenderer" (lambda () (pig:ctx-set-widget-renderer ctx "stale-members-renderer" (lambda (width) (declare (ignore width)) (list "x")))))
+      (member-outcome "onUpdate" (lambda () (pig:ctx-on-update ctx "x")))
+      (member-outcome "getSettings" (lambda () (type-of (pig:ctx-get-settings ctx)))))
+    (let ((report (format nil "~{~A~^~%~}" (reverse lines))))
+      (when stale (error "stale-members~%~A" report))
+      (core-info ctx (format nil "members~%~A" report)))))
 (defun core-schema (&rest members) (apply #'pig:obj "type" "object" members))
 (defun core-json (text) (pig:from-json text))
 (defun core-dialog-text (value) (if (stringp value) value ""))
+;;; The model object of the wire as the Go SDK's ModelInfo.UnmarshalJSON normalizes it, or :null for no model.
+(defun core-normalized-model (model)
+  (if (null model)
+      :null
+      (flet ((text (&rest keys) (or (loop for key in keys for v = (pig:jget model key) when (and (stringp v) (plusp (length v))) return v) ""))
+             (number-of (v) (if (realp v) v 0))
+             (cost (flat nested)
+               (let ((top (let ((v (pig:jget model flat))) (if (realp v) v 0))) (cost (pig:jget model "cost")))
+                 (if (and (zerop top) (hash-table-p cost)) (let ((v (pig:jget cost nested))) (if (realp v) v 0)) top))))
+        (let ((provider (pig:jget model "provider")))
+          (pig:obj "id" (text "id" "modelId") "name" (text "name" "displayName")
+                   "provider" (let ((id (if (hash-table-p provider) (pig:jget provider "id") provider))) (if (stringp id) id ""))
+                   "contextWindow" (number-of (pig:jget model "contextWindow"))
+                   "maxOutputTokens" (let ((v (number-of (pig:jget model "maxOutputTokens")))) (if (zerop v) (number-of (pig:jget model "maxTokens")) v))
+                   "reasoning" (if (eq (pig:jget model "reasoning") t) t :false)
+                   "inputCostPer1M" (cost "inputCostPer1M" "input") "outputCostPer1M" (cost "outputCostPer1M" "output")
+                   "cacheReadCostPer1M" (cost "cacheReadCostPer1M" "cacheRead") "cacheWriteCostPer1M" (cost "cacheWriteCostPer1M" "cacheWrite"))))))
+
 (defun core-join (list &optional (separator ",")) (format nil (concatenate 'string "~{~A~^" separator "~}") list))
 (defun core-sleep-until (predicate seconds)
   (loop with deadline = (+ (get-internal-real-time) (* seconds internal-time-units-per-second))
         until (or (funcall predicate) (> (get-internal-real-time) deadline)) do (sleep 0.005)))
 (defun core-nan () (sb-kernel:make-double-float #x7ff80000 0))
+(defun core-io-wait (addr)
+  "Dial ADDR (host:port), write \"waiting\" and return when the peer writes a line."
+  (let* ((colon (position #\: addr :from-end t))
+         (socket (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+    (sb-bsd-sockets:socket-connect socket (sb-bsd-sockets:make-inet-address (subseq addr 0 colon)) (parse-integer addr :start (1+ colon)))
+    (let ((stream (sb-bsd-sockets:socket-make-stream socket :input t :output t :buffering :none :external-format :utf-8)))
+      (unwind-protect (progn (write-line "waiting" stream) (finish-output stream) (read-line stream nil nil))
+        (close stream)))))
+(defvar *core-name-wait-addr* nil
+  "The address the session_info_changed handler waits on first; NIL when the handler is not armed (io_wait_name).")
 
 ;;; ---------------------------------------------------------------- tools
 
@@ -33,24 +81,51 @@
     (pig:tool ext "echo" "Echo input text"
               (core-json "{\"type\":\"object\",\"required\":[\"text\"],\"properties\":{\"text\":{\"type\":\"string\",\"description\":\"Text to echo\"},\"offset\":{\"type\":\"number\"}}}")
               (lambda (ctx params) (declare (ignore ctx)) (pig:obj "content" (concatenate 'string "echo: " (core-str (pig:jget params "text"))))))
+    ;; D232 shared-cells rows: instance-local state, the process's event bus, and what this instance heard (the same three tools in every SDK fixture).
+    (let ((calls 0) (heard '()) (heard-lock (sb-thread:make-mutex)))
+      (pig:events-on (pig:extension-events ext) "shared-cells"
+                     (lambda (ctx data) (declare (ignore ctx))
+                       (sb-thread:with-mutex (heard-lock) (setf heard (append heard (list (pig:jget data "from")))))))
+      (pig:tool ext "counter" "This instance's call count" (core-schema "properties" (pig:obj))
+                (lambda (ctx params) (declare (ignore ctx params))
+                  (pig:obj "content" (format nil "~D" (sb-thread:with-mutex (heard-lock) (incf calls))))))
+      (pig:tool ext "ping" "Emit on the shared-cells channel"
+                (core-json "{\"type\":\"object\",\"required\":[\"name\"],\"properties\":{\"name\":{\"type\":\"string\"}}}")
+                (lambda (ctx params)
+                  (pig:events-emit (pig:ctx-events ctx) "shared-cells" (pig:obj "from" (pig:jget params "name")))
+                  (pig:obj "content" "pinged")))
+      (pig:tool ext "received" "What this instance heard on shared-cells" (core-schema "properties" (pig:obj))
+                (lambda (ctx params) (declare (ignore ctx params))
+                  (pig:obj "content" (sb-thread:with-mutex (heard-lock) (format nil "received=~{~A~^,~}" heard))))))
     (pig:tool ext "render_probe" "Render its own tool card" (core-schema "properties" (pig:obj))
               (lambda (ctx params) (declare (ignore ctx params)) "render ok"))
     (pig:tool-renderers ext "render_probe" :render-shell "self"
       :render-call (lambda (ctx args render width)
                      (declare (ignore ctx))
                      (let ((calls (incf (gethash "calls" (pig:tool-render-context-state render) 0))))
-                       (list (format nil "toolrender:call:~A:partial=~A:calls=~D:width=~D" (pig:jget args "topic")
-                                     (if (pig:tool-render-context-is-partial render) "true" "false") calls width))))
+                       (list (format nil "toolrender:call:~A:partial=~A:calls=~D:width=~D:last=~A" (pig:jget args "topic")
+                                     (if (pig:tool-render-context-is-partial render) "true" "false") calls width
+                                     (or (first (coerce (pig:tool-render-context-last-component render) 'list)) "none")))))
       :render-result (lambda (ctx result options render width)
                        (declare (ignore ctx))
-                       (list (format nil "toolrender:result:~A:~A:expanded=~A:calls=~A:width=~D:duration=~A"
+                       (list (format nil "toolrender:result:~A:~A:expanded=~A:calls=~A:width=~D:duration=~A:last=~A"
                                      (pig:jref result "content" 0 "text") (pig:jref result "details" "k")
                                      (if (eq (pig:jget options "expanded") t) "true" "false")
                                      (gethash "calls" (pig:tool-render-context-state render)) width
-                                     (or (pig:tool-render-context-duration-ms render) "none")))))
+                                     (or (pig:tool-render-context-duration-ms render) "none")
+                                     (or (first (coerce (pig:tool-render-context-last-component render) 'list)) "none")))))
     (pig:tool ext "big_out" "Return text of the size in the argument" (core-schema "properties" (pig:obj))
               (lambda (ctx params) (declare (ignore ctx))
                 (core-text-content (make-string (pig:jget params "n") :initial-element #\a :element-type 'base-char))))
+    ;; lone_decl: a description, a parameter name and a parameter's text hold a lone UTF-16 surrogate
+    ;; (TestConformance_ToolDeclarationLoneSurrogatesAgreeAcrossSDKs).
+    (let ((high (code-char #xD83D)) (low (code-char #xDE00)))
+      (pig:tool ext "lone_decl" (format nil "D[~C]" high)
+                (core-schema "properties"
+                             (pig:obj (format nil "K[~C~C]" low high)
+                                      (pig:obj "type" "string" "description" (format nil "PD[~C]" high)
+                                               "enum" (vector (format nil "E[~C]" low)) "default" (format nil "DF[~C]" high))))
+                (lambda (ctx params) (declare (ignore ctx params)) (core-text-content "lone"))))
     (pig:tool ext "echo_params" "Return the arguments as the result details" (core-schema "properties" (pig:obj))
               (lambda (ctx params) (declare (ignore ctx)) (pig:obj "content" (vector (pig:obj "type" "text" "text" "echoed")) "details" params)))
     (pig:tool ext "nan_out" "Return details holding NaN and Infinity" (core-schema "properties" (pig:obj))
@@ -83,6 +158,29 @@
                 (pig:ctx-on-update ctx (core-text-content "waiting"))
                 (sleep 8)
                 (pig:obj "content" "late")))
+    ;; signal_host_probe: the host keeps answering a tool's host calls after the abort, as Pi's in-process calls are.
+    (pig:tool ext "signal_host_probe" "Await host dialogs across the abort" (core-schema "properties" (pig:obj))
+              (lambda (ctx params) (declare (ignore params))
+                (flet ((ask (title) (handler-case (let ((text (pig:ctx-input ctx title :placeholder "p"))) (if (stringp text) text ""))
+                                      (error (e) (format nil "failed: ~A" e)))))
+                  (let* ((first (ask "tool_signal:first"))
+                         (aborted (if (pig:ctx-cancelled-p ctx) "true" "false"))
+                         (second (ask "tool_signal:later")))
+                    (pig:obj "content" (format nil "tool_signal:~A:~A:~A" aborted first second))))))
+    ;; aborted_entry_probe: called with its run already aborted, it echoes the nonce, reports whether its signal was aborted on its first line, and makes a host call after that, which the host answers (TestConformance_ToolCalledAbortedEntersWithItsSignalAborted).
+    (pig:tool ext "aborted_entry_probe" "Report the signal a tool starts with" (core-schema "properties" (pig:obj))
+              (lambda (ctx params)
+                (let* ((nonce (core-str (pig:jref params "nonce")))
+                       (aborted (if (pig:ctx-cancelled-p ctx) "true" "false"))
+                       (answer (handler-case (let ((text (pig:ctx-input ctx (format nil "aborted_entry:~A" nonce) :placeholder "p"))) (if (stringp text) text ""))
+                                 (error (e) (format nil "failed: ~A" e)))))
+                  (pig:obj "content" (format nil "aborted_entry:~A:~A:~A" nonce aborted answer)))))
+    ;; signal_nested_probe: a nested tool call keeps being answered after the abort, as Pi's in-process calls are.
+    (pig:tool ext "signal_nested_probe" "Run abort_tool as a nested tool call" (core-schema "properties" (pig:obj))
+              (lambda (ctx params) (declare (ignore params))
+                (pig:obj "content"
+                         (handler-case (concatenate 'string "tool_signal_nested:" (core-str (pig:jref (pig:ctx-execute-tool ctx "abort_tool" (pig:obj)) "result" "content" 0 "text")))
+                           (error (e) (format nil "tool_signal_nested:failed: ~A" e))))))
     (pig:command ext "abort_probe" "Report whether abort_tool saw its abort signal"
                  (lambda (ctx args) (declare (ignore args)) (core-info ctx (concatenate 'string "abort:" (if abort-observed "true" "false")))))
     (pig:command ext "abort_reason" "Report the cancellation reason abort_tool saw"
@@ -216,6 +314,14 @@
                                                                   (nreverse names)))))
   (pig:command ext "active_tools_get" "Report the active tools"
                (lambda (ctx args) (declare (ignore args)) (core-info ctx (concatenate 'string "active_tools:" (core-join (coerce (pig:ctx-get-active-tools ctx) 'list))))))
+  ;; mcp_register_run registers two MCP servers in one synchronous run and reads the active tools after each call (TestConformance_McpServerRegisteredAtRunTimeIsHandledInsideTheCall).
+  (pig:command ext "mcp_register_run" "Register two MCP servers and report the active tools after each"
+               (lambda (ctx args) (declare (ignore args))
+                 (let ((reads '()))
+                   (dolist (name '("conformance-run-a" "conformance-run-b"))
+                     (pig:ctx-register-mcp-server ctx name (pig:obj "url" (concatenate 'string "https://" name ".invalid/mcp")))
+                     (push (core-join (coerce (pig:ctx-get-active-tools ctx) 'list)) reads))
+                   (core-info ctx (concatenate 'string "mcp_register_run:" (core-join (nreverse reads) "|"))))))
   (pig:command ext "commands-probe" "Read the host's slash commands"
                (lambda (ctx args) (declare (ignore args))
                  (core-info ctx (pig:to-json (coerce (loop for c across (pig:ctx-get-commands ctx)
@@ -235,6 +341,23 @@
                  (multiple-value-bind (ok error) (pig:ctx-set-model ctx args)
                    (when (plusp (length error)) (error "~A" error))
                    (core-info ctx (format nil "setModel=~A" (if ok "true" "false"))))))
+  (pig:command ext "set_model_object" "Switch to the model object in the arguments"
+               (lambda (ctx args)
+                 (multiple-value-bind (ok error)
+                     (handler-case (pig:ctx-set-model ctx (pig:from-json args))
+                       (pig:host-call-error (e) (values nil (pig:host-call-error-message e))))
+                   (core-info ctx (if (plusp (length error))
+                                      (format nil "setModelObject=error:~A" error)
+                                      (format nil "setModelObject=~A" (if ok "true" "false")))))))
+  (pig:command ext "set_model_object_before_agent_start" "Switch to the model object in the arguments before each agent start"
+               (lambda (ctx args) (declare (ignore ctx))
+                 (let ((model (pig:from-json args)))
+                   (pig:on ext "before_agent_start"
+                           (lambda (hctx data) (declare (ignore data))
+                             (multiple-value-bind (ok error) (pig:ctx-set-model hctx model)
+                               (when (plusp (length error)) (error "~A" error))
+                               (core-info hctx (format nil "beforeAgentSetModel=~A" (if ok "true" "false"))))
+                             nil)))))
   (pig:command ext "thinking_set" "Set the thinking level"
                (lambda (ctx args) (pig:ctx-set-thinking-level ctx (string-trim '(#\Space #\Newline) args))))
   (pig:command ext "thinking_get" "Report the thinking level"
@@ -248,6 +371,29 @@
                                                           "|"))))
                    (core-info ctx (format nil "getThinkingLevel=~A;getCommands=~A" (pig:ctx-get-thinking-level ctx) (core-join commands))))))
   (pig:command ext "append_entry" "Append a custom entry" (lambda (ctx args) (declare (ignore args)) (pig:ctx-append-entry ctx "conformance-entry" "hello-entry")))
+  ;; An entry and a message with the optional member left out, then with it written as null: NIL is Pi's omitted argument and :NULL is its null.
+  (pig:command ext "entry_null_members" "Append entries and send messages with an omitted and a null member"
+               (lambda (ctx args)
+                 (declare (ignore args))
+                 (pig:ctx-append-entry ctx "conformance-null-omitted" nil)
+                 (pig:ctx-append-entry ctx "conformance-null-explicit" :null)
+                 (pig:ctx-send-message ctx "conformance-null-omitted" "x" :display nil)
+                 (pig:ctx-send-message ctx "conformance-null-explicit" "x" :display nil :details :null)))
+  ;; setLabel on the entry in the arguments without a label, with a null one and with an empty one: Pi writes a different entry for each.
+  (pig:command ext "label_members" "Set a label that is omitted, null and empty"
+               (lambda (ctx args)
+                 (pig:ctx-set-label ctx args)
+                 (pig:ctx-set-label ctx args :null)
+                 (pig:ctx-set-label ctx args "")))
+  ;; The setup callback's session manager: an entry and a message with the optional member left out, then with it written as null.
+  (pig:command ext "setup_null_members" "Seed a new session with an omitted and a null member"
+               (lambda (ctx args)
+                 (declare (ignore args))
+                 (pig:ctx-new-session ctx :setup (lambda (manager)
+                                                   (pig:setup-append-custom-entry manager "api-custom")
+                                                   (pig:setup-append-custom-entry manager "api-custom" :null)
+                                                   (pig:setup-append-custom-message-entry manager "api-message" "x" nil)
+                                                   (pig:setup-append-custom-message-entry manager "api-message" "x" t :null)))))
   (pig:command ext "append-entries-probe" "Append a custom entry for each comma-separated type"
                (lambda (ctx args)
                  (let ((start 0))
@@ -268,6 +414,33 @@
                (lambda (ctx args) (declare (ignore args)) (pig:ctx-send-message ctx "notice" "default")))
   (pig:command ext "send_user_message" "Send a user message"
                (lambda (ctx args) (pig:ctx-send-user-message ctx (if (plusp (length args)) (pig:from-json args) "hello-user") :deliver-as "followUp")))
+  (pig:command ext "send_user_message_delivery" "Send a user message with the delivery named by the argument"
+               (lambda (ctx args)
+                 (let ((text (concatenate 'string "delivery-" args)))
+                   (if (string= args "absent")
+                       (pig:ctx-send-user-message ctx text)
+                       (pig:ctx-send-user-message ctx text :deliver-as args)))))
+  (pig:command ext "send_refusal_order" "Send a refused user message and others in one run, as the argument names"
+               (lambda (ctx args)
+                 (flet ((first-sends ()
+                          (pig:ctx-send-user-message ctx "order-absent")
+                          (pig:ctx-send-user-message ctx "order-steer" :deliver-as "steer")
+                          (pig:ctx-send-user-message ctx "order-followUp" :deliver-as "followUp"))
+                        (after-return (send)
+                          (sb-thread:make-thread (lambda () (sleep 0.1) (funcall send)) :name "refusal-order-detached")))
+                   (cond ((string= args "first") (first-sends))
+                         ((string= args "between")
+                          (pig:ctx-send-user-message ctx "order-absent")
+                          (pig:ctx-send-user-message ctx "order-steer" :deliver-as "steer")
+                          (pig:ctx-send-user-message ctx "order-absent-2"))
+                         ((string= args "yielded") (pig:ctx-yield ctx) (first-sends))
+                         ((string= args "throws") (first-sends) (error "order-throws"))
+                         ((string= args "blocked") (first-sends) (sleep 30))
+                         ((string= args "detached") (after-return #'first-sends))
+                         ((string= args "detached_alone") (after-return (lambda () (pig:ctx-send-user-message ctx "order-absent"))))
+                         (t (error "send_refusal_order: unknown case ~A" args))))))
+  (pig:command ext "send_user_message_expand" "Send a user message with expandPromptTemplates set to the argument"
+               (lambda (ctx args) (pig:ctx-send-user-message ctx "expand-user" :deliver-as "followUp" :expand-prompt-templates (if (string= args "true") t :false))))
   (pig:command ext "status" "Set a status entry" (lambda (ctx args) (declare (ignore args)) (pig:ctx-set-status ctx "conformance" "ok")))
   (pig:command ext "status_burst" "Set one status repeatedly without awaiting"
                (lambda (ctx args) (declare (ignore args)) (dotimes (i 200) (pig:ctx-set-status ctx "burst" (princ-to-string i)))))
@@ -277,7 +450,42 @@
   (pig:command ext "liveness_host_call" "Exercise an awaited host call" (lambda (ctx args) (declare (ignore args)) (pig:ctx-wait-for-idle ctx)))
   (pig:command ext "liveness_user_call" "Exercise an interactive host call" (lambda (ctx args) (declare (ignore args)) (pig:ctx-input ctx "Question" :placeholder "Answer")))
   (pig:command ext "liveness_fire_call" "Exercise a no-result UI host call" (lambda (ctx args) (declare (ignore args)) (pig:ctx-set-title ctx "Conformance title")))
+  ;; io_wait and io_wait_settled wait on a plain TCP read: they dial the address they get, announce themselves with a "waiting" line and return when the peer writes a line
+  (pig:command ext "io_wait" "Wait on a socket read" (lambda (ctx args) (declare (ignore ctx)) (core-io-wait args)))
+  (pig:command ext "io_wait_settled" "Make agent_settled wait on a socket read"
+               (lambda (ctx args) (declare (ignore ctx))
+                 (pig:on ext "agent_settled" (lambda (hctx data) (declare (ignore hctx data)) (core-io-wait args) nil))))
+  (pig:command ext "io_wait_name" "Make the session_info_changed handler wait on a socket read"
+               (lambda (ctx args) (declare (ignore ctx)) (setf *core-name-wait-addr* args)))
+  ;; io_wait_input and io_wait_start subscribe an input / before_agent_start handler that waits on a socket read first and then notifies "<event>:<text or prompt>".
+  (pig:command ext "io_wait_input" "Make an input handler wait on a socket read"
+               (lambda (ctx args) (declare (ignore ctx))
+                 (pig:on ext "input" (lambda (hctx data) (core-io-wait args) (core-info hctx (concatenate 'string "input:" (core-key-str data "text" ""))) nil))))
+  (pig:command ext "io_wait_start" "Make a before_agent_start handler wait on a socket read"
+               (lambda (ctx args) (declare (ignore ctx))
+                 (pig:on ext "before_agent_start" (lambda (hctx data) (core-io-wait args) (core-info hctx (concatenate 'string "before_agent_start:" (core-key-str data "prompt" ""))) nil))))
   (pig:command ext "usage-probe" "Report context usage" (lambda (ctx args) (declare (ignore args)) (core-info ctx (pig:to-json (or (pig:ctx-get-context-usage ctx) :null)))))
+  (pig:command ext "replica-probe" "Report the replicated model, session id, name, file and context usage"
+               (lambda (ctx args)
+                 (when (and (> (length args) 10) (string= "set-model:" args :end2 10)) (pig:ctx-set-model ctx (subseq args 10)))
+                 (let ((manager (pig:ctx-session-manager ctx)))
+                   (flet ((text-or-null (value) (if (and (stringp value) (plusp (length value))) value :null)))
+                     (core-info ctx (pig:to-json (pig:obj "model" (core-normalized-model (pig:ctx-get-model-info ctx))
+                                                          "sessionId" (pig:ctx-get-session-id ctx)
+                                                          "managerSessionId" (pig:session-get-session-id manager)
+                                                          "sessionName" (text-or-null (pig:ctx-get-session-name ctx))
+                                                          "sessionFile" (text-or-null (pig:ctx-get-session-file ctx))
+                                                          "managerSessionName" (text-or-null (pig:session-get-session-name manager))
+                                                          "managerSessionFile" (text-or-null (pig:session-get-session-file manager))
+                                                          "usage" (or (pig:ctx-get-context-usage ctx) :null))))))))
+  (pig:command ext "registry-model-probe" "Register the active model's provider with a new name, then read the model"
+               (lambda (ctx args)
+                 (pig:register-provider ext "replica-reg"
+                                        (pig:obj "baseUrl" "https://probe.invalid/v1" "api" "openai-completions" "apiKey" "probe-key"
+                                                 "models" (vector (pig:obj "id" "m" "name" args "reasoning" :false "input" (vector "text")
+                                                                           "cost" (pig:obj "input" 0 "output" 0 "cacheRead" 0 "cacheWrite" 0)
+                                                                           "contextWindow" 1000 "maxTokens" 100))))
+                 (core-info ctx (format nil "regname=~A" (let ((info (pig:ctx-get-model-info ctx))) (if info (let ((n (pig:jget info "name"))) (if (stringp n) n "")) ""))))))
   (pig:command ext "scoped-models-probe" "Report the model scope"
                (lambda (ctx args) (declare (ignore args)) (core-info ctx (pig:to-json (pig:ctx-get-scoped-models ctx)))))
   (pig:command ext "session-log-probe" "Read a paged session log"
@@ -314,6 +522,8 @@
                    (let ((held (pig:ctx-signal ctx)))
                      (pig:ctx-abort ctx)
                      (core-info ctx (concatenate 'string "abort:" (state held) ":" (state (pig:ctx-signal ctx)))))))
+    (pig:command ext "stale-members" "Call the members that fail with the stale message"
+                 (lambda (ctx args) (declare (ignore args)) (core-stale-members ctx)))
     (pig:command ext "stale-probe" "Report cwd, mode, hasUI and model"
                  (lambda (ctx args) (declare (ignore args))
                    (let ((report (format nil "stale:~A|~A|~A|~A" (pig:ctx-cwd ctx) (pig:ctx-mode ctx) (if (pig:ctx-has-ui-p ctx) "true" "false") (pig:ctx-model ctx))))
@@ -536,7 +746,27 @@
             (lambda (ctx data) (declare (ignore ctx))
               (unless (equal (map 'list (lambda (e) (pig:jget e "customType")) (pig:jget data "entries")) '("kept" "before-error")) (error "entries"))
               (unless (= 2 (length (pig:jref data "context" "contextEntries"))) (error "context entries"))
-              (pig:obj "entries" (vector (pig:obj "type" "custom" "customType" "conformance-boundary")) "continue" t)))
+              ;; One draft with a null replacement, one without the member, and a compaction that keeps nothing.
+              (pig:obj "entries" (vector (pig:obj "type" "custom" "customType" "conformance-boundary")
+                                         (pig:obj "type" "context_edit" "targetId" "conformance-failed-attempt" "replacement" :null)
+                                         (pig:obj "type" "context_edit" "targetId" "conformance-omitted-member")
+                                         (pig:obj "type" "compaction" "summary" "conformance-summary" "firstKeptEntryId" :null
+                                                  "details" (pig:obj "format" "conformance-checkpoint") "usage" :null)
+                                         ;; A data, a details and (above) a usage member written as null: Pi's file holds each as null.
+                                         (pig:obj "type" "custom" "customType" "conformance-null-data" "data" :null)
+                                         (pig:obj "type" "custom_message" "customType" "conformance-null-details" "content" "x" "display" :false "details" :null))
+                       "continue" t)))
+    (pig:on ext "agent_before_settle"
+            (lambda (ctx data)
+              (let ((entries (pig:jget data "entries")))
+                (unless (= 6 (length entries)) (error "boundary result reached the next handler as ~D entries" (length entries)))
+                (flet ((member-token (index key)
+                         (multiple-value-bind (value present) (gethash key (elt entries index))
+                           (cond ((not present) "absent") ((or (null value) (eq value :null)) "null") (t "value")))))
+                  (core-info ctx (format nil "agent_before_settle_drafts:~D:~A:~A:~A:~A:~A:~A:~A:~A" (length entries) (member-token 1 "replacement") (member-token 2 "replacement")
+                                         (member-token 3 "firstKeptEntryId") (pig:jref (elt entries 3) "details" "format")
+                                         (member-token 0 "data") (member-token 3 "usage") (member-token 4 "data") (member-token 5 "details"))))
+                nil)))
     (pig:on ext "session_start"
             (lambda (ctx data)
               (core-info ctx (concatenate 'string "session_start:" (core-key-str data "reason" "")))
@@ -546,10 +776,17 @@
     (pig:on ext "session_shutdown"
             (lambda (ctx data)
               (core-info ctx (concatenate 'string "session_shutdown:" (core-key-str data "reason" "")))
+              ;; The handler's own context is still active (Pi invalidates after the handlers ran): the stale-members test reads every member from here.
+              (when (equal (core-key-str data "reason" "") "stale-members-test") (core-stale-members ctx))
               (when (let ((f (pig:jget data "targetSessionFile"))) (and (stringp f) (plusp (length f))))
                 (core-info ctx (concatenate 'string "target:" (pig:jget data "targetSessionFile"))))
               nil))
-    (pig:on ext "session_info_changed" (lambda (ctx data) (core-info ctx (concatenate 'string "session_info_changed:" (core-key-str data "name" ""))) nil))
+    (pig:on ext "session_info_changed"
+            (lambda (ctx data)
+              ;; io_wait_name arms the handler to wait on a socket read first, as a handler that awaits does in Pi.
+              (when *core-name-wait-addr* (core-io-wait *core-name-wait-addr*))
+              (core-info ctx (concatenate 'string "session_info_changed:" (core-key-str data "name" "")))
+              nil))
     (pig:on ext "session_before_compact"
             (lambda (ctx data) (core-info ctx (format nil "session_before_compact:~A:~A" (core-key-str data "reason" "") (core-lower (pig:jget data "willRetry")))) nil))
     (pig:on ext "session_compact"
@@ -590,6 +827,45 @@
                                           (core-info hctx (format nil "event_field:~A.~A=~A" name field
                                                                   (if (nth-value 1 (gethash field data)) (pig:to-json (gethash field data)) "absent")))
                                           nil)))))
+      ;; event_level_edit_probe: `<event> <top|deep>`, a handler that edits the event in place and returns nothing. `top` assigns a member of the event itself (probeTop); `deep` edits inside the message the event carries (the first user message of a `messages` list): the text of its first text block, else a string content, else a `probe` member. Every edit writes `other-event-edit`.
+      (pig:command ext "event_level_edit_probe" "Subscribe to the event named by the argument `<event> <top|deep>` with a handler that edits the event itself or the message inside it in place"
+                   (lambda (ctx args) (declare (ignore ctx))
+                     (multiple-value-bind (name level) (split-first args)
+                       (let ((edited "other-event-edit"))
+                         (pig:on ext name
+                                 (lambda (hctx data) (declare (ignore hctx))
+                                   (if (equal level "top")
+                                       (setf (gethash "probeTop" data) edited)
+                                       (let* ((messages (gethash "messages" data))
+                                              (target (or (gethash "message" data)
+                                                          (and (vectorp messages) (plusp (length messages))
+                                                               (or (find-if (lambda (m) (and (hash-table-p m) (equal (gethash "role" m) "user"))) messages)
+                                                                   (aref messages 0))))))
+                                         (when (hash-table-p target)
+                                           (let* ((content (gethash "content" target))
+                                                  (first-block (and (vectorp content) (not (stringp content)) (plusp (length content)) (aref content 0))))
+                                             (cond
+                                               ((and (hash-table-p first-block) (equal (gethash "type" first-block) "text")) (setf (gethash "text" first-block) edited))
+                                               ((stringp content) (setf (gethash "content" target) edited))
+                                               (t (setf (gethash "probe" target) edited)))))))
+                                   nil))))))
+      ;; event_member_probe: `<event> <set|delete|once> <member> [json]`, a handler that assigns the member the JSON, deletes it, or (once) assigns it in its first call only and reports `member_probe_stale:<event>:<bool>` whether a later call found it already there.
+      (pig:command ext "event_member_probe" "Subscribe to the event named by the argument `<event> <set|delete|once> <member> [json]` with a handler that assigns, deletes or once assigns a member of the event"
+                   (lambda (ctx args) (declare (ignore ctx))
+                     (multiple-value-bind (name rest) (split-first args)
+                       (multiple-value-bind (op rest) (split-first rest)
+                         (multiple-value-bind (member raw) (split-first rest)
+                           (let ((value (if (plusp (length (string-trim '(#\Space #\Newline #\Tab) (or raw "")))) (pig:from-json raw) nil))
+                                 (calls 0))
+                             (pig:on ext name
+                                     (lambda (hctx data)
+                                       (incf calls)
+                                       (cond ((equal op "delete") (remhash member data))
+                                             ((and (equal op "once") (> calls 1))
+                                              (core-info hctx (format nil "member_probe_stale:~A:~A" name
+                                                                      (if (and (nth-value 1 (gethash member data)) (equal (pig:to-json (gethash member data)) (pig:to-json value))) "true" "false"))))
+                                             (t (setf (gethash member data) value)))
+                                       nil))))))))
       (pig:command ext "event_probe_result" "Queue the JSON result the next event_probe_on handler call of an event returns"
                    (lambda (ctx args) (declare (ignore ctx))
                      (multiple-value-bind (name raw) (split-first args)
@@ -604,34 +880,218 @@
                                        (core-info hctx (format nil "event_probe_data:~A:~A" name (pig:to-json data)))
                                        (when (and (hash-table-p data) (vectorp (pig:jget data "servers")) (not (stringp (pig:jget data "servers"))))
                                          (core-info hctx (format nil "event_probe_servers:~A" (core-join (map 'list (lambda (s) (core-py-str (pig:jget s "name"))) (pig:jget data "servers"))))))
-                                       (let ((queued (gethash name results)))
-                                         (when queued (setf (gethash name results) (cdr queued)) (car queued)))))
+                                       ;; Pi ignores what a before_provider_headers handler returns and sends the headers object the handlers edited (runner.ts emitBeforeProviderHeaders), so the queued result becomes the headers by editing event.headers in place, as the Node and Python fixtures do.
+                                       (let* ((queued (gethash name results))
+                                              (value (when queued (setf (gethash name results) (cdr queued)) (car queued)))
+                                              (headers (and (equal name "before_provider_headers") (hash-table-p value) (pig:jget data "headers"))))
+                                         (if (hash-table-p headers)
+                                             (progn (clrhash headers)
+                                                    (maphash (lambda (key header) (setf (gethash key headers) header)) value)
+                                                    nil)
+                                             value))))
                              (gethash name offs)))))
       (pig:command ext "event_probe_off" "Unsubscribe the event_probe_on handlers of the event named by the argument"
                    (lambda (ctx args) (declare (ignore ctx))
                      (let ((name (string-trim '(#\Space #\Newline #\Tab) args)))
                        (dolist (off (reverse (gethash name offs))) (funcall off))
                        (remhash name offs))))
+      ;; lone_passthrough subscribes to the event named by the argument with a handler that returns the value it received, and lone_send sends the
+      ;; argument's text back through sendUserMessage, sendMessage or registerProvider (TestConformance_LoneSurrogatePassThroughAcrossSDKs).
+      (pig:command ext "lone_passthrough" "Subscribe to the event named by the argument with a handler that returns the value it received"
+                   (lambda (ctx args) (declare (ignore ctx))
+                     (let ((name (string-trim '(#\Space #\Newline #\Tab) args)))
+                       (pig:on ext (if (equal name "context_edit") "context" name)
+                               (lambda (hctx data)
+                                 (flet ((seen (text)
+                                          (core-info hctx (format nil "lone_seen:~A:~A" name
+                                                                  (if (stringp text) (format nil "~{~(~X~)~^.~}" (map 'list #'char-code text)) "none"))))
+                                        (first-of (items) (if (and (vectorp items) (not (stringp items)) (plusp (length items))) (aref items 0) (pig:obj))))
+                                   (cond ((equal name "input")
+                                          (seen (pig:jget data "text"))
+                                          (pig:obj "action" "transform" "text" (pig:jget data "text")))
+                                         ((equal name "before_agent_start")
+                                          (seen (pig:jget data "systemPrompt"))
+                                          (pig:obj "systemPrompt" (pig:jget data "systemPrompt")))
+                                         ((equal name "tool_result")
+                                          (seen (pig:jget (first-of (pig:jget data "content")) "text"))
+                                          (pig:obj "content" (pig:jget data "content")))
+                                         (t
+                                          (let ((content (pig:jget (first-of (pig:jget data "messages")) "content")))
+                                            (seen (if (stringp content) content (pig:jget (first-of content) "text"))))
+                                          (if (equal name "context_edit")
+                                              (pig:obj "messages" (vector (first-of (pig:jget data "messages")) (pig:obj "role" "user" "content" "edited" "timestamp" 2)))
+                                              (pig:obj "messages" (pig:jget data "messages"))))))))
+                       nil)))
+      (pig:command ext "lone_send" "Send the argument's text back through sendUserMessage, sendMessage or registerProvider"
+                   (lambda (ctx args)
+                     (multiple-value-bind (kind value) (split-first args)
+                       (core-info ctx (format nil "lone_seen:~A:~A" kind (format nil "~{~(~X~)~^.~}" (map 'list #'char-code value))))
+                       (cond ((equal kind "user") (pig:ctx-send-user-message ctx value :deliver-as "followUp"))
+                             ((equal kind "custom") (pig:ctx-send-message ctx "lone" value :display t))
+                             (t (pig:register-provider ext "lone-compat"
+                                                       (pig:obj "baseUrl" "https://probe.invalid/v1" "api" "openai-completions" "apiKey" "probe-key"
+                                                                "models" (vector (pig:obj "id" "m" "name" value "reasoning" :false "input" (vector "text")
+                                                                                          "cost" (pig:obj "input" 0 "output" 0 "cacheRead" 0 "cacheWrite" 0)
+                                                                                          "contextWindow" 1000 "maxTokens" 100
+                                                                                          "compat" (pig:obj "openRouterRouting" (pig:obj "sort" value))))))))
+                       nil)))
       (pig:command ext "event_result_probe" "Subscribe to an event with a handler that returns the given JSON"
                    (lambda (ctx args) (declare (ignore ctx))
                      (multiple-value-bind (name raw) (split-first args)
                        (let ((result (pig:from-json raw))) (pig:on ext name (lambda (hctx data) (declare (ignore hctx data)) result))))))
+      ;; event_signal_probe: session_before_compact / session_before_tree handler that returns the state of its event signal (the request's cancellation) on its first line and after a dialog it opened was answered, and the dialog's answer: the signal aborts while the dialog is pending (mode "wait") or before the handler runs (mode "first"), and Pi's in-process host call still returns its answer.
+      (pig:command ext "event_signal_probe" "Subscribe to session_before_compact or session_before_tree with a handler that returns the state of its event signal"
+                   (lambda (ctx args) (declare (ignore ctx))
+                     (let ((name (string-trim '(#\Space #\Newline #\Tab) args)))
+                       (pig:on ext name
+                               (lambda (hctx data)
+                                 (let* ((source (if (equal name "session_before_tree") (pig:jget data "preparation") data))
+                                        (mode (let ((m (pig:jget source "customInstructions"))) (if (stringp m) m "")))
+                                        (before (pig:ctx-cancelled-p hctx))
+                                        (answer (handler-case (let ((text (pig:ctx-input hctx (format nil "event_signal:~A:~A:pending" name mode) :placeholder "p"))) (if (stringp text) text ""))
+                                                  (error (e) (format nil "failed: ~A" e))))
+                                        (state (format nil "event_signal:~A:~A:~A:~A" mode (if before "true" "false") (if (pig:ctx-cancelled-p hctx) "true" "false") answer)))
+                                   (if (equal name "session_before_compact")
+                                       (pig:obj "compaction" (pig:obj "summary" state "firstKeptEntryId" "k" "tokensBefore" 1))
+                                       (pig:obj "label" state))))))))
+      ;; tool_call_abort_probe: a tool_call handler that answers from a dialog it opened (TestConformance_ToolCallHandlerIsAwaitedThroughTheAbort).
+      (pig:command ext "tool_call_abort_probe" "Subscribe to tool_call with a handler that answers from a dialog it opened"
+                   (lambda (ctx args) (declare (ignore ctx args))
+                     (pig:on ext "tool_call"
+                             (lambda (hctx data)
+                               (let* ((mode (let ((m (pig:jget (pig:jget data "input") "mode"))) (if (stringp m) m "")))
+                                      (answer (handler-case (let ((text (pig:ctx-input hctx (format nil "tool_call_abort:~A:pending" mode) :placeholder "p"))) (if (stringp text) text ""))
+                                                (error (e) (format nil "failed: ~A" e)))))
+                                 (pig:obj "block" t "reason" (format nil "tool_call_abort:~A:~A" mode answer)))))))
+      (pig:command ext "event_ordered_result_probe" "Subscribe to an event with a handler that returns the given JSON, members in written order"
+                   (lambda (ctx args) (declare (ignore ctx))
+                     (multiple-value-bind (name raw) (split-first args)
+                       (let ((result (pig:from-json raw))) (pig:on ext name (lambda (hctx data) (declare (ignore hctx data)) result))))))
+      (pig:command ext "event_keys_probe" "Subscribe to the event named by the argument with a handler that reports the key order of its payload"
+                   (lambda (ctx args) (declare (ignore ctx))
+                     (let ((name (string-trim '(#\Space #\Newline #\Tab) args)))
+                       (flet ((keys (object) (let (ks) (maphash (lambda (k v) (declare (ignore v)) (push k ks)) object) (coerce (nreverse ks) 'vector))))
+                         (pig:on ext name
+                                 (lambda (hctx data)
+                                   (let ((payload (pig:jget data "payload")))
+                                     (core-info hctx (format nil "event_keys:~A:~A" name (pig:to-json (vector (keys payload) (keys (pig:jget payload "zeta")))))))
+                                   nil))))))
+      (pig:command ext "event_echo_probe" "Subscribe to the event named by the argument with a handler that hands back the objects it was sent"
+                   (lambda (ctx args) (declare (ignore ctx))
+                     (let ((name (string-trim '(#\Space #\Newline #\Tab) args)))
+                       (pig:on ext name
+                               (lambda (hctx data) (declare (ignore hctx))
+                                 (cond ((equal name "turn_end") (pig:obj "entries" (pig:jget data "entries")))
+                                       ((equal name "context") (pig:obj "messages" (subseq (pig:jget data "messages") 1)))
+                                       ((equal name "before_provider_request") (pig:jget data "payload"))
+                                       ((equal name "tool_result") (pig:obj "content" (pig:jget data "content") "details" (pig:jget data "details")))
+                                       ((equal name "message_end") (pig:obj "message" (pig:jget data "message")))
+                                       (t (error "event_echo_probe has no echo for ~A" name))))))))
+      (pig:command ext "event_mutate_probe" "Subscribe to the event named by the argument `<event> [mode]` with a handler that works on the event's payload (before_provider_request) or headers (before_provider_headers) as the mode says: no mode edits it in place and returns nothing, fail edits it and fails, replace edits nothing and returns a replacement, both edits it in place under a key of its own and returns the replacement, delete (headers) sets the header the first edit wrote to null"
+                   (lambda (ctx args) (declare (ignore ctx))
+                     (let* ((trimmed (string-trim '(#\Space #\Newline #\Tab) args))
+                            (space (position #\Space trimmed))
+                            (name (subseq trimmed 0 space))
+                            (mode (if space (string-trim '(#\Space #\Newline #\Tab) (subseq trimmed space)) ""))
+                            (headers-event (equal name "before_provider_headers")))
+                       (pig:on ext name
+                               (lambda (hctx data) (declare (ignore hctx))
+                                 (let ((key (cond ((equal mode "fail") "inPlaceBeforeError") ((equal mode "both") "inPlaceAlongside") (t "inPlace"))))
+                                   (cond (headers-event
+                                          (cond ((equal mode "delete") (setf (gethash "x-pig-inPlace" (pig:jget data "headers")) :null))
+                                                ((not (equal mode "replace"))
+                                                 (setf (gethash (concatenate 'string "x-pig-" key) (pig:jget data "headers")) "in-place-edit"))))
+                                         ((not (equal mode "replace"))
+                                          (let* ((payload (pig:jget data "payload")) (zeta (pig:jget payload "zeta")))
+                                            (setf (gethash key payload) "in-place-edit")
+                                            (when (hash-table-p zeta) (setf (gethash key zeta) "in-place-edit"))))))
+                                 (when (equal mode "fail") (error "failed after the edit"))
+                                 (when (member mode '("replace" "both") :test #'equal)
+                                   (if headers-event (pig:obj "x-pig-replaced" "returned") (pig:obj "replaced" "returned"))))))))
+      ;; event_assign_probe: `<event>`, a handler that ASSIGNS a new value to the event's input (tool_call), messages (context) or entries (turn_end) instead of editing the old value in place, and returns nothing.
+      (pig:command ext "event_assign_probe" "Subscribe to the event named by the argument with a handler that assigns a new value to the event's input, messages or entries"
+                   (lambda (ctx args) (declare (ignore ctx))
+                     (let* ((words (multiple-value-list (split-first args)))
+                            (name (first words)) (variant (string-trim '(#\Space #\Newline #\Tab) (or (second words) "")))
+                           (edited "other-event-edit"))
+                       (pig:on ext name
+                               (lambda (hctx data) (declare (ignore hctx))
+                                 (cond
+                                   ((equal name "tool_call") (setf (gethash "input" data) (pig:obj "command" edited)))
+                                   ((equal name "context")
+                                    (setf (gethash "messages" data)
+                                          (cond ((equal variant "bad") "oops")
+                                                ((equal variant "badmsg") (vector 42))
+                                                (t (vector (pig:obj "role" "user" "content" (vector (pig:obj "type" "text" "text" edited)) "timestamp" 1))))))
+                                   ((equal name "turn_end") (setf (gethash "entries" data) (vector (pig:obj "type" "custom" "customType" edited))))
+                                   (t (error "event_assign_probe has no event ~A" name)))
+                                 nil)))))
+      ;; event_edit_probe: `<event> <edit> [fail]`, a handler that makes one edit of the event's content, details, isError, message or messages (tool_result, message_end, context), returns nothing and, with fail, signals an error after the edit. Every edit writes the value `other-event-edit`, which no other test uses.
+      (pig:command ext "event_edit_probe" "Subscribe to the event named by the argument with a handler that edits the event in place and returns nothing"
+                   (lambda (ctx args) (declare (ignore ctx))
+                     (multiple-value-bind (name rest) (split-first args)
+                      (multiple-value-bind (edit rest) (split-first rest)
+                     (let* ((fail (equal rest "fail"))
+                            (edited "other-event-edit")
+                            (which (concatenate 'string name "/" edit)))
+                       (flet ((text () (vector (pig:obj "type" "text" "text" edited)))
+                              (first-block (blocks) (aref blocks 0)))
+                         (pig:on ext name
+                                 (lambda (hctx data) (declare (ignore hctx))
+                                   (cond
+                                     ((equal which "tool_result/content-assign") (setf (gethash "content" data) (text)))
+                                     ((equal which "tool_result/details-assign") (setf (gethash "details" data) (pig:obj "k" edited)))
+                                     ((equal which "tool_result/iserror-assign") (setf (gethash "isError" data) t))
+                                     ((equal which "tool_result/content-deep") (setf (gethash "text" (first-block (pig:jget data "content"))) edited))
+                                     ((equal which "tool_result/details-deep") (setf (gethash "k" (pig:jget data "details")) edited))
+                                     ((equal which "message_end/deep") (setf (gethash "text" (first-block (pig:jget (pig:jget data "message") "content"))) edited))
+                                     ((equal which "message_end/content-assign") (setf (gethash "content" (pig:jget data "message")) (text)))
+                                     ((equal which "message_end/message-assign") (setf (gethash "message" data) (pig:obj "role" "user" "content" (text) "timestamp" 1)))
+                                     ((equal which "context/deep") (setf (gethash "text" (first-block (pig:jget (aref (pig:jget data "messages") 0) "content"))) edited))
+                                     (t (error "event_edit_probe has no edit ~A" which)))
+                                   (when fail (error "failed after the edit"))
+                                   nil))))))))
       (pig:command ext "event_payload_probe" "Subscribe and report the payload of the event named by the argument"
                    (lambda (ctx args) (declare (ignore ctx))
                      (let ((name (string-trim '(#\Space #\Newline #\Tab) args)))
                        (pig:on ext name (lambda (hctx data) (core-info hctx (format nil "event_payload:~A:~A" name (pig:to-json data))) nil)))))
+      ;; event_isolation_probe: two handlers; the first reports the marker it received, writes a sentinel into its container and changes it again from a thread after returning; the second reports what it received (TestConformance_EventHandlersDoNotShareTheirPayload). A boundary event's marker is the first context entry's sourceEntry id (the container is that source entry); a context or context_with_system event's is the length of messages (the container is that list).
       (pig:command ext "event_isolation_probe" "Subscribe two handlers that report the nested marker they received and then write sentinels into it"
                    (lambda (ctx args) (declare (ignore ctx))
-                     (let ((name (string-trim '(#\Space #\Newline #\Tab) args)))
-                       (flet ((source (data) (let ((entries (pig:jref data "context" "contextEntries"))) (and entries (plusp (length entries)) (pig:jget (aref entries 0) "sourceEntry")))))
+                     (let* ((name (string-trim '(#\Space #\Newline #\Tab) args))
+                            (conversation (member name '("context" "context_with_system") :test #'equal)))
+                       (labels ((first-of (vector) (and vector (plusp (length vector)) (aref vector 0)))
+                                (source (data) (let ((entry (first-of (pig:jref data "context" "contextEntries")))) (and entry (pig:jget entry "sourceEntry"))))
+                                (marker (data) (if conversation (length (pig:jget data "messages")) (pig:jget (source data) "id")))
+                                (scribble (data value)
+                                  (if conversation
+                                      (let ((message (make-hash-table :test 'equal)))
+                                        (setf (gethash "role" message) "user" (gethash "content" message) value (gethash "timestamp" message) 0)
+                                        (setf (gethash "messages" data) (concatenate 'simple-vector (pig:jget data "messages") (vector message))))
+                                      (setf (gethash "id" (source data)) value)))
+                                (messages (data)
+                                  (if conversation
+                                      (let ((list (pig:jget data "messages")))
+                                        (loop for i below 3 collect (and (< i (length list)) (aref list i))))
+                                      (let ((entry (first-of (pig:jref data "context" "contextEntries"))))
+                                        (list (first-of (pig:jref data "context" "contextMessages"))
+                                              (first-of (pig:jref data "context" "llmMessages"))
+                                              (and entry (first-of (pig:jget entry "messages")))))))
+                                (report (found) (format nil "~{~A~^|~}" (mapcar (lambda (m) (if m (pig:jget m "content") "None")) found))))
                          (pig:on ext name (lambda (hctx data)
-                                            (let ((container (source data)))
-                                              (core-info hctx (format nil "event_isolation:A:~A:end" (pig:jget container "id")))
-                                              (setf (gethash "id" container) "SENTINEL-HANDLER-A")
-                                              (sb-thread:make-thread (lambda () (sleep 0.1) (setf (gethash "id" container) "SENTINEL-LATE-WRITER"))))
+                                            (core-info hctx (format nil "event_isolation:A:~A:end" (marker data)))
+                                            (scribble data "SENTINEL-HANDLER-A")
+                                            (let ((found (messages data)))
+                                              (core-info hctx (format nil "event_isolation_msgs:A:~A" (report found)))
+                                              (dolist (m found) (when m (setf (gethash "content" m) "SENTINEL-HANDLER-A")))
+                                              (sb-thread:make-thread (lambda ()
+                                                                       (sleep 0.1)
+                                                                       (scribble data "SENTINEL-LATE-WRITER")
+                                                                       (dolist (m found) (when m (setf (gethash "content" m) "SENTINEL-LATE-WRITER"))))))
                                             nil))
                          (pig:on ext name (lambda (hctx data)
-                                            (core-info hctx (format nil "event_isolation:B:~A:end" (pig:jget (source data) "id")))
+                                            (core-info hctx (format nil "event_isolation:B:~A:end" (marker data)))
+                                            (core-info hctx (format nil "event_isolation_msgs:B:~A" (report (messages data))))
                                             nil)))))))))
 
 (def-fixture "core-flags" (ext)
@@ -648,6 +1108,18 @@
                (lambda (ctx args)
                  (let* ((request (pig:from-json args)) (kind (pig:jget request "kind")) (directory (pig:jget request "dir"))
                         (read (cond ((equal kind "model") (lambda () (pig:ctx-model ctx)))
+                                    ((equal kind "model-name")
+                                     (lambda () (let ((info (pig:ctx-get-model-info ctx))) (if info (let ((n (pig:jget info "name"))) (if (stringp n) n "")) ""))))
+                                    ((equal kind "session-id") (lambda () (pig:ctx-get-session-id ctx)))
+                                    ((equal kind "usage-then-id")
+                                     (lambda () (let ((usage (pig:ctx-get-context-usage ctx)))
+                                                  (let ((tokens (and usage (pig:jget usage "tokens"))))
+                                                    (cond ((not (integerp tokens)) "none")
+                                                          ((= tokens 250) (format nil "tokens=250,id=~A" (pig:ctx-get-session-id ctx)))
+                                                          (t (format nil "tokens=~A" tokens)))))))
+                                    ((equal kind "context-usage")
+                                     (lambda () (let ((usage (pig:ctx-get-context-usage ctx)))
+                                                  (if usage (let ((tokens (pig:jget usage "tokens"))) (format nil "tokens=~A" (if (integerp tokens) tokens ""))) "none"))))
                                     ((equal kind "session-name") (lambda () (pig:ctx-session-name ctx)))
                                     ((and (> (length kind) 9) (string= "settings:" kind :end2 9))
                                      (lambda () (pig:to-json (or (pig:jget (pig:ctx-get-settings ctx) (subseq kind 9)) :null))))
@@ -767,6 +1239,29 @@
                                (core-info hctx (format nil "rw_idle_in_settled=~A" (if (pig:ctx-is-idle-p hctx) "true" "false"))))
                              nil))))))
 
+(def-fixture "core-console" (ext)
+  (pig:command ext "console-probe" "Write console lines to stdout and stderr"
+               (lambda (ctx args) (declare (ignore ctx))
+                 (dolist (n '(1 2))
+                   (unless (equal args "stderr")
+                     (format *standard-output* "probe-out-~D~%" n)
+                     (finish-output *standard-output*))
+                   (format *error-output* "probe-err-~D~%" n)
+                   (finish-output *error-output*)))))
+
+;; panic-probe and the on-loaded handler signal after a deliberate stderr line the extension itself writes (TestConformance_SDKDiagnosticsReachOnlyTheExtensionLog).
+(def-fixture "core-panic" (ext)
+  (pig:on-loaded ext (lambda (ctx) (declare (ignore ctx))
+                       (when (plusp (length (sb-posix:getenv "PIG_FIXTURE_PANIC_PROBE")))
+                         (format *error-output* "probe-err-loaded~%")
+                         (finish-output *error-output*)
+                         (error "probe-panic-boom"))))
+  (pig:command ext "panic-probe" "Signal after an stderr line of the extension's own"
+               (lambda (ctx args) (declare (ignore ctx args))
+                 (format *error-output* "probe-err-command~%")
+                 (finish-output *error-output*)
+                 (error "probe-panic-boom"))))
+
 (def-fixture "core-context" (ext)
   (pig:command ext "context-probe" "Report ctx.mode + ctx.getSystemPromptOptions()"
                (lambda (ctx args) (declare (ignore args))
@@ -828,6 +1323,21 @@
               (let ((tag (pig:jget params "tag")))
                 (pig:with-file-mutation-queue
                  (pig:jget params "file")
+                 (lambda ()
+                   (with-open-file (out (pig:jget params "file") :direction :output :if-exists :append :if-does-not-exist :create :external-format :utf-8)
+                     (write-string tag out) (write-char #\Newline out))))
+                (pig:obj "content" (concatenate 'string "mutated " tag))))))
+
+(def-fixture "core-mutation-order-ctx" (ext)
+  ;; makes CALLS getter calls, then takes the queue through its context and appends its tag (TestFileMutationOrderOfTheContextFormAcrossSDKs)
+  (pig:tool ext "mutation_order_ctx_probe" "Make getter calls, take the queue through the context and append a tag"
+            (core-schema "properties" (pig:obj "file" (pig:obj "type" "string") "tag" (pig:obj "type" "string") "calls" (pig:obj "type" "number")))
+            (lambda (ctx params)
+              (let ((tag (pig:jget params "tag"))
+                    (calls (pig:jget params "calls")))
+                (dotimes (i (if (integerp calls) calls 0)) (pig:ctx-get-context-usage ctx))
+                (pig:ctx-with-file-mutation-queue
+                 ctx (pig:jget params "file")
                  (lambda ()
                    (with-open-file (out (pig:jget params "file") :direction :output :if-exists :append :if-does-not-exist :create :external-format :utf-8)
                      (write-string tag out) (write-char #\Newline out))))

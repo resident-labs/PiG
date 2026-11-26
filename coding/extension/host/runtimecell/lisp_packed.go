@@ -24,7 +24,7 @@ import (
 
 // lispImageFormat names the shape of the generated image. Bump it when build.lisp or the runner contract changes in a way the SDK tree hash
 // does not already cover.
-const lispImageFormat = "pig-lisp-image-1"
+const lispImageFormat = "pig-lisp-image-3"
 
 // LispExtension describes one factory-style Lisp extension that can be built into a generated runner image. The factory is the one
 // function NEW-EXTENSION its ASDF system, or its single source file, defines; Package names the system or the file (without .lisp).

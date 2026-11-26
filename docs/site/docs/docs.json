@@ -8,6 +8,7 @@
     "cli.md": "adapted-pi",
     "codemode.md": "adapted-pi",
     "compaction.md": "adapted-pi",
+    "coming-from-pi.md": "pig-authored",
     "concepts.md": "pig-authored",
     "configuration.md": "adapted-pi",
     "containerization.md": "pig-authored",
@@ -16,10 +17,12 @@
     "development.md": "pig-authored",
     "environment-variables.md": "adapted-pi",
     "evals.md": "pig-authored",
+    "event-bus.md": "pig-authored",
     "extensions.md": "adapted-pi",
     "first-extension.md": "pig-authored",
     "first-run.md": "pig-authored",
     "glossary.md": "pig-authored",
+    "go-hot-reload.md": "pig-authored",
     "how-pig-works.md": "adapted-pi",
     "index.md": "pig-authored",
     "install-troubleshooting.md": "pig-authored",
@@ -29,12 +32,14 @@
     "llama-cpp.md": "adapted-pi",
     "mcp.md": "adapted-pi",
     "message-types.md": "adapted-pi",
+    "models-configuration.md": "adapted-pi",
     "models.md": "adapted-pi",
     "nvidia-rtx-llama-cpp.md": "adapted-pi",
     "packages.md": "adapted-pi",
     "piglet-binaries.md": "pig-authored",
     "piglet-lifecycle.md": "pig-authored",
     "piglets.md": "pig-authored",
+    "port-your-extension.md": "pig-authored",
     "publishing.md": "pig-authored",
     "prompt-templates.md": "adapted-pi",
     "providers.md": "adapted-pi",
@@ -58,6 +63,7 @@
     "tui.md": "adapted-pi",
     "typescript-runtimes.md": "pig-authored",
     "trust.md": "pig-authored",
+    "ui-views.md": "pig-authored",
     "usage.md": "adapted-pi",
     "usecase-clean-spreadsheet.md": "pig-authored",
     "usecase-draft-document.md": "pig-authored",
@@ -65,9 +71,19 @@
     "usecase-summarise-pdfs.md": "pig-authored",
     "usecase-weekly-report.md": "pig-authored",
     "virtual-models.md": "adapted-pi",
+    "what-is-a-piglet.md": "pig-authored",
     "windows.md": "adapted-pi"
   },
   "navigation": [
+    {
+      "title": "Coming from Pi",
+      "items": [
+        {
+          "title": "Coming from Pi",
+          "path": "coming-from-pi.md"
+        }
+      ]
+    },
     {
       "title": "Get Started",
       "items": [
@@ -86,6 +102,10 @@
         {
           "title": "How PiG Works",
           "path": "how-pig-works.md"
+        },
+        {
+          "title": "What Is a Piglet",
+          "path": "what-is-a-piglet.md"
         }
       ]
     },
@@ -227,8 +247,20 @@
               "path": "first-extension.md"
             },
             {
+              "title": "Port Your Extension",
+              "path": "port-your-extension.md"
+            },
+            {
               "title": "Build Extensions",
               "path": "extensions.md"
+            },
+            {
+              "title": "Call Another Extension",
+              "path": "event-bus.md"
+            },
+            {
+              "title": "Reload a Go Extension",
+              "path": "go-hot-reload.md"
             },
             {
               "title": "Add Custom Providers",
@@ -237,6 +269,10 @@
             {
               "title": "Build Terminal UI Components",
               "path": "tui.md"
+            },
+            {
+              "title": "Build Extension Views",
+              "path": "ui-views.md"
             },
             {
               "title": "Integrate with the CLI",
@@ -268,6 +304,10 @@
         {
           "title": "Settings",
           "path": "settings.md"
+        },
+        {
+          "title": "Models Configuration",
+          "path": "models-configuration.md"
         },
         {
           "title": "Settings by Example",

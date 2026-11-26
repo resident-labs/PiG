@@ -7,6 +7,7 @@ import (
 
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
+	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
 )
 
 // ExtensionBindings supplies mode-owned UI, command actions and handlers before session_start dispatch (upstream ExtensionBindings, agent-session.ts:300-307). A field left at its zero value is Pi's undefined: BindExtensions keeps the earlier value for it.
@@ -43,11 +44,6 @@ func (b ExtensionBindings) mergedWith(next ExtensionBindings) ExtensionBindings 
 		b.OnError = next.OnError
 	}
 	return b
-}
-
-// hasBindings is Pi's reload condition (agent-session.ts:3688-3692): the mode supplied a UI context, command actions, a shutdown handler or an error listener.
-func (b ExtensionBindings) hasBindings() bool {
-	return b.UIContext != nil || !reflect.ValueOf(b.CommandContextActions).IsZero() || b.ShutdownHandler != nil || b.OnError != nil
 }
 
 // mergeExtensionBindings merges bindings into the session's stored bindings and returns the result.
@@ -95,11 +91,15 @@ func (s *Session) bindExtensionCore(runner *inproc.Runner) {
 		// upstream: agent-session.ts:3339-3355 binds the tool actions of the runtime the extension API reads.
 		GetActiveTools: s.ActiveToolNames, GetAllTools: s.GetAllTools, SetActiveTools: s.SetActiveToolsByName, RefreshTools: s.RefreshTools,
 		SetLabel: func(entryID string, label *string) error {
-			_, err := s.inner.AppendLabelChange(entryID, label)
+			_, err := s.inner.Load().AppendLabelChange(entryID, label)
+			return err
+		},
+		SetLabelNull: func(entryID string) error {
+			_, err := s.inner.Load().AppendLabelEntry(icodingagent.LabelEntry{TargetID: entryID, LabelNull: true})
 			return err
 		},
 	}, extension.ContextActions{
-		SessionManager: s.inner, ModelRegistry: s.services.Registry(),
+		SessionManager: s.inner.Load(), ModelRegistry: s.services.Registry(),
 		GetModel: func() extension.Model { return s.Model() },
 		IsIdle:   s.IsIdle, HasPendingMessages: s.HasPendingMessages, GetSignal: s.Signal,
 		IsProjectTrusted: s.SettingsManager().IsProjectTrusted,
@@ -119,6 +119,11 @@ func (s *Session) extensionAbort() {
 		return
 	}
 	s.RequestAbort()
+}
+
+// SetExtensionAbortHandler stores the mode's handler for ctx.abort() in the Session's bindings, as Pi's bindExtensions({ abortHandler }) does (agent-session.ts:3259-3276), for a mode that binds its runner itself. Every runner the Session binds, at startup or after a reload, reaches it through extensionAbort. A nil handler keeps the earlier one, as an undefined binding does.
+func (s *Session) SetExtensionAbortHandler(handler func()) {
+	s.mergeExtensionBindings(ExtensionBindings{AbortHandler: handler})
 }
 
 // extensionShutdown is ctx.shutdown() (agent-session.ts:3450-3452): it calls the mode's shutdown handler when one is bound, at call time. Without a bound handler ctx.shutdown stays whatever the mode bound on the runner.

@@ -126,7 +126,7 @@ func TestAResumedSessionSendsOnlyTheChangeSinceItsLastUpdate(t *testing.T) {
 	if err := first.session.Prompt(t.Context(), "two"); err != nil {
 		t.Fatal(err)
 	}
-	second := newRecoveryHarness(t, harnessOptions{contextUpdates: true, emptySessionManager: true, sessionManager: first.session.inner}, done, done)
+	second := newRecoveryHarness(t, harnessOptions{contextUpdates: true, emptySessionManager: true, sessionManager: first.session.inner.Load()}, done, done)
 	hostSections(t, second, "goal", "b")
 	if err := second.session.Prompt(t.Context(), "three"); err != nil {
 		t.Fatal(err)

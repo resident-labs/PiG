@@ -116,8 +116,10 @@ type harnessOptions struct {
 	contextWindow       int
 	maxTokens           int
 	inputLimits         *ai.ModelInputLimits
-	tools               []agent.AgentTool
-	extension           extension.Extension
+	// reasoning makes the model a reasoning model, so the thinking level can be set.
+	reasoning bool
+	tools     []agent.AgentTool
+	extension extension.Extension
 	// extensions are loaded after extension, in order.
 	extensions []extension.Extension
 	resources  *SystemPromptResources
@@ -135,6 +137,10 @@ type harnessOptions struct {
 	contextUpdates bool
 	// systemPrompt is SessionOptions.SystemPrompt.
 	systemPrompt string
+	// provider replaces the scripted provider as the model's provider, so a session runs against a real provider over a hermetic server; the scripted responses are then unused.
+	provider ai.Provider
+	// transport is the Session's SessionOptions.Transport, the caller's own choice that outranks the settings'.
+	transport ai.Transport
 }
 
 type recoveryHarness struct {
@@ -175,7 +181,11 @@ func newRecoveryHarness(t *testing.T, opts harnessOptions, responses ...scripted
 	if contextWindow == 0 {
 		contextWindow = 128_000
 	}
-	model := &ai.Model{ID: "faux-1", DisplayName: "faux-1", Provider: provider, Capabilities: ai.ModelCapabilities{ContextWindow: contextWindow, MaxOutputTokens: opts.maxTokens}, InputLimits: opts.inputLimits}
+	var modelProvider ai.Provider = provider
+	if opts.provider != nil {
+		modelProvider = opts.provider
+	}
+	model := &ai.Model{ID: "faux-1", DisplayName: "faux-1", Provider: modelProvider, Capabilities: ai.ModelCapabilities{ContextWindow: contextWindow, MaxOutputTokens: opts.maxTokens}, InputLimits: opts.inputLimits, ProviderMeta: ai.ProviderMetadata{Reasoning: opts.reasoning}}
 	var runner *inproc.Runner
 	if opts.extension.Handlers != nil || len(opts.extensions) > 0 {
 		loaded := opts.extensions
@@ -185,6 +195,7 @@ func newRecoveryHarness(t *testing.T, opts harnessOptions, responses ...scripted
 		runner = inproc.NewRunner(loaded, t.TempDir(), opts.runtime)
 	}
 	options := SessionOptions{Model: model, SkipBuiltinTools: !opts.defaultTools, Tools: opts.tools, Runner: runner, SystemPromptResources: opts.resources, AllowedTools: opts.allowedTools, ExcludedTools: opts.excludedTools, ContextUpdates: opts.contextUpdates, SystemPrompt: opts.systemPrompt}
+	options.Transport = opts.transport
 	if opts.emptySessionManager {
 		options.existing = opts.sessionManager
 		if options.existing == nil {
@@ -627,5 +638,126 @@ func TestPrePromptRecoveryOfAResumedLengthStopOmitsTheTruncatedCallAndItsResult(
 	}
 	if strings.Contains(requests[0], `"role":"toolResult"`) || strings.Contains(requests[0], `"stopReason":"length"`) {
 		t.Fatalf("request still carries the truncated call or its result: %s", requests[0])
+	}
+}
+
+func TestDefaultRetryDeciderDrivesSessionRetriesAndDelays(t *testing.T) {
+	t.Cleanup(func() { icodingagent.SetDefaultRetryDecider(nil, false) })
+	var seen []int
+	icodingagent.SetDefaultRetryDecider(func(attempt, maxAttempts int, response ai.AssistantMessage) ai.RetryDecision {
+		seen = append(seen, attempt)
+		status := 0
+		if response.FailureResponse != nil {
+			status = response.FailureResponse.Status
+		}
+		if status == 401 && attempt <= 2 && attempt <= maxAttempts {
+			return ai.RetryDecision{Retry: true, DelayMs: 2 + attempt}
+		}
+		return ai.RetryDecision{Retry: false}
+	}, true)
+	unauth := func([]ai.Message) *ai.AssistantMessage {
+		return &ai.AssistantMessage{
+			Provider: "faux", Model: "faux-1", StopReason: ai.StopReasonError,
+			ErrorMessage:    `401 {"message":"bad key"}`,
+			FailureResponse: &ai.FailureResponse{Status: 401, Headers: map[string]string{"retry-after": "1"}},
+			Timestamp:       time.Now().UnixMilli(),
+		}
+	}
+	h := newRecoveryHarness(t, harnessOptions{settings: `{"retry":{"enabled":true,"maxRetries":5,"baseDelayMs":500}}`},
+		unauth, unauth, unauth, fauxReply("unreachable", ai.StopReasonStop, 0),
+	)
+	_, _ = h.session.Send(context.Background(), "hello")
+	events := h.settle(t)
+	if got := h.provider.callCount(); got != 3 {
+		t.Fatalf("model calls = %d, want 3 (initial + 2 auth retries)", got)
+	}
+	var willRetry []bool
+	var delays []int
+	for _, ev := range events {
+		switch ev := ev.(type) {
+		case agent.AgentEndEvent:
+			willRetry = append(willRetry, ev.WillRetry)
+		case agent.AutoRetryStartEvent:
+			delays = append(delays, ev.DelayMs)
+		}
+	}
+	if len(willRetry) != 3 || !willRetry[0] || !willRetry[1] || willRetry[2] {
+		t.Fatalf("willRetry = %v, want [true true false]", willRetry)
+	}
+	if len(delays) != 2 || delays[0] != 3 || delays[1] != 4 {
+		t.Fatalf("delays = %v, want [3 4]", delays)
+	}
+	if len(seen) != 3 {
+		t.Fatalf("decider called %d times, want 3 (once per attempt)", len(seen))
+	}
+}
+
+func TestDefaultRetryDeciderRetainsFailureResponseHeadersAfterJSONMessageEndReplacement(t *testing.T) {
+	t.Cleanup(func() { icodingagent.SetDefaultRetryDecider(nil, false) })
+	var seenHeaders []map[string]string
+	icodingagent.SetDefaultRetryDecider(func(attempt, maxAttempts int, response ai.AssistantMessage) ai.RetryDecision {
+		if response.FailureResponse != nil {
+			seenHeaders = append(seenHeaders, response.FailureResponse.Headers)
+		} else {
+			seenHeaders = append(seenHeaders, nil)
+		}
+		if attempt <= maxAttempts && response.FailureResponse != nil && response.FailureResponse.Headers["retry-after"] == "2" {
+			return ai.RetryDecision{Retry: true, DelayMs: 7}
+		}
+		return ai.RetryDecision{Retry: false}
+	}, true)
+	rateLimited := func([]ai.Message) *ai.AssistantMessage {
+		return &ai.AssistantMessage{
+			Provider: "faux", Model: "faux-1", StopReason: ai.StopReasonError,
+			ErrorMessage:    `429 {"message":"rate limited"}`,
+			FailureResponse: &ai.FailureResponse{Status: 429, Headers: map[string]string{"retry-after": "2"}},
+			Timestamp:       time.Now().UnixMilli(),
+		}
+	}
+	ext := extension.Extension{
+		Path: "/ext/rewrite",
+		Handlers: map[string][]extension.HandlerFn{
+			"message_end": {func(args ...any) (any, error) {
+				ev := args[0].(extension.MessageEndEvent)
+				if ev.Message.Assistant == nil || ev.Message.Assistant.StopReason != ai.StopReasonError {
+					return nil, nil
+				}
+				raw, err := json.Marshal(ev.Message)
+				if err != nil {
+					return nil, err
+				}
+				var wire map[string]any
+				if err := json.Unmarshal(raw, &wire); err != nil {
+					return nil, err
+				}
+				wire["errorMessage"] = ev.Message.Assistant.ErrorMessage + " (service temporarily unavailable)"
+				res, err := json.Marshal(map[string]any{"message": wire})
+				if err != nil {
+					return nil, err
+				}
+				return json.RawMessage(res), nil
+			}},
+		},
+	}
+	h := newRecoveryHarness(t, harnessOptions{
+		settings:  `{"retry":{"enabled":true,"maxRetries":2,"baseDelayMs":500}}`,
+		extension: ext,
+	}, rateLimited, fauxReply("recovered", ai.StopReasonStop, 0))
+	_, _ = h.session.Send(context.Background(), "hello")
+	events := h.settle(t)
+	if got := h.provider.callCount(); got != 2 {
+		t.Fatalf("model calls = %d, want 2", got)
+	}
+	if len(seenHeaders) != 1 || seenHeaders[0]["retry-after"] != "2" {
+		t.Fatalf("seenHeaders = %#v, want retry-after=2", seenHeaders)
+	}
+	var delays []int
+	for _, ev := range events {
+		if start, ok := ev.(agent.AutoRetryStartEvent); ok {
+			delays = append(delays, start.DelayMs)
+		}
+	}
+	if len(delays) != 1 || delays[0] != 7 {
+		t.Fatalf("delays = %v, want [7]", delays)
 	}
 }

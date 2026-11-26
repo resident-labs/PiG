@@ -42,7 +42,7 @@ func (s *Session) runDefaultCompaction(ctx context.Context, prep compaction.Comp
 	if streamFn == nil {
 		streamFn = compaction.CompleterStreamFn(request.completer)
 	}
-	return compaction.Compact(ctx, prep, request.model, request.apiKey, request.headers, customInstructions, request.thinkingLevel, streamFn, request.env, retry, retryCallbacks, "")
+	return compaction.CompactStandalone(ctx, prep, request.model, request.apiKey, request.headers, customInstructions, request.thinkingLevel, streamFn, request.env, retry, retryCallbacks, "")
 }
 
 // sessionRequest is one request the agent sent: its model, transcript and options, and the agent messages it was built from.

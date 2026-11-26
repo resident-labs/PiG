@@ -2,7 +2,7 @@
 
 # Extension SDK surface matrix
 
-Every extension-facing surface of Pi 1.5.0's extension API, and how each PiG extension runtime realizes it. The rows come from Pi's `packages/coding-agent/src/core/extensions/types.ts` and the declarations it re-exports or exposes through its members (`EventBus`, `ExecOptions`/`ExecResult`, `CacheWarmingDecisionEvent`, `ReadonlySessionManager`, `ModelRegistry`, `Theme`, `AgentToolResult`), read from `.upstream/v1.5.0`.
+Every extension-facing surface of Pi 1.6.0's extension API, and how each PiG extension runtime realizes it. The rows come from Pi's `packages/coding-agent/src/core/extensions/types.ts` and the declarations it re-exports or exposes through its members (`EventBus`, `ExecOptions`/`ExecResult`, `CacheWarmingDecisionEvent`, `ReadonlySessionManager`, `ModelRegistry`, `Theme`, `AgentToolResult`), read from `.upstream/v1.6.0`.
 
 A cell's status comes from the runtime itself: the Go SDK's exported identifiers, the Rust SDK's `pub` items, the Python SDK's classes, members and parameters and the Lisp SDK's exported symbols and the keyword and optional parameters of its exported functions, read from their source, and the Node runtime's objects, read by instantiating the runtime in Node (`test/parity/cmd/sdksurface/probe.mjs`), plus the properties it reads from an extension's definitions. [`test/parity/sdk-surface.toml`](../test/parity/sdk-surface.toml) names the symbol where a language's naming differs from the default rule and says why a realization is a stand-in; a named symbol that does not exist is `missing`. Payload, result and option fields that cross the subprocess wire are also checked against the host's Go decoding type, so a field an SDK sends but the host drops is `missing`. The PiG additive sections list surfaces PiG adds where Pi has none, such as the component kit (D107); the map names each one's symbols, and its cells are classified the same way.
 
@@ -10,7 +10,7 @@ A cell's status comes from the runtime itself: the Go SDK's exported identifiers
 - `stand-in/partial`: the symbol exists; the note says what differs and why.
 - `missing`: no symbol. Each missing cell is listed in [`test/parity/sdk-surface-exceptions.toml`](../test/parity/sdk-surface-exceptions.toml) with its reviewed reason, and `go test ./test/parity/cmd/sdksurface` fails on any other.
 
-The package sections list every runtime export of the modules Pi serves to extensions (`pi-coding-agent`, `pi-tui`, `pi-ai`, `pi-ai/compat`, `pi-ai/models`, `pi-ai/providers/all`, `pi-agent-core`), from the compiler-derived inventory of Pi's `.d.ts` files (`test/parity/interfaces/upstream-v1.5.0.json`), and every public instance member of each exported class represented by that inventory. Static factories and overload-specific reachability are outside this probe. Only the Node runtime imports these modules. The probe loads each module the runtime serves and classifies every value by where its code lives, using the V8 inspector's function locations:
+The package sections list every runtime export of the modules Pi serves to extensions (`pi-coding-agent`, `pi-tui`, `pi-ai`, `pi-ai/compat`, `pi-ai/models`, `pi-ai/providers/all`, `pi-agent-core`), from the compiler-derived inventory of Pi's `.d.ts` files (`test/parity/interfaces/upstream-v1.6.0.json`), and every public instance member of each exported class represented by that inventory. Static factories and overload-specific reachability are outside this probe. Only the Node runtime imports these modules. The probe loads each module the runtime serves and classifies every value by where its code lives, using the V8 inspector's function locations:
 
 - `Pi's own code`: the function originates in the vendored pinned modules or their dependencies; host import rewrites can still affect behavior (D73).
 - `bridged`: PiG's implementation in the extension runtime, a line-for-line port or a host bridge, locked by the D73 tests (`TestNodeRuntimeShimsExportEveryPinnedPiValue`, `TestPiTuiComponentsMatchThePinnedPackage`, `TestPiAiUtilitiesMatchThePinnedPackage`, `TestPiThemeHelpersMatchThePinnedPackage`).
@@ -21,34 +21,34 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 
 ## Summary
 
-529 extension API surfaces:
+525 extension API surfaces:
 
 | Runtime | implemented | stand-in/partial | missing (all with a reviewed exception) |
 |---|---|---|---|
-| Node runtime | 491 | 27 | 11 |
-| Go | 493 | 26 | 10 |
-| Rust | 493 | 26 | 10 |
-| Python | 493 | 26 | 10 |
-| Lisp | 500 | 19 | 10 |
+| Node runtime | 498 | 26 | 1 |
+| Go | 502 | 23 | 0 |
+| Rust | 500 | 25 | 0 |
+| Python | 502 | 23 | 0 |
+| Lisp | 506 | 19 | 0 |
 
-31 PiG-only surfaces:
+35 PiG-only surfaces:
 
 | Runtime | implemented | stand-in/partial | missing (all with a reviewed exception) |
 |---|---|---|---|
-| Node runtime | 29 | 0 | 2 |
-| Go | 31 | 0 | 0 |
-| Rust | 31 | 0 | 0 |
-| Python | 31 | 0 | 0 |
-| Lisp | 31 | 0 | 0 |
+| Node runtime | 33 | 0 | 2 |
+| Go | 35 | 0 | 0 |
+| Rust | 35 | 0 | 0 |
+| Python | 35 | 0 | 0 |
+| Lisp | 35 | 0 | 0 |
 
-1639 package exports and class members, Node runtime:
+1663 package exports and class members, Node runtime:
 
 | Module | Pi's own code | bridged | stand-in | missing (all with a reviewed exception) |
 |---|---|---|---|---|
-| `pi-coding-agent` | 907 | 10 | 0 | 10 |
-| `pi-tui` | 368 | 1 | 0 | 1 |
-| `pi-ai` | 102 | 3 | 0 | 0 |
-| `pi-ai/compat` | 153 | 11 | 0 | 0 |
+| `pi-coding-agent` | 910 | 10 | 0 | 10 |
+| `pi-tui` | 370 | 1 | 0 | 1 |
+| `pi-ai` | 107 | 7 | 0 | 0 |
+| `pi-ai/compat` | 159 | 15 | 0 | 0 |
 | `pi-ai/models` | 16 | 0 | 0 | 0 |
 | `pi-ai/providers/all` | 12 | 0 | 0 | 0 |
 | `pi-agent-core` | 45 | 0 | 0 | 0 |
@@ -88,7 +88,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 |---|---|---|---|---|---|---|
 | `pi.getFlag` | `ExtensionAPI.getFlag` | implemented `api.getFlag` | implemented `Context.GetFlag` | implemented `Context::get_flag` | implemented `Context.get_flag` | implemented `pig:flag` |
 | `pi.registerMessageRenderer` | `ExtensionAPI.registerMessageRenderer` | stand-in/partial `api.registerMessageRenderer`: the renderer's Component renders to lines at the requested width inside the extension process | stand-in/partial `Extension.MessageRenderer`: renders lines at the requested width: a Pi Component cannot cross the process boundary | stand-in/partial `Extension::message_renderer`: renders lines at the requested width: a Pi Component cannot cross the process boundary | stand-in/partial `Extension.message_renderer`: renders lines at the requested width: a Pi Component cannot cross the process boundary | stand-in/partial `pig:message-renderer`: renders lines at the requested width: a Pi Component cannot cross the process boundary |
-| `pi.registerMarkdownTransformer` | `ExtensionAPI.registerMarkdownTransformer` | implemented `api.registerMarkdownTransformer` | implemented `Extension.MarkdownTransformer` | implemented `Extension::markdown_transformer` | implemented `Extension.markdown_transformer` | implemented `pig:markdown-transformer` |
+| `pi.registerMarkdownTransformer` | `ExtensionAPI.registerMarkdownTransformer` | implemented `api.registerMarkdownTransformer` | implemented `Extension.MarkdownTransformer` | implemented `Extension::markdown_transformer_with_options` | implemented `Extension.markdown_transformer` | implemented `pig:markdown-transformer` |
 | `pi.registerEntryRenderer` | `ExtensionAPI.registerEntryRenderer` | stand-in/partial `api.registerEntryRenderer`: the renderer's Component renders to lines at the requested width inside the extension process | stand-in/partial `Extension.EntryRenderer`: renders lines at the requested width: a Pi Component cannot cross the process boundary | stand-in/partial `Extension::entry_renderer`: renders lines at the requested width: a Pi Component cannot cross the process boundary | stand-in/partial `Extension.entry_renderer`: renders lines at the requested width: a Pi Component cannot cross the process boundary | stand-in/partial `pig:entry-renderer`: renders lines at the requested width: a Pi Component cannot cross the process boundary |
 | `pi.registerToolRenderer` | `ExtensionAPI.registerToolRenderer` | implemented `api.registerToolRenderer` | implemented `Extension.ToolRenderer` | implemented `Extension::tool_renderer` | implemented `Extension.tool_renderer` | implemented `pig:tool-renderer` |
 | `pi.sendMessage` | `ExtensionAPI.sendMessage` | implemented `api.sendMessage` | implemented `Context.SendMessage` | implemented `Context::send_message` | implemented `Context.send_message` | implemented `pig:ctx-send-message` |
@@ -115,7 +115,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | Surface | Pi declaration | Node runtime | Go | Rust | Python | Lisp |
 |---|---|---|---|---|---|---|
 | `pi.sendUserMessage(options.deliverAs)` | `ExtensionAPI.sendUserMessage(options.deliverAs)` | implemented `api.sendUserMessage` | implemented `Context.SendUserMessage` | implemented `Context::send_user_message` | implemented `Context.send_user_message(deliver_as)` | implemented `pig:ctx-send-user-message(deliver-as)` |
-| `pi.sendUserMessage(options.expandPromptTemplates)` | `ExtensionAPI.sendUserMessage(options.expandPromptTemplates)` | missing (`api.sendUserMessage`: the host drops `expandPromptTemplates` (subprocess.SendUserMessageOptions)) [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) |
+| `pi.sendUserMessage(options.expandPromptTemplates)` | `ExtensionAPI.sendUserMessage(options.expandPromptTemplates)` | implemented `api.sendUserMessage` | implemented `Context.SendUserMessageWith` | implemented `Context::send_user_message_with` | implemented `Context.send_user_message(expand_prompt_templates)` | implemented `pig:ctx-send-user-message(expand-prompt-templates)` |
 
 ## pi (ExtensionAPI)
 
@@ -186,8 +186,8 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `pi.setModel` | `ExtensionAPI.setModel` | implemented `api.setModel` | implemented `Context.SetModel` | implemented `Context::set_model` | implemented `Context.set_model` | implemented `pig:ctx-set-model` |
 | `pi.getThinkingLevel` | `ExtensionAPI.getThinkingLevel` | implemented `api.getThinkingLevel` | implemented `Context.GetThinkingLevel` | implemented `Context::get_thinking_level` | implemented `Context.get_thinking_level` | implemented `pig:ctx-get-thinking-level` |
 | `pi.setThinkingLevel` | `ExtensionAPI.setThinkingLevel` | implemented `api.setThinkingLevel` | implemented `Context.SetThinkingLevel` | implemented `Context::set_thinking_level` | implemented `Context.set_thinking_level` | implemented `pig:ctx-set-thinking-level` |
-| `pi.registerProvider` | `ExtensionAPI.registerProvider` | stand-in/partial `api.registerProvider`: config registration reaches the host; native callback providers remain process-local | stand-in/partial `Extension.RegisterProvider`: registration declaration is applied at load; use ModelRegistry.RegisterProvider for live config registration | stand-in/partial `Extension::register_provider`: registration declaration is applied at load; use ModelRegistry.register_provider for live config registration | stand-in/partial `Extension.register_provider`: registration declaration is applied at load; use ModelRegistry.register_provider for live config registration | implemented `pig:register-provider` |
-| `pi.unregisterProvider` | `ExtensionAPI.unregisterProvider` | stand-in/partial `api.unregisterProvider`: config removal reaches the host; native providers remain process-local | stand-in/partial `Extension.UnregisterProvider`: registration declarations are removed at load; live config removal is exposed by ModelRegistry.UnregisterProvider | stand-in/partial `Extension::unregister_provider`: registration declarations are removed at load; live config removal is exposed by ModelRegistry.unregister_provider | stand-in/partial `Extension.unregister_provider`: registration declarations are removed at load; live config removal is exposed by ModelRegistry.unregister_provider | implemented `pig:unregister-provider` |
+| `pi.registerProvider` | `ExtensionAPI.registerProvider` | stand-in/partial `api.registerProvider`: config registration reaches the host; native callback providers remain process-local | implemented `Extension.RegisterProvider` | stand-in/partial `Extension::register_provider`: Extension::register_provider queues at load (the extension is moved into run, so a later call does not compile); after load a handler calls ModelRegistry::register_provider through Context::model_registry, which applies the config at once through the host | implemented `Extension.register_provider` | implemented `pig:register-provider` |
+| `pi.unregisterProvider` | `ExtensionAPI.unregisterProvider` | stand-in/partial `api.unregisterProvider`: config removal reaches the host; native providers remain process-local | implemented `Extension.UnregisterProvider` | stand-in/partial `Extension::unregister_provider`: Extension::unregister_provider drops a queued registration at load; after load a handler calls ModelRegistry::unregister_provider through Context::model_registry, which removes the provider at once through the host | implemented `Extension.unregister_provider` | implemented `pig:unregister-provider` |
 | `pi.registerMcpServer` | `ExtensionAPI.registerMcpServer` | implemented `api.registerMcpServer` | implemented `Extension.RegisterMcpServer` | implemented `Extension::register_mcp_server` | implemented `Extension.register_mcp_server` | implemented `pig:register-mcp-server` |
 | `pi.unregisterMcpServer` | `ExtensionAPI.unregisterMcpServer` | implemented `api.unregisterMcpServer` | implemented `Extension.UnregisterMcpServer` | implemented `Extension::unregister_mcp_server` | implemented `Extension.unregister_mcp_server` | implemented `pig:unregister-mcp-server` |
 | `pi.getMcpServers` | `ExtensionAPI.getMcpServers` | implemented `api.getMcpServers` | implemented `Context.GetMcpServers` | implemented `Context::get_mcp_servers` | implemented `Context.get_mcp_servers` | implemented `pig:ctx-get-mcp-servers` |
@@ -320,7 +320,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `session_before_compact event.customInstructions` | `SessionBeforeCompactEvent.customInstructions` | implemented `api.on` | implemented `EventFunc` | implemented `EventHandler` | implemented `Extension.on_event` | implemented `pig:on` |
 | `session_before_compact event.reason` | `SessionBeforeCompactEvent.reason` | implemented `api.on` | implemented `EventFunc` | implemented `EventHandler` | implemented `Extension.on_event` | implemented `pig:on` |
 | `session_before_compact event.willRetry` | `SessionBeforeCompactEvent.willRetry` | implemented `api.on` | implemented `EventFunc` | implemented `EventHandler` | implemented `Extension.on_event` | implemented `pig:on` |
-| `session_before_compact event.signal` | `SessionBeforeCompactEvent.signal` | stand-in/partial `read:event.signal`: event.signal is the handler request's AbortSignal, aborted when the host cancels the request | stand-in/partial `Context.Done`: the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary | stand-in/partial `Context::is_cancelled`: the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary | stand-in/partial `Context.is_cancelled`: the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary | stand-in/partial `pig:ctx-cancelled-p`: the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary |
+| `session_before_compact event.signal` | `SessionBeforeCompactEvent.signal` | stand-in/partial `read:event.signal`: event.signal is the handler request's AbortSignal, aborted by the signal-only cancel (CancelPayload.signal_only), which cancels no host call, and already aborted for a handler dispatched after the abort (signal_aborted) | stand-in/partial `Context.Done`: the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary: the host sends a signal-only cancel (CancelPayload.signal_only) when the signal ends while the handler runs and keeps its reply; the abort aborts the handler signal and cancels no host call, as Pi's in-process calls never fail with it, and a handler dispatched after the abort starts with it aborted (signal_aborted) | stand-in/partial `Context::is_cancelled`: the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary: the host sends a signal-only cancel (CancelPayload.signal_only) when the signal ends while the handler runs and keeps its reply; the abort aborts the handler signal and cancels no host call, as Pi's in-process calls never fail with it, and a handler dispatched after the abort starts with it aborted (signal_aborted) | stand-in/partial `Context.is_cancelled`: the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary: the host sends a signal-only cancel (CancelPayload.signal_only) when the signal ends while the handler runs and keeps its reply; the abort aborts the handler signal and cancels no host call, as Pi's in-process calls never fail with it, and a handler dispatched after the abort starts with it aborted (signal_aborted) | stand-in/partial `pig:ctx-cancelled-p`: the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary: the host sends a signal-only cancel (CancelPayload.signal_only) when the signal ends while the handler runs and keeps its reply; the abort aborts the handler signal and cancels no host call, as Pi's in-process calls never fail with it, and a handler dispatched after the abort starts with it aborted (signal_aborted) |
 
 ## Event results
 
@@ -396,7 +396,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | Surface | Pi declaration | Node runtime | Go | Rust | Python | Lisp |
 |---|---|---|---|---|---|---|
 | `session_before_tree event.preparation` | `SessionBeforeTreeEvent.preparation` | implemented `api.on` | implemented `EventFunc` | implemented `EventHandler` | implemented `Extension.on_event` | implemented `pig:on` |
-| `session_before_tree event.signal` | `SessionBeforeTreeEvent.signal` | stand-in/partial `read:event.signal`: event.signal is the handler request's AbortSignal, aborted when the host cancels the request | stand-in/partial `Context.Done`: the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary | stand-in/partial `Context::is_cancelled`: the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary | stand-in/partial `Context.is_cancelled`: the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary | stand-in/partial `pig:ctx-cancelled-p`: the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary |
+| `session_before_tree event.signal` | `SessionBeforeTreeEvent.signal` | stand-in/partial `read:event.signal`: event.signal is the handler request's AbortSignal, aborted by the signal-only cancel (CancelPayload.signal_only), which cancels no host call, and already aborted for a handler dispatched after the abort (signal_aborted) | stand-in/partial `Context.Done`: the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary: the host sends a signal-only cancel (CancelPayload.signal_only) when the signal ends while the handler runs and keeps its reply; the abort aborts the handler signal and cancels no host call, as Pi's in-process calls never fail with it, and a handler dispatched after the abort starts with it aborted (signal_aborted) | stand-in/partial `Context::is_cancelled`: the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary: the host sends a signal-only cancel (CancelPayload.signal_only) when the signal ends while the handler runs and keeps its reply; the abort aborts the handler signal and cancels no host call, as Pi's in-process calls never fail with it, and a handler dispatched after the abort starts with it aborted (signal_aborted) | stand-in/partial `Context.is_cancelled`: the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary: the host sends a signal-only cancel (CancelPayload.signal_only) when the signal ends while the handler runs and keeps its reply; the abort aborts the handler signal and cancels no host call, as Pi's in-process calls never fail with it, and a handler dispatched after the abort starts with it aborted (signal_aborted) | stand-in/partial `pig:ctx-cancelled-p`: the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary: the host sends a signal-only cancel (CancelPayload.signal_only) when the signal ends while the handler runs and keeps its reply; the abort aborts the handler signal and cancels no host call, as Pi's in-process calls never fail with it, and a handler dispatched after the abort starts with it aborted (signal_aborted) |
 
 ## Event results
 
@@ -464,15 +464,6 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | Surface | Pi declaration | Node runtime | Go | Rust | Python | Lisp |
 |---|---|---|---|---|---|---|
 | `pi.on("cache_warming_decision")` | `ExtensionAPI.on` | implemented `api.on` | implemented `EventCacheWarmingDecision` | implemented `EVENT_CACHE_WARMING_DECISION` | implemented `EVENT_CACHE_WARMING_DECISION` | implemented `pig:on` |
-
-## Event payloads
-
-| Surface | Pi declaration | Node runtime | Go | Rust | Python | Lisp |
-|---|---|---|---|---|---|---|
-| `cache_warming_decision event.warmCost` | `CacheWarmingDecisionEvent.warmCost` | implemented `api.on` | implemented `EventFunc` | implemented `EventHandler` | implemented `Extension.on_event` | implemented `pig:on` |
-| `cache_warming_decision event.missCost` | `CacheWarmingDecisionEvent.missCost` | implemented `api.on` | implemented `EventFunc` | implemented `EventHandler` | implemented `Extension.on_event` | implemented `pig:on` |
-| `cache_warming_decision event.continuationProbability` | `CacheWarmingDecisionEvent.continuationProbability` | implemented `api.on` | implemented `EventFunc` | implemented `EventHandler` | implemented `Extension.on_event` | implemented `pig:on` |
-| `cache_warming_decision event.action` | `CacheWarmingDecisionEvent.action` | implemented `api.on` | implemented `EventFunc` | implemented `EventHandler` | implemented `Extension.on_event` | implemented `pig:on` |
 
 ## Event results
 
@@ -866,7 +857,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 
 | Surface | Pi declaration | Node runtime | Go | Rust | Python | Lisp |
 |---|---|---|---|---|---|---|
-| `user_bash return.operations` | `UserBashEventResult.operations` | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) |
+| `user_bash return.operations` | `UserBashEventResult.operations` | implemented `read:result.operations` | implemented `BashOperations` | implemented `Context::bash_operations` | implemented `BashOperations` | implemented `pig:make-bash-operations` |
 | `user_bash return.result` | `UserBashEventResult.result` | implemented `api.on` | implemented `EventFunc` | implemented `EventHandler` | implemented `Extension.on_event` | implemented `pig:on` |
 
 ## Events
@@ -953,7 +944,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `ctx.modelRegistry.getProviderAuth` | `ModelRegistry.getProviderAuth` | implemented `RuntimeModelRegistry.getProviderAuth` | implemented `ModelRegistry.GetProviderAuth` | implemented `ModelRegistry::get_provider_auth` | implemented `ModelRegistry.get_provider_auth` | implemented `pig:registry-get-provider-auth` |
 | `ctx.modelRegistry.getApiKeyForProvider` | `ModelRegistry.getApiKeyForProvider` | implemented `RuntimeModelRegistry.getApiKeyForProvider` | implemented `ModelRegistry.GetApiKeyForProvider` | implemented `ModelRegistry::get_api_key_for_provider` | implemented `ModelRegistry.get_api_key_for_provider` | implemented `pig:registry-get-api-key-for-provider` |
 | `ctx.modelRegistry.isUsingOAuth` | `ModelRegistry.isUsingOAuth` | implemented `RuntimeModelRegistry.isUsingOAuth` | implemented `ModelRegistry.IsUsingOAuth` | implemented `ModelRegistry::is_using_oauth` | implemented `ModelRegistry.is_using_oauth` | implemented `pig:registry-is-using-oauth` |
-| `ctx.modelRegistry.registerProvider` | `ModelRegistry.registerProvider` | stand-in/partial `RuntimeModelRegistry.registerProvider`: config registration reaches the host; native callback providers remain process-local | stand-in/partial `ModelRegistry.RegisterProvider`: config overload only; native Provider callback objects are not implemented | stand-in/partial `ModelRegistry::register_provider`: config overload only; native Provider callback objects are not implemented | stand-in/partial `ModelRegistry.register_provider`: config overload only; native Provider callback objects are not implemented | implemented `pig:registry-register-provider` |
+| `ctx.modelRegistry.registerProvider` | `ModelRegistry.registerProvider` | stand-in/partial `RuntimeModelRegistry.registerProvider`: config registration reaches the host; native callback providers remain process-local | implemented `ModelRegistry.RegisterProvider` | implemented `ModelRegistry::register_provider` | implemented `ModelRegistry.register_provider` | implemented `pig:registry-register-provider` |
 | `ctx.modelRegistry.unregisterProvider` | `ModelRegistry.unregisterProvider` | implemented `RuntimeModelRegistry.unregisterProvider` | implemented `ModelRegistry.UnregisterProvider` | implemented `ModelRegistry::unregister_provider` | implemented `ModelRegistry.unregister_provider` | implemented `pig:registry-unregister-provider` |
 | `ctx.modelRegistry.registerVirtualModel` | `ModelRegistry.registerVirtualModel` | implemented `RuntimeModelRegistry.registerVirtualModel` | implemented `ModelRegistry.RegisterVirtualModel` | implemented `ModelRegistry::register_virtual_model` | implemented `ModelRegistry.register_virtual_model` | implemented `pig:registry-register-virtual-model` |
 | `ctx.modelRegistry.unregisterVirtualModel` | `ModelRegistry.unregisterVirtualModel` | implemented `RuntimeModelRegistry.unregisterVirtualModel` | implemented `ModelRegistry.UnregisterVirtualModel` | implemented `ModelRegistry::unregister_virtual_model` | implemented `ModelRegistry.unregister_virtual_model` | implemented `pig:registry-unregister-virtual-model` |
@@ -1017,7 +1008,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | Surface | Pi declaration | Node runtime | Go | Rust | Python | Lisp |
 |---|---|---|---|---|---|---|
 | `ctx.newSession(options.parentSession)` | `ExtensionCommandContext.newSession(options.parentSession)` | implemented `RuntimeContext.newSession` | implemented `Context.NewSession` | implemented `Context::new_session` | implemented `Context.new_session` | implemented `pig:ctx-new-session` |
-| `ctx.newSession(options.setup)` | `ExtensionCommandContext.newSession(options.setup)` | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) |
+| `ctx.newSession(options.setup)` | `ExtensionCommandContext.newSession(options.setup)` | implemented `read:entry.callback` | implemented `SetupFunc` | implemented `Context::new_session_setup` | implemented `SetupSessionManager` | implemented `pig:ctx-new-session(setup)` |
 | `ctx.newSession(options.withSession)` | `ExtensionCommandContext.newSession(options.withSession)` | implemented `read:entry.callback` | implemented `WithSessionFunc` | implemented `Context::new_session_with` | implemented `ReplacedSessionContext` | implemented `pig:ctx-new-session(with-session)` |
 | `ctx.newSession → cancelled` | `ExtensionCommandContext.newSession → cancelled` | implemented `RuntimeContext.newSession` | implemented `CancelledResult.Cancelled` | implemented `Context::new_session` | implemented `Context.new_session` | implemented `pig:ctx-new-session` |
 
@@ -1098,7 +1089,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | Surface | Pi declaration | Node runtime | Go | Rust | Python | Lisp |
 |---|---|---|---|---|---|---|
 | `withSession ctx.sendUserMessage(options.deliverAs)` | `ReplacedSessionContext.sendUserMessage(options.deliverAs)` | implemented `read:context.sendUserMessage` | implemented `Context.SendUserMessage` | implemented `Context::send_user_message` | implemented `Context.send_user_message(deliver_as)` | implemented `pig:ctx-send-user-message(deliver-as)` |
-| `withSession ctx.sendUserMessage(options.expandPromptTemplates)` | `ReplacedSessionContext.sendUserMessage(options.expandPromptTemplates)` | missing (`read:context.sendUserMessage`: the host drops `expandPromptTemplates` (subprocess.SendUserMessageOptions)) [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) |
+| `withSession ctx.sendUserMessage(options.expandPromptTemplates)` | `ReplacedSessionContext.sendUserMessage(options.expandPromptTemplates)` | implemented `read:context.sendUserMessage` | implemented `Context.SendUserMessageWith` | implemented `Context::send_user_message_with` | implemented `Context.send_user_message(expand_prompt_templates)` | implemented `pig:ctx-send-user-message(expand-prompt-templates)` |
 
 ## ctx.ui (ExtensionUIContext)
 
@@ -1221,7 +1212,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 |---|---|---|---|---|---|---|
 | `ctx.ui.theme.name` | `Theme.name` | implemented `ThemeShim.name` | implemented `UITheme.Name` | implemented `Theme.name` | implemented `Theme.name` | implemented `pig:theme-name` |
 | `ctx.ui.theme.sourcePath` | `Theme.sourcePath` | implemented `ThemeShim.sourcePath` | implemented `UITheme.SourcePath` | implemented `Theme.source_path` | implemented `Theme.source_path` | implemented `pig:theme-source-path` |
-| `ctx.ui.theme.sourceInfo` | `Theme.sourceInfo` | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) |
+| `ctx.ui.theme.sourceInfo` | `Theme.sourceInfo` | implemented `ThemeShim.sourceInfo` | implemented `UITheme.SourceInfo` | implemented `Theme.source_info` | implemented `Theme.source_info` | implemented `pig:theme-source-info` |
 | `ctx.ui.theme.appearance` | `Theme.appearance` | implemented `ThemeShim.appearance` | implemented `UITheme.Appearance` | implemented `Theme::appearance` | implemented `Theme.appearance` | implemented `pig:theme-appearance` |
 | `ctx.ui.theme.colors` | `Theme.colors` | implemented `ThemeShim.colors` | implemented `UITheme.Colors` | implemented `Theme::colors` | implemented `Theme.colors` | implemented `pig:theme-colors` |
 | `ctx.ui.theme.style` | `Theme.style` | implemented `ThemeShim.style` | implemented `UITheme.Style` | implemented `Theme::style` | implemented `Theme.style` | implemented `pig:theme-style` |
@@ -1293,7 +1284,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `tool.defaultActive` | `ToolDefinition.defaultActive` | implemented `read:tool.defaultActive` | implemented `ToolDefinition.DefaultActive` | implemented `ToolDefinition.default_active` | implemented `ToolDefinition.default_active` | implemented `pig:register-tool(default-active)` |
 | `tool.prepareLoadout` | `ToolDefinition.prepareLoadout` | implemented `read:tool.prepareLoadout` | implemented `ToolDefinition.PrepareLoadout` | implemented `ToolDefinition.prepare_loadout` | implemented `ToolDefinition.prepare_loadout` | implemented `pig:register-tool(prepare-loadout)` |
 | `tool.executionMode` | `ToolDefinition.executionMode` | implemented `read:tool.executionMode` | implemented `ToolDefinition.ExecutionMode` | implemented `ToolDefinition.execution_mode` | implemented `ToolDefinition.execution_mode` | implemented `pig:register-tool(execution-mode)` |
-| `tool.execute` | `ToolDefinition.execute` | stand-in/partial `read:tool.execute`: the AbortSignal is the tool request's, aborted when the host cancels it | stand-in/partial `ToolDefinition.Execute`: params arrive as JSON; onUpdate is ctx.OnUpdate/on_update and the AbortSignal is the request's cancellation | stand-in/partial `ToolDefinition.execute`: params arrive as JSON; onUpdate is ctx.OnUpdate/on_update and the AbortSignal is the request's cancellation | stand-in/partial `ToolDefinition.execute`: params arrive as JSON; onUpdate is ctx.OnUpdate/on_update and the AbortSignal is the request's cancellation | stand-in/partial `pig:register-tool(execute)`: params arrive as JSON; onUpdate is ctx.OnUpdate/on_update and the AbortSignal is the request's cancellation |
+| `tool.execute` | `ToolDefinition.execute` | stand-in/partial `read:tool.execute`: the AbortSignal is the tool request's, aborted by the signal-only cancel, which cancels none of the tool's host calls; the ordinary cancel follows when D111's grace period ends | stand-in/partial `ToolDefinition.Execute`: params arrive as JSON; onUpdate is ctx.OnUpdate/on_update and the AbortSignal is the request's cancellation: the host aborts it with a signal-only cancel (CancelPayload.signal_only), which cancels none of the tool's host calls, as in Pi; only its nested executeTool calls take the abort, and the ordinary cancel follows when D111's grace period ends | stand-in/partial `ToolDefinition.execute`: params arrive as JSON; onUpdate is ctx.OnUpdate/on_update and the AbortSignal is the request's cancellation: the host aborts it with a signal-only cancel (CancelPayload.signal_only), which cancels none of the tool's host calls, as in Pi; only its nested executeTool calls take the abort, and the ordinary cancel follows when D111's grace period ends | stand-in/partial `ToolDefinition.execute`: params arrive as JSON; onUpdate is ctx.OnUpdate/on_update and the AbortSignal is the request's cancellation: the host aborts it with a signal-only cancel (CancelPayload.signal_only), which cancels none of the tool's host calls, as in Pi; only its nested executeTool calls take the abort, and the ordinary cancel follows when D111's grace period ends | stand-in/partial `pig:register-tool(execute)`: params arrive as JSON; onUpdate is ctx.OnUpdate/on_update and the AbortSignal is the request's cancellation: the host aborts it with a signal-only cancel (CancelPayload.signal_only), which cancels none of the tool's host calls, as in Pi; only its nested executeTool calls take the abort, and the ordinary cancel follows when D111's grace period ends |
 | `tool.renderCall` | `ToolDefinition.renderCall` | stand-in/partial `read:tool.renderCall`: the returned Component renders to lines inside the extension process | stand-in/partial `ToolDefinition.RenderCall`: returns lines at the requested width: a Pi Component cannot cross the process boundary | stand-in/partial `ToolDefinition.render_call`: returns lines at the requested width: a Pi Component cannot cross the process boundary | stand-in/partial `ToolDefinition.render_call`: returns lines at the requested width: a Pi Component cannot cross the process boundary | stand-in/partial `pig:register-tool(render-call)`: returns lines at the requested width: a Pi Component cannot cross the process boundary |
 | `tool.renderResult` | `ToolDefinition.renderResult` | stand-in/partial `read:tool.renderResult`: the returned Component renders to lines inside the extension process | stand-in/partial `ToolDefinition.RenderResult`: returns lines at the requested width: a Pi Component cannot cross the process boundary | stand-in/partial `ToolDefinition.render_result`: returns lines at the requested width: a Pi Component cannot cross the process boundary | stand-in/partial `ToolDefinition.render_result`: returns lines at the requested width: a Pi Component cannot cross the process boundary | stand-in/partial `pig:register-tool(render-result)`: returns lines at the requested width: a Pi Component cannot cross the process boundary |
 | `tool execute result.content` | `AgentToolResult.content` | implemented `read:result.content` | implemented `ToolResult.Content` | implemented `ToolResult::json` | implemented `Extension.tool` | implemented `pig:tool` |
@@ -1305,7 +1296,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `tool render context.args` | `ToolRenderContext.args` | implemented `read:payload.args` | implemented `ToolRenderContext.Args` | implemented `ToolRenderContext.args` | implemented `ToolRenderContext.args` | implemented `pig:tool-render-context-args` |
 | `tool render context.toolCallId` | `ToolRenderContext.toolCallId` | implemented `read:payload.context` | implemented `ToolRenderContext.ToolCallID` | implemented `ToolRenderContext.tool_call_id` | implemented `ToolRenderContext.tool_call_id` | implemented `pig:tool-render-context-tool-call-id` |
 | `tool render context.invalidate` | `ToolRenderContext.invalidate` | implemented `read:payload.card` | implemented `ToolRenderContext.Invalidate` | implemented `ToolRenderContext::invalidate` | implemented `ToolRenderContext.invalidate` | implemented `pig:tool-render-context-invalidate` |
-| `tool render context.lastComponent` | `ToolRenderContext.lastComponent` | stand-in/partial `read:card.state`: the component this card's renderer last returned, kept inside the extension process | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) |
+| `tool render context.lastComponent` | `ToolRenderContext.lastComponent` | implemented `read:card.state` | implemented `ToolRenderContext.LastComponent` | implemented `ToolRenderContext.last_component` | implemented `ToolRenderContext.last_component` | implemented `pig:tool-render-context-last-component` |
 | `tool render context.state` | `ToolRenderContext.state` | implemented `read:card.state` | implemented `ToolRenderContext.State` | implemented `ToolRenderContext.state` | implemented `ToolRenderContext.state` | implemented `pig:tool-render-context-state` |
 | `tool render context.cwd` | `ToolRenderContext.cwd` | implemented `read:payload.context` | implemented `ToolRenderContext.Cwd` | implemented `ToolRenderContext.cwd` | implemented `ToolRenderContext.cwd` | implemented `pig:tool-render-context-cwd` |
 | `tool render context.executionStarted` | `ToolRenderContext.executionStarted` | implemented `read:payload.context` | implemented `ToolRenderContext.ExecutionStarted` | implemented `ToolRenderContext.execution_started` | implemented `ToolRenderContext.execution_started` | implemented `pig:tool-render-context-execution-started` |
@@ -1314,7 +1305,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `tool render context.expanded` | `ToolRenderContext.expanded` | implemented `read:payload.context` | implemented `ToolRenderContext.Expanded` | implemented `ToolRenderContext.expanded` | implemented `ToolRenderContext.expanded` | implemented `pig:tool-render-context-expanded` |
 | `tool render context.showImages` | `ToolRenderContext.showImages` | implemented `read:payload.context` | implemented `ToolRenderContext.ShowImages` | implemented `ToolRenderContext.show_images` | implemented `ToolRenderContext.show_images` | implemented `pig:tool-render-context-show-images` |
 | `tool render context.isError` | `ToolRenderContext.isError` | implemented `read:payload.context` | implemented `ToolRenderContext.IsError` | implemented `ToolRenderContext.is_error` | implemented `ToolRenderContext.is_error` | implemented `pig:tool-render-context-is-error` |
-| `tool render context.durationMs` | `ToolRenderContext.durationMs` | missing [exception](#exceptions) | implemented `ToolRenderContext.DurationMs` | implemented `ToolRenderContext.duration_ms` | implemented `ToolRenderContext.duration_ms` | implemented `pig:tool-render-context-duration-ms` |
+| `tool render context.durationMs` | `ToolRenderContext.durationMs` | implemented `read:payload.context` | implemented `ToolRenderContext.DurationMs` | implemented `ToolRenderContext.duration_ms` | implemented `ToolRenderContext.duration_ms` | implemented `pig:tool-render-context-duration-ms` |
 | `tool render context.outputPad` | `ToolRenderContext.outputPad` | implemented `read:payload.context` | implemented `ToolRenderContext.OutputPad` | implemented `ToolRenderContext.output_pad` | implemented `ToolRenderContext.output_pad` | implemented `pig:tool-render-context-output-pad` |
 | `tool render context.keyText` | `ToolRenderContext.keyText` | implemented `read:payload.context` | implemented `ToolRenderContext.KeyText` | implemented `ToolRenderContext::key_text` | implemented `ToolRenderContext.key_text` | implemented `pig:tool-render-context-key-text` |
 | `tool render context.keyHint` | `ToolRenderContext.keyHint` | implemented `read:payload.context` | implemented `ToolRenderContext.KeyHint` | implemented `ToolRenderContext::key_hint` | implemented `ToolRenderContext.key_hint` | implemented `pig:tool-render-context-key-hint` |
@@ -1337,21 +1328,21 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `provider.baseUrl` | `ProviderConfig.baseUrl` | implemented `api.registerProvider` | implemented `Extension.RegisterProvider` | implemented `Extension::register_provider` | implemented `Extension.register_provider` | implemented `pig:register-provider` |
 | `provider.apiKey` | `ProviderConfig.apiKey` | implemented `api.registerProvider` | implemented `Extension.RegisterProvider` | implemented `Extension::register_provider` | implemented `Extension.register_provider` | implemented `pig:register-provider` |
 | `provider.api` | `ProviderConfig.api` | implemented `api.registerProvider` | implemented `Extension.RegisterProvider` | implemented `Extension::register_provider` | implemented `Extension.register_provider` | implemented `pig:register-provider` |
-| `provider.streamSimple` | `ProviderConfig.streamSimple` | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) |
+| `provider.streamSimple` | `ProviderConfig.streamSimple` | implemented `read:config.streamSimple` | implemented `ProviderStreamSimpleFunc` | implemented `ProviderOperations.stream_simple` | implemented `Extension.register_provider` | implemented `pig:register-provider` |
 | `provider.images` | `ProviderConfig.images` | implemented `read:config.images` | implemented `ProviderImagesFunc` | implemented `ProviderOperations.images` | implemented `Extension.register_provider` | implemented `pig:register-provider` |
 | `provider.classifiers` | `ProviderConfig.classifiers` | implemented `read:config.classifiers` | implemented `ProviderClassifyFunc` | implemented `ProviderOperations.classifiers` | implemented `Extension.register_provider` | implemented `pig:register-provider` |
 | `provider.headers` | `ProviderConfig.headers` | implemented `api.registerProvider` | implemented `Extension.RegisterProvider` | implemented `Extension::register_provider` | implemented `Extension.register_provider` | implemented `pig:register-provider` |
 | `provider.authHeader` | `ProviderConfig.authHeader` | implemented `api.registerProvider` | implemented `Extension.RegisterProvider` | implemented `Extension::register_provider` | implemented `Extension.register_provider` | implemented `pig:register-provider` |
 | `provider.models` | `ProviderConfig.models` | implemented `api.registerProvider` | implemented `Extension.RegisterProvider` | implemented `Extension::register_provider` | implemented `Extension.register_provider` | implemented `pig:register-provider` |
-| `provider.refreshModels` | `ProviderConfig.refreshModels` | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) |
+| `provider.refreshModels` | `ProviderConfig.refreshModels` | implemented `read:config.refreshModels` | implemented `ProviderRefreshModelsFunc` | implemented `ProviderOperations.refresh_models` | implemented `Extension.register_provider` | implemented `pig:register-provider` |
 | `provider.oauth` | `ProviderConfig.oauth` | implemented `api.registerProvider` | implemented `OAuthProvider` | implemented `Extension::register_oauth_provider` | implemented `Extension.register_oauth_provider` | implemented `pig:register-oauth-provider` |
 | `provider.oauth.name` | `ProviderConfig.oauth.name` | implemented `read:oauth.name` | implemented `OAuthProvider.Name` | implemented `OAuthProvider.name` | implemented `OAuthProvider.name` | implemented `pig:oauth-provider-name` |
 | `provider.oauth.isSubscription` | `ProviderConfig.oauth.isSubscription` | implemented `read:oauth.isSubscription` | implemented `OAuthProvider.IsSubscription` | implemented `OAuthProvider.is_subscription` | implemented `OAuthProvider.is_subscription` | implemented `pig:oauth-provider-is-subscription` |
-| `provider.oauth.usesCallbackServer` | `ProviderConfig.oauth.usesCallbackServer` | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) |
+| `provider.oauth.usesCallbackServer` | `ProviderConfig.oauth.usesCallbackServer` | implemented `read:oauth.usesCallbackServer` | implemented `OAuthProvider.UsesCallbackServer` | implemented `OAuthProvider.uses_callback_server` | implemented `OAuthProvider.uses_callback_server` | implemented `pig:oauth-provider-uses-callback-server` |
 | `provider.oauth.login` | `ProviderConfig.oauth.login` | implemented `read:oauth.login` | implemented `OAuthProvider.Login` | implemented `OAuthProvider.login` | implemented `OAuthProvider.login` | implemented `pig:oauth-provider-login` |
 | `provider.oauth.refreshToken` | `ProviderConfig.oauth.refreshToken` | implemented `read:oauth.refreshToken` | implemented `OAuthProvider.RefreshToken` | implemented `OAuthProvider.refresh_token` | implemented `OAuthProvider.refresh_token` | implemented `pig:oauth-provider-refresh-token` |
 | `provider.oauth.getApiKey` | `ProviderConfig.oauth.getApiKey` | implemented `read:oauth.getApiKey` | implemented `OAuthProvider.GetAPIKey` | implemented `OAuthProvider.get_api_key` | implemented `OAuthProvider.get_api_key` | implemented `pig:oauth-provider-get-api-key` |
-| `provider.oauth.modifyModels` | `ProviderConfig.oauth.modifyModels` | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) | missing [exception](#exceptions) |
+| `provider.oauth.modifyModels` | `ProviderConfig.oauth.modifyModels` | implemented `read:oauth.modifyModels` | implemented `OAuthProvider.ModifyModels` | implemented `OAuthProvider.modify_models` | implemented `OAuthProvider.modify_models` | implemented `pig:oauth-provider-modify-models` |
 | `provider model.type` | `ProviderModelConfig.type` | implemented `api.registerProvider` | implemented `Extension.RegisterProvider` | implemented `Extension::register_provider` | implemented `Extension.register_provider` | implemented `pig:register-provider` |
 | `provider model.api` | `ProviderModelConfig.api` | implemented `api.registerProvider` | implemented `Extension.RegisterProvider` | implemented `Extension::register_provider` | implemented `Extension.register_provider` | implemented `pig:register-provider` |
 | `provider model.reasoning` | `ProviderModelConfig.reasoning` | implemented `api.registerProvider` | implemented `Extension.RegisterProvider` | implemented `Extension::register_provider` | implemented `Extension.register_provider` | implemented `pig:register-provider` |
@@ -1421,6 +1412,10 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `kit tool renderResult(view)` | `a tool result card drawn from a view (spec §9)` | implemented `read:tool.renderResult` | implemented `ToolRenderers.ResultView` | implemented `ToolRendererSet.result_view` | implemented `ToolRenderers.result_view` | implemented `pig:register-tool(result-view)` |
 | `kit message renderer(view)` | `a custom message drawn from a view (spec §9)` | implemented `api.registerMessageRenderer` | implemented `Extension.MessageViewRenderer` | implemented `Extension::message_view_renderer` | implemented `Extension.message_view_renderer` | implemented `pig:message-view-renderer` |
 | `kit entry renderer(view)` | `a custom session entry drawn from a view (spec §9)` | implemented `api.registerEntryRenderer` | implemented `Extension.EntryViewRenderer` | implemented `Extension::entry_view_renderer` | implemented `Extension.entry_view_renderer` | implemented `pig:entry-view-renderer` |
+| `kit message renderer view event` | `the events of the mouse regions of a message renderer's view (Pi: the MouseRegion closure of the component the renderer returns)` | implemented `api.registerMessageRenderer` | implemented `Extension.MessageViewEvent` | implemented `Extension::message_view_event` | implemented `Extension.message_view_event` | implemented `pig:message-view-event` |
+| `kit entry renderer view event` | `the events of the mouse regions of an entry renderer's view (Pi: the MouseRegion closure of the component the renderer returns)` | implemented `api.registerEntryRenderer` | implemented `Extension.EntryViewEvent` | implemented `Extension::entry_view_event` | implemented `Extension.entry_view_event` | implemented `pig:entry-view-event` |
+| `kit message renderer state` | `the renderer state of one displayed message (Pi: the WeakMap a renderer keeps by message object)` | implemented `api.registerMessageRenderer` | implemented `MessageRenderOptions.State` | implemented `MessageRenderOptions.state` | implemented `MessageRenderOptions.state` | implemented `pig:message-render-options-state` |
+| `kit entry renderer state` | `the renderer state of one displayed entry (Pi: the WeakMap a renderer keeps by entry object)` | implemented `api.registerEntryRenderer` | implemented `EntryRenderOptions.State` | implemented `EntryRenderOptions.state` | implemented `MessageRenderOptions.state` | implemented `pig:entry-render-options-state` |
 | `kit lines list annotation` | `a lines node's frontend-only list (spec §2, §13.2)` | implemented `read:list.selectedIndex` | implemented `kit.Lines.List` | implemented `kit::List` | implemented `kit.List` | implemented `pig:kit-list` |
 
 ## Package exports: pi-coding-agent
@@ -1521,6 +1516,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `pi-coding-agent: AgentSessionRuntime.setBeforeSessionInvalidate` | `AgentSessionRuntime.setBeforeSessionInvalidate` | Pi's own code |
 | `pi-coding-agent: AgentSessionRuntime.setRebindSession` | `AgentSessionRuntime.setRebindSession` | Pi's own code |
 | `pi-coding-agent: AgentSessionRuntime.switchSession` | `AgentSessionRuntime.switchSession` | Pi's own code |
+| `pi-coding-agent: AgentSessionRuntime.takeUnreportedDiagnostics` | `AgentSessionRuntime.takeUnreportedDiagnostics` | Pi's own code |
 | `pi-coding-agent: ArminComponent` | `class ArminComponent` | Pi's own code |
 | `pi-coding-agent: ArminComponent.dispose` | `ArminComponent.dispose` | Pi's own code |
 | `pi-coding-agent: ArminComponent.invalidate` | `ArminComponent.invalidate` | Pi's own code |
@@ -1864,6 +1860,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `pi-coding-agent: ModelRuntime.removeRuntimeApiKey` | `ModelRuntime.removeRuntimeApiKey` | Pi's own code |
 | `pi-coding-agent: ModelRuntime.resolveModel` | `ModelRuntime.resolveModel` | Pi's own code |
 | `pi-coding-agent: ModelRuntime.setRuntimeApiKey` | `ModelRuntime.setRuntimeApiKey` | Pi's own code |
+| `pi-coding-agent: ModelRuntime.settleCredentialWrites` | `ModelRuntime.settleCredentialWrites` | Pi's own code |
 | `pi-coding-agent: ModelRuntime.stream` | `ModelRuntime.stream` | Pi's own code |
 | `pi-coding-agent: ModelRuntime.streamDeferred` | `ModelRuntime.streamDeferred` | Pi's own code |
 | `pi-coding-agent: ModelRuntime.streamSimple` | `ModelRuntime.streamSimple` | Pi's own code |
@@ -1887,6 +1884,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `pi-coding-agent: OAuthSelectorComponent.capturesViewportInput` | `OAuthSelectorComponent.capturesViewportInput` | Pi's own code |
 | `pi-coding-agent: OAuthSelectorComponent.children` | `OAuthSelectorComponent.children` | Pi's own code |
 | `pi-coding-agent: OAuthSelectorComponent.clear` | `OAuthSelectorComponent.clear` | Pi's own code |
+| `pi-coding-agent: OAuthSelectorComponent.dispose` | `OAuthSelectorComponent.dispose` | Pi's own code |
 | `pi-coding-agent: OAuthSelectorComponent.focused` | `OAuthSelectorComponent.focused` | Pi's own code |
 | `pi-coding-agent: OAuthSelectorComponent.handleInput` | `OAuthSelectorComponent.handleInput` | Pi's own code |
 | `pi-coding-agent: OAuthSelectorComponent.handleMouse` | `OAuthSelectorComponent.handleMouse` | Pi's own code |
@@ -2614,6 +2612,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `pi-tui: TuiAltScreen.setFocus` | `TuiAltScreen.setFocus` | Pi's own code |
 | `pi-tui: TuiAltScreen.setLayoutRoot` | `TuiAltScreen.setLayoutRoot` | Pi's own code |
 | `pi-tui: TuiAltScreen.setShowHardwareCursor` | `TuiAltScreen.setShowHardwareCursor` | Pi's own code |
+| `pi-tui: TuiAltScreen.setSuspendSignalHandler` | `TuiAltScreen.setSuspendSignalHandler` | Pi's own code |
 | `pi-tui: TuiAltScreen.setTerminalColorSchemeNotifications` | `TuiAltScreen.setTerminalColorSchemeNotifications` | Pi's own code |
 | `pi-tui: TuiAltScreen.setWheelScrollLines` | `TuiAltScreen.setWheelScrollLines` | Pi's own code |
 | `pi-tui: TuiAltScreen.showOverlay` | `TuiAltScreen.showOverlay` | Pi's own code |
@@ -2649,6 +2648,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `pi-tui: TuiMainScreen.setClearOnShrink` | `TuiMainScreen.setClearOnShrink` | Pi's own code |
 | `pi-tui: TuiMainScreen.setFocus` | `TuiMainScreen.setFocus` | Pi's own code |
 | `pi-tui: TuiMainScreen.setShowHardwareCursor` | `TuiMainScreen.setShowHardwareCursor` | Pi's own code |
+| `pi-tui: TuiMainScreen.setSuspendSignalHandler` | `TuiMainScreen.setSuspendSignalHandler` | Pi's own code |
 | `pi-tui: TuiMainScreen.setTerminalColorSchemeNotifications` | `TuiMainScreen.setTerminalColorSchemeNotifications` | Pi's own code |
 | `pi-tui: TuiMainScreen.showOverlay` | `TuiMainScreen.showOverlay` | Pi's own code |
 | `pi-tui: TuiMainScreen.start` | `TuiMainScreen.start` | Pi's own code |
@@ -2740,6 +2740,10 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `pi-ai: AssistantMessageEventStream.end` | `AssistantMessageEventStream.end` | Pi's own code |
 | `pi-ai: AssistantMessageEventStream.push` | `AssistantMessageEventStream.push` | Pi's own code |
 | `pi-ai: AssistantMessageEventStream.result` | `AssistantMessageEventStream.result` | Pi's own code |
+| `pi-ai: CACHE_WARMING_IDLE_CONTINUATION_PROBABILITY` | `variable CACHE_WARMING_IDLE_CONTINUATION_PROBABILITY` | bridged |
+| `pi-ai: CACHE_WARMING_MAX_AGE_MS` | `variable CACHE_WARMING_MAX_AGE_MS` | bridged |
+| `pi-ai: CACHE_WARMING_MAX_IDLE_AGE_MS` | `variable CACHE_WARMING_MAX_IDLE_AGE_MS` | bridged |
+| `pi-ai: CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS` | `variable CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS` | bridged |
 | `pi-ai: DEFAULT_MAX_AGENT_RETRY_DELAY_MS` | `variable DEFAULT_MAX_AGENT_RETRY_DELAY_MS` | bridged |
 | `pi-ai: EventStream` | `class EventStream` | Pi's own code |
 | `pi-ai: EventStream.[Symbol.asyncIterator]` | `EventStream.[Symbol.asyncIterator]` | Pi's own code |
@@ -2788,6 +2792,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `pi-ai: declarationsEqual` | `function declarationsEqual` | Pi's own code |
 | `pi-ai: defaultProviderAuthContext` | `function defaultProviderAuthContext` | Pi's own code |
 | `pi-ai: envApiKeyAuth` | `function envApiKeyAuth` | Pi's own code |
+| `pi-ai: evaluateCacheWarming` | `function evaluateCacheWarming` | Pi's own code |
 | `pi-ai: extractDiagnosticError` | `function extractDiagnosticError` | Pi's own code |
 | `pi-ai: fauxAssistantMessage` | `function fauxAssistantMessage` | Pi's own code |
 | `pi-ai: fauxProvider` | `function fauxProvider` | Pi's own code |
@@ -2797,6 +2802,8 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `pi-ai: formatThrownValue` | `function formatThrownValue` | Pi's own code |
 | `pi-ai: formatUserAgent` | `function formatUserAgent` | Pi's own code |
 | `pi-ai: getAttributionHeaders` | `function getAttributionHeaders` | Pi's own code |
+| `pi-ai: getCacheWarmingDelayMs` | `function getCacheWarmingDelayMs` | Pi's own code |
+| `pi-ai: getCacheWarmingRequestOptions` | `function getCacheWarmingRequestOptions` | Pi's own code |
 | `pi-ai: getClientVersion` | `function getClientVersion` | Pi's own code |
 | `pi-ai: getCurrentSystemMessage` | `function getCurrentSystemMessage` | Pi's own code |
 | `pi-ai: getCurrentSystemPrompt` | `function getCurrentSystemPrompt` | Pi's own code |
@@ -2807,12 +2814,14 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `pi-ai: getModelType` | `function getModelType` | Pi's own code |
 | `pi-ai: getOpenCodeSessionHeaders` | `function getOpenCodeSessionHeaders` | Pi's own code |
 | `pi-ai: getOverflowPatterns` | `function getOverflowPatterns` | Pi's own code |
+| `pi-ai: getPromptCacheTtlMs` | `function getPromptCacheTtlMs` | Pi's own code |
 | `pi-ai: getSupportedThinkingLevels` | `function getSupportedThinkingLevels` | Pi's own code |
 | `pi-ai: getSystemMessageText` | `function getSystemMessageText` | Pi's own code |
 | `pi-ai: getToolStateChanges` | `function getToolStateChanges` | Pi's own code |
 | `pi-ai: hasApi` | `function hasApi` | Pi's own code |
 | `pi-ai: hasNonAdditiveToolChanges` | `function hasNonAdditiveToolChanges` | Pi's own code |
 | `pi-ai: hasToolRedefinitions` | `function hasToolRedefinitions` | Pi's own code |
+| `pi-ai: isCacheWarmingReplayable` | `function isCacheWarmingReplayable` | Pi's own code |
 | `pi-ai: isContextOverflow` | `function isContextOverflow` | Pi's own code |
 | `pi-ai: isModelType` | `function isModelType` | Pi's own code |
 | `pi-ai: isRecoverableLength` | `function isRecoverableLength` | Pi's own code |
@@ -2858,6 +2867,10 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `pi-ai/compat: AssistantMessageEventStream.end` | `AssistantMessageEventStream.end` | Pi's own code |
 | `pi-ai/compat: AssistantMessageEventStream.push` | `AssistantMessageEventStream.push` | Pi's own code |
 | `pi-ai/compat: AssistantMessageEventStream.result` | `AssistantMessageEventStream.result` | Pi's own code |
+| `pi-ai/compat: CACHE_WARMING_IDLE_CONTINUATION_PROBABILITY` | `variable CACHE_WARMING_IDLE_CONTINUATION_PROBABILITY` | bridged |
+| `pi-ai/compat: CACHE_WARMING_MAX_AGE_MS` | `variable CACHE_WARMING_MAX_AGE_MS` | bridged |
+| `pi-ai/compat: CACHE_WARMING_MAX_IDLE_AGE_MS` | `variable CACHE_WARMING_MAX_IDLE_AGE_MS` | bridged |
+| `pi-ai/compat: CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS` | `variable CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS` | bridged |
 | `pi-ai/compat: DEFAULT_MAX_AGENT_RETRY_DELAY_MS` | `variable DEFAULT_MAX_AGENT_RETRY_DELAY_MS` | bridged |
 | `pi-ai/compat: EventStream` | `class EventStream` | Pi's own code |
 | `pi-ai/compat: EventStream.[Symbol.asyncIterator]` | `EventStream.[Symbol.asyncIterator]` | Pi's own code |
@@ -2911,6 +2924,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `pi-ai/compat: declarationsEqual` | `function declarationsEqual` | Pi's own code |
 | `pi-ai/compat: defaultProviderAuthContext` | `function defaultProviderAuthContext` | Pi's own code |
 | `pi-ai/compat: envApiKeyAuth` | `function envApiKeyAuth` | Pi's own code |
+| `pi-ai/compat: evaluateCacheWarming` | `function evaluateCacheWarming` | Pi's own code |
 | `pi-ai/compat: extractDiagnosticError` | `function extractDiagnosticError` | Pi's own code |
 | `pi-ai/compat: fauxAssistantMessage` | `function fauxAssistantMessage` | Pi's own code |
 | `pi-ai/compat: fauxProvider` | `function fauxProvider` | Pi's own code |
@@ -2925,6 +2939,8 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `pi-ai/compat: getApiProvider` | `function getApiProvider` | Pi's own code |
 | `pi-ai/compat: getApiProviders` | `function getApiProviders` | Pi's own code |
 | `pi-ai/compat: getAttributionHeaders` | `function getAttributionHeaders` | Pi's own code |
+| `pi-ai/compat: getCacheWarmingDelayMs` | `function getCacheWarmingDelayMs` | Pi's own code |
+| `pi-ai/compat: getCacheWarmingRequestOptions` | `function getCacheWarmingRequestOptions` | Pi's own code |
 | `pi-ai/compat: getClientVersion` | `function getClientVersion` | Pi's own code |
 | `pi-ai/compat: getCurrentSystemMessage` | `function getCurrentSystemMessage` | Pi's own code |
 | `pi-ai/compat: getCurrentSystemPrompt` | `function getCurrentSystemPrompt` | Pi's own code |
@@ -2942,6 +2958,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `pi-ai/compat: getModels` | `variable getModels` | Pi's own code |
 | `pi-ai/compat: getOpenCodeSessionHeaders` | `function getOpenCodeSessionHeaders` | Pi's own code |
 | `pi-ai/compat: getOverflowPatterns` | `function getOverflowPatterns` | Pi's own code |
+| `pi-ai/compat: getPromptCacheTtlMs` | `function getPromptCacheTtlMs` | Pi's own code |
 | `pi-ai/compat: getProviders` | `variable getProviders` | Pi's own code |
 | `pi-ai/compat: getSupportedThinkingLevels` | `function getSupportedThinkingLevels` | Pi's own code |
 | `pi-ai/compat: getSystemMessageText` | `function getSystemMessageText` | Pi's own code |
@@ -2951,6 +2968,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `pi-ai/compat: hasApi` | `function hasApi` | Pi's own code |
 | `pi-ai/compat: hasNonAdditiveToolChanges` | `function hasNonAdditiveToolChanges` | Pi's own code |
 | `pi-ai/compat: hasToolRedefinitions` | `function hasToolRedefinitions` | Pi's own code |
+| `pi-ai/compat: isCacheWarmingReplayable` | `function isCacheWarmingReplayable` | Pi's own code |
 | `pi-ai/compat: isContextOverflow` | `function isContextOverflow` | Pi's own code |
 | `pi-ai/compat: isModelType` | `function isModelType` | Pi's own code |
 | `pi-ai/compat: isRecoverableLength` | `function isRecoverableLength` | Pi's own code |
@@ -2982,6 +3000,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 | `pi-ai/compat: resolveTranscriptTools` | `function resolveTranscriptTools` | Pi's own code |
 | `pi-ai/compat: retryAssistantCall` | `function retryAssistantCall` | Pi's own code |
 | `pi-ai/compat: retryDelayMs` | `function retryDelayMs` | Pi's own code |
+| `pi-ai/compat: setBedrockProviderLoader` | `function setBedrockProviderLoader` | Pi's own code |
 | `pi-ai/compat: setBedrockProviderModule` | `function setBedrockProviderModule` | Pi's own code |
 | `pi-ai/compat: stream` | `function stream` | Pi's own code |
 | `pi-ai/compat: streamAnthropic` | `variable streamAnthropic` | Pi's own code |
@@ -3101,20 +3120,9 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`; `make sdk-surface-drift` 
 
 | Surface | Runtimes | Reason |
 |---|---|---|
-| `pi.sendUserMessage(options.expandPromptTemplates)` | Node runtime, Go, Rust, Python, Lisp | The host SendUserMessageOptions carries deliverAs only; expandPromptTemplates would be dropped. Requires host prompt-expansion control. |
-| `ctx.newSession(options.setup)` | Node runtime, Go, Rust, Python, Lisp | The wire has no writable replacement SessionManager callback handle. Requires replacement callback ownership in the Pi runner bridge (0.3.0), not JSON serialization of a function. |
-| `withSession ctx.sendUserMessage(options.expandPromptTemplates)` | Node runtime, Go, Rust, Python, Lisp | The host SendUserMessageOptions carries deliverAs only; expandPromptTemplates would be dropped. Requires host prompt-expansion control. |
-| `ctx.ui.theme.sourceInfo` | Node runtime, Go, Rust, Python, Lisp | The theme snapshot carries sourcePath but no SourceInfo. Requires theme resource provenance publication. |
-| `user_bash return.operations` | Node runtime, Go, Rust, Python, Lisp | The wire has no host-invoked streaming BashOperations executor callback. Returning a completed result works; operations requires callback/stream ownership. |
-| `tool render context.lastComponent` | Go, Rust, Python, Lisp | Native renderers return lines rather than Components (D56), so no previous component is returned. Card state persists separately in context.state/State. |
-| `provider.streamSimple` | Node runtime, Go, Rust, Python, Lisp | The host cannot invoke an extension-served provider EventStream. Requires provider callback and streaming transport, not the existing host-served modelStream direction. |
-| `provider.refreshModels` | Node runtime, Go, Rust, Python, Lisp | The provider bridge has no host-to-extension refreshModels request or publication callback handles. |
-| `provider.oauth.usesCallbackServer` | Node runtime, Go, Rust, Python, Lisp | Deprecated and ignored by upstream 0.99.2 canonical auth flows (core/extensions/types.ts); runtimes do not forward this inert legacy metadata. |
-| `provider.oauth.modifyModels` | Node runtime, Go, Rust, Python, Lisp | The host OAuth bridge has no credential-dependent modify-models callback request. |
 | `ctx.ui.setTheme → error` | Node runtime | Node returns synchronously before host theme validation, so it cannot report host errors. Requires synchronous validation/state acknowledgement rather than optimistic success. |
 | `pi-coding-agent: KeybindingsManager` | Node runtime | Pi's published root index.d.ts re-exports KeybindingsManager as a type only. Both actual runtime namespaces omit it (TestNodeCodingAgentTypeOnlyExportsMatchPi). |
 | `pi-coding-agent: KeybindingsManager.*` | Node runtime | Members of the type-only root re-export have no runtime receiver. Both Pi and PiG omit the value; the actual class remains in the private core/keybindings module. |
 | `pi-tui: StdinBuffer.[Symbol.captureRejectionSymbol]` | Node runtime | Inherited optional Node EventEmitter rejection hook. Pi's StdinBuffer does not install it; this declaration is not an implemented method in the Pi oracle either. |
-| `tool render context.durationMs` | Node runtime | New in Pi 1.1.0: the tool render context carries this member. Go, Rust and Python publish it; the Node runtime does not yet. Closed by porting the member through the Node runtime with a conformance row. |
 | `kit view events` | Node runtime | Node frames carry the lines Pi's components rendered, so every key reaches the runtime as ui.custom.input and Pi's SelectList and SettingsList handle it there: their onSelectionChange, onSelect and onChange callbacks are a Node author's events, as in Pi. The host never sends ui.view.event to Node. |
 | `kit event` | Node runtime | Node authors receive Pi's own SelectList and SettingsList callbacks (see kit view events); there is no event object to declare. |

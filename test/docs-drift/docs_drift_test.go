@@ -95,17 +95,20 @@ func TestDocumentedSlashCommandsExist(t *testing.T) {
 		"/sprite":    "PiG Standard piglogin extension",
 		"/review":    "example prompt template a user creates (prompt-templates.md)",
 		"/component": "example prompt template a user creates (prompt-templates.md)",
-		"/greet":     "command of the tour extension the reader writes in first-extension.md",
+		"/greet":     "command of the tour extension the reader writes in first-extension.md, and of the greeter extension in go-hot-reload.md",
+		"/locate":    "command of the asker extension the reader writes in event-bus.md",
 		"/ask":       "command of the tour extension the reader writes in first-extension.md",
 		// piglets/README.md and piglets/standard/README.md document the commands their Piglets register.
-		"/pig-porter":  "the porter Piglet's command (piglets/porter)",
-		"/angry-pigs":  "the PiG Standard game extension (piglets/standard)",
-		"/bun-runtime": "the PiG Standard Bun runtime extension (piglets/standard/extensions/bunruntime)",
-		"/aot-runtime": "the pig-aot Piglet's compiled-extensions runtime extension (piglets/aot/extensions/aotruntime)",
+		"/pig-porter":   "the porter Piglet's command (piglets/porter)",
+		"/angry-pigs":   "the PiG Standard game extension (piglets/standard)",
+		"/bun-runtime":  "the PiG Standard Bun runtime extension (piglets/standard/extensions/bunruntime)",
+		"/bolt-runtime": "the pig-bolt Piglet's compiled-extensions runtime extension (piglets/pig-bolt/extensions/boltruntime)",
 		// The bug ledger entry for tui.showOverlay names the commands of Pi's overlay QA example extension.
 		"/overlay-focus":     "Pi's overlay QA example extension (coding-agent examples/extensions/overlay-qa-tests.ts)",
 		"/overlay-passive":   "Pi's overlay QA example extension (coding-agent examples/extensions/overlay-qa-tests.ts)",
 		"/overlay-streaming": "Pi's overlay QA example extension (coding-agent examples/extensions/overlay-qa-tests.ts)",
+		// The bug ledger entry for the expandPromptTemplates option of sendUserMessage uses a prompt template a user would write as its example.
+		"/my-command": "example prompt template a user creates (bug ledger entry for sendUserMessage expandPromptTemplates)",
 	}
 	// Words in backticks that start with a slash and are paths, not commands.
 	paths := map[string]string{

@@ -19,17 +19,18 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	_ "embed"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
+
+	"github.com/MichaelKinsy/PiG/internal/zstdblob"
 )
 
 //go:embed legacy.txt
@@ -107,6 +108,14 @@ func abbreviate(s string) string {
 	return s
 }
 
+// dataOnlyModFile is the one file other than a fragment that dir may hold: the go.mod that keeps the directory out of the
+// root module zip (automation/release/modulesize). Nothing else is allowed besides the .md fragments.
+const dataOnlyModFile = "go.mod"
+
+func isDataOnlyModFile(entry fs.DirEntry) bool {
+	return entry.Name() == dataOnlyModFile && !entry.IsDir()
+}
+
 // load reads every fragment in dir. Fragments in the legacy list are exempt from the name and format rules; one that
 // does not parse is assembled under "### Unsorted". A legacy entry whose file is gone is a problem: the list only shrinks.
 // A missing dir holds no fragments: Git does not keep the directory a fold empties.
@@ -121,6 +130,9 @@ func load(dir string) ([]fragment, []error) {
 	var problems []error
 	for _, entry := range entries {
 		name := entry.Name()
+		if isDataOnlyModFile(entry) {
+			continue
+		}
 		if entry.IsDir() || !strings.HasSuffix(name, ".md") {
 			problems = append(problems, fmt.Errorf("%s: only .md fragments belong in %s", name, dir))
 			continue
@@ -190,11 +202,30 @@ func render(fragments []fragment) string {
 	return b.String()
 }
 
+// unreleasedEntries is the text under "## [Unreleased]" in changelog, empty when the section is empty or absent.
+func unreleasedEntries(changelog string) string {
+	const heading = "## [Unreleased]\n"
+	_, after, ok := strings.Cut(changelog, heading)
+	if !ok {
+		return ""
+	}
+	body := after
+	if next := strings.Index(body, "\n## ["); next >= 0 {
+		body = body[:next]
+	}
+	return strings.TrimSpace(body)
+}
+
 // fold appends the bullets of fragments to the sections of the "## [<version>]" release in changelog, in the order of
 // sections; a release heading "Upgrading from <previous>" is the Upgrading section. A section the release lacks is added
 // after the sections that precede it in that order; other headings keep their place. A fragment without sections cannot
-// be placed and stops the fold.
+// be placed and stops the fold. So does an entry under "## [Unreleased]": the fold moves fragments only, and an entry
+// left there is missing from the release (`make set-version ... SET_VERSION_ARGS=--move-unreleased` moves it). Unreleased is
+// not a fold target: its fragments are assembled by `make changelog-unreleased` and are never written to CHANGELOG.md.
 func fold(changelog string, fragments []fragment, version string) (string, error) {
+	if version == "Unreleased" {
+		return "", errors.New("\"Unreleased\" is not a release: changelog-fold appends fragments to a release heading (make set-version VERSION=x.y.z creates it); make changelog-unreleased prints the fragments' assembly")
+	}
 	var unsorted []string
 	for _, f := range fragments {
 		if f.unsorted != "" {
@@ -215,6 +246,9 @@ func fold(changelog string, fragments []fragment, version string) (string, error
 	heading := regexp.MustCompile(`(?m)^## \[` + regexp.QuoteMeta(version) + `\]( - .*)?\n`).FindStringIndex(changelog)
 	if heading == nil {
 		return "", fmt.Errorf("CHANGELOG.md has no \"## [%s]\" heading", version)
+	}
+	if entries := unreleasedEntries(changelog); entries != "" {
+		return "", fmt.Errorf("CHANGELOG.md still has entries under \"## [Unreleased]\"; the release would not carry them. Run make set-version VERSION=%s SET_VERSION_ARGS=--move-unreleased (add --release-modules on a release branch) first:\n%s", version, entries)
 	}
 	start := heading[1]
 	end := len(changelog)
@@ -317,7 +351,7 @@ func foldInto(dir, changelogPath, legacyPath, recordsPath, version string, fragm
 	if err := os.WriteFile(changelogPath, []byte(out), 0o644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(changelogPath+".gz", gzipChangelog([]byte(out)), 0o644); err != nil {
+	if err := writeChangelogFrame(changelogPath, []byte(out)); err != nil {
 		return err
 	}
 	folded := map[string]bool{}
@@ -344,10 +378,23 @@ func foldInto(dir, changelogPath, legacyPath, recordsPath, version string, fragm
 	if err := os.WriteFile(legacyPath, []byte(text), 0o644); err != nil {
 		return err
 	}
-	if left, err := os.ReadDir(dir); err != nil && !errors.Is(err, fs.ErrNotExist) || len(left) > 0 {
+	left, err := os.ReadDir(dir)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	return dropRecordEntryFile(recordsPath, filepath.ToSlash(dir)+"/")
+	if slices.ContainsFunc(left, func(entry fs.DirEntry) bool { return !isDataOnlyModFile(entry) }) {
+		return nil
+	}
+	prefix := filepath.ToSlash(dir) + "/"
+	if err := dropRecordEntryFile(recordsPath, prefix); err != nil {
+		return err
+	}
+	for _, f := range fragments {
+		if err := dropRecordEntryFile(recordsPath, prefix+f.name); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func run(args []string, stdout *os.File) error {
@@ -376,7 +423,7 @@ func run(args []string, stdout *os.File) error {
 		return fmt.Errorf("%s", strings.Join(msg, "\n"))
 	}
 	if check {
-		if err := checkChangelogGzip("CHANGELOG.md"); err != nil {
+		if err := checkChangelogFrame("CHANGELOG.md"); err != nil {
 			return err
 		}
 	}
@@ -397,33 +444,32 @@ func main() {
 	}
 }
 
-// gzipChangelog is the embedded form of CHANGELOG.md (embed.go): best compression, no name or mtime, so it is deterministic.
-func gzipChangelog(text []byte) []byte {
-	var buf bytes.Buffer
-	w, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
-	_, _ = w.Write(text)
-	_ = w.Close()
-	return buf.Bytes()
+// writeChangelogFrame writes the embedded form of CHANGELOG.md (embed.go), one zstd frame, beside path. A frame that already decodes to text stays as it is.
+func writeChangelogFrame(path string, text []byte) error {
+	existing, err := os.ReadFile(path + ".zst")
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return os.WriteFile(path+".zst", zstdblob.Reuse(existing, text), 0o644)
 }
 
-// checkChangelogGzip fails when path+".gz", which the binary embeds, does not inflate to exactly path.
-func checkChangelogGzip(path string) error {
-	fix := "run: gzip -9nc " + path + " > " + path + ".gz"
+// checkChangelogFrame fails when path+".zst", which the binary embeds, does not decode to exactly path.
+func checkChangelogFrame(path string) error {
+	fix := "run: go run ./automation/gen/zstdfile " + path + " " + path + ".zst"
 	want, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	data, err := os.ReadFile(path + ".gz")
+	data, err := os.ReadFile(path + ".zst")
 	if err != nil {
-		return fmt.Errorf("%s.gz: %w; %s", path, err, fix)
+		return fmt.Errorf("%s.zst: %w; %s", path, err, fix)
 	}
-	r, err := gzip.NewReader(bytes.NewReader(data))
+	got, err := zstdblob.Decode(data)
 	if err != nil {
-		return fmt.Errorf("%s.gz is not gzip: %w; %s", path, err, fix)
+		return fmt.Errorf("%s.zst is not a zstd frame: %w; %s", path, err, fix)
 	}
-	got, err := io.ReadAll(r)
-	if err != nil || !bytes.Equal(got, want) {
-		return fmt.Errorf("%s.gz does not inflate to exactly %s; %s", path, path, fix)
+	if !bytes.Equal(got, want) {
+		return fmt.Errorf("%s.zst does not decode to exactly %s; %s", path, path, fix)
 	}
 	return nil
 }

@@ -695,6 +695,48 @@ def ctx_json(value):
     return _json_stringify(value)
 
 
+def dynamic_modify_models(models, creds):
+    # The models without the "drop" id, in reverse order, each named after the credential's access token.
+    if creds.access == "boom":
+        raise RuntimeError("modify boom")
+    return [{**model, "name": model["name"] + "+" + creds.access} for model in reversed(models) if model["id"] != "drop"]
+
+
+def dynamic_refresh_models(context):
+    access = None if context.credential is None else context.credential.get("access")
+    if access == "boom":
+        raise RuntimeError("refresh boom")
+    context.publish(pig_sdk.ModelsPublication(persist={"models": [], "checkedAt": 99}))
+    state = {"updated": False}
+
+    def update():
+        state["updated"] = True
+
+    accepted = context.publish(pig_sdk.ModelsPublication(update=update))
+
+    def shown(value):
+        return "none" if value is None else str(value).lower() if isinstance(value, bool) else str(value)
+
+    stored = None if context.stored is None else context.stored.get("checkedAt")
+    name = "refresh|net=%s|force=%s|cred=%s|stored=%s|base=%s|updated=%s|accepted=%s" % (
+        shown(context.allow_network), shown(context.force), shown(access), shown(stored), shown(context.base_url), shown(state["updated"]), shown(accepted))
+    return [{"id": "r1", "name": name, "api": "dyn-api", "reasoning": False, "input": ["text"], "cost": ZERO, "contextWindow": 1000, "maxTokens": 100}]
+
+
+def register_dynamic_provider(ext):
+    # The provider "dyn": usesCallbackServer, oauth.modifyModels and refreshModels (types.ts:1930, 2026, 2034); the Go, Node, Rust and Lisp fixtures register the same provider.
+    # Declared twice while the factory runs, as Pi queues every registerProvider call and the registry merges them: the models and refreshModels first, the OAuth capability second.
+    ext.register_provider("dyn", {
+        "api": "dyn-api", "baseUrl": "https://dyn.test/v1", "apiKey": "dyn-key",
+        "models": [{"id": "a", "name": "A", "reasoning": False, "input": ["text"], "cost": ZERO, "contextWindow": 1000, "maxTokens": 100}],
+        "refreshModels": dynamic_refresh_models,
+    })
+    ext.register_oauth_provider("dyn", {}, pig_sdk.OAuthProvider(
+        name="Dynamic OAuth", login=lambda callbacks: pig_sdk.OAuthCredentials(access="login"),
+        refresh_token=lambda creds: creds, get_api_key=lambda creds: creds.access,
+        modify_models=dynamic_modify_models, uses_callback_server=True,
+    ))
+
 def new_extension():
     ext = pig_sdk.Extension("model-types")
     ext.register_provider("ops", {
@@ -706,6 +748,7 @@ def new_extension():
         "images": {"test-images": image_impl},
         "classifiers": {"test-classifier": classify_impl},
     })
+    register_dynamic_provider(ext)
     ext.register_provider(pig_sdk.Provider(
         id="pixels", name="Pixels",
         auth=pig_sdk.ProviderAuth(api_key=pig_sdk.APIKeyAuth(name="Pixels key", resolve=lambda _input: pig_sdk.AuthResult(auth={"apiKey": "pixels-key"}))),
@@ -802,6 +845,14 @@ def new_extension():
             registry.unregister_provider("late")
         return json.dumps({"mode": args.get("mode")})
 
+    def insecure_provider(ctx, args):
+        registry = ctx.model_registry
+        registry.register_provider("tls", {"baseUrl": "https://tls.test/v1", "insecure": True})
+        registry.register_provider("tls", {"insecure": False})
+        registry.register_provider("tls", {"baseUrl": "https://tls.test/v2"})
+        registry.register_provider("tls", {"insecure": True})
+        return json.dumps({"registered": 4})
+
     def tui_probe(ctx, args):
         from pig_sdk import tui
 
@@ -857,7 +908,7 @@ def new_extension():
         report["swapped"] = swapped
         return json.dumps(report)
 
-    for name, handler in (("late_provider", late_provider), ("typed_reads", typed_reads), ("classify_probe", classify_probe), ("images_probe", images_probe), ("virtual_probe", virtual_probe), ("virtual_visible", virtual_visible), ("theme_probe", theme_probe), ("tui_probe", tui_probe), ("tui_theme_probe", tui_theme_probe), ("ops_status", lambda ctx, args: json.dumps({"cancelled": CANCELLED["n"]}))):
+    for name, handler in (("late_provider", late_provider), ("insecure_provider", insecure_provider), ("typed_reads", typed_reads), ("classify_probe", classify_probe), ("images_probe", images_probe), ("virtual_probe", virtual_probe), ("virtual_visible", virtual_visible), ("theme_probe", theme_probe), ("tui_probe", tui_probe), ("tui_theme_probe", tui_theme_probe), ("ops_status", lambda ctx, args: json.dumps({"cancelled": CANCELLED["n"]}))):
         ext.register_tool(pig_sdk.ToolDefinition(name=name, label=name, description=name, parameters={"type": "object"}, execute=handler))
     register_host_surface(ext)
     return ext

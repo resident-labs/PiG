@@ -2,12 +2,12 @@ package cli
 
 import (
 	"context"
-	"slices"
 
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
 )
 
 // interactiveRuntime adapts *coding.Runtime to the Session replacement contract of InteractiveMode.
@@ -47,6 +47,30 @@ func (r interactiveRuntime) ExtensionCommandActions(session codingagent.Interact
 
 func (r interactiveRuntime) EmitQuitShutdown() { r.rt.EmitQuitShutdown() }
 
+// EmitQuitShutdownAfterStop is the dispose of the quit by keys, which runs after the TUI stopped (Pi: this.stop(), then `await this.runtimeHost.dispose()`, interactive-mode.ts shutdown).
+func (r interactiveRuntime) EmitQuitShutdownAfterStop() {
+	r.rt.EmitQuitShutdownAfterInputEnd(func() { exitAtDrainedQuit(r.rt.Session()) })
+}
+
+// exitAtDrainedQuit ends the process as Pi's ends when its event loop empties under the pending dispose of a quit: status 0, with no session_shutdown and no resume hint (the dispose never returns).
+// pig additive (D19): Pi's extensions end with its process. Here the Session stops persisting first, because ending the extension processes fails the pending request with an error of the host's own, which Pi's process never produces; then the extension hosts end by their normal shutdown (stopStartupExtensions, the close main defers), and TerminateProcesses ends what a replaced Session's host still runs, as the RPC exit does.
+func exitAtDrainedQuit(session *coding.Session) {
+	// The report arrives on a goroutine of the extension host, which the host's shutdown joins, so the exit runs apart from it.
+	go func() { //portlint:allow golifetime the goroutine ends in the process exit (exitProcess), as Pi's loop-drain exit ends the process
+		session.Dispose()
+		stopStartupExtensions()
+		if host := session.ExtensionHost(); host != nil {
+			host.TerminateProcesses()
+		}
+		// Pi interactive-mode.ts:4569-4571 (31b407dc63, #11889) kills tracked detached shells right before process.exit:
+		// a drained quit skips InteractiveMode.Stop, so a running `!` command would otherwise outlive exitProcess(0).
+		tools.KillTrackedDetachedChildren()
+		exitProcess(0)
+	}()
+}
+
+func (r interactiveRuntime) SetBeforeQuitDispose(settle func()) { r.rt.SetBeforeQuitDispose(settle) }
+
 func (r interactiveRuntime) SetBeforeSessionReplacement(drain func(context.Context) error) {
 	r.rt.SetBeforeSessionReplacement(drain)
 }
@@ -57,6 +81,10 @@ func (r interactiveRuntime) SetBeforeSessionInvalidate(hook func()) {
 
 func (r interactiveRuntime) SetRebindSession(rebind func(context.Context, codingagent.InteractiveSessionHandle) error) {
 	r.rt.SetRebindSession(func(ctx context.Context, session *coding.Session) error { return rebind(ctx, session) })
+}
+
+func (r interactiveRuntime) TakeUnreportedDiagnostics() []codingagent.AgentSessionRuntimeDiagnostic {
+	return r.rt.TakeUnreportedDiagnostics()
 }
 
 // interactiveStart is the Session start options of an interactive build.
@@ -91,7 +119,7 @@ func (b *cliRuntimeBuilder) interactiveInputs(build *cliBuild, startup coding.Se
 	start.CWDOverride = startup.CWDOverride
 	return cliSessionInputs{
 		Services: build.Services, Extensions: build.Extensions, Start: start, Host: build.Host, Bridge: build.Bridge, Runtime: build.Runtime,
-		Diagnostics:          codingagent.DeduplicateDiagnostics(slices.Concat(build.StartupDiagnostics, build.ExtensionDiagnostics)),
+		Diagnostics:          build.runtimeDiagnostics(),
 		ModelFallbackMessage: build.ModelFallbackMessage,
 		Invalidate: func(message string) {
 			if build.Host != nil {
@@ -140,9 +168,12 @@ func (b *cliRuntimeBuilder) interactiveReplacement(build *cliBuild, session *cod
 		ExtensionRunner:         session.ExtensionRunner(),
 		SessionStartEvent:       session.StartEvent(),
 		ExtensionConflicts:      codingagent.DetectExtensionConflicts(build.Extensions),
+		ExtensionWarnings:       build.ExtensionWarnings,
 		BuiltinExtensions:       build.BuiltinExtensions,
 		ExplicitBuiltinPaths:    build.ExplicitBuiltinPaths,
 		ReloadBuiltinExtensions: build.ReloadBuiltinExtensions,
+		ModelBuilder:            func(spec string) (*ai.Model, error) { return coding.BuildModel(spec, services) },
+		ModelBinder:             session.ModelRuntime().BindModelObject,
 		ModelLookup:             session.ModelRuntime().GetModel,
 		ModelCatalog:            session.ModelRuntime().GetModels,
 		ModelClassify:           session.ModelRuntime().Classify,

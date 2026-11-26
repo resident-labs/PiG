@@ -68,6 +68,11 @@ func TestMainScreenFramesMatchPiOracle(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(ResetCapabilitiesCache)
+	// The generator runs in a fresh Node process that registers no Kitty image, so getMaxKittyImageRows is 0 there and an overlay hides
+	// no image whose line is above the viewport (hideImagesUnderOverlay). Start from that empty registry, not from the rows earlier tests
+	// registered, and leave none behind.
+	resetKittyRegistry(t)
+	t.Cleanup(func() { resetKittyRegistry(t) })
 	// A step that overflows writes pi-tui-crash.log; keep it out of the shared temporary directory. The comparison checks only the message prefix.
 	logDir := t.TempDir()
 	failures := 0
@@ -268,12 +273,12 @@ func TestMainScreenFixtureIsCurrent(t *testing.T) {
 	}
 }
 
-// piOracleCommand runs a Pi oracle script with its own temporary directory. Pi writes pi-tui-crash.log to os.tmpdir() when a
+// piOracleCommand runs a Pi oracle script with one argument (the Pi dist path or the pinned version) and its own temporary directory. Pi writes pi-tui-crash.log to os.tmpdir() when a
 // replayed scenario overflows, so the shared one would keep it (CI test-fast assert-clean-tmp). Node reads TMPDIR, and TEMP or TMP on Windows.
-func piOracleCommand(t *testing.T, script, dist string) *exec.Cmd {
+func piOracleCommand(t *testing.T, script, arg string) *exec.Cmd {
 	t.Helper()
 	tmp := t.TempDir()
-	cmd := exec.CommandContext(t.Context(), "node", script, dist)
+	cmd := exec.CommandContext(t.Context(), "node", script, arg)
 	cmd.Env = append(os.Environ(), "TMPDIR="+tmp, "TEMP="+tmp, "TMP="+tmp)
 	return cmd
 }

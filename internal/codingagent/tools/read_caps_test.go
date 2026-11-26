@@ -1,12 +1,16 @@
 package tools
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
 func TestReadConfiguredOutputCaps(t *testing.T) {
-	tool := CreateReadTool(t.TempDir(), &ReadToolOptions{MaxLines: 2, MaxBytes: 8})
+	dir := t.TempDir()
+	tool := CreateReadTool(dir, &ReadToolOptions{MaxLines: 2, MaxBytes: 8})
 	if got := tool.Schema().Description; !strings.Contains(got, "2 lines or 8B") {
 		t.Fatalf("unexpected description: %q", got)
 	}
@@ -23,7 +27,18 @@ func TestReadConfiguredOutputCaps(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := tool.readTextResult(readParams{Path: "note.txt", Offset: tc.offset}, []byte(tc.file))
 			if err != nil || got.Text() != tc.want {
-				t.Fatalf("got %q, %v; want %q", got.Text(), err, tc.want)
+				t.Fatalf("whole file got %q, %v; want %q", got.Text(), err, tc.want)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "note.txt"), []byte(tc.file), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			offset := 0.0
+			if tc.offset != nil {
+				offset = *tc.offset
+			}
+			got, err = tool.Execute(t.Context(), "", []byte(fmt.Sprintf(`{"path":"note.txt","offset":%g}`, offset)), nil)
+			if err != nil || got.IsError || got.Text() != tc.want {
+				t.Fatalf("streamed file got %q, %v; want %q", got.Text(), err, tc.want)
 			}
 		})
 	}

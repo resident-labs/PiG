@@ -17,7 +17,7 @@ func TestConformance_LanguageFromPathAgreesAcrossSDKs(t *testing.T) {
 	t.Parallel()
 
 	var paths []string
-	for _, extension := range []string{"ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "rb", "rs", "go", "java", "kt", "swift", "c", "h", "cpp", "cc", "cxx", "hpp", "cs", "php", "sh", "bash", "zsh", "fish", "ps1", "sql", "html", "htm", "css", "scss", "sass", "less", "json", "yaml", "yml", "toml", "xml", "md", "markdown", "dockerfile", "makefile", "cmake", "lua", "perl", "r", "scala", "clj", "ex", "exs", "erl", "hs", "ml", "vim", "graphql", "proto", "tf", "hcl"} {
+	for _, extension := range []string{"ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "rb", "rs", "go", "java", "kt", "swift", "dart", "groovy", "gradle", "nix", "c", "h", "cpp", "cc", "cxx", "hpp", "cs", "php", "sh", "bash", "zsh", "fish", "ps1", "sql", "html", "htm", "css", "scss", "sass", "less", "json", "yaml", "yml", "toml", "xml", "md", "markdown", "dockerfile", "makefile", "cmake", "lua", "perl", "r", "scala", "clj", "ex", "exs", "erl", "hs", "ml", "vim", "graphql", "proto", "tf", "hcl"} {
 		paths = append(paths, "file."+extension, "dir/FILE."+strings.ToUpper(extension), "a.b."+strings.ToUpper(extension[:1])+extension[1:], extension)
 	}
 	paths = append(paths, "", ".", "x.", ".ts", "file", "Dockerfile", "Makefile", "dir.d/Makefile", "a.b/c.ts", "a.ts/b", "noext", "x.unknown", "x.TSX", "x. ts", "x.ts ", "x.t\u015f", "x.\u0130", "x.\u212a", "x.v\u0130m", "x.\u212at", "日本語.py", "a\\b.go", "x.constructorless", "x..ts", "...", "x.tS")
@@ -29,13 +29,13 @@ func TestConformance_LanguageFromPathAgreesAcrossSDKs(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		before := len(*h.notify)
+		before := len(h.ui.Recorded())
 		if !h.runner.ExecuteCommand(context.Background(), "language_probe", string(args)) {
 			t.Fatal("fixture has no language_probe command")
 		}
 		var reported string
 		pollUntilConformance(t, "language_probe: no report", func() bool {
-			for _, n := range (*h.notify)[before:] {
+			for _, n := range h.ui.Recorded()[before:] {
 				if rest, ok := strings.CutPrefix(n, "language:"); ok {
 					reported = strings.TrimSuffix(strings.TrimSuffix(rest, ":info"), ":end")
 					return true

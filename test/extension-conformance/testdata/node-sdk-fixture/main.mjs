@@ -1,18 +1,60 @@
+import { connect as ioWaitConnect } from "node:net";
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import zlib from "node:zlib";
+import { Readable } from "node:stream";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import * as piAi from "@earendil-works/pi-ai";
+import { Value } from "typebox/value";
 import { join as joinPath } from "node:path";
 import * as piTui from "@earendil-works/pi-tui";
 import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 const { Container } = piTui;
+
+// Pi's waitForChildProcess releases the pipes of a shell that exited once they have been quiet for EXIT_STDIO_GRACE_MS (100 ms), a wall-clock timer that a writer's
+// CPU-bound gap between lines can outrun on a loaded host (the command then ends normally instead of at its deadline). The shell-exit cases need the writer to hold the
+// pipes until the deadline, so that one timer, set by Pi's armIdleTimer, never fires, as the host's own grace never elapses in the same cases (Pi's #5303 test uses
+// virtual time for it). Every other timer is untouched.
+// stdioGraceHolds counts the timers held, so a shell-exit case that holds none (a pin that renames armIdleTimer, changes the delay or loses the frame name) fails
+// loudly instead of going back to racing the wall clock.
+let stdioGraceHolds = 0;
+{
+  const wallClockSetTimeout = globalThis.setTimeout;
+  const longest = 2 ** 31 - 1;
+  globalThis.setTimeout = function setTimeout(callback, delay, ...rest) {
+    if (delay === 100 && typeof callback === "function" && new Error().stack.includes("armIdleTimer")) {
+      stdioGraceHolds++;
+      return wallClockSetTimeout(callback, longest, ...rest);
+    }
+    return wallClockSetTimeout(callback, delay, ...rest);
+  };
+}
 import {
   createBashToolDefinition, createGrepToolDefinition, createLsToolDefinition, createReadToolDefinition, CONFIG_DIR_NAME, isToolCallEventType, CustomEditor, getAgentDir, getPackageDir, getShellConfig, generateDiffString, generateUnifiedPatch, sessionEntryToContextMessages, buildSessionContext, convertToPng, resizeImage, readStoredCredential, VERSION, formatSize, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES, truncateHead, truncateLine, truncateTail, withFileMutationQueue, isBashToolResult, isEditToolResult, isFindToolResult, isGrepToolResult, isLsToolResult, isPowerShellToolResult, isReadToolResult, isWriteToolResult,
   getMarkdownTheme, getSelectListTheme, getSettingsListTheme, renderDiff,
 } from "@earendil-works/pi-coding-agent";
 
+// stringifyEventPayload is JSON.stringify of an event payload, a Set written as its array. A replacer function makes JSON.stringify run out of V8 stack at a lower depth than
+// plain JSON.stringify (nested arrays fail from 2500 levels with one, from 4400 without), so the replacer is used only when the payload holds a Set (found without recursion).
+function stringifyEventPayload(event) {
+  const seen = new Set();
+  const pending = [event];
+  let hasSet = false;
+  while (pending.length > 0 && !hasSet) {
+    const value = pending.pop();
+    if (value instanceof Set) hasSet = true;
+    else if (value !== null && typeof value === "object" && !seen.has(value)) {
+      seen.add(value);
+      for (const member of Object.values(value)) pending.push(member);
+    }
+  }
+  return hasSet ? JSON.stringify(event, (_key, value) => (value instanceof Set ? [...value] : value)) : JSON.stringify(event);
+}
+// D232: a module-level counter the factory increments; every generation in one Node process shares it.
+let processFactoryCalls = 0;
 export default function (pi) {
   pi.ownThinkingRuns(true);
+  processFactoryCalls++;
   // factoryAgentDir is getAgentDir() while the factory runs, where Pi's extensions call it (TestConformance_HostConfigurationAgreesAcrossSDKs).
   const factoryAgentDir = getAgentDir();
   let schemaRejected = false;
@@ -49,12 +91,23 @@ export default function (pi) {
     const checked = (tag, check) => (value) => { log.push(`check:${tag}`); return check(value); };
     const worded = (tag, message) => (value) => { log.push(`error:${tag}`); return message(value); };
     const equals = (tag, want) => Type.Refine(Type.String(), checked(tag, (v) => v === want), worded(`${tag}m`, () => `not ${want}`));
-    pi.registerTool({ name: "refine-probe", description: "Arguments checked by refinements", parameters: Type.Refine(Type.Object({
+    const probe = Type.Refine(Type.Object({
       name: Type.Refine(Type.String(), checked("len", (v) => v.length >= 3), worded("lenmsg", () => "name is too short")),
       qty: Type.Optional(Type.Refine(Type.Integer(), checked("even", (v) => v % 2 === 0), worded("evenmsg", (v) => `qty must be even, got ${v}`))),
       pick: Type.Union([equals("u1", "a"), equals("u2", "b")]),
       boom: Type.Optional(Type.Refine(Type.String(), checked("boom", () => { throw new Error("kaboom"); }))),
-    }), checked("root", () => true), worded("rootmsg", () => "root refused")), execute: async () => ({ content: [{ type: "text", text: "ok" }] }) });
+    }), checked("root", () => true), worded("rootmsg", () => "root refused"));
+    pi.registerTool({ name: "refine-probe", description: "Arguments checked by refinements", parameters: probe, execute: async () => ({ content: [{ type: "text", text: "ok" }] }) });
+    // refine_value (TestConformance_RefinedValueRunsRefinements): TypeBox's own Value.Check and Value.Errors of the same schema, with the calls they made.
+    pi.registerCommand("refine_value", { description: "Run Value.Check or Value.Errors on the refine-probe schema", handler: async (args, ctx) => {
+      const { mode, value } = JSON.parse(args);
+      let report;
+      try {
+        const result = mode === "cycle" ? Value.Check(Type.Unsafe({ $ref: "#" }), 1) : mode === "check" ? Value.Check(probe, value) : [...Value.Errors(probe, value)].map((e) => ({ keyword: e.keyword, schemaPath: e.schemaPath, instancePath: e.instancePath, params: e.params, message: e.message }));
+        report = { result, calls: log.splice(0) };
+      } catch (error) { report = { thrown: String(error && error.message), calls: log.splice(0) }; }
+      ctx.ui.notify(`refine_value:${JSON.stringify(report)}:end`, "info");
+    } });
     pi.registerCommand("refine_log", { description: "Report and clear the refinement call log", handler: async (_args, ctx) => { const calls = log.splice(0); ctx.ui.notify(`refine_log:${JSON.stringify(calls)}:end`, "info"); } });
   }
   pi.registerCommand("schema-probe", { description: "Report schema rejection", handler: async (_args, ctx) => ctx.ui.notify(`schema-rejected:${schemaRejected}`, "info") });
@@ -116,22 +169,35 @@ export default function (pi) {
     const ok = await pi.setModel({ provider: "probe", id: "model" });
     ctx.ui.notify(JSON.stringify([pi.getThinkingLevel(), ok]), "info");
   }});
-  pi.registerCommand("replicated-accessors", { description: "Read the replicated accessors after each write", handler: async (_args, ctx) => {
+  // replicated-accessors reads after each write straight from the handler's first synchronous run. With the argument "after-await" (TestNodeReplicatedWritesReadBackAfterAwait) it is the product shape beside that: the same writes and reads after one real wait, as an extension's handler makes them once it has awaited a timer or a host call. The host's session pushes then reach the receive loop's waiter, which cannot read them until the handler's synchronous run ends, not the calls the handler makes in that run. This fixture registers pi.onLoaded as well (below), so every request also first awaits the loaded handlers' promise. The other SDK fixtures ignore the argument.
+  pi.registerCommand("replicated-accessors", { description: "Read the replicated accessors after each write", handler: async (args, ctx) => {
+    const wait = args === "after-await" ? () => new Promise((resolve) => setTimeout(resolve, 5)) : undefined;
     const lastType = () => { const entries = ctx.sessionManager.getEntries(); return entries[entries.length - 1]?.type ?? ""; };
     const out = { name0: ctx.sessionManager.getSessionName() ?? "", model0: ctx.model?.id ?? "", provider0: ctx.model?.provider ?? "" };
+    if (wait) await wait();
     pi.setSessionName("renamed");
     out.name1 = ctx.sessionManager.getSessionName() ?? "";
+    out.entryAfterName = lastType();
     pi.setLabel("one", "lab");
     out.entryAfterLabel = lastType();
     pi.sendMessage({ customType: "probe", content: "hi", display: true });
     out.entryAfterMessage = lastType();
+    out.entryCount = ctx.sessionManager.getEntries().length;
     await pi.setModel({ provider: "prov-after", id: "id-after" });
     out.model1 = ctx.model?.id ?? "";
     out.provider1 = ctx.model?.provider ?? "";
     out.qualified1 = `${out.provider1}/${out.model1}`;
+    // The log read again once the serve loop ran: a push it applied a second time would collapse the log to one entry.
+    out.entryCountLater = ctx.sessionManager.getEntries().length;
+    out.lastLater = lastType();
     ctx.ui.notify(JSON.stringify(out), "info");
   }});
   pi.registerCommand("active_tools_set", { description: "Set the active tools to the comma-separated names", handler: async (args) => pi.setActiveTools(String(args).trim().split(",")) });
+  pi.registerCommand("host_error_probe", { description: "Report what a host error on navigateTree looks like to the extension", handler: async (_args, ctx) => {
+    let text = "no error", code = "-";
+    try { await ctx.navigateTree("entry"); } catch (error) { text = error.message; code = error.code || "-"; }
+    ctx.ui.notify(`host_error:${text}|${code}`, "info");
+  }});
   pi.registerCommand("session_actions_unbound", { description: "Report what unbound session actions answer", handler: async (_args, ctx) => {
     const parts = [];
     for (const [name, call] of [["new", () => ctx.newSession()], ["fork", () => ctx.fork("entry")], ["navigate", () => ctx.navigateTree("entry")], ["switch", () => ctx.switchSession("/s.jsonl")]]) {
@@ -140,8 +206,70 @@ export default function (pi) {
     try { await ctx.reload(); parts.push("reload=ok"); } catch (error) { parts.push(`reload=error:${error.message}`); }
     ctx.ui.notify(`unbound:${parts.join(",")}`, "info");
   }});
+  // event_session_actions_on keeps the handler's context; event_session_actions_stored calls the actions through it after the handler's request ended. Pi's createContext() object has no such member (runner.ts:877-987), so Node's reports `undefined` and the call throws Pi's TypeError.
+  const sessionActionNames = ["waitForIdle", "newSession", "fork", "navigateTree", "switchSession", "reload"];
+  const reportSessionActions = async (ctx) => {
+    const parts = [];
+    for (const [name, call] of [["wait", () => ctx.waitForIdle()], ["new", () => ctx.newSession()], ["fork", () => ctx.fork("entry")], ["navigate", () => ctx.navigateTree("entry")], ["switch", () => ctx.switchSession("/s.jsonl")], ["reload", () => ctx.reload()]]) {
+      try { await call(); parts.push(`${name}=allowed`); } catch (error) { parts.push(/is not a function/.test(error.message) ? `${name}=rejected` : `${name}=error:${error.message}`); }
+    }
+    return parts.join(",");
+  };
+  // sessionActionShape is what Pi's JavaScript shows of an event context: typeof of each member, and the synchronous error a call throws.
+  const sessionActionShape = (ctx) => {
+    let thrown = "returned", thrownSwitch = "returned";
+    try { void Promise.resolve(ctx.waitForIdle()).catch(() => {}); } catch (error) { thrown = `${error.constructor.name}:${error.message}`; }
+    try { void Promise.resolve(ctx.switchSession("/s.jsonl")).catch(() => {}); } catch (error) { thrownSwitch = `${error.constructor.name}:${error.message}`; }
+    return `${sessionActionNames.map((name) => typeof ctx[name]).join(",")};${thrown};${thrownSwitch}`;
+  };
+  let keptEventCtx;
+  pi.registerCommand("event_session_actions_on", { description: "Subscribe to the event named by the argument with a handler that calls the session actions", handler: async (args) => {
+    pi.on(String(args).trim(), async (_event, ctx) => {
+      keptEventCtx = ctx;
+      ctx.ui.notify(`event_shape:${sessionActionShape(ctx)}`, "info");
+      ctx.ui.notify(`event_actions:${await reportSessionActions(ctx)}`, "info");
+    });
+  }});
+  pi.registerCommand("event_session_actions_stored", { description: "Call the session actions through the context an event handler kept", handler: async (_args, ctx) => {
+    ctx.ui.notify(`stored_shape:${sessionActionShape(keptEventCtx)}`, "info");
+    ctx.ui.notify(`stored_actions:${await reportSessionActions(keptEventCtx)}`, "info");
+  }});
+  // session_actions_tool makes the same calls through the context of a tool's execute: Pi's createContext() object (runner.ts:877-987), so none exists.
+  pi.registerTool({ name: "session_actions_tool", label: "session_actions_tool", description: "Call the session actions through the tool's context", parameters: { type: "object", properties: {} }, execute: async (_id, _params, _signal, _onUpdate, ctx) => ({ content: [{ type: "text", text: `tool_actions:${await reportSessionActions(ctx)}` }], details: {} }) });
+  // wait_idle_command waits for the run from a command context (runner.ts createCommandContext), and wait_idle_with_session from a withSession callback's context.
+  pi.registerCommand("wait_idle_command", { description: "Wait for the run from a command", handler: async (_args, ctx) => {
+    let text = "done";
+    try { await ctx.waitForIdle(); } catch (error) { text = `error:${error.message}`; }
+    ctx.ui.notify(`wait_idle:${text}`, "info");
+  }});
+  pi.registerCommand("wait_idle_with_session", { description: "Wait for the run from a withSession callback", handler: async (_args, ctx) => {
+    // The callback runs while this command's switchSession call is in flight, so the notice is sent once the call returned.
+    let text = "never ran";
+    await ctx.switchSession("/s.jsonl", { withSession: async (replaced) => {
+      text = "done";
+      try { await replaced.waitForIdle(); } catch (error) { text = `error:${error.message}`; }
+    } });
+    ctx.ui.notify(`with_session_wait:${text}`, "info");
+  }});
   pi.registerCommand("active_tools_get", { description: "Report the active tools", handler: async (_args, ctx) => ctx.ui.notify(`active_tools:${pi.getActiveTools().join(",")}`, "info") });
-  pi.registerCommand("provider_probe_register", { description: "Register a provider with one model", handler: async () => pi.registerProvider("conformance-probe", JSON.parse(`{"baseUrl":"https://probe.invalid/v1","api":"openai-completions","apiKey":"probe-key","models":[{"id":"probe-model","name":"Probe Model","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1000,"maxTokens":100}]}`)) });
+  // mcp_register_run registers two MCP servers in one synchronous run and reads the active tools after each call (TestConformance_McpServerRegisteredAtRunTimeIsHandledInsideTheCall).
+  pi.registerCommand("mcp_register_run", { description: "Register two MCP servers and report the active tools after each", handler: async (_args, ctx) => {
+    const reads = [];
+    for (const name of ["conformance-run-a", "conformance-run-b"]) {
+      pi.registerMcpServer(name, { url: `https://${name}.invalid/mcp` });
+      reads.push(pi.getActiveTools().join(","));
+    }
+    ctx.ui.notify(`mcp_register_run:${reads.join("|")}`, "info");
+  } });
+  // registry-model-probe registers the provider of the active model again with the argument as the model's name, then reads the model (TestARegistryWriteIsVisibleToTheNextModelReadAcrossSDKs).
+  pi.registerCommand("registry-model-probe", {
+    description: "Register the active model's provider with a new name, then read the model",
+    handler: async (args, ctx) => {
+      await pi.registerProvider("replica-reg", { baseUrl: "https://probe.invalid/v1", api: "openai-completions", apiKey: "probe-key", models: [{ id: "m", name: args, reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 100 }] });
+      ctx.ui.notify("regname=" + (ctx.model?.name ?? ""), "info");
+    },
+  });
+  pi.registerCommand("provider_probe_register", { description: "Register a provider with one model", handler: async () => pi.registerProvider("conformance-probe", JSON.parse(`{"baseUrl":"https://probe.invalid/v1","api":"openai-completions","apiKey":"probe-key","models":[{"id":"probe-model","name":"Probe Model","reasoning":true,"input":["text","image"],"cost":{"input":3.5,"output":4.5,"cacheRead":0.35,"cacheWrite":0.45},"contextWindow":54321,"maxTokens":4321}]}`)) });
   pi.registerCommand("provider_probe_unregister", { description: "Unregister the provider", handler: async () => pi.unregisterProvider("conformance-probe") });
   pi.registerCommand("commands-probe", { description: "Read the host's slash commands", handler: async (_args, ctx) => {
     ctx.ui.notify(JSON.stringify(pi.getCommands().filter((c) => c.name === "conformance-listed").map((c) => [c.name, c.source, c.description ?? ""])), "info");
@@ -215,7 +343,8 @@ export default function (pi) {
   pi.registerMessageRenderer("keyhints-message", (message, options) => ({ render: () => [hintsOf(options, message.content)], invalidate() {} }));
   pi.registerEntryRenderer("keyhints-entry", (entry, options) => ({ render: () => [hintsOf(options, entry.data)], invalidate() {} }));
   pi.registerMarkdownTransformer((markdown, context) =>
-    `md:${markdown}:${context.messageType}:streaming=${context.isStreaming}:width=${context.availableWidth}`);
+    `md:${markdown}:${context.messageType}:streaming=${context.isStreaming}:width=${context.availableWidth}`,
+  { messageTypes: ["user", "assistant", "assistant-thinking", "custom", "summary", "changelog"] });
   const resolvedLine = (prefix, toolName) => (args) => ({ render: () => [`${prefix}:${toolName}:${args?.q}`], invalidate: () => {} });
   pi.registerToolRenderer((toolName, next) => {
     switch (toolName) {
@@ -240,11 +369,14 @@ export default function (pi) {
     renderCall(args, _theme, context) {
       context.state.calls = (context.state.calls ?? 0) + 1;
       const calls = context.state.calls;
-      return { render: (width) => [`toolrender:call:${args.topic}:partial=${context.isPartial}:calls=${calls}:width=${width}`], invalidate() {} };
+      // lastComponent is the component this card's call renderer returned before; its line is what it drew last
+      const last = context.lastComponent?.line ?? "none";
+      return { line: undefined, render(width) { this.line = `toolrender:call:${args.topic}:partial=${context.isPartial}:calls=${calls}:width=${width}:last=${last}`; return [this.line]; }, invalidate() {} };
     },
     renderResult(result, options, _theme, context) {
       const calls = context.state.calls;
-      return { render: (width) => [`toolrender:result:${result.content[0].text}:${result.details.k}:expanded=${Boolean(options.expanded)}:calls=${calls}:width=${width}:duration=${context.durationMs ?? "none"}`], invalidate() {} };
+      const last = context.lastComponent?.line ?? "none";
+      return { line: undefined, render(width) { this.line = `toolrender:result:${result.content[0].text}:${result.details.k}:expanded=${Boolean(options.expanded)}:calls=${calls}:width=${width}:duration=${context.durationMs ?? "none"}:last=${last}`; return [this.line]; }, invalidate() {} };
     },
   });
   pi.registerTool({
@@ -253,6 +385,15 @@ export default function (pi) {
     parameters: { type: "object", required: ["text"], properties: { text: { type: "string", description: "Text to echo" }, offset: { type: "number" } } },
     async execute(_id, params) { return { content: [{ type: "text", text: `echo: ${params.text ?? ""}` }] }; },
   });
+  // D232 shared-cells rows: instance-local state, the process's event bus, and what this instance heard (the same three tools in every SDK fixture).
+  let sharedCalls = 0;
+  const sharedHeard = [];
+  pi.events.on("shared-cells", (data) => sharedHeard.push(data.from));
+  pi.registerTool({ name: "counter", description: "This instance's call count", parameters: { type: "object", properties: {} }, async execute() { return { content: [{ type: "text", text: String(++sharedCalls) }] }; } });
+  // Registered only for the module-state row, so the other conformance comparisons see the tool set every SDK fixture shares.
+  if (process.env.PIG_FIXTURE_MODULE_STATE) pi.registerTool({ name: "module_state", description: "The factory calls this process's module has seen", parameters: { type: "object", properties: {} }, async execute() { return { content: [{ type: "text", text: "factoryCalls=" + processFactoryCalls }] }; } });
+  pi.registerTool({ name: "ping", description: "Emit on the shared-cells channel", parameters: { type: "object", required: ["name"], properties: { name: { type: "string" } } }, async execute(_id, params) { pi.events.emit("shared-cells", { from: params.name }); return { content: [{ type: "text", text: "pinged" }] }; } });
+  pi.registerTool({ name: "received", description: "What this instance heard on shared-cells", parameters: { type: "object", properties: {} }, async execute() { return { content: [{ type: "text", text: "received=" + sharedHeard.join(",") }] }; } });
   let abortObserved = false;
   pi.registerTool({
     name: "update_tool",
@@ -270,6 +411,15 @@ export default function (pi) {
     parameters: { type: "object", properties: {} },
     async execute(_id, params) {
       return { content: [{ type: "text", text: "a".repeat(params.n) }] };
+    },
+  });
+  // lone_decl: a description, a parameter name and a parameter's text hold a lone UTF-16 surrogate (TestConformance_ToolDeclarationLoneSurrogatesAgreeAcrossSDKs).
+  pi.registerTool({
+    name: "lone_decl",
+    description: "D[\ud83d]",
+    parameters: { type: "object", properties: { "K[\ude00\ud83d]": { type: "string", description: "PD[\ud83d]", enum: ["E[\ude00]"], default: "DF[\ud83d]" } } },
+    async execute() {
+      return { content: [{ type: "text", text: "lone" }] };
     },
   });
   pi.registerTool({
@@ -328,6 +478,46 @@ export default function (pi) {
       onUpdate({ content: [{ type: "text", text: "waiting" }] });
       await new Promise((resolve) => setTimeout(resolve, 8000));
       return { content: [{ type: "text", text: "late" }] };
+    },
+  });
+  // signal_host_probe awaits host dialogs across the abort: the host keeps answering a tool's host calls after the abort, as Pi's in-process calls are.
+  pi.registerTool({
+    name: "signal_host_probe",
+    description: "Await host dialogs across the abort",
+    parameters: { type: "object", properties: {} },
+    async execute(_id, _params, signal, _onUpdate, ctx) {
+      let first;
+      try { first = await ctx.ui.input("tool_signal:first", "p"); } catch (error) { first = `failed: ${error?.message ?? error}`; }
+      const aborted = signal.aborted;
+      let second;
+      try { second = await ctx.ui.input("tool_signal:later", "p"); } catch (error) { second = `failed: ${error?.message ?? error}`; }
+      return { content: [{ type: "text", text: `tool_signal:${aborted}:${first}:${second}` }] };
+    },
+  });
+  // aborted_entry_probe is called with its run already aborted (TestConformance_ToolCalledAbortedEntersWithItsSignalAborted): Pi runs tool.execute with an aborted signal. It echoes the nonce it was given, reports whether its signal was aborted on its first line, and makes a host call after that, which the host answers.
+  pi.registerTool({
+    name: "aborted_entry_probe",
+    description: "Report the signal a tool starts with",
+    parameters: { type: "object", properties: {} },
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const aborted = signal.aborted;
+      let answer;
+      try { answer = await ctx.ui.input(`aborted_entry:${params.nonce}`, "p"); } catch (error) { answer = `failed: ${error?.message ?? error}`; }
+      return { content: [{ type: "text", text: `aborted_entry:${params.nonce}:${aborted}:${answer}` }] };
+    },
+  });
+  // signal_nested_probe runs abort_tool as a nested call: the host keeps answering a tool's host calls after the abort, as Pi's in-process calls are.
+  pi.registerTool({
+    name: "signal_nested_probe",
+    description: "Run abort_tool as a nested tool call",
+    parameters: { type: "object", properties: {} },
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      try {
+        const outcome = await ctx.executeTool("abort_tool", {});
+        return { content: [{ type: "text", text: `tool_signal_nested:${outcome.result.content[0].text}` }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `tool_signal_nested:failed: ${error?.message ?? error}` }] };
+      }
     },
   });
   pi.registerCommand("abort_probe", {
@@ -417,6 +607,20 @@ export default function (pi) {
     async execute(_id, params) {
       if (params.late === "loop") await new Promise((resolve) => setImmediate(resolve));
       await withFileMutationQueue(params.file, async () => {
+        const before = fs.existsSync(params.file) ? fs.readFileSync(params.file, "utf8") : "";
+        fs.writeFileSync(params.file, `${before}${params.tag}\n`);
+      });
+      return { content: [{ type: "text", text: `mutated ${params.tag}` }] };
+    },
+  });
+  // mutation_order_ctx_probe makes `calls` getter calls, then takes the queue through its context (TestFileMutationOrderOfTheContextFormAcrossSDKs).
+  pi.registerTool({
+    name: "mutation_order_ctx_probe",
+    description: "Make getter calls, take the queue through the context and append a tag",
+    parameters: { type: "object", properties: { file: { type: "string" }, tag: { type: "string" }, calls: { type: "number" } } },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      for (let i = 0; i < (params.calls ?? 0); i++) ctx.getContextUsage();
+      await ctx.withFileMutationQueue(params.file, async () => {
         const before = fs.existsSync(params.file) ? fs.readFileSync(params.file, "utf8") : "";
         fs.writeFileSync(params.file, `${before}${params.tag}\n`);
       });
@@ -605,6 +809,31 @@ export default function (pi) {
       ctx.ui.notify("overlay-handle=ok", "info");
     },
   });
+  pi.registerCommand("overlay-invalidate-probe", {
+    description: "Count the host's invalidations of a mounted overlay and draw the theme",
+    handler: async (args, ctx) => {
+      const row = () => `${ctx.ui.theme.name}|${ctx.ui.theme.fg("accent", "x")}`;
+      await ctx.ui.custom((_tui, _theme, _keys, done) => {
+        const handleInput = (data) => { if (data === "q") done("closed"); };
+        // A component without invalidate() is rendered again all the same.
+        if (String(args ?? "").trim() === "plain") return { render: () => [`plain live=${row()}`], handleInput };
+        let invalidations = 0;
+        let kept = row();
+        return {
+          render: () => [`inv=${invalidations} kept=${kept} live=${ctx.ui.theme.name}`],
+          handleInput,
+          invalidate() { invalidations++; kept = row(); },
+        };
+      }, { overlay: true });
+      ctx.ui.notify("overlay-invalidate=ok", "info");
+    },
+  });
+  pi.registerCommand("theme-read-probe", {
+    description: "Report the theme the extension holds, with no component mounted",
+    handler: async (_args, ctx) => {
+      ctx.ui.notify(`theme-read=${ctx.ui.theme.name}|${ctx.ui.theme.fg("accent", "x")}`, "info");
+    },
+  });
   pi.registerCommand("overlay-focus-probe", {
     description: "Render the focus the host publishes to a mounted overlay",
     handler: async (_args, ctx) => {
@@ -693,7 +922,7 @@ export default function (pi) {
       f.push(`visibleOff=${screen.hasOverlay()}/${screen.hasOverlayEntries}`);hOff.hide();
       const ov2=screen.showOverlay(ov,{width:8});
       docInv=0;ovInv=0;screen.invalidate();
-      f.push(`invalidate=${docInv>0}/${ovInv>0}`);
+      f.push(`invalidate=${docInv}/${ovInv}`);
       ov2.hide();
       const mutLog=[];let armed=false,mutInv=0;
       const extra={render:()=>["EXTRA"],invalidate(){}},target={render:()=>["TARGET"],invalidate(){}},popup={render:()=>["POP"],invalidate(){}};
@@ -709,7 +938,7 @@ export default function (pi) {
         r.push(`overlay=${screen.hasOverlay()}/${screen.hasOverlayEntries}/${h.isFocused()}/${first}`);
         h.hide();r.push(`hidden=${screen.hasOverlayEntries}`);
         screen.scrollBy(-2);r.push(`scroll=${screen.viewportTop}/${screen.isFollowingOutput}`);
-        mutInv=0;screen.invalidate();r.push(`invalidate=${mutInv>0}`);
+        mutInv=0;screen.invalidate();r.push(`invalidate=${mutInv}`);
         r.push(`lines=${screen.getScreenLines().length}`);
         mutLog.push(r.join(","));
         return ["MUT"];
@@ -793,6 +1022,46 @@ export default function (pi) {
   pi.registerCommand("liveness_host_call", { description: "Exercise an awaited host call", handler: async (_args, ctx) => ctx.waitForIdle() });
   pi.registerCommand("liveness_user_call", { description: "Exercise an interactive host call", handler: async (_args, ctx) => ctx.ui.input("Question", "Answer") });
   pi.registerCommand("liveness_fire_call", { description: "Exercise a no-result UI host call", handler: async (_args, ctx) => ctx.ui.setTitle("Conformance title") });
+  // io_wait waits on a plain TCP read: it dials the address it gets, announces itself with a "waiting" line and returns when the peer writes a line.
+  pi.registerCommand("io_wait", {
+    description: "Wait on a socket read",
+    handler: (args) => new Promise((resolve, reject) => {
+      const [host, port] = String(args).split(":");
+      const socket = ioWaitConnect({ host, port: Number(port) });
+      socket.setEncoding("utf8");
+      socket.on("connect", () => socket.write("waiting\n"));
+      socket.on("data", () => { socket.destroy(); resolve(); });
+      socket.on("error", reject);
+    }),
+  });
+  let nameWaitAddr = "";
+  pi.registerCommand("io_wait_name", {
+    description: "Make the session_info_changed handler wait on a socket read",
+    handler: async (args) => { nameWaitAddr = String(args); },
+  });
+  // io_wait_input and io_wait_start subscribe an input / before_agent_start handler that waits on a socket read first and then notifies "<event>:<text or prompt>".
+  const ioWaitOnce = (addr) => new Promise((resolve, reject) => {
+    const [host, port] = addr.split(":");
+    const socket = ioWaitConnect({ host, port: Number(port) });
+    socket.setEncoding("utf8");
+    socket.on("connect", () => socket.write("waiting\n"));
+    socket.on("data", () => { socket.destroy(); resolve(); });
+    socket.on("error", reject);
+  });
+  pi.registerCommand("io_wait_input", {
+    description: "Make an input handler wait on a socket read",
+    handler: async (args) => {
+      const addr = String(args);
+      pi.on("input", async (event, ctx) => { await ioWaitOnce(addr); ctx.ui.notify(`input:${event.text}`, "info"); });
+    },
+  });
+  pi.registerCommand("io_wait_start", {
+    description: "Make a before_agent_start handler wait on a socket read",
+    handler: async (args) => {
+      const addr = String(args);
+      pi.on("before_agent_start", async (event, ctx) => { await ioWaitOnce(addr); ctx.ui.notify(`before_agent_start:${event.prompt}`, "info"); });
+    },
+  });
   pi.registerCommand("command_error", { description: "Return a command error", handler: async () => { throw new Error("command exploded"); } });
   pi.registerCommand("command_awaited_error", {
     description: "Return an error after awaited work",
@@ -806,12 +1075,348 @@ export default function (pi) {
     description: "Set one status repeatedly without awaiting",
     handler: async (_args, ctx) => { for (let i = 0; i < 200; i++) ctx.ui.setStatus("burst", String(i)); },
   });
+  // effect_probe: one host API called in the synchronous part of an event handler, a command or a tool, which then returns (TestConformance_HandlerEffectsPrecedeTheReleaseOfItsCaller).
+  const effectProbeKinds = {
+    notify: (ctx) => ctx.ui.notify("effect_probe:notify", "info"),
+    status: (ctx) => ctx.ui.setStatus("effect_probe", "status"),
+    title: (ctx) => ctx.ui.setTitle("effect_probe:title"),
+    widget: (ctx) => ctx.ui.setWidget("effect_probe", ["effect_probe:widget"]),
+    editor: (ctx) => ctx.ui.setEditorText("effect_probe:editor"),
+    // The host actions after a slow notify: the call that follows the notify can apply only once the notify did.
+    append: (ctx) => { ctx.ui.notify("effect_probe:lead", "info"); pi.appendEntry("effect_probe", "entry"); },
+    sendUserMessage: (ctx) => { ctx.ui.notify("effect_probe:lead", "info"); pi.sendUserMessage("effect_probe:user"); },
+    failedAppend: (ctx) => { pi.appendEntry("effect_probe_fails", "entry"); ctx.ui.notify("effect_probe:notify", "info"); },
+  };
+  pi.registerCommand("effect_probe_on", { description: "Subscribe a handler that calls one host API and returns: <event> <kind> [sync|await]; a sync handler is not an async function, an await handler then awaits a timer for 20 s", handler: async (args) => { const [event, kind, style] = String(args).trim().split(" "); if (style === "sync") pi.on(event, (_event, ctx) => { effectProbeKinds[kind](ctx); }); else if (style === "await") pi.on(event, async (_event, ctx) => { effectProbeKinds[kind](ctx); await new Promise((resolve) => setTimeout(resolve, 20000)); }); else pi.on(event, async (_event, ctx) => { effectProbeKinds[kind](ctx); }); } });
+  pi.registerCommand("effect_probe_run", { description: "Call one host API and return", handler: async (args, ctx) => { effectProbeKinds[String(args).trim()](ctx); } });
+  pi.registerCommand("effect_probe_tool", {
+    description: "Register a tool that calls one host API and returns",
+    handler: async () => {
+      pi.registerTool({ name: "effect_probe_tool", label: "effect_probe_tool", description: "Call one host API and return", parameters: { type: "object", properties: { kind: { type: "string" } } }, execute: async (_id, params, _signal, _update, ctx) => { effectProbeKinds[params.kind](ctx); return { content: [{ type: "text", text: "ok" }] }; } });
+    },
+  });
   // A width handler makes a host call the way any other handler does; the host's reply must reach it (conformance TestConformance_WidthHandlerHostCall).
   let widthProbe;
   pi.registerCommand("arm_width_probe", { description: "Notify from a width handler", handler: async (_args, ctx) => { widthProbe ??= ctx.ui.onWidthChange(async (width) => { await ctx.ui.notify(`width-probe:${width}`, "info"); await ctx.ui.notify(`width-probe-returned:${width}`, "info"); }); } });
   let eventProbeOff;
   pi.registerCommand("event_probe_subscribe", { description: "Subscribe to turn_end after connecting", handler: async () => { eventProbeOff = pi.on("turn_end", async (event, ctx) => { ctx.ui.notify(`event_probe:${event.messageEntryId}`, "info"); }); } });
   pi.registerCommand("event_probe_unsubscribe", { description: "Remove the turn_end handler registered after connecting", handler: async () => { eventProbeOff?.(); eventProbeOff = undefined; } });
+  // D614 plugin UI mounts: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewMounts).
+  const viewText = (ctx, suffix) => ({ root: { kind: "text", text: `fixture-view-${ctx.ui.viewAbilities()?.limits.intentArgBytes ?? 0}${suffix}` } });
+  const viewCode = async (call) => {
+    try {
+      await call();
+      return "none";
+    } catch (err) {
+      return err.code;
+    }
+  };
+  let viewCancelledTag = "";
+  pi.registerCommand("ui_view_abilities", { description: "Report the replicated client abilities", handler: async (_args, ctx) => {
+    const ab = ctx.ui.viewAbilities();
+    ctx.ui.notify(ab ? `view-abilities:mounts=${ab.limits.mounts},argbytes=${ab.limits.intentArgBytes},slots=${ab.slots.join("+")},nodes=${ab.nodes.join("+")},markdown=${ab.markdown}` : "view-abilities:none", "info");
+  } });
+  pi.registerCommand("ui_view_probe", { description: "Mount, update, hide, show, finish and remove a view", handler: async (_args, ctx) => {
+    let st = await ctx.ui.mountView({ key: "probe", slot: "panel", view: viewText(ctx, "") });
+    ctx.ui.notify(`view-mounted:epoch=${st.mount.epoch},rev=${st.mount.rev},state=${st.state}`, "info");
+    const first = st.mount;
+    st = await ctx.ui.updateView(first, { view: viewText(ctx, "-2") });
+    ctx.ui.notify(`view-updated:rev=${st.mount.rev}`, "info");
+    ctx.ui.notify(`view-stale:${await viewCode(() => ctx.ui.updateView(first, { view: viewText(ctx, "-stale") }))}`, "info");
+    const cur = st.mount;
+    ctx.ui.notify(`view-hidden:${(await ctx.ui.hideView(cur)).state}`, "info");
+    ctx.ui.notify(`view-shown:${(await ctx.ui.showView(cur)).state}`, "info");
+    ctx.ui.notify(`view-finished:${(await ctx.ui.finishView(cur)).state}`, "info");
+    ctx.ui.notify(`view-terminal:${await viewCode(() => ctx.ui.removeView(cur))}`, "info");
+    ctx.ui.notify(`view-final:${(await ctx.ui.viewState("probe")).state}`, "info");
+    const intents = [
+      { name: "fx.add", arg: { type: "object", properties: { n: { type: "integer" } }, required: ["n"] }, answer: { type: "object", properties: { sum: { type: "integer" } }, required: ["sum"] } },
+      { name: "fx.wait", arg: { type: "object", properties: { tag: { type: "string" } }, required: ["tag"] }, cancellable: true, timeoutMs: 5000 },
+    ];
+    st = await ctx.ui.mountView({ key: "probe2", slot: "panel", view: viewText(ctx, "-live"), intents });
+    ctx.ui.notify(`view-second:epoch=${st.mount.epoch},rev=${st.mount.rev}`, "info");
+  } });
+  pi.registerCommand("ui_view_cancelled", { description: "Report the intent whose handler was cancelled", handler: async (_args, ctx) => ctx.ui.notify(`intent-cancelled:${viewCancelledTag}`, "info") });
+  pi.registerCommand("ui_view_state", { description: "Report the state of the second mount", handler: async (_args, ctx) => {
+    const st = await ctx.ui.viewState("probe2");
+    ctx.ui.notify(`view-state:${st.state}:${st.reason ?? ""}`, "info");
+  } });
+  // D614 amendment: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewExtras).
+  const xClaim = (claims, name) => (claims ?? []).find((c) => c.name === name)?.value;
+  const xPicked = (ab) => xClaim((ab.slotClaims ?? []).find((s) => s.slot === "panel")?.claims, "display.colors");
+  const xList = (id, label) => ({ root: { kind: "select-list", id, items: [{ value: id, label }], maxVisible: 5 } });
+  const xRects = (n) => Array.from({ length: n }, () => ({ kind: "rect", width: 1, height: 1 }));
+  pi.registerCommand("ui_view_extras", { description: "Mount a view with alternatives, a drawing, a11y and focus, and probe the bounds", handler: async (_args, ctx) => {
+    const ab = ctx.ui.viewAbilities();
+    const picked = xPicked(ab);
+    ctx.ui.notify(`view-x-claims:colors=${xClaim(ab.claims, "display.colors")},kind=${xClaim(ab.claims, "display.kind")},gestures=${xClaim(ab.claims, "input.gestures").join("+")},hover=${xClaim(ab.claims, "display.hover")},panel.colors=${picked},profiles=${ab.drawing.profiles.join("+")},shapes=${ab.drawing.shapes},pixels=${ab.drawing.pixels}`, "info");
+    const base = xList("base", "fixture-x-base");
+    const st = await ctx.ui.mountView({
+      key: "extras", slot: "panel", view: base, intents: [{ name: "fx.tap", arg: { type: "object" } }],
+      alternatives: [{
+        when: { any: [{ all: [{ claim: "display.colors", op: "equals", value: picked }] }] },
+        view: xList("alt", `fixture-x-alt-${picked}`),
+        drawing: { profile: "scene", shapes: xRects(ab.drawing.shapes - 1), regions: [{ key: "r", shape: { kind: "rect", width: 4, height: 4 }, gestures: ["activate"], intent: "fx.tap", name: "Tap" }] },
+      }],
+      a11y: [{ node: "alt", name: `Extras ${picked}`, role: "button", checked: true, relations: [{ kind: "describedBy", target: "base" }] }, { node: "base", name: "Base" }],
+      focus: [{ node: "alt", request: "mount", restore: "previous" }],
+    });
+    ctx.ui.notify(`view-x-mounted:${st.state}`, "info");
+    const attempt = async (label, content) => ctx.ui.notify(`view-x-${label}:${await viewCode(() => ctx.ui.updateView(st.mount, { view: base, ...content }))}`, "info");
+    const scene = (shapes) => ({ drawing: { profile: "scene", shapes } });
+    let nested = { kind: "rect", width: 1, height: 1 };
+    for (let i = 0; i < 8; i++) nested = { kind: "group", children: [nested] };
+    await attempt("alts", { alternatives: Array.from({ length: 9 }, () => ({ when: { any: [{ all: [{ claim: "display.hover", op: "present" }] }] }, view: base })) });
+    await attempt("nest", scene([nested]));
+    await attempt("points", scene([{ kind: "polyline", points: Array.from({ length: 1025 }, (_, i) => ({ x: i, y: i })) }]));
+    await attempt("shapes", scene(xRects(4097)));
+    await attempt("a11y", { a11y: Array.from({ length: 257 }, (_, i) => ({ node: `n${i}` })) });
+    await attempt("over", scene(xRects(ab.drawing.shapes + 1)));
+    await attempt("pixels", { drawing: { profile: "pixels", pixels: { width: 2, height: 2, asset: "img", scaling: "nearest" } }, assets: [{ id: "img", mime: "image/png", size: 4, sha256: "a".repeat(64), delivery: "inline" }] });
+    let stale = "none";
+    for (let i = 0; i < 3; i++) stale = await viewCode(() => ctx.ui.updateView({ ...st.mount, rev: st.mount.rev + 50 }, { view: base }));
+    ctx.ui.notify(`view-x-stale:${stale}`, "info");
+    const notices = await ctx.ui.viewDiagnostics("extras");
+    const count = (code) => notices.filter((n) => n.code === code && n.path === "update").reduce((sum, n) => sum + n.count, 0);
+    ctx.ui.notify(`view-x-diag:invalid=${count("invalid")},limit=${count("limit")},unsupported=${count("unsupported")},stale=${count("stale")}`, "info");
+    ctx.ui.notify(`view-x-bigresult:${await viewCode(() => ctx.ui.finishView(st.mount, "r".repeat(65536)))}`, "info");
+  } });
+  pi.registerCommand("ui_view_extras_end", { description: "Read the notices of the extras mount and finish it with a result", handler: async (_args, ctx) => {
+    const picked = xPicked(ctx.ui.viewAbilities());
+    const st = await ctx.ui.viewState("extras");
+    const notices = await ctx.ui.viewDiagnostics("extras");
+    ctx.ui.notify(`view-x-diag2:n=${notices.length},last=${notices[notices.length - 1]?.path ?? ""}`, "info");
+    const done = await ctx.ui.finishView(st.mount, { picked });
+    ctx.ui.notify(`view-x-finished:${done.state},picked=${done.result?.picked}`, "info");
+    const cur = await ctx.ui.viewState("extras");
+    ctx.ui.notify(`view-x-state:${cur.state},picked=${cur.result?.picked}`, "info");
+  } });
+  // D614: the redraw panel and the abilities watcher, the same way in every SDK fixture (conformance TestConformance_UIViewAnswerRedraw and
+  // TestConformance_UIViewAbilitiesEvent).
+  const redrawShape = (member) => ({ type: "object", properties: { [member]: { type: "integer" } }, required: [member] });
+  const redrawIntents = ["fx.redraw", "fx.foreign"].map((name) => ({ name, arg: redrawShape("n"), answer: redrawShape("rev") }));
+  const textView = (text) => ({ root: { kind: "text", text } });
+  // foreignUpdate hands an update to the loop the ui_view_redraw command started: the call is made in that command's continuation, so it is the
+  // extension's, not an intent handler's.
+  let foreignUpdate = async () => { throw new Error("ui_view_redraw has not run"); };
+  pi.registerCommand("ui_view_redraw", { description: "Mount the panel whose intents redraw it", handler: async (_args, ctx) => {
+    const st = await ctx.ui.mountView({ key: "redraw", slot: "panel", view: textView("fixture-redraw-0"), intents: redrawIntents });
+    const jobs = [];
+    let wake = () => {};
+    foreignUpdate = (mount, content) => new Promise((resolve, reject) => { jobs.push({ mount, content, resolve, reject }); wake(); });
+    (async () => {
+      for (;;) {
+        while (jobs.length === 0) await new Promise((resolve) => { wake = resolve; });
+        const job = jobs.shift();
+        ctx.ui.updateView(job.mount, job.content).then(job.resolve, job.reject);
+      }
+    })();
+    ctx.ui.notify(`view-redraw:rev=${st.mount.rev}`, "info");
+  } });
+  const viewWatch = { armed: false, block: false, events: 0, release: undefined };
+  const describeAbilities = (ab) => (ab ? `slots=${ab.slots.join("+")},mounts=${ab.limits.mounts}` : "none");
+  pi.onViewAbilities(async (ab, ctx) => {
+    viewWatch.events++;
+    if (!viewWatch.armed) return;
+    if (viewWatch.block) {
+      viewWatch.block = false;
+      ctx.ui.notify("view-event-blocked", "info");
+      await new Promise((resolve) => { viewWatch.release = resolve; });
+      ctx.ui.notify("view-event-released", "info");
+    }
+    if (!ab) {
+      ctx.ui.notify("view-event:none", "info");
+      return;
+    }
+    ctx.ui.notify(`view-event:${describeAbilities(ab)},same=${describeAbilities(ab) === describeAbilities(ctx.ui.viewAbilities())}`, "info");
+    try {
+      const st = await ctx.ui.mountView({ key: "arrived", slot: "panel", view: textView(`fixture-arrived-${ab.limits.mounts}`) });
+      ctx.ui.notify(`view-arrived:${st.state}`, "info");
+    } catch (err) {
+      ctx.ui.notify(`view-arrived:${err.code}`, "info");
+    }
+  });
+  pi.registerCommand("ui_view_watch", { description: "Arm the abilities watcher", handler: async (_args, ctx) => { viewWatch.armed = true; ctx.ui.notify("view-watch:armed", "info"); } });
+  pi.registerCommand("ui_view_block", { description: "Block the abilities watcher on its next event", handler: async (_args, ctx) => { viewWatch.block = true; ctx.ui.notify("view-block:set", "info"); } });
+  pi.registerCommand("ui_view_release", { description: "Release the blocked abilities watcher", handler: async (_args, ctx) => { viewWatch.release?.(); viewWatch.release = undefined; ctx.ui.notify("view-release:done", "info"); } });
+  pi.registerCommand("ui_view_events", { description: "Report how often the abilities watcher ran", handler: async (_args, ctx) => ctx.ui.notify(`view-events:${viewWatch.events}`, "info") });
+  // D614: a view an agent's tool shows. The command registers the tool; the tool mounts a titled panel, hides it, shows it and
+  // updates it with a focus request, the same way in every SDK fixture (conformance TestConformance_UIViewToolShowsAndFocuses).
+  // D521: bigint_tool registers a tool whose schema declares a bigint parameter and answers the kind of value it receives for it and the value.
+  pi.registerCommand("bigint_tool", { description: "Register the tool that reports what a bigint argument arrives as", handler: async () => {
+    pi.registerTool({
+      name: "bigint_arg",
+      label: "bigint_arg",
+      description: "Report the kind and value of n",
+      parameters: { type: "object", required: ["n"], properties: { n: { type: "bigint" } } },
+      async execute(_id, params) { return { content: [{ type: "text", text: `${typeof params.n === "string" ? "string" : "other"}:${params.n}` }] }; },
+    });
+  } });
+  pi.registerCommand("ui_view_tool", { description: "Register the tool that shows a titled view", handler: async () => {
+    pi.registerTool({
+      name: "view_show",
+      label: "view_show",
+      description: "Mount, show and focus a titled view",
+      parameters: { type: "object", properties: {} },
+      async execute(_id, params, _signal, _onUpdate, ctx) {
+        const text = (value) => ({ content: [{ type: "text", text: value }] });
+        if (params.op === "hide") return text(`view-tool:${(await ctx.ui.hideView((await ctx.ui.viewState("shown")).mount)).state}`);
+        const content = (title, request) => ({
+          title, view: xList(params.node, "fixture-shown"),
+          intents: [{ name: "fx.reopen", arg: { type: "object" }, whenHidden: true }, { name: "fx.tap", arg: { type: "object" } }],
+          focus: [request ? { node: params.node, request } : { node: params.node }],
+        });
+        let st = await ctx.ui.mountView({ key: "shown", slot: "panel", ...content(params.title) });
+        st = await ctx.ui.hideView(st.mount);
+        st = await ctx.ui.showView(st.mount);
+        st = await ctx.ui.updateView(st.mount, content(`${params.title}/2`, "update"));
+        return text(`view-tool:${st.state},rev=${st.mount.rev}`);
+      },
+    });
+  } });
+  // D614 grid node: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewGrid). The argument is the
+  // row's token: the cell values, the selection and one chip text are built from it. A view is a plain object here, so this fixture can
+  // also write a member the record lacks (the `member` line); the builders of the Go, Rust and Python kits cannot.
+  pi.registerCommand("ui_view_grid", { description: "Mount a month as a grid and probe the bounds of the grid", handler: async (args, ctx) => {
+    const tok = args.trim();
+    const cells = [{ label: "30", dim: true }, { label: "31", dim: true }];
+    for (let d = 1; d <= 28; d++) {
+      const cell = { value: `${tok}-${d}`, label: String(d) };
+      if (d === 1) Object.assign(cell, { chips: [{ text: `${tok} standup`, color: "#3366cc" }, { text: "lunch", color: "accent" }], more: 2 });
+      if (d === 2) Object.assign(cell, { mark: "current", color: "#ff000080" });
+      if (d === 3) cell.chips = [{ text: "plain" }];
+      if (d === 28) delete cell.label;
+      cells.push(cell);
+    }
+    const content = (grid) => ({
+      view: { root: { kind: "container", children: [{ kind: "text", text: `Month ${tok}`, paddingX: 0, paddingY: 0 }, { kind: "grid", id: "month", ...grid }] } },
+      intents: [{ name: "fx.pick", nodeKey: "month", arg: { type: "object", properties: { value: { type: "string" } }, required: ["value"] } }],
+      fallback: { kind: "text", text: `grid-fallback ${tok}`, paddingX: 0, paddingY: 0 },
+    });
+    const st = await ctx.ui.mountView({ key: "grid", slot: "panel", ...content({ columns: 7, head: ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"], chipRows: 2, selected: `${tok}-2`, cells }) });
+    ctx.ui.notify(`view-g-mounted:${st.state}`, "info");
+    const attempt = async (label, columns, cells) => ctx.ui.notify(`view-g-${label}:${await viewCode(() => ctx.ui.updateView(st.mount, content({ columns, cells })))}`, "info");
+    await attempt("cells", 7, Array.from({ length: 129 }, () => ({ label: "x" })));
+    await attempt("chips", 7, [{ value: "a", chips: Array.from({ length: 9 }, () => ({ text: "c" })) }]);
+    await attempt("columns", 17, [{ value: "a" }]);
+    await attempt("mark", 7, [{ value: "a", mark: tok }]);
+    await attempt("member", 7, [{ value: "a", extra: 1 }]);
+    const cur = await ctx.ui.viewState("grid");
+    ctx.ui.notify(`view-g-state:${cur.state},rev=${cur.mount.rev}`, "info");
+  } });
+  // D614 node ids: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewNodeIds). The argument is the
+  // row's token: the ids of the container, the text and the box are built from it.
+  pi.registerCommand("ui_view_node_ids", { description: "Mount a view whose container, text and box carry an id", handler: async (args, ctx) => {
+    const tok = args.trim();
+    const st = await ctx.ui.mountView({
+      key: "ids",
+      slot: "panel",
+      view: { root: { kind: "container", id: `${tok}-root`, children: [
+        { kind: "text", id: `${tok}-label`, text: `Label ${tok}`, paddingX: 0, paddingY: 0, bg: "selectedBg" },
+        { kind: "box", id: `${tok}-frame`, paddingX: 1, paddingY: 0, bg: "toolPendingBg", children: [{ kind: "text", text: "inside", paddingX: 0, paddingY: 0 }] },
+      ] } },
+      a11y: [{ node: `${tok}-label`, name: `Label ${tok}` }],
+    });
+    ctx.ui.notify(`view-i-mounted:${st.state}`, "info");
+  } });
+  // D614 image id: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewImageID). The argument is the row's token and a Kitty image id only that row uses: the image node carries both, its bytes are the token's.
+  pi.registerCommand("ui_view_image_id", { description: "Mount a view whose image node carries a Kitty image id", handler: async (args, ctx) => {
+    const [tok, number] = args.trim().split(" ");
+    const bytes = Buffer.from(`pig-image-${tok}`);
+    const ref = createHash("sha256").update(bytes).digest("hex");
+    const st = await ctx.ui.mountView({
+      key: "image-id",
+      slot: "panel",
+      view: {
+        root: { kind: "image", id: `${tok}-photo`, ref, mimeType: "image/png", imageId: Number(number), filename: `${tok}.png` },
+        images: [{ ref, mimeType: "image/png", data: bytes.toString("base64") }],
+      },
+    });
+    ctx.ui.notify(`view-m-mounted:${st.state}`, "info");
+  } });
+  // D614 bindings: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewBindings).
+  pi.registerCommand("ui_view_bindings", { description: "Mount a view with bindings and probe what the host refuses", handler: async (args, ctx) => {
+    const [key, number] = args.split(" ");
+    const n = Number(number);
+    const content = (bindings) => ({
+      view: viewText(ctx, "-bind"), bindings,
+      intents: [{ name: "fx.go", arg: { type: "object", properties: { n: { type: "integer" } }, required: ["n"] } }, { name: "fx.tap", arg: { type: "object" } }],
+    });
+    const goTo = (key, n) => ({ key, intent: "fx.go", arg: { n } });
+    const tap = (key) => ({ key, intent: "fx.tap" });
+    const st = await ctx.ui.mountView({ key: "bind", slot: "panel", ...content([{ ...goTo(key, n), name: `Go ${n}` }, goTo("w", n + 1), { gesture: "swipe-left", intent: "fx.tap" }]) });
+    ctx.ui.notify(`view-b-mounted:${st.state}`, "info");
+    const attempt = async (label, bindings) => ctx.ui.notify(`view-b-${label}:${await viewCode(() => ctx.ui.updateView(st.mount, content(bindings)))}`, "info");
+    await attempt("many", [..."abcdefghijklmnopqrstuvwxyz0123456"].map(tap));
+    await attempt("reserved", [tap("shift+tab")]);
+    await attempt("order", [tap("ctrl+shift+p"), tap("shift+ctrl+p")]);
+    await attempt("gesture", [{ gesture: "pinch", intent: "fx.tap" }]);
+    await attempt("arg", [goTo("a", "x")]);
+    await attempt("ok", [goTo("ctrl+shift+p", n), goTo("shift+ctrl+q", n + 1)]);
+  } });
+  // D614 slot dialog: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewDialog).
+  pi.registerCommand("ui_view_dialog", { description: "Mount a titled view with a bound key in the dialog slot, hide it and show it", handler: async (args, ctx) => {
+    const [key, number] = args.split(" ");
+    const n = Number(number);
+    let st;
+    try {
+      st = await ctx.ui.mountView({
+        key: "dlg", slot: "dialog", title: `Chart ${n}`, view: viewText(ctx, "-dlg"),
+        intents: [{ name: "fx.add", arg: { type: "object", properties: { n: { type: "integer" } }, required: ["n"] }, answer: { type: "object", properties: { sum: { type: "integer" } }, required: ["sum"] } }],
+        bindings: [{ key, intent: "fx.add", arg: { n } }],
+      });
+    } catch (err) {
+      ctx.ui.notify(`view-d-mounted:${err.code}`, "info");
+      return;
+    }
+    ctx.ui.notify(`view-d-mounted:${st.state}`, "info");
+    ctx.ui.notify(`view-d-hidden:${(await ctx.ui.hideView(st.mount)).state}`, "info");
+    ctx.ui.notify(`view-d-shown:${(await ctx.ui.showView(st.mount)).state}`, "info");
+  } });
+  // D614 dismiss: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewDismiss).
+  pi.registerCommand("ui_view_dismiss", { description: "Mount a dialog with a dismiss intent and probe what the host refuses", handler: async (args, ctx) => {
+    const object = { type: "object" };
+    const tap = { name: "fx.tap", arg: object };
+    const closing = (name) => ({ name, arg: object, dismiss: true });
+    const content = (intents) => ({ view: viewText(ctx, "-dismiss"), intents });
+    const st = await ctx.ui.mountView({ key: "dismiss", slot: "dialog", ...content([tap, closing(args)]) });
+    ctx.ui.notify(`view-d-mounted:${st.state}`, "info");
+    const attempt = async (label, intents) => ctx.ui.notify(`view-d-${label}:${await viewCode(() => ctx.ui.updateView(st.mount, content(intents)))}`, "info");
+    await attempt("two", [tap, closing(args), closing(`${args}2`)]);
+    await attempt("node", [tap, { ...closing(args), nodeKey: "n" }]);
+    await attempt("arg", [tap, { ...closing(args), arg: { type: "object", properties: { value: { type: "string" } }, required: ["value"] } }]);
+    await attempt("ok", [closing(args), tap]);
+  } });
+  pi.onViewIntent(async (inv, ctx) => {
+    if (inv.intent.startsWith("fx.close-")) {
+      // The user dismissed the dialog: the client raised the intent with {}, and its handler removes the mount.
+      if (JSON.stringify(inv.arg) !== "{}") return { outcome: "refused", error: "dismiss takes {}" };
+      await ctx.ui.removeView({ ...inv.mount, rev: inv.rev });
+      return { outcome: "done" };
+    }
+    if (inv.intent === "fx.redraw" || inv.intent === "fx.foreign") {
+      const own = inv.intent === "fx.redraw";
+      const content = { view: textView(`fixture-${own ? "redraw" : "foreign"}-${inv.arg.n + (ctx.ui.viewAbilities()?.limits.intentArgBytes ?? 0)}`), intents: redrawIntents };
+      const mount = { key: inv.mount.key, epoch: inv.mount.epoch, rev: inv.rev };
+      const st = own ? await ctx.ui.updateView(mount, content) : await foreignUpdate(mount, content);
+      return { outcome: "done", answer: { rev: st.mount.rev } };
+    }
+    if (inv.intent === "fx.reopen") {
+      // The user opened the hidden view: its handler shows it.
+      await ctx.ui.showView({ ...inv.mount, rev: inv.rev });
+      return { outcome: "done" };
+    }
+    if (inv.intent === "fx.pick") return { outcome: "done", answer: { node: inv.nodeKey, picked: inv.arg.value } };
+    if (inv.intent === "fx.add") return { outcome: "done", answer: { sum: inv.arg.n * 2 + (ctx.ui.viewAbilities()?.limits.intentArgBytes ?? 0) } };
+    if (inv.intent === "fx.wait") {
+      ctx.ui.notify(`intent-started:${inv.arg.tag}`, "info");
+      if (!inv.signal.aborted) await new Promise((resolve) => inv.signal.addEventListener("abort", resolve, { once: true }));
+      // A call made after the cancel is cancelled with its request, so the tag is kept for ui_view_cancelled.
+      viewCancelledTag = inv.arg.tag;
+      return { outcome: "done", answer: {} };
+    }
+    return { outcome: "refused", error: "unknown intent" };
+  });
   pi.registerCommand("report_geometry", { description: "Report observed terminal geometry", handler: async (_args, ctx) => ctx.ui.notify(`geometry:${ctx.width}x${ctx.height}`, "info") });
 
   pi.registerCommand("surface_footer", { description: "Install a footer renderer", handler: async (_args, ctx) => ctx.ui.setFooter(() => ({ render: (width) => [`footer@${width}`], invalidate() {} })) });
@@ -845,9 +1450,50 @@ export default function (pi) {
   pi.registerCommand("send_message_default", { description: "Send a custom message with default options", handler: async () => pi.sendMessage({ customType: "notice", content: "default", display: true }) });
   pi.registerCommand("send_message_no_turn", { description: "Send a custom message that never starts a turn", handler: async () => pi.sendMessage({ customType: "notice", content: "no-turn", display: true }, { triggerTurn: false }) });
   pi.registerCommand("send_user_message", { description: "Send a user message", handler: async (args) => pi.sendUserMessage(args ? JSON.parse(args) : "hello-user", { deliverAs: "followUp" }) });
+  pi.registerCommand("send_user_message_delivery", { description: "Send a user message with the delivery named by the argument", handler: async (args) => args === "absent" ? pi.sendUserMessage("delivery-absent") : pi.sendUserMessage("delivery-" + args, { deliverAs: args }) });
+  pi.registerCommand("send_refusal_order", { description: "Send a refused user message and others in one run, as the argument names", handler: async (args) => {
+    const first = () => { pi.sendUserMessage("order-absent"); pi.sendUserMessage("order-steer", { deliverAs: "steer" }); pi.sendUserMessage("order-followUp", { deliverAs: "followUp" }); };
+    switch (args) {
+      case "first": first(); break;
+      case "between": pi.sendUserMessage("order-absent"); pi.sendUserMessage("order-steer", { deliverAs: "steer" }); pi.sendUserMessage("order-absent-2"); break;
+      case "yielded": await Promise.resolve(); first(); break;
+      case "throws": first(); throw new Error("order-throws");
+      case "blocked": first(); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30000); break;
+      case "detached": setTimeout(first, 100); break;
+      case "detached_alone": setTimeout(() => pi.sendUserMessage("order-absent"), 100); break;
+      default: throw new Error(`send_refusal_order: unknown case ${args}`);
+    }
+  } });
+  pi.registerCommand("send_user_message_expand", { description: "Send a user message with expandPromptTemplates set to the argument", handler: async (args) => pi.sendUserMessage("expand-user", { deliverAs: "followUp", expandPromptTemplates: args === "true" }) });
   pi.registerCommand("set_session_name", { description: "Set the session name", handler: async () => pi.setSessionName("conformance-session") });
   pi.registerCommand("event_result_probe", { description: "Subscribe to an event with a handler that returns the given JSON", handler: async (args) => { const [name, ...rest] = String(args).trim().split(" "); const result = JSON.parse(rest.join(" ")); pi.on(name, async () => result); } });
+  pi.registerCommand("event_signal_probe", { description: "Subscribe to session_before_compact or session_before_tree with a handler that returns the state of its event signal", handler: async (args) => { const name = String(args).trim(); pi.on(name, async (event, ctx) => {
+    const mode = (name === "session_before_tree" ? event.preparation : event).customInstructions;
+    const before = event.signal.aborted;
+    // Pi's handler awaits ordinary host calls with the signal aborted or aborting (custom-compaction.ts notifies first): the call returns the user's answer.
+    let answer;
+    try { answer = await ctx.ui.input(`event_signal:${name}:${mode}:pending`, "p"); } catch (error) { answer = `failed: ${error?.message ?? error}`; }
+    const state = `event_signal:${mode}:${before}:${event.signal.aborted}:${answer}`;
+    return name === "session_before_compact" ? { compaction: { summary: state, firstKeptEntryId: "k", tokensBefore: 1 } } : { label: state };
+  }); } });
+  pi.registerCommand("tool_call_abort_probe", { description: "Subscribe to tool_call with a handler that answers from a dialog it opened", handler: async () => { pi.on("tool_call", async (event, ctx) => {
+    const mode = event.input?.mode ?? "";
+    let answer;
+    try { answer = await ctx.ui.input(`tool_call_abort:${mode}:pending`, "p"); } catch (error) { answer = `failed: ${error?.message ?? error}`; }
+    return { block: true, reason: `tool_call_abort:${mode}:${answer}` };
+  }); } });
+  pi.registerCommand("event_ordered_result_probe", { description: "Subscribe to an event with a handler that returns the given JSON, members in written order", handler: async (args) => { const [name, ...rest] = String(args).trim().split(" "); const result = JSON.parse(rest.join(" ")); pi.on(name, async () => result); } });
+  pi.registerCommand("event_keys_probe", { description: "Subscribe to the event named by the argument with a handler that reports the key order of its payload", handler: async (args) => { const name = String(args).trim(); pi.on(name, async (event, ctx) => { ctx.ui.notify("event_keys:" + name + ":" + JSON.stringify([Object.keys(event.payload), Object.keys(event.payload.zeta)]), "info"); }); } });
+  pi.registerCommand("event_echo_probe", { description: "Subscribe to the event named by the argument with a handler that hands back the objects it was sent", handler: async (args) => { const name = String(args).trim(); pi.on(name, async (event) => { switch (name) { case "turn_end": return { entries: event.entries }; case "context": return { messages: event.messages.slice(1) }; case "before_provider_request": return event.payload; case "tool_result": return { content: event.content, details: event.details }; case "message_end": return { message: event.message }; } throw new Error(`event_echo_probe has no echo for ${name}`); }); } });
+  pi.registerCommand("event_mutate_probe", { description: "Subscribe to the event named by the argument `<event> [mode]` with a handler that works on the event's payload (before_provider_request) or headers (before_provider_headers) as the mode says: no mode edits it in place and returns nothing, fail throws after the edit, replace edits nothing and returns a replacement, both edits it in place under a key of its own and returns the replacement, delete (headers) sets the header the first edit wrote to null", handler: async (args) => { const [name, mode] = String(args).trim().split(/\s+/); const key = mode === "fail" ? "inPlaceBeforeError" : mode === "both" ? "inPlaceAlongside" : "inPlace"; const headers = name === "before_provider_headers"; pi.on(name, async (event) => { if (headers) { if (mode === "delete") event.headers["x-pig-inPlace"] = null; else if (mode !== "replace") event.headers[`x-pig-${key}`] = "in-place-edit"; } else if (mode !== "replace") { event.payload[key] = "in-place-edit"; if (event.payload.zeta) event.payload.zeta[key] = "in-place-edit"; } if (mode === "fail") throw new Error("failed after the edit"); if (mode === "replace" || mode === "both") return headers ? { "x-pig-replaced": "returned" } : { replaced: "returned" }; }); } });
+  pi.registerCommand("event_edit_probe", { description: "Subscribe to the event named by the argument `<event> <edit> [fail]` with a handler that makes one edit of the event's content, details, isError, message or messages (tool_result, message_end, context; message_start, turn_end and agent_end hold only the Node probe), returns nothing and, with fail, throws after the edit", handler: async (args) => { const [name, edit, fail] = String(args).trim().split(/\s+/); const edited = "other-event-edit"; const text = () => [{ type: "text", text: edited }]; pi.on(name, async (event) => { switch (`${name}/${edit}`) { case "tool_result/content-assign": event.content = text(); break; case "tool_result/details-assign": event.details = { k: edited }; break; case "tool_result/iserror-assign": event.isError = true; break; case "tool_result/content-deep": event.content[0].text = edited; break; case "tool_result/details-deep": event.details.k = edited; break; case "message_end/deep": case "message_start/deep": case "turn_end/deep": event.message.content[0].text = edited; break; case "agent_end/deep": event.messages[event.messages.length - 1].content[0].text = edited; break; case "message_end/content-assign": event.message.content = text(); break; case "message_end/message-assign": event.message = { role: "user", content: text(), timestamp: 1 }; break; case "context/deep": event.messages[0].content[0].text = edited; break; default: throw new Error(`event_edit_probe has no edit ${name}/${edit}`); } if (fail === "fail") throw new Error("failed after the edit"); }); } });
   pi.registerCommand("event_field_probe", { description: "Report a field of the events named by the argument `<event> <field>`", handler: async (args) => { const [name, field] = String(args).trim().split(/\s+/); pi.on(name, async (event, ctx) => { ctx.ui.notify(`event_field:${name}.${field}=${JSON.stringify(event[field]) ?? "absent"}`, "info"); }); } });
+  // event_level_edit_probe `<event> <top|deep>` subscribes to the event with a handler that edits it in place and returns nothing: `top` assigns a member of the event itself (probeTop), `deep` edits inside the message the event carries (the first user message of a `messages` list): the text of its first text block, else a string content, else a `probe` member. Every edit writes `other-event-edit` (TestInPlaceMessageEventEditsMatchPi).
+  pi.registerCommand("event_level_edit_probe", { description: "Subscribe to the event named by the argument `<event> <top|deep>` with a handler that edits the event itself or the message inside it in place", handler: async (args) => { const [name, level] = String(args).trim().split(/\s+/); const edited = "other-event-edit"; pi.on(name, async (event) => { if (level === "top") { event.probeTop = edited; return; } const list = event.messages; const target = event.message ?? (Array.isArray(list) ? (list.find((m) => m?.role === "user") ?? list[0]) : undefined); if (!target || typeof target !== "object") return; const first = Array.isArray(target.content) ? target.content[0] : undefined; if (first && typeof first === "object" && first.type === "text") first.text = edited; else if (typeof target.content === "string") target.content = edited; else target.probe = edited; }); } });
+  // event_member_probe `<event> <set|delete|once> <member> [json]` subscribes to the event with a handler that assigns the member the JSON, deletes it, or (once) assigns it in its first call only and reports `member_probe_stale:<event>:<bool>` whether a later call found it already there (TestInPlaceMessageEventEditsMatchPi).
+  pi.registerCommand("event_member_probe", { description: "Subscribe to the event named by the argument `<event> <set|delete|once> <member> [json]` with a handler that assigns, deletes or once assigns a member of the event", handler: async (args) => { const [, name, op, member, raw] = String(args).trim().match(/^(\S+)\s+(\S+)\s+(\S+)\s*([\s\S]*)$/); const value = raw === "" ? undefined : JSON.parse(raw); let calls = 0; pi.on(name, async (event, ctx) => { calls++; if (op === "delete") { delete event[member]; return; } if (op === "once" && calls > 1) { ctx.ui.notify(`member_probe_stale:${name}:${JSON.stringify(event[member]) === JSON.stringify(value)}`, "info"); return; } event[member] = value; }); } });
+  // event_assign_probe: `<event>`, a handler that ASSIGNS a new value to one member of the event (tool_call input, context messages, turn_end entries) instead of editing the old value in place, and returns nothing (TestAssignedEventMembersFollowPi).
+  pi.registerCommand("event_assign_probe", { description: "Subscribe to the event named by the argument with a handler that assigns a new value to the event's input, messages or entries", handler: async (args) => { const name = String(args).trim(); const edited = "other-event-edit"; pi.on(name, async (event) => { if (name === "tool_call") event.input = { command: edited }; else if (name === "context") event.messages = [{ role: "user", content: [{ type: "text", text: edited }], timestamp: 1 }]; else if (name === "turn_end") event.entries = [{ type: "custom", customType: edited }]; else throw new Error(`event_assign_probe has no event ${name}`); }); } });
   pi.registerCommand("event_probe_on", { description: "Subscribe to the event named by the argument", handler: async (args) => { const name = String(args).trim(); pi.on(name, async (_event, ctx) => { ctx.ui.notify(`event_probe_on:${name}`, "info"); }); } });
   pi.registerCommand("host_state_probe", {
     description: "Report the thinking level and the session commands",
@@ -978,8 +1624,29 @@ export default function (pi) {
     description: "Switch to the model in the arguments",
     handler: async (args, ctx) => {
       const slash = args.indexOf("/");
-      const ok = await pi.setModel({ provider: args.slice(0, slash), id: args.slice(slash + 1) });
+      const provider = args.slice(0, slash), id = args.slice(slash + 1);
+      // The registry's model of that name, as a Pi extension passes it; a name the registry does not list is an object built by hand.
+      const ok = await pi.setModel(ctx.modelRegistry.find(provider, id) ?? { provider, id });
       ctx.ui.notify(`setModel=${ok}`, "info");
+    },
+  });
+  pi.registerCommand("set_model_object", {
+    description: "Switch to the model object in the arguments",
+    handler: async (args, ctx) => {
+      try {
+        ctx.ui.notify(`setModelObject=${await pi.setModel(JSON.parse(args))}`, "info");
+      } catch (err) {
+        ctx.ui.notify(`setModelObject=error:${err.message}`, "info");
+      }
+    },
+  });
+  pi.registerCommand("set_model_object_before_agent_start", {
+    description: "Switch to the model object in the arguments before each agent start",
+    handler: async (args) => {
+      const model = JSON.parse(args);
+      pi.on("before_agent_start", async (_event, ctx) => {
+        ctx.ui.notify(`beforeAgentSetModel=${await pi.setModel(model)}`, "info");
+      });
     },
   });
   const eventProbeOn = new Map();
@@ -987,8 +1654,48 @@ export default function (pi) {
   pi.registerCommand("event_probe_result", { description: "Queue the JSON result the next event_probe_on handler call of an event returns", handler: async (args) => { const text = String(args).trim(); const split = text.indexOf(" "); const name = text.slice(0, split); eventProbeResults.set(name, [...(eventProbeResults.get(name) ?? []), JSON.parse(text.slice(split + 1))]); } });
   pi.registerCommand("event_probe_on", { description: "Subscribe to the event named by the argument", handler: async (args) => { const name = String(args).trim(); const off = pi.on(name, async (event, ctx) => { ctx.ui.notify(`event_probe_on:${name}`, "info"); ctx.ui.notify(`event_probe_data:${name}:${JSON.stringify(event)}`, "info"); if (Array.isArray(event?.servers)) ctx.ui.notify(`event_probe_servers:${event.servers.map((server) => server.name).join(",")}`, "info"); ctx.ui.notify(`event_payload:${name}:${JSON.stringify(event, (_key, value) => (value instanceof Set ? [...value].sort() : value))}`, "info"); const queued = (eventProbeResults.get(name) ?? []).shift(); if (name === "before_provider_headers" && queued) { for (const key of Object.keys(event.headers)) delete event.headers[key]; Object.assign(event.headers, queued); return undefined; } return queued; }); eventProbeOn.set(name, [...(eventProbeOn.get(name) ?? []), off]); } });
   pi.registerCommand("event_probe_off", { description: "Unsubscribe the event_probe_on handlers of the event named by the argument", handler: async (args) => { const name = String(args).trim(); for (const off of eventProbeOn.get(name) ?? []) off(); eventProbeOn.delete(name); } });
+  // lone_passthrough subscribes to the event named by the argument with a handler that returns the value it received, and lone_send sends the
+  // argument's text back through sendUserMessage, sendMessage or registerProvider (TestConformance_LoneSurrogatePassThroughAcrossSDKs).
+  const loneUnits = (text) => (typeof text === "string" ? Array.from({ length: text.length }, (_, i) => text.charCodeAt(i).toString(16)).join(".") : "none");
+  const loneContent = (content) => (typeof content === "string" ? content : content?.[0]?.text);
+  const loneSeen = { input: (event) => event.text, before_agent_start: (event) => event.systemPrompt, tool_result: (event) => event.content?.[0]?.text, context: (event) => loneContent(event.messages?.[0]?.content), context_edit: (event) => loneContent(event.messages?.[0]?.content) };
+  const loneResult = { input: (event) => ({ action: "transform", text: event.text }), before_agent_start: (event) => ({ systemPrompt: event.systemPrompt }), tool_result: (event) => ({ content: event.content }), context: (event) => ({ messages: event.messages }), context_edit: (event) => ({ messages: [event.messages[0], { role: "user", content: "edited", timestamp: 2 }] }) };
+  pi.registerCommand("lone_passthrough", { description: "Subscribe to the event named by the argument with a handler that returns the value it received", handler: async (args) => { const name = String(args).trim(); pi.on(name === "context_edit" ? "context" : name, async (event, ctx) => { ctx.ui.notify(`lone_seen:${name}:${loneUnits(loneSeen[name](event))}`, "info"); return loneResult[name](event); }); } });
+  pi.registerCommand("lone_send", { description: "Send the argument's text back through sendUserMessage, sendMessage or registerProvider", handler: async (args, ctx) => { const text = String(args); const split = text.indexOf(" "); const kind = text.slice(0, split); const value = text.slice(split + 1); ctx.ui.notify(`lone_seen:${kind}:${loneUnits(value)}`, "info"); if (kind === "user") pi.sendUserMessage(value, { deliverAs: "followUp" }); else if (kind === "custom") pi.sendMessage({ customType: "lone", content: value, display: true }); else await pi.registerProvider("lone-compat", { baseUrl: "https://probe.invalid/v1", api: "openai-completions", apiKey: "probe-key", models: [{ id: "m", name: value, reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 100, compat: { openRouterRouting: { sort: value } } }] }); } });
   // A JavaScript Set (session_before_compact preparation.fileOps) has no JSON form; the other SDKs receive the host's array, so report the Set as its members.
-  pi.registerCommand("event_payload_probe", { description: "Subscribe and report the payload of the event named by the argument", handler: async (args) => { const name = String(args).trim(); pi.on(name, async (event, ctx) => { ctx.ui.notify(`event_payload:${name}:${JSON.stringify(event, (_key, value) => (value instanceof Set ? [...value] : value))}`, "info"); }); } });
+  pi.registerCommand("event_payload_probe", { description: "Subscribe and report the payload of the event named by the argument", handler: async (args) => { const name = String(args).trim(); pi.on(name, async (event, ctx) => { ctx.ui.notify(`event_payload:${name}:${stringifyEventPayload(event)}`, "info"); }); } });
+  // event_isolation_probe: two handlers; the first reports the marker it received, writes a sentinel into its container and changes it again from a timer after returning; the second reports what it received (TestConformance_EventHandlersDoNotShareTheirPayload). A boundary event's marker is the first context entry's sourceEntry id (the container is that source entry); a context or context_with_system event's is the length of event.messages (the container is that list).
+  pi.registerCommand("event_isolation_probe", { description: "Subscribe two handlers that report the nested marker they received and then write sentinels into it", handler: async (args) => {
+    const name = String(args).trim();
+    const conversation = name === "context" || name === "context_with_system";
+    const source = (event) => event.context?.contextEntries?.[0]?.sourceEntry;
+    const marker = (event) => (conversation ? (event.messages ?? []).length : source(event)?.id);
+    const scribble = (event, value) => {
+      if (conversation) event.messages.push({ role: "user", content: value, timestamp: 0 });
+      else source(event).id = value;
+    };
+    const messages = (event) => {
+      if (conversation) return [0, 1, 2].map((i) => event.messages?.[i]);
+      const context = event.context ?? {};
+      return [context.contextMessages?.[0], context.llmMessages?.[0], context.contextEntries?.[0]?.messages?.[0]];
+    };
+    const report = (found) => found.map((m) => (m ? String(m.content) : "None")).join("|");
+    pi.on(name, async (event, ctx) => {
+      ctx.ui.notify(`event_isolation:A:${marker(event)}:end`, "info");
+      scribble(event, "SENTINEL-HANDLER-A");
+      const found = messages(event);
+      ctx.ui.notify(`event_isolation_msgs:A:${report(found)}`, "info");
+      for (const m of found) if (m) m.content = "SENTINEL-HANDLER-A";
+      setTimeout(() => {
+        scribble(event, "SENTINEL-LATE-WRITER");
+        for (const m of found) if (m) m.content = "SENTINEL-LATE-WRITER";
+      }, 100);
+    });
+    pi.on(name, async (event, ctx) => {
+      ctx.ui.notify(`event_isolation:B:${marker(event)}:end`, "info");
+      ctx.ui.notify(`event_isolation_msgs:B:${report(messages(event))}`, "info");
+    });
+  } });
   pi.registerCommand("tool_result_guards_probe", { description: "Report the tool_result guards that accept each tool_result event", handler: async () => { const guards = { bash: isBashToolResult, edit: isEditToolResult, find: isFindToolResult, grep: isGrepToolResult, ls: isLsToolResult, powershell: isPowerShellToolResult, read: isReadToolResult, write: isWriteToolResult }; pi.on("tool_result", async (event, ctx) => { ctx.ui.notify(`tool_result_guards:${Object.keys(guards).filter((name) => guards[name](event)).join(",")}:end`, "info"); }); } });
   pi.registerCommand("language_probe", { description: "Report the highlight language of a path", handler: async (args, ctx) => {
     const c = JSON.parse(args);
@@ -1083,21 +1790,36 @@ export default function (pi) {
   const builtinReport = (result) => {
     const report = { content: result.content.map((block) => block.type === "text" ? { type: "text", text: block.text } : { type: block.type, mimeType: block.mimeType }), isError: !!result.isError };
     if (result.details !== undefined && result.details !== null) { report.details = result.details; report.detailsJSON = JSON.stringify(result.details); }
-    if (result.structuredContent && typeof result.structuredContent === "object") { report.structuredKeys = Object.keys(result.structuredContent); report.exitCode = result.structuredContent.exit_code; }
+    if (result.structuredContent && typeof result.structuredContent === "object") { report.structuredKeys = Object.keys(result.structuredContent); report.exitCode = result.structuredContent.exit_code ?? null; /* an object without exit_code (an image read) reports null, as the native fixtures' nil does */ }
     return report;
   };
   const builtinOptions = (c, log) => {
     const hook = c.hook ? (spawn) => { log.push(`spawnHook:${spawn.command}`); return { command: "printf '%s|%s' \"$HOOK_VAR\" \"$PI_SESSION_ID\"", cwd: spawn.cwd, env: { ...spawn.env, HOOK_VAR: "hook-env" } }; } : undefined;
     const custom = c.ops === "custom";
     switch (c.tool) {
-      case "read": return { autoResizeImages: c.autoResizeImages ?? undefined, operations: custom ? { readFile: async (p) => { log.push(`readFile:${p}`); return Buffer.from(`OPS:${p}`); }, access: async (p) => { log.push(`access:${p}`); } } : undefined };
+      case "read": if (c.ops === "stream") return { operations: { readFile: async (p) => { log.push(`readFile:${p}`); return Buffer.from(`OPS:${p}`); }, access: async (p) => { log.push(`access:${p}`); }, createReadStream: (p) => { log.push(`createReadStream:${p}`); return Readable.from([Buffer.from("STREAM:"), Buffer.from(`${p}\n`)]); } } };
+        return { autoResizeImages: c.autoResizeImages ?? undefined, operations: custom ? { readFile: async (p) => { log.push(`readFile:${p}`); return Buffer.from(`OPS:${p}`); }, access: async (p) => { log.push(`access:${p}`); } } : undefined };
       case "write": return { operations: custom ? { writeFile: async (p, content) => { log.push(`writeFile:${p}:${content}`); }, mkdir: async (d) => { log.push(`mkdir:${d}`); } } : undefined };
       case "edit": return { operations: custom ? { readFile: async (p) => { log.push(`readFile:${p}`); return Buffer.from("hello world\n"); }, writeFile: async (p, content) => { log.push(`writeFile:${p}:${content}`); }, access: async (p) => { log.push(`access:${p}`); } } : undefined };
       case "ls": return { operations: custom ? { exists: async (p) => { log.push(`exists:${p}`); return true; }, stat: async (p) => { log.push(`stat:${p}`); return { isDirectory: () => !p.includes(".") }; }, readdir: async (p) => { log.push(`readdir:${p}`); return ["b.txt", "a.txt", "sub"]; } } : undefined };
-      case "grep": return { operations: custom ? { isDirectory: async (p) => { log.push(`isDirectory:${p}`); throw new Error("no such path for the probe"); } } : undefined };
-      case "find": return { operations: custom ? { exists: async (p) => { log.push(`exists:${p}`); return false; }, glob: async (pattern) => { log.push(`glob:${pattern}`); return []; } } : undefined };
+      // readFile is Pi's deprecated GrepOperations.readFile: a JS extension passes one and Pi never calls it; every native SDK's grepdir case passes one too.
+      case "grep": if (c.ops === "grepdir") return { operations: { isDirectory: async (p) => { log.push(`isDirectory:${p}`); return true; }, readFile: async (p) => { log.push(`readFile:${p}`); return ""; } } };
+        return { operations: custom ? { isDirectory: async (p) => { log.push(`isDirectory:${p}`); throw new Error("no such path for the probe"); }, readFile: async (p) => { log.push(`readFile:${p}`); return ""; } } : undefined };
+      case "find": if (c.ops === "globlimit") return { operations: { exists: async (p) => { log.push(`exists:${p}`); return true; }, glob: async (pattern, cwd, o) => { log.push(`glob:${pattern}:limit=${o.limit}`); return ["a.txt", "b.txt", "c.txt"].slice(0, o.limit); } } };
+        return { operations: custom ? { exists: async (p) => { log.push(`exists:${p}`); return false; }, glob: async (pattern) => { log.push(`glob:${pattern}`); return []; } } : undefined };
       case "powershell": return { exposeSessionEnvironment: c.exposeSessionEnvironment ?? undefined };
-      default: return { commandPrefix: c.commandPrefix || undefined, exposeSessionEnvironment: c.exposeSessionEnvironment ?? undefined, spawnHook: hook, operations: custom ? { exec: async (command, cwd, o) => { log.push(`exec:${command}|cwd=${cwd}`); o.onData(Buffer.from(`custom:${command}`)); return { exitCode: 0 }; } } : undefined };
+      default: if (c.ops === "localThread") {
+        // The local operations run on another thread (Node has one thread, so the nearest is another turn of the event loop) and their error comes back unchanged.
+        const local = piCodingAgent.createLocalBashOperations();
+        return { operations: { exec: (command, cwd, o) => new Promise((resolve, reject) => { setImmediate(() => { local.exec(command, cwd, o).then(resolve, reject); }); }) } };
+      }
+      if (c.ops === "local" || c.ops === "localWrapped") {
+        // The bash tool runs on the local operations. "local" rethrows their error unchanged; "localWrapped" throws a new Error with the same message, which is not the
+        // backend's class and keeps nothing of it (bash.ts matches the class).
+        const local = piCodingAgent.createLocalBashOperations();
+        return { operations: { exec: async (command, cwd, o) => { try { return await local.exec(command, cwd, o); } catch (error) { throw c.ops === "localWrapped" ? new Error(error.message) : error; } } } };
+      }
+      return { commandPrefix: c.commandPrefix || undefined, exposeSessionEnvironment: c.exposeSessionEnvironment ?? undefined, spawnHook: hook, operations: custom ? { exec: async (command, cwd, o) => { log.push(`exec:${command}|cwd=${cwd}`); o.onData(Buffer.from(`custom:${command}`)); return { exitCode: 0 }; } } : undefined };
     }
   };
   const builtinFactories = { read: [piCodingAgent.createReadToolDefinition, piCodingAgent.createReadTool], write: [piCodingAgent.createWriteToolDefinition, piCodingAgent.createWriteTool], edit: [piCodingAgent.createEditToolDefinition, piCodingAgent.createEditTool], bash: [piCodingAgent.createBashToolDefinition, piCodingAgent.createBashTool], grep: [piCodingAgent.createGrepToolDefinition, piCodingAgent.createGrepTool], find: [piCodingAgent.createFindToolDefinition, piCodingAgent.createFindTool], ls: [piCodingAgent.createLsToolDefinition, piCodingAgent.createLsTool], powershell: [piCodingAgent.createPowerShellToolDefinition, piCodingAgent.createPowerShellTool] };
@@ -1148,10 +1870,15 @@ export default function (pi) {
     const updates = [];
     const onUpdate = c.updates || c.abortOnOutput ? (partial) => { const text = partial.content.filter((b) => b.type === "text").map((b) => b.text).join("\n"); updates.push(text); if (c.abortOnOutput && text !== "") controller.abort(); } : undefined;
     const report = {};
+    const holdsBefore = stdioGraceHolds;
     try {
       const result = c.noContext ? await createTool(c.factoryCwd, options).execute("probe-call", c.params ?? {}, controller.signal, onUpdate) : await createDefinition(c.factoryCwd, options).execute("probe-call", c.params ?? {}, controller.signal, onUpdate, ctx);
       report.result = builtinReport(result);
     } catch (error) { report.error = error.message; }
+    // The shell-exit cases (local operations over a shell that exits while a writer holds the pipes) must have held Pi's post-exit grace timer at least once.
+    if (["local", "localWrapped", "localThread"].includes(c.ops) && stdioGraceHolds === holdsBefore) {
+      report.error = "the fixture held no post-exit stdio grace timer: Pi's waitForChildProcess no longer sets a 100 ms timer from armIdleTimer, so the shell-exit cases would race the wall clock";
+    }
     if (c.updates) report.updates = updates;
     report.calls = log;
     emit(report);
@@ -1319,6 +2046,18 @@ export default function (pi) {
   } });
   let installedEditorFactory;
   pi.registerCommand("editor-install", { description: "Install a custom editor component", handler: async (_args, ctx) => { installedEditorFactory = (tui, theme, keybindings) => new CustomEditor(tui, theme, keybindings); ctx.ui.setEditorComponent(installedEditorFactory); } });
+  // An editor that refuses a provider with the "!" trigger, as an extension's own setAutocompleteProvider may throw.
+  pi.registerCommand("editor-install-refusing", { description: "Install a custom editor that refuses a rebuilt autocomplete provider", handler: async (_args, ctx) => {
+    ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+      const editor = new CustomEditor(tui, theme, keybindings);
+      const take = editor.setAutocompleteProvider.bind(editor);
+      editor.setAutocompleteProvider = (provider) => {
+        if ((provider.triggerCharacters ?? []).includes("!")) throw new Error("EDITOR_SYNC_REFUSED");
+        take(provider);
+      };
+      return editor;
+    });
+  } });
   pi.registerCommand("editor-get-probe", { description: "Report the factory getEditorComponent returns", handler: async (_args, ctx) => { const got = ctx.ui.getEditorComponent(); ctx.ui.notify(`editor_get:${got === undefined ? "absent" : got === installedEditorFactory ? "installed" : "other"}:end`, "info"); } });
   pi.registerCommand("editor-clear", { description: "Restore the host's editor", handler: async (_args, ctx) => { installedEditorFactory = undefined; ctx.ui.setEditorComponent(undefined); } });
   pi.registerCommand("settings_probe", { description: "Report the effective settings", handler: async (_args, ctx) => ctx.ui.notify(`settings_probe:${JSON.stringify(pi.getSettings())}`, "info") });
@@ -1329,6 +2068,28 @@ export default function (pi) {
   pi.registerCommand("set_label", { description: "Set an entry label", handler: async () => pi.setLabel("label-entry", "conformance-label") });
   pi.registerShortcut("ctrl+alt+y", { description: "Conformance shortcut", handler: async () => {} });
   pi.registerCommand("append_entry", { description: "Append a custom entry", handler: async () => pi.appendEntry("conformance-entry", "hello-entry") });
+  // An entry and a message with the optional member left out, then with it written as null.
+  pi.registerCommand("entry_null_members", { description: "Append entries and send messages with an omitted and a null member", handler: async () => {
+    pi.appendEntry("conformance-null-omitted");
+    pi.appendEntry("conformance-null-explicit", null);
+    pi.sendMessage({ customType: "conformance-null-omitted", content: "x", display: false });
+    pi.sendMessage({ customType: "conformance-null-explicit", content: "x", display: false, details: null });
+  } });
+  // setLabel on the entry in the arguments without a label, with a null one and with an empty one: Pi writes a different entry for each.
+  pi.registerCommand("label_members", { description: "Set a label that is omitted, null and empty", handler: async (args) => {
+    pi.setLabel(args);
+    pi.setLabel(args, null);
+    pi.setLabel(args, "");
+  } });
+  // The setup callback's SessionManager: an entry and a message with the optional member left out, then with it written as null.
+  pi.registerCommand("setup_null_members", { description: "Seed a new session with an omitted and a null member", handler: async (_args, ctx) => {
+    await ctx.newSession({ setup: async (sessionManager) => {
+      sessionManager.appendCustomEntry("api-custom");
+      sessionManager.appendCustomEntry("api-custom", null);
+      sessionManager.appendCustomMessageEntry("api-message", "x", false);
+      sessionManager.appendCustomMessageEntry("api-message", "x", true, null);
+    } });
+  } });
   pi.registerCommand("append-entries-probe", { description: "Append a custom entry for each comma-separated type", handler: async (args) => { for (const customType of String(args).split(",")) pi.appendEntry(customType, `data-of-${customType}`); } });
   pi.registerCommand("scoped-models-probe", { description: "Report the model scope", handler: async (_args, ctx) => ctx.ui.notify(JSON.stringify(ctx.scopedModels), "info") });
   pi.registerCommand("ui-availability", {
@@ -1403,6 +2164,27 @@ export default function (pi) {
     description: "Report cwd, mode, hasUI and model",
     handler: (_args, ctx) => ctx.ui.notify(`stale:${ctx.cwd}|${ctx.mode}|${ctx.hasUI}|${ctx.model?.id ?? ""}`, "info"),
   });
+  // stale-members calls the members Pi guards with assertActive (runner.ts:883-1037): each outcome is one line, and the command fails with every
+  // line when one carries the stale message, else it reports them. Node has no width, height or tool-update member on the context.
+  pi.registerCommand("stale-members", {
+    description: "Call the members that fail with the stale message",
+    handler: (_args, ctx) => {
+      const lines = [];
+      let stale = false;
+      const member = (name, call) => {
+        let outcome;
+        try { outcome = `ok:${call() ?? ""}`; } catch (error) { outcome = `throws:${error.message}`; }
+        stale = stale || outcome.includes("This extension ctx is stale");
+        lines.push(`${name}=${outcome}`);
+      };
+      member("theme", () => typeof ctx.ui.theme);
+      member("sessionName", () => ctx.sessionManager.getSessionName());
+      member("setWidgetLines", () => ctx.ui.setWidget("stale-members", ["x"]));
+      member("setWidgetView", () => ctx.ui.setWidget("stale-members-view", () => ({ render: () => ["x"], invalidate() {} })));
+      if (stale) throw new Error(`stale-members\n${lines.join("\n")}`);
+      ctx.ui.notify(`members\n${lines.join("\n")}`, "info");
+    },
+  });
   pi.registerCommand("signal-probe", {
     description: "Report ctx.signal",
     handler: (_args, ctx) => ctx.ui.notify(`signal:${ctx.signal === undefined ? "none" : ctx.signal.aborted ? "aborted" : "live"}`, "info"),
@@ -1437,6 +2219,45 @@ export default function (pi) {
   });
   pi.registerCommand("usage-probe", {
     handler: (_args, ctx) => ctx.ui.notify(JSON.stringify(ctx.getContextUsage() ?? null), "info"),
+  });
+  pi.registerCommand("console-probe", {
+    description: "Write console lines to stdout and stderr",
+    handler: async (args) => {
+      for (const n of [1, 2]) {
+        if (args !== "stderr") console.log(`probe-out-${n}`);
+        console.error(`probe-err-${n}`);
+      }
+    },
+  });
+  // panic-probe and the onLoaded handler throw after a deliberate stderr line the extension itself writes (TestConformance_SDKDiagnosticsReachOnlyTheExtensionLog).
+  pi.onLoaded(() => {
+    if (process.env.PIG_FIXTURE_PANIC_PROBE) {
+      console.error("probe-err-loaded");
+      throw new Error("probe-panic-boom");
+    }
+  });
+  pi.registerCommand("panic-probe", {
+    description: "Throw after an stderr line of the extension's own",
+    handler: async () => {
+      console.error("probe-err-command");
+      throw new Error("probe-panic-boom");
+    },
+  });
+  // replica-probe (TestReplicatedReadsAreLocalAcrossSDKs) reads the model object, the session id, the session manager's id and the context usage, and reports them as one JSON object. Its argument is empty, or "set-model:<provider>/<id>" to call setModel before it reads. Every SDK fixture reports the same shape.
+  pi.registerCommand("replica-probe", {
+    description: "Report the replicated model object, session ids and context usage",
+    handler: async (args, ctx) => {
+      if (args.startsWith("set-model:")) {
+        const [provider, ...rest] = args.slice("set-model:".length).split("/");
+        await pi.setModel({ provider, id: rest.join("/") });
+      }
+      const m = ctx.model;
+      const model = m === undefined || !m.id ? null : {
+        id: m.id, name: m.name ?? "", provider: typeof m.provider === "string" ? m.provider : m.provider?.id ?? "", contextWindow: m.contextWindow ?? 0, maxOutputTokens: m.maxTokens ?? 0, reasoning: m.reasoning === true,
+        inputCostPer1M: m.cost?.input ?? 0, outputCostPer1M: m.cost?.output ?? 0, cacheReadCostPer1M: m.cost?.cacheRead ?? 0, cacheWriteCostPer1M: m.cost?.cacheWrite ?? 0,
+      };
+      ctx.ui.notify(JSON.stringify({ model, sessionId: ctx.sessionManager.getSessionId(), managerSessionId: ctx.sessionManager.getSessionId(), sessionName: ctx.sessionManager.getSessionName() ?? null, sessionFile: ctx.sessionManager.getSessionFile() ?? null, managerSessionName: ctx.sessionManager.getSessionName() ?? null, managerSessionFile: ctx.sessionManager.getSessionFile() ?? null, usage: ctx.getContextUsage() ?? null }), "info");
+    },
   });
   pi.registerCommand("context-probe", {
     description: "Report ctx.mode + ctx.getSystemPromptOptions()",
@@ -1926,6 +2747,33 @@ export default function (pi) {
       ctx.ui.notify(`${result ?? ""}`, "info");
     },
   });
+  // The click cards, written as Pi's renderers are: the state lives in a WeakMap keyed by the message (entry) object, which the renderer receives on every rebuild, and a MouseRegion over the text counts the click.
+  const clickCard = (prefix, subjectOf) => {
+    const states = new WeakMap();
+    return (subject, options) => {
+      let state = states.get(subject);
+      if (state === undefined) {
+        state = { clicks: 0, last: "none" };
+        states.set(subject, state);
+      }
+      const content = { render: () => [`${prefix}:${subjectOf(subject)}:clicks=${state.clicks}:last=${state.last}:expanded=${options.expanded}`], invalidate() {} };
+      return new piTui.MouseRegion(content, (event) => {
+        if (event.type !== "click") return undefined;
+        state.clicks += 1;
+        state.last = `${event.x},${event.y}`;
+        return { handled: true };
+      });
+    };
+  };
+  pi.registerMessageRenderer("conformance-click-message", clickCard("clickcard", (message) => message.content));
+  // A card in a padded Box, as Pi's own cards are: the MouseRegion answers inside the padding only, so Box.handleMouse leaves a click on the padding unhandled.
+  const paddedClick = clickCard("clickpadded", (message) => message.content);
+  pi.registerMessageRenderer("conformance-click-padded", (message, options, theme) => {
+    const box = new piTui.Box(3, 0);
+    box.addChild(paddedClick(message, options, theme));
+    return box;
+  });
+  pi.registerEntryRenderer("conformance-click-entry", clickCard("clickentry", (entry) => entry.data));
   pi.registerMessageRenderer("kit-message", (_message, _options, theme) => new KitProbe(theme));
   pi.registerEntryRenderer("kit-entry", (_entry, _options, theme) => new KitProbe(theme));
   pi.registerCommand("kit-surfaces", {
@@ -2278,7 +3126,24 @@ export default function (pi) {
     if (event.entries.length !== 2 || event.context.contextEntries.length !== 2 || event.entries[0].customType !== "kept" || event.entries[1].customType !== "before-error") {
       throw new Error("lost boundary mutation or preview");
     }
-    return { entries: [{ type: "custom", customType: "conformance-boundary" }], continue: true };
+    // One draft with a null replacement, one without the member, and a compaction that keeps nothing.
+    return {
+      entries: [
+        { type: "custom", customType: "conformance-boundary" },
+        { type: "context_edit", targetId: "conformance-failed-attempt", replacement: null },
+        { type: "context_edit", targetId: "conformance-omitted-member" },
+        { type: "compaction", summary: "conformance-summary", firstKeptEntryId: null, details: { format: "conformance-checkpoint" }, usage: null },
+        // A data, a details and (above) a usage member written as null: Pi's file holds each as null.
+        { type: "custom", customType: "conformance-null-data", data: null },
+        { type: "custom_message", customType: "conformance-null-details", content: "x", display: false, details: null },
+      ],
+      continue: true,
+    };
+  });
+  pi.on("agent_before_settle", (event, ctx) => {
+    if (event.entries.length !== 6) throw new Error(`boundary result reached the next handler as ${event.entries.length} entries`);
+    const member = (index, key) => (key in event.entries[index] ? (event.entries[index][key] === null ? "null" : "value") : "absent");
+    ctx.ui.notify(`agent_before_settle_drafts:${event.entries.length}:${member(1, "replacement")}:${member(2, "replacement")}:${member(3, "firstKeptEntryId")}:${event.entries[3].details?.format}:${member(0, "data")}:${member(3, "usage")}:${member(4, "data")}:${member(5, "details")}`, "info");
   });
   pi.on("session_start", async (event, ctx) => {
     ctx.ui.notify(`session_start:${event.reason ?? ""}`, "info");
@@ -2288,7 +3153,20 @@ export default function (pi) {
     ctx.ui.notify(`session_shutdown:${event.reason ?? ""}`, "info");
     if (event.targetSessionFile) ctx.ui.notify(`target:${event.targetSessionFile}`, "info");
   });
-  pi.on("session_info_changed", async (event, ctx) => ctx.ui.notify(`session_info_changed:${event.name ?? ""}`, "info"));
+  pi.on("session_info_changed", async (event, ctx) => {
+    // io_wait_name arms the handler to wait on a socket read first, as a handler that awaits does in Pi.
+    if (nameWaitAddr) {
+      await new Promise((resolve, reject) => {
+        const [host, port] = nameWaitAddr.split(":");
+        const socket = ioWaitConnect({ host, port: Number(port) });
+        socket.setEncoding("utf8");
+        socket.on("connect", () => socket.write("waiting\n"));
+        socket.on("data", () => { socket.destroy(); resolve(); });
+        socket.on("error", reject);
+      });
+    }
+    ctx.ui.notify(`session_info_changed:${event.name ?? ""}`, "info");
+  });
   pi.on("session_before_compact", async (event, ctx) => ctx.ui.notify(`session_before_compact:${event.reason ?? ""}:${Boolean(event.willRetry)}`, "info"));
   pi.on("session_compact", async (event, ctx) => ctx.ui.notify(`session_compact:${event.reason ?? ""}:${Boolean(event.willRetry)}:${Boolean(event.fromExtension)}`, "info"));
   pi.on("session_compact_failed", async (event, ctx) => ctx.ui.notify(`session_compact_failed:${event.reason ?? ""}:${event.errorMessage ?? ""}:${Boolean(event.aborted)}:${Boolean(event.willRetry)}:${Boolean(event.fromExtension)}`, "info"));
@@ -2313,11 +3191,15 @@ export default function (pi) {
       ctx.ui.notify(`ui_prompt:${event.type}:${event.reason}:${event.kind}:${"title" in event ? event.title : "(none)"}`, "info");
     });
   }
-  // state-push-probe (TestHostStateChangeReachesABackgroundReaderAcrossSDKs) arms a timer that reads one replicated accessor from outside every request and returns: the host then changes its own state with no call and no event to this extension, and the timer reports the first value that differs from the one it armed on, or the value it still holds after the window, to a file in the directory the arguments name. The arguments are {"kind": "model" | "session-name" | "thinking-level" | "theme" | "settings:<key>" | "mcp", "dir": <directory>}; the report is "<armed>=><read>".
+  // state-push-probe (TestHostStateChangeReachesABackgroundReaderAcrossSDKs) arms a timer that reads one replicated accessor from outside every request and returns: the host then changes its own state with no call and no event to this extension, and the timer reports the first value that differs from the one it armed on, or the value it still holds after the window, to a file in the directory the arguments name. The arguments are {"kind": "model" | "model-name" | "session-id" | "context-usage" | "session-name" | "thinking-level" | "theme" | "settings:<key>" | "mcp", "dir": <directory>}; the report is "<armed>=><read>".
   pi.registerCommand("state-push-probe", { description: "Read one replicated accessor from a timer between requests", handler: async (args, ctx) => {
     const { kind, dir } = JSON.parse(args);
     let read;
     if (kind === "model") read = () => ctx.model?.id ?? "";
+    else if (kind === "model-name") read = () => ctx.model?.name ?? "";
+    else if (kind === "usage-then-id") read = () => { const usage = ctx.getContextUsage(); if (!usage || usage.tokens == null) return "none"; return usage.tokens === 250 ? `tokens=250,id=${ctx.sessionManager.getSessionId()}` : `tokens=${usage.tokens}`; };
+    else if (kind === "context-usage") read = () => { const usage = ctx.getContextUsage(); return usage ? `tokens=${usage.tokens ?? ""}` : "none"; };
+    else if (kind === "session-id") read = () => ctx.sessionManager.getSessionId();
     else if (kind === "session-name") read = () => pi.getSessionName() ?? "";
     else if (kind === "theme") read = () => ctx.ui.theme.name ?? "";
     else if (kind === "thinking-level") read = () => pi.getThinkingLevel();

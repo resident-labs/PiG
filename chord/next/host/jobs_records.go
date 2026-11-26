@@ -1,7 +1,7 @@
 package host
 
 import (
-	"container/list"
+	containerlist "container/list"
 	"context"
 	"fmt"
 
@@ -11,9 +11,10 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/data"
 	"github.com/MichaelKinsy/PiG/chord/next/documents"
 	"github.com/MichaelKinsy/PiG/chord/next/store"
+	chordtelemetry "github.com/MichaelKinsy/PiG/chord/next/telemetry"
 )
 
-// Ports packages/chord/src/next/jobs/records.ts
+// Ports packages/chord/src/jobs/records.ts
 //
 // A job's records on its object (§15, slice 6a §1.2, slice 6b §4): its runs by id and by key, the active count, the run
 // state documents, `running` and the runs waiting for a live attempt, across the object's attempts. Records and state
@@ -128,11 +129,11 @@ const (
 
 // runSet is a set of runs in insertion order (Pi's `Set`).
 type runSet struct {
-	items map[*jobRun]*list.Element
-	order list.List
+	items map[*jobRun]*containerlist.Element
+	order containerlist.List
 }
 
-func newRunSet() *runSet { return &runSet{items: map[*jobRun]*list.Element{}} }
+func newRunSet() *runSet { return &runSet{items: map[*jobRun]*containerlist.Element{}} }
 
 func (set *runSet) add(run *jobRun) {
 	if _, found := set.items[run]; !found {
@@ -281,7 +282,7 @@ func (records *jobRecords) undeclare() {
 	waiting := records.waiting.snapshot()
 	records.waiting.clear()
 	for _, run := range waiting {
-		records.loop.Go(func() { records.record(run, recordChange{kind: changeBlock, run: run, reason: BlockedVersion}) })
+		startTask(records.loop, func() { records.record(run, recordChange{kind: changeBlock, run: run, reason: BlockedVersion}) })
 	}
 }
 
@@ -554,11 +555,8 @@ func (records *jobRecords) stage(tx *documents.Transaction, args any, ctx contex
 		return nil, data.NewChordError(data.ChordErrorInit{Code: data.CodeUnavailable, Reason: data.ReasonBusy, Message: message}, nil)
 	}
 	persisted := records.persisted != nil
-	var trace map[string]string
-	if persisted {
-		span := chordctx.Telemetry(ctx)
-		trace = span.Propagation().Inject(span)
-	}
+	// Its starter's carrier: its later phases are children of it (a persisted run stores it, for a later process).
+	trace := chordtelemetry.CarrierOf(chordctx.Telemetry(ctx))
 	phase := phaseRunning
 	if persisted {
 		phase = phasePending
@@ -797,7 +795,7 @@ func (records *jobRecords) progressed(tx *documents.Transaction, run *jobRun) er
 // settled is: a run's invocation settled: its outcome is recorded (phase `finishing`) in a transaction of the object
 // behind the state changes admitted before, so `outcome.State` has them; then it is finished on the live attempt.
 func (records *jobRecords) settled(run *jobRun, ended jobEnded) {
-	records.loop.Go(func() { records.recordOutcome(run, ended) })
+	startTask(records.loop, func() { records.recordOutcome(run, ended) })
 }
 
 // cut is: a running run whose attempt was sealed: its signal fires with err, its invocation is fenced (later state
@@ -825,7 +823,7 @@ func (records *jobRecords) cut(run *jobRun, err *data.ChordError, reason cutReas
 		if reason == cutReload {
 			ended = reload
 		}
-		records.loop.Go(func() { records.recordOutcome(run, ended) })
+		startTask(records.loop, func() { records.recordOutcome(run, ended) })
 	}
 }
 
@@ -874,7 +872,7 @@ func (records *jobRecords) writeAtClose(ctx context.Context) {
 	}
 	fence := store.CommitFence{
 		Admit: func() bool { return true },
-		Adopt: func(int64, []int64) error {
+		Adopt: func(int64, []int64, int) error {
 			records.loop.Run(func() {
 				for _, adopt := range adopts {
 					adopt()
@@ -1020,6 +1018,7 @@ func (records *jobRecords) restored(loaded loadedRecord, ctx context.Context) (r
 	id, record := loaded.id, loaded.record
 	definition := records.definition
 	run := newJobRun(records.loop, id, record.Version, record.Fingerprint, record.Key, record.Args, record.Phase, record.Trace)
+	run.traceOrder = record.TraceOrder
 	run.restarts = record.Restarts
 	run.finishFailures = record.FinishFailures
 	run.abortMarked = record.Abort
@@ -1151,7 +1150,7 @@ func (records *jobRecords) need(run *jobRun) {
 	// A job the code no longer declares: blocked `version`, kept (slice 7b section 8).
 	if !records.declared {
 		if run.phase != phaseBlocked {
-			records.loop.Go(func() { records.record(run, recordChange{kind: changeBlock, run: run, reason: BlockedVersion}) })
+			startTask(records.loop, func() { records.record(run, recordChange{kind: changeBlock, run: run, reason: BlockedVersion}) })
 		}
 		return
 	}
@@ -1171,7 +1170,7 @@ func (records *jobRecords) dispatch(run *jobRun, target *job) {
 	}
 	// Not of a version the code takes: blocked `version` until a reload brings matching code.
 	if !records.takes(run) {
-		records.loop.Go(func() { records.record(run, recordChange{kind: changeBlock, run: run, reason: BlockedVersion}) })
+		startTask(records.loop, func() { records.record(run, recordChange{kind: changeBlock, run: run, reason: BlockedVersion}) })
 		return
 	}
 	if run.phase == phaseFinishing {
@@ -1182,11 +1181,11 @@ func (records *jobRecords) dispatch(run *jobRun, target *job) {
 		return
 	}
 	if run.abortMarked {
-		records.loop.Go(func() { records.recordOutcome(run, aborted) })
+		startTask(records.loop, func() { records.recordOutcome(run, aborted) })
 		return
 	}
 	if run.resuming && records.definition.Persist != nil && records.definition.Persist.Resume == ResumeAbandon {
-		records.loop.Go(func() { records.recordOutcome(run, restart) })
+		startTask(records.loop, func() { records.recordOutcome(run, restart) })
 		return
 	}
 	run.resuming = false

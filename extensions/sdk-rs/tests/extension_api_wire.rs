@@ -1046,11 +1046,11 @@ fn exec_signal_cancels_the_command() {
     host.reply(&cancel, json!({}));
     host.reply(
         &call,
-        json!({"stdout":"so far","stderr":"","code":0,"killed":true}),
+        json!({"stdout":"so far","stderr":"","code":143,"killed":true}),
     );
     assert_eq!(
         host.response("r1")["result"]["details"],
-        json!({"stdout":"so far","code":0,"killed":true})
+        json!({"stdout":"so far","code":143,"killed":true})
     );
     host.finish();
 }
@@ -1108,7 +1108,7 @@ fn exec_with_a_cancelled_signal_sends_the_cancel_behind_the_call() {
     host.reply(&cancel, json!({}));
     host.reply(
         &call,
-        json!({"stdout":"","stderr":"","code":0,"killed":true}),
+        json!({"stdout":"","stderr":"","code":143,"killed":true}),
     );
     assert_eq!(host.response("r1")["result"]["details"]["killed"], true);
     host.finish();
@@ -1365,6 +1365,71 @@ fn own_thinking_runs_reaches_the_register_frame_and_the_runtime_call() {
     assert!(
         host.register["register"]
             .get("owns_thinking_runs")
+            .is_none(),
+        "register: {}",
+        host.register
+    );
+    host.finish();
+}
+
+// Pi eebd5d90, options.messageTypes: the register frame lists the surfaces of a Markdown transformer; no options list the three transcript
+// types, an empty list none, and no transformer no key.
+#[test]
+fn markdown_transformer_message_types_reach_the_register_frame() {
+    let surfaces = ["assistant", "custom", "summary", "changelog"];
+    let mut ext = Extension::new("api");
+    ext.markdown_transformer_with_options(
+        |markdown, _| Some(markdown.to_string()),
+        pig_sdk::MarkdownTransformerOptions {
+            message_types: Some(surfaces.iter().map(|s| s.to_string()).collect()),
+        },
+    );
+    let host = Host::start(ext, json!({}));
+    assert_eq!(
+        host.register["register"]["markdown_transformer"],
+        json!(true),
+        "register: {}",
+        host.register
+    );
+    assert_eq!(
+        host.register["register"]["markdown_message_types"],
+        json!(surfaces),
+        "register: {}",
+        host.register
+    );
+    host.finish();
+
+    let mut ext = Extension::new("api");
+    ext.markdown_transformer(|markdown, _| Some(markdown.to_string()));
+    let host = Host::start(ext, json!({}));
+    assert_eq!(
+        host.register["register"]["markdown_message_types"],
+        json!(["user", "assistant", "assistant-thinking"]),
+        "register: {}",
+        host.register
+    );
+    host.finish();
+
+    let mut ext = Extension::new("api");
+    ext.markdown_transformer_with_options(
+        |markdown, _| Some(markdown.to_string()),
+        pig_sdk::MarkdownTransformerOptions {
+            message_types: Some(vec![]),
+        },
+    );
+    let host = Host::start(ext, json!({}));
+    assert_eq!(
+        host.register["register"]["markdown_message_types"],
+        json!([]),
+        "register: {}",
+        host.register
+    );
+    host.finish();
+
+    let host = Host::start(Extension::new("api"), json!({}));
+    assert!(
+        host.register["register"]
+            .get("markdown_message_types")
             .is_none(),
         "register: {}",
         host.register

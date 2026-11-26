@@ -16,11 +16,11 @@ import (
 func TestEveryExitPathReachableWhileATUIRunsRestoresTheTerminal(t *testing.T) {
 	// exempt: file:function -> why no TUI owns the terminal there.
 	exempt := map[string]string{
-		"coding/cli/guard.go:guardBinaryIdentity":        "runs before any mode starts",
-		"coding/cli/rpc_mode.go:serveRPCMode":            "RPC mode has no TUI: stdin and stdout are the JSONL protocol",
-		"coding/cli/rpc_shutdown_unix.go:dieBySignal":    "RPC shutdown; the process dies by the signal",
-		"coding/cli/rpc_shutdown_windows.go:dieBySignal": "RPC shutdown; the process exits with the signal's status",
+		"coding/cli/guard.go:guardBinaryIdentity": "runs before any mode starts",
+		"coding/cli/rpc_mode.go:serveRPCMode":     "RPC mode has no TUI: stdin and stdout are the JSONL protocol",
 	}
+	// restoreHelpers: same-package functions that restore for their callers; each must itself call tui.RestoreTerminalOnExit.
+	restoreHelpers := map[string]bool{"releaseForExit": false}
 	fset := token.NewFileSet()
 	var seen int
 	for _, pattern := range []string{"*.go", filepath.Join("..", "..", "internal", "codingagent", "*.go")} {
@@ -51,6 +51,11 @@ func TestEveryExitPathReachableWhileATUIRunsRestoresTheTerminal(t *testing.T) {
 					if !ok {
 						return true
 					}
+					if id, isIdent := call.Fun.(*ast.Ident); isIdent {
+						if _, helper := restoreHelpers[id.Name]; helper {
+							restores = true
+						}
+					}
 					sel, ok := call.Fun.(*ast.SelectorExpr)
 					if !ok {
 						return true
@@ -67,6 +72,9 @@ func TestEveryExitPathReachableWhileATUIRunsRestoresTheTerminal(t *testing.T) {
 					}
 					return true
 				})
+				if _, helper := restoreHelpers[fn.Name.Name]; helper && restores {
+					restoreHelpers[fn.Name.Name] = true
+				}
 				if !exits {
 					continue
 				}
@@ -83,6 +91,11 @@ func TestEveryExitPathReachableWhileATUIRunsRestoresTheTerminal(t *testing.T) {
 	}
 	if seen == 0 {
 		t.Fatal("found no os.Exit call: the scan is broken")
+	}
+	for name, restores := range restoreHelpers {
+		if !restores {
+			t.Errorf("%s is trusted to restore the terminal for its callers but does not call tui.RestoreTerminalOnExit", name)
+		}
 	}
 }
 

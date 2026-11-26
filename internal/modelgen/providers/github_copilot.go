@@ -89,6 +89,24 @@ func githubCopilotGPT6Luna() ChatModel {
 	)
 }
 
+// The authenticated Copilot catalog lists this decision model on /v1/systemone (checked 2026-11-02) without
+// a context window or price, and GitHub's Copilot pricing page does not list it. These are Azure's values,
+// which OpenRouter and Vercel AI Gateway also list.
+func githubCopilotMicrosoftDecision1() *Obj {
+	return O(
+		"type", "classifier",
+		"id", "microsoft-decision-1",
+		"name", "Microsoft-Decision-1",
+		"api", "typesafe-system-one",
+		"provider", "github-copilot",
+		"baseUrl", githubCopilotBaseURL,
+		"input", Strings("text"),
+		"cost", O("input", 0.042, "output", 0, "cacheRead", 0, "cacheWrite", 0),
+		"contextWindow", 32768,
+		"headers", githubCopilotStaticHeaders(),
+	)
+}
+
 func githubCopilot() ProviderDefinition {
 	return ProviderDefinition{
 		ID: "github-copilot",
@@ -100,14 +118,13 @@ func githubCopilot() ProviderDefinition {
 				SkipDeprecated:       true,
 				DefaultContextWindow: 128000,
 				DefaultMaxTokens:     8192,
-				Map: func(model ChatModel, _ *ModelsDevModel) (ChatModel, error) {
+				Map: func(model ChatModel, source *ModelsDevModel) (ChatModel, error) {
 					api := githubCopilotAPI(model.Str("id"))
 					result := Spread(model).Set("api", api)
 					if api == "openai-completions" {
 						result.Set("compat", O(
 							"supportsStore", false,
-							"supportsDeveloperRole", false,
-							"supportsReasoningEffort", false,
+							"supportsReasoningEffort", source.HasEffortOption(),
 						))
 					}
 					if model.Str("id") == "claude-opus-5.5" {
@@ -127,7 +144,12 @@ func githubCopilot() ProviderDefinition {
 			}
 			return models, nil
 		},
-		Compat: ApiCompatDefaults{"openai-completions": FixedCompat(O("supportsStrictMode", true))},
+		Classifiers: func(*ProviderContext) ([]*Obj, error) { return []*Obj{githubCopilotMicrosoftDecision1()}, nil },
+		Compat: ApiCompatDefaults{
+			"anthropic-messages": FixedCompat(O("supportsStrictTools", true)),
+			"openai-completions": FixedCompat(O("supportsStrictMode", true)),
+			"openai-responses":   FixedCompat(O("supportsStrictMode", true)),
+		},
 		Finalize: func(model ChatModel, _ *ProviderContext) {
 			id := model.Str("id")
 			if strings.HasPrefix(id, "gpt-5") {

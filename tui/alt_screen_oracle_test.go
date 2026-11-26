@@ -54,12 +54,13 @@ func setOracleEnv(t *testing.T, name string, set bool, value string) {
 	_ = os.Unsetenv(name)
 }
 
-// altScreenOracleStartMarker is what the oracle terminal writes from Terminal.start; Pig's Start never calls a Terminal (the driver owns it), so
-// the marker and the cursor hide Pi's start() issues right after it are the only bytes left out of the comparison.
+// altScreenOracleTerminalStart is what the oracle terminal writes from Terminal.start: the test writes it where the driver starts the terminal,
+// between BeforeTerminalStart and Start, so the whole of Pi's start() bytes (the alternate screen's enter first, the cursor hide after the
+// terminal's start) is compared, in Pi's order.
 // altScreenOracleStopMarker is what Pi's stop() writes between the renderer's own two writes: the terminal's showCursor and stop.
 const altScreenOracleStopMarker = "\x1b[?25h<terminal.stop>"
 
-const altScreenOracleStartMarker = "<terminal.start>\x1b[?25l"
+const altScreenOracleTerminalStart = "<terminal.start>"
 
 // The fixture is the pinned Pi's TuiAltScreen run over seeded component trees (flat and nested containers, kitty and iTerm2 image lines),
 // terminal sizes (including 1-row and 3-row terminals), and frame sequences with growth, shrink, in-place edits, resizes, forced renders, scrolling
@@ -68,6 +69,8 @@ const altScreenOracleStartMarker = "<terminal.start>\x1b[?25l"
 // components returned at that step's size. Scrolling the rows that moved (D205) writes other bytes than Pi, so it is off here.
 func TestAltScreenFramesMatchPiOracle(t *testing.T) {
 	t.Setenv("PIG_TUI_SCROLL_ROWS", "0")
+	// Pi's bytes are compared, so this is byte mode: the screen writer (D624) sends other bytes for the same screen. It sits under ProcessTerminal.write, which these renderers, writing to their own buffer, do not pass; the variable holds for one that does.
+	t.Setenv("PIG_TUI_SCREEN_WRITER", "pi")
 	checkAltScreenOracle(t, false)
 }
 
@@ -81,6 +84,8 @@ func TestAltScreenScrolledFramesShowPisScreens(t *testing.T) {
 // step of every scenario of the pinned Pi's fixture writes exactly the bytes Pi's step wrote, as escaped_output_equal compares them.
 // PIG_TUI_SCROLL_ROWS=0 in a terminal that would scroll does the same.
 func TestAltScreenScrollFallsBackToPisBytes(t *testing.T) {
+	// Byte mode, as in TestAltScreenFramesMatchPiOracle: Pi's bytes are compared.
+	t.Setenv("PIG_TUI_SCREEN_WRITER", "pi")
 	for _, tc := range []struct {
 		name string
 		env  map[string]string
@@ -209,6 +214,12 @@ func checkAltScreenOracleIn(t *testing.T, screens bool, env map[string]string, t
 	// the images earlier tests or an earlier -count run registered, and leave none behind.
 	resetKittyRegistry(t)
 	t.Cleanup(func() { resetKittyRegistry(t) })
+	// The generator's Node process had pushed no Kitty keyboard flags, so Pi's start writes no pop and push of them (the alternate screen
+	// moves an outstanding push to its own screen, tui_alt_screen.go). A test that started a terminal earlier in this process and left
+	// its push outstanding (TestKeyboardProtocolNegotiationUsesDeviceAttributesFallback does) is another environment: start from none
+	// and give back what was there.
+	pushed := keyboardProtocolPushed.Swap(false)
+	t.Cleanup(func() { keyboardProtocolPushed.Store(pushed) })
 	recordOnly, closeClipped := tap != nil && tap.recordOnly, tap != nil && tap.closeClipped
 	failures, scrolledSteps := 0, 0
 	report := func(format string, args ...any) {
@@ -250,8 +261,11 @@ func checkAltScreenOracleIn(t *testing.T, screens bool, env map[string]string, t
 				host(part)
 			}
 		}
+		// Pi's start(): beforeTerminalStart, terminal.start() (the marker), then the cursor hide and the rest.
+		ui.BeforeTerminalStart()
+		out.WriteString(altScreenOracleTerminalStart)
 		ui.Start()
-		if got, want := out.String(), strings.ReplaceAll(sc.StartOut, altScreenOracleStartMarker, ""); got != want {
+		if got, want := out.String(), sc.StartOut; got != want {
 			report("scenario %d (%dx%d, images %q) start\n got %q\nwant %q", index, sc.Cols, sc.Rows, sc.Images, got, want)
 			continue
 		}
@@ -259,12 +273,12 @@ func checkAltScreenOracleIn(t *testing.T, screens bool, env map[string]string, t
 			report("scenario %d: images %q after start, Pi %q", index, got, sc.ImagesAfterStart)
 		}
 		if tap != nil {
-			tap.start(index, sc.Cols, sc.Rows, sc.Images, out.String())
+			tap.start(index, sc.Cols, sc.Rows, sc.Images, strings.ReplaceAll(out.String(), altScreenOracleTerminalStart, ""))
 		}
 		cols := sc.Cols
 		pigVT, piVT := newRowsVT(max(1, sc.Rows)), newRowsVT(max(1, sc.Rows))
-		pigVT.apply(out.String())
-		piVT.apply(strings.ReplaceAll(sc.StartOut, altScreenOracleStartMarker, ""))
+		pigVT.apply(strings.ReplaceAll(out.String(), altScreenOracleTerminalStart, ""))
+		piVT.apply(strings.ReplaceAll(sc.StartOut, altScreenOracleTerminalStart, ""))
 		pending = nil
 		var overlays []*oracleLines
 		var handles []*OverlayHandle
@@ -450,6 +464,6 @@ func TestAltScreenFixtureIsCurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(generated, committed) {
-		t.Fatalf("testdata/alt-screen-oracle.json.gz is not the output of the installed Pi %s: regenerate it with node tui/testdata/alt-screen-oracle.mjs <pi-tui dist/index.js> | gzip", pigversion.UpstreamVersion)
+		t.Fatalf("testdata/alt-screen-oracle.json.gz is not the output of the installed Pi %s: regenerate it with make regenerate-alt-screen-oracle", pigversion.UpstreamVersion)
 	}
 }

@@ -1,6 +1,7 @@
 package extensionconformance
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -48,6 +49,9 @@ func TestInTreeGoModulesPinTheRepositorySDKVersion(t *testing.T) {
 			switch entry.Name() {
 			case ".git", ".upstream", "node_modules", "target":
 				return filepath.SkipDir
+			case "tmp":
+				// Scratch that git ignores (`tmp/` in .gitignore), not the repository's code.
+				return filepath.SkipDir
 			}
 			return nil
 		}
@@ -81,4 +85,21 @@ func TestInTreeGoModulesPinTheRepositorySDKVersion(t *testing.T) {
 			t.Errorf("%s was not checked", rel)
 		}
 	}
+}
+
+// rootGoDirective returns the go directive of the root module at root. A fixture module that requires the replaced root module must declare at least that language version: the go command rejects a main module that declares less than a module it requires ("updates to go.mod needed"), in an isolated build and in a packed cell alike.
+func rootGoDirective(root string) (string, error) {
+	path := filepath.Join(root, "go.mod")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	file, err := modfile.Parse(path, data, nil)
+	if err != nil {
+		return "", err
+	}
+	if file.Go == nil {
+		return "", fmt.Errorf("%s has no go directive", path)
+	}
+	return file.Go.Version, nil
 }

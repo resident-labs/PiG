@@ -64,10 +64,10 @@ func TestOpenRouterRoutingVariantsMirrorTheirBaseEntries(t *testing.T) {
 			if !reflect.DeepEqual(derived, original) {
 				t.Errorf("%s differs from %s beyond its id, name and record", got.ID, base.ID)
 			}
-			wantRecord := decodedRecord(t, base.Record)
+			wantRecord := decodedRecord(t, ResolveCatalogRecord(base.Record))
 			wantRecord["id"], wantRecord["name"] = got.ID, got.DisplayName
-			if !reflect.DeepEqual(decodedRecord(t, got.Record), wantRecord) {
-				t.Errorf("%s: record %s is not the base record with its id and name replaced", got.ID, got.Record)
+			if !reflect.DeepEqual(decodedRecord(t, ResolveCatalogRecord(got.Record)), wantRecord) {
+				t.Errorf("%s: record %s is not the base record with its id and name replaced", got.ID, ResolveCatalogRecord(got.Record))
 			}
 		}
 	}
@@ -76,7 +76,14 @@ func TestOpenRouterRoutingVariantsMirrorTheirBaseEntries(t *testing.T) {
 			t.Errorf("%s lists a routing variant: only OpenRouter has them", provider)
 		}
 	}
-	if got, want := len(ListModels("")), len(GeneratedModels)+len(listed)-len(bases); got != want {
+	// The whole list holds the catalog models of the APIs this build links: all of GeneratedModels in the default build.
+	built := 0
+	for i := range GeneratedModels {
+		if BuiltAPI(GeneratedModels[i].API) {
+			built++
+		}
+	}
+	if got, want := len(ListModels("")), built+len(listed)-len(bases); got != want {
 		t.Errorf("the whole list has %d entries, want %d", got, want)
 	}
 }
@@ -167,16 +174,21 @@ func TestRewriteRecordIdentity(t *testing.T) {
 func TestDerivedOpenRouterVariantsAreBuiltOnce(t *testing.T) {
 	bases := piListedModels(ListModels("openrouter"))
 	count := func() int {
+		held := 0
+		if bundle := derivedVariants.bundle.Load(); bundle != nil {
+			held = len(bundle.models) - len(bundle.source)
+		}
 		derivedVariants.RLock()
 		defer derivedVariants.RUnlock()
-		return len(derivedVariants.byKey)
+		return held + len(derivedVariants.byKey)
 	}
 	first := count()
 	if first < len(bases)*len(OpenRouterRoutingVariants) {
 		t.Fatalf("%d derived variants held after a list of %d bases", first, len(bases))
 	}
+	bundle := derivedVariants.bundle.Load()
 	allocs := testing.AllocsPerRun(5, func() { _ = ListModels("openrouter") })
-	if second := count(); second != first {
+	if second := count(); second != first || derivedVariants.bundle.Load() != bundle {
 		t.Errorf("a second list holds %d derived variants, the first held %d", second, first)
 	}
 	// Copying held entries costs the two lists it builds, not the 2,661 deriving every variant took.
@@ -185,10 +197,7 @@ func TestDerivedOpenRouterVariantsAreBuiltOnce(t *testing.T) {
 	}
 	spec := "openrouter/" + bases[0].ID + ":nitro"
 	got, _ := LookupModelExact(spec)
-	derivedVariants.RLock()
-	held := derivedVariants.byKey[derivedVariantKey{bases[0].ID, "nitro"}]
-	derivedVariants.RUnlock()
-	if got != &held.entry {
+	if held := bundle.variant(&bases[0], "nitro"); held == nil || got != held {
 		t.Error("a lookup returns an entry other than the held one")
 	}
 }

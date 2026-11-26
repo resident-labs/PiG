@@ -47,7 +47,8 @@
     "TestSyncedTreeHoldsExactlyTheBundleWithDocumentedModes",
     "TestSyncFailureKeepsPreviousTreeAndCleansStaging",
     "TestPruneWithoutCacheEntriesDoesNotFingerprintStagedSDKs",
-    "TestBundleHashStreamsTheWholeFileDigest"
+    "TestBundleHashIsTheStagingDigestOfItsFiles",
+    "TestWarmBundleCheckDecodesNothing"
   ],
   "./coding": [
     "TestRuntimeOpenUsesTheValidatedSessionSnapshot",
@@ -66,6 +67,7 @@
     "TestCatalogCacheHitIgnoresOnlyRuntimeProvider",
     "TestCatalogSnapshotAvoidsMetadataSerialization",
     "TestCloneCatalogInputDoesNotAllocateInlineStructs",
+    "TestCloneCatalogInputLiveAllocationBudget",
     "TestModelCatalogBindingPublishesTheFinishedBindingOnce",
     "TestModelCatalogBindingKeepsPublicationBytesAndCalls",
     "TestModelCatalogBindingKeepsRegistrationOrdering"

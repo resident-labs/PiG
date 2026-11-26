@@ -11,11 +11,13 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/coding/extension/host/subprocess"
 	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/timings"
+	"github.com/MichaelKinsy/PiG/internal/goroutineid"
 	"github.com/MichaelKinsy/PiG/internal/packagemanager"
 	"github.com/MichaelKinsy/PiG/internal/resolvepath"
 	"github.com/MichaelKinsy/PiG/tui"
@@ -119,8 +121,36 @@ type DefaultResourceLoaderOptions struct {
 	Runtime *extension.ExtensionRuntime
 	// DisabledBuiltinExtensions names the built-in extensions whose `builtin:<name>` paths are left out of the extension set (resource-loader.ts disabledBuiltinExtensions).
 	DisabledBuiltinExtensions []string
+	// PackageCommandOutput is where git and npm output goes when Packages are installed or refreshed (resource-loader.ts packageCommandOutput). The zero value is PackageCommandOutputInherit, the terminal; a host that draws on the terminal passes PackageCommandOutputCapture.
+	PackageCommandOutput PackageCommandOutput
+	// OnPackageProgress is called when Packages are installed or refreshed, e.g. to show `Installing npm:foo...` (resource-loader.ts onPackageProgress).
+	OnPackageProgress ProgressCallback
 	// LoadExtensions loads the extension set of a reload; nil loads the extension files of the resolved Packages and settings and of AdditionalExtensionPaths through a subprocess Extension Host (resource-loader.ts:513-600). A reload with ResolveProjectTrust calls it first for the bootstrap pass, then once for the final set.
 	LoadExtensions func(ctx context.Context, request ExtensionLoadRequest) (LoadExtensionsResult, error)
+}
+
+// PackageCommandOutput is where git and npm output goes while Packages are installed, updated or refreshed (package-manager.ts PackageCommandOutput).
+type PackageCommandOutput = packagemanager.CommandOutput
+
+const (
+	// PackageCommandOutputInherit writes the output to the terminal, live. It is the default.
+	PackageCommandOutputInherit = packagemanager.CommandOutputInherit
+	// PackageCommandOutputCapture writes nothing to the terminal and keeps git and ssh from prompting, for hosts that draw on it. A failure carries the end of the output.
+	PackageCommandOutputCapture = packagemanager.CommandOutputCapture
+)
+
+// ProgressEvent describes one Package operation: Type is "start", "progress", "complete" or "error", Action "install", "remove", "update" or "pull". Completion omits Message (package-manager.ts ProgressEvent).
+type ProgressEvent = packagemanager.ProgressEvent
+
+// ProgressCallback receives the progress events of Package operations (package-manager.ts ProgressCallback).
+type ProgressCallback = packagemanager.ProgressCallback
+
+// newPackageManager is the loader's package manager over its options, as the resource-loader.ts constructor makes one.
+func (l *DefaultResourceLoader) newPackageManager() *packagemanager.PackageManager {
+	manager := packagemanager.NewPackageManager(packagemanager.PackageManagerOptions{CWD: l.cwd, SettingsManager: l.settings, CommandOutput: l.options.PackageCommandOutput})
+	manager.AgentDir = l.agentDir
+	manager.SetProgressCallback(l.options.OnPackageProgress)
+	return manager
 }
 
 // DefaultResourceLoader resolves skills, prompt templates, context files and system prompt files from the default user and project resource locations, the settings-configured paths, the configured Packages and the additional paths, applying project trust as Pi's does, and installs a missing npm or git Package as Pi's package manager does. It loads themes, and extensions through the LoadExtensions hook the Extension Host supplies. A new loader is empty until Reload runs, as Pi's DefaultResourceLoader is.
@@ -130,8 +160,9 @@ type DefaultResourceLoader struct {
 	settings *SettingsManager
 	options  DefaultResourceLoaderOptions
 
-	// opMu serialises Reload and ExtendResources, which rewrite the state below.
-	opMu sync.Mutex
+	// opMu serialises Reload, LoadProjectTrustExtensions, ExtendResources and Close, which rewrite the state below. operation is the one that holds it, nil when none does.
+	opMu      sync.Mutex
+	operation atomic.Pointer[loaderOperation]
 	// lastSkillPaths, lastPromptPaths and lastThemePaths are the paths of the last reload or extension; resourceMetadata is the metadata of the last reload (resource-loader.ts resourceMetadataByPath); extensionSources are the source infos ExtendResources recorded. They are touched only under opMu.
 	lastSkillPaths, lastPromptPaths, lastThemePaths []string
 	resourceMetadata                                *pathMetadataIndex
@@ -204,8 +235,8 @@ func (l *DefaultResourceLoader) Reload(options ...ResourceLoaderReloadOptions) e
 
 // ReloadWith is Reload with the context ctx. A ResolveProjectTrust in options first loads the bootstrap extension set with project settings forced untrusted and hands it to the callback, then applies the answer to the settings (resource-loader.ts reload(options)); the final extension set reuses the bootstrap load. A failed decision or bootstrap load fails the reload and leaves the previous results in place, with the project untrusted as the bootstrap pass left it.
 func (l *DefaultResourceLoader) ReloadWith(ctx context.Context, options ...ResourceLoaderReloadOptions) error {
-	l.opMu.Lock()
-	defer l.opMu.Unlock()
+	ctx, unlock := l.enterOperation(ctx)
+	defer unlock()
 	// resource-loader.ts:510: each reload starts the extensions timeline over.
 	timings.ResetTimings(timings.Extensions)
 	var preTrust *LoadExtensionsResult
@@ -231,8 +262,7 @@ func (l *DefaultResourceLoader) ReloadWith(ctx context.Context, options ...Resou
 // discover rediscovers every resource from the settings as they currently are.
 func (l *DefaultResourceLoader) discover(ctx context.Context, preTrust *LoadExtensionsResult) error {
 	trusted := l.settings.IsProjectTrusted()
-	manager := packagemanager.NewPackageManager(packagemanager.PackageManagerOptions{CWD: l.cwd, SettingsManager: l.settings})
-	manager.AgentDir = l.agentDir
+	manager := l.newPackageManager()
 	resolved, err := manager.ResolveContext(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("coding: %w", err)
@@ -678,10 +708,42 @@ func cloneCollection[T any](collection []T) []T {
 // NoResources is a ResourceLoader with no resources. A caller that expands resources and builds its system prompt itself supplies it so the Session neither discovers, expands nor renders any.
 var NoResources ResourceLoader = &staticResourceLoader{}
 
+// ownedResourceLoader reference-counts a DefaultResourceLoader constructed by resolveResourceLoader so its Extension Host closes once the last Session sharing it closes.
+type ownedResourceLoader struct {
+	loader *DefaultResourceLoader
+	refs   atomic.Int32
+}
+
+func newOwnedResourceLoader(loader *DefaultResourceLoader) *ownedResourceLoader {
+	o := &ownedResourceLoader{loader: loader}
+	o.refs.Store(1)
+	return o
+}
+
+func (o *ownedResourceLoader) acquire() bool {
+	for {
+		n := o.refs.Load()
+		if n <= 0 {
+			return false
+		}
+		if o.refs.CompareAndSwap(n, n+1) {
+			return true
+		}
+	}
+}
+
+func (o *ownedResourceLoader) release() {
+	if o.refs.Add(-1) == 0 {
+		o.loader.Close()
+	}
+}
+
 // resourceLoaderRef is the loader a Session is bound to. promptFromLoader reports that the Session builds its default system prompt from the loader (agent-session.ts _rebuildSystemPrompt); a Session bound to NoResources leaves the prompt to its caller.
 type resourceLoaderRef struct {
 	loader           ResourceLoader
 	promptFromLoader bool
+	// owned is non-nil when resolveResourceLoader constructed the underlying DefaultResourceLoader; each Session sharing it holds one reference and releases it in Close (D19).
+	owned *ownedResourceLoader
 }
 
 // resolveResourceLoader returns the supplied loader, or a DefaultResourceLoader over the Services' cwd, agent directory and settings that has reloaded when none is supplied (sdk.ts createAgentSession awaits resourceLoader.reload()). The reload rereads the Services' settings and drops the transient overrides applied to them.
@@ -695,10 +757,45 @@ func resolveResourceLoader(svcs *AgentSessionServices, supplied ResourceLoader) 
 	}
 	loader := NewDefaultResourceLoader(DefaultResourceLoaderOptions{CWD: svcs.CWD(), AgentDir: svcs.AgentDir(), SettingsManager: svcs.SettingsManager()})
 	if err := loader.Reload(); err != nil {
+		loader.Close()
 		return nil, err
 	}
 	timings.Time("resourceLoader.reload")
-	return &resourceLoaderRef{loader: loader, promptFromLoader: true}, nil
+	return &resourceLoaderRef{loader: loader, promptFromLoader: true, owned: newOwnedResourceLoader(loader)}, nil
+}
+
+// loaderOperation is a Reload, LoadProjectTrustExtensions, ExtendResources or Close in progress, which holds its loader's opMu. goroutine is the one it runs on.
+type loaderOperation struct{ goroutine uint64 }
+
+// operationHeldKey marks a context handed to the callbacks of an operation; its value is that operation.
+type operationHeldKey struct{}
+
+// enterOperation is takeOperation for an operation with callbacks that receive a context: the returned context marks them as running inside it.
+func (l *DefaultResourceLoader) enterOperation(ctx context.Context) (context.Context, func()) {
+	operation, leave := l.takeOperation(ctx.Value(operationHeldKey{}))
+	if operation == nil {
+		return ctx, leave
+	}
+	return context.WithValue(ctx, operationHeldKey{}, operation), leave
+}
+
+// takeOperation takes opMu for an operation and returns it with the function that ends it. held is the operation mark of the caller's context, nil without one.
+//
+// Pi has no lock: a callback of a running reload() that calls reload(), extendResources() or another method of the loader runs it at once (resource-loader.ts:541-710). A call made from inside the operation in progress therefore runs inside it, without waiting for opMu, which that operation holds until its callback returns; the returned operation is then nil. A call is inside the operation when it runs on the operation's goroutine (an override or any other callback that gets no context) or carries the context the operation handed to its callback. That context stops marking anything once its operation has ended.
+//
+// pig divergence (D632): operations that overlap from outside wait for each other, where Pi's reloads interleave at their awaits.
+func (l *DefaultResourceLoader) takeOperation(held any) (*loaderOperation, func()) {
+	self := goroutineid.Current()
+	if current := l.operation.Load(); current != nil && (held == current || current.goroutine == self) {
+		return nil, func() {}
+	}
+	l.opMu.Lock()
+	operation := &loaderOperation{goroutine: self}
+	l.operation.Store(operation)
+	return operation, func() {
+		l.operation.Store(nil)
+		l.opMu.Unlock()
+	}
 }
 
 // RefreshPromptResources rereads the context files and the skills at the paths the last reload and extension found,

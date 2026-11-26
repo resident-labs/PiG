@@ -1,6 +1,6 @@
 package host
 
-// pi: packages/chord/test/next/examples/06-natives.ts
+// pi: packages/chord/test/examples/06-natives.ts
 
 import (
 	"context"
@@ -13,12 +13,17 @@ import (
 	"time"
 
 	"github.com/MichaelKinsy/PiG/chord"
+	chordctx "github.com/MichaelKinsy/PiG/chord/context"
 	"github.com/MichaelKinsy/PiG/chord/delta"
 	"github.com/MichaelKinsy/PiG/chord/next/contracts"
 	"github.com/MichaelKinsy/PiG/chord/next/data"
 )
 
 // --- 06-natives.ts -------------------------------------------------------------------------------------------------
+
+// hungClose is what a close that never settles (Pi's promise that nothing resolves) waits on: TestMain closes it after the
+// tests, so the goroutine of that close is not one the leak check reports.
+var hungClose = make(chan struct{})
 
 func TestExample06Natives(t *testing.T) {
 	clock := exLocal("example.clock", contracts.Params{exProp("zone", exStr())},
@@ -90,8 +95,9 @@ func TestExample06Natives(t *testing.T) {
 				return errors.New("socket close failed")
 			})
 			closeTimeout := 50 * time.Millisecond
-			self.Open(func(context.Context) (any, error) { return "worker", nil }, func(any, NativeCloseReason, context.Context) error {
-				select {} // never settles
+			self.Open(func(context.Context) (any, error) { return "worker", nil }, func(_ any, _ NativeCloseReason, ctx context.Context) error {
+				_, _ = chordctx.Receive(context.WithoutCancel(ctx), hungClose) // never settles
+				return nil
 			}, NativeOptions{CloseTimeout: &closeTimeout})
 			return exImpl(map[string]chord.Watchable[delta.JsonValue]{"n": exConstant(float64(1))}, nil), nil
 		}, ServeOptions{})

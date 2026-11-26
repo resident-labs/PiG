@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	jsjson "github.com/MichaelKinsy/PiG/extensions/sdk/json"
+	"github.com/MichaelKinsy/PiG/internal/atomicfile"
 	"github.com/MichaelKinsy/PiG/internal/pigstrip"
 	"github.com/MichaelKinsy/PiG/tui"
 )
@@ -40,6 +41,9 @@ type KeybindingsManager struct {
 	// merged is upstream's single KEYBINDINGS manager: the tui.* and app.*
 	// table with every user override. syncToTUI installs it for tui components.
 	merged *tui.TUIKeybindingsManager
+	// matchKeys holds keysOf of every action merged defines, read by Matches for each key typed; rebuild replaces it with merged and nothing
+	// writes it afterwards.
+	matchKeys map[string][]string
 }
 
 // appKeybindingRow is one row of the app.* definition table. A row with platform set takes its keys from it; the rest take keys, and a row with
@@ -77,7 +81,7 @@ var appKeybindingRows = [...]appKeybindingRow{
 	{id: "app.message.followUp", description: "Queue follow-up message", platform: &tui.PlatformKeys{Other: []KeyID{"alt+enter"}, Windows: []KeyID{"ctrl+q"}}},
 	{id: "app.message.copy", description: "Copy selection or last assistant message", keys: []KeyID{"ctrl+x"}},
 	{id: "app.message.dequeue", description: "Restore queued messages", platform: &tui.PlatformKeys{Other: []KeyID{"alt+up"}, Windows: []KeyID{"alt+q"}}},
-	{id: "app.clipboard.pasteImage", description: "Paste files on macOS, images, or text from clipboard", platform: &tui.PlatformKeys{Other: []KeyID{"ctrl+v"}, Windows: []KeyID{"alt+v"}}},
+	{id: "app.clipboard.pasteImage", description: "Paste files on macOS, images, or text from clipboard", platform: &tui.PlatformKeys{Other: []KeyID{"ctrl+v"}, Windows: []KeyID{"alt+v", "ctrl+v"}}},
 	{id: "app.session.new", description: "Start a new session"},
 	{id: "app.session.tree", description: "Open session tree"},
 	{id: "app.session.fork", description: "Fork current session"},
@@ -362,6 +366,10 @@ func (km *KeybindingsManager) rebuild() {
 		}
 	}
 	km.merged = tui.NewKeybindingsManager(definitions, userBindings)
+	km.matchKeys = make(map[string][]string, len(definitions))
+	for action := range definitions {
+		km.matchKeys[action] = km.merged.GetKeys(action)
+	}
 }
 
 // stripOwner is the strip entry of the built-in an app action runs.
@@ -388,27 +396,12 @@ func appActionStripped(action string) bool {
 	return ok && pigstrip.Has(owner.list, owner.id)
 }
 
-// legacyKeybindingName is upstream isLegacyKeybindingName and its KEYBINDING_NAME_MIGRATIONS[key] lookup (keybindings.ts:302,328). `key in` also finds
-// the names Object.prototype inherits, and the lookup then yields the inherited value, so such a key migrates to that value's string (a function's
-// source text, or "[object Object]" for __proto__) as node prints it.
+// legacyKeybindingName is upstream isLegacyKeybindingName and its KEYBINDING_NAME_MIGRATIONS[key] lookup (keybindings.ts:264,286).
 func legacyKeybindingName(key string) (string, bool) {
-	if next, ok := legacyKeybindingNameMigrations()[key]; ok {
-		return next, true
-	}
-	if key == "__proto__" {
-		return "[object Object]", true
-	}
-	if key == "constructor" {
-		return "function Object() { [native code] }", true
-	}
-	if slices.Contains(objectPrototypeFunctionNames, key) {
-		return "function " + key + "() { [native code] }", true
-	}
-	return "", false
+	// pig divergence (D645): the migrations are own entries, so a key named like an Object.prototype member (constructor, toString, __proto__) is no legacy name and stays as written; Pi's `key in KEYBINDING_NAME_MIGRATIONS` on a plain object finds the inherited member and renames the key to that member's text.
+	next, ok := legacyKeybindingNameMigrations()[key]
+	return next, ok
 }
-
-var objectPrototypeFunctionNames = []string{"hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toLocaleString", "toString", "valueOf",
-	"__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__"}
 
 func migrateKeybindingsConfig(raw map[string]any) (map[string]any, bool) {
 	out := map[string]any{}
@@ -553,8 +546,9 @@ func (km *KeybindingsManager) Save(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
+	// pig divergence (D651): replaced through a private temporary file and a rename, in place where that is refused; Pi writes the file in place.
 	// PiG-only write (Pi never saves the file but for its migration): the mode of that write, coding-agent/src/migrations.ts:168 writeFileSync(configPath, ..., "utf-8"), no mode, 0666 with the umask taken out.
-	return os.WriteFile(path, buf.Bytes(), 0o666)
+	return atomicfile.WriteFile(path, buf.Bytes(), 0o666)
 }
 
 // keysOf is the resolved keys of an action the merged table defines, tui.* and app.* alike as upstream's KeybindingsManager extends the tui
@@ -599,7 +593,8 @@ func (km *KeybindingsManager) KeyText(action string) string {
 }
 
 func (km *KeybindingsManager) Matches(input, action string) bool {
-	for _, key := range km.keysOf(action) {
+	// keysOf copies the action's keys; a typed key asks for every action, so the copies of one rebuild are read here.
+	for _, key := range km.matchKeys[action] {
 		// Upstream KeybindingsManager.matches delegates every resolved KeyId to
 		// matchesKey. Keeping one matcher here preserves Kitty-mode ambiguity,
 		// alternate-layout, remapped-layout, and terminal-protocol semantics for

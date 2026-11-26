@@ -29,6 +29,10 @@ var fixtureRoot, fixtureSourceRoot string
 
 // TestMain isolates the config root and points the SDK roots at this tree.
 func TestMain(m *testing.M) {
+	testenv.GrabTerminalIfRequested()
+	if mode := os.Getenv(processExitHelperEnv); mode != "" {
+		runProcessExitHelper(mode)
+	}
 	coding.EnableTestFauxProvider()
 	switch os.Getenv(execEchoHelperEnv) {
 	case "1":
@@ -67,7 +71,7 @@ func TestMain(m *testing.M) {
 		})
 		stopStallDump = func() { stall.Stop() }
 	}
-	testRoot, err := os.MkdirTemp("", "pig-cmd-")
+	testRoot, err := testenv.MkdirShortTemp("pig-cmd-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "create isolated test home:", err)
 		os.Exit(2)

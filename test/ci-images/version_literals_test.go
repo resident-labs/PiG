@@ -39,9 +39,15 @@ type allowedVersionLiteral struct {
 
 var versionLiteralAllowlist = []allowedVersionLiteral{
 	// The sources of truth that live in scanned files.
-	{".github/workflows/ci.yml", "12.1.0", "source of truth for npm: the NPM_VERSION env; make compliance checks every copy against it"},
+	{".github/workflows/ci.yml", "12.2.1", "source of truth for npm: the NPM_VERSION env; make compliance checks every copy against it"},
 	{".github/workflows/ci.yml", "1.97.1", "source of truth for Rust: the RUST_VERSION env; make compliance checks every copy against it"},
 
+	// Versions that are not copies of a pin.
+	{".github/workflows/bolt-bench.yml", "1.0.0", "the PiG release whose published Pi-Bolt result directory (2026-10-23-pig-1.0.0) the harness commands are copied from"},
+	{".github/workflows/bolt-bench.yml", "1.1.4", "default of the bolt_tag input: the released Pi-Bolt this workflow compares against, not a pin of this tree"},
+	{".github/workflows/bolt-bench.yml", "0.7.0", "default of the pig_tag input: the released PiG this workflow compares against, not a pin of this tree"},
+	{".github/workflows/ci.yml", "26.5.1", "the oldest Node whose sandbox the terminal surface tests need; a requirement of that test, not a Node pin"},
+	{"automation/make/ci.mk", "26.5.1", "the oldest Node whose sandbox the terminal surface tests need; a requirement of that test, not a Node pin"},
 	// Pins that live in a script of their own.
 	{"automation/ci/build-libxcb.sh", "1.16.1", "the libxcb release the script builds for the X11 display oracle; the sha256 beside it fixes the bytes"},
 
@@ -50,9 +56,11 @@ var versionLiteralAllowlist = []allowedVersionLiteral{
 	{"automation/images/ci-go/metadata.env", "1.27.4", "IMAGE_TAG; make compliance checks it against .go-version"},
 	{"automation/images/ci-parity/Dockerfile", "1.27.4", "ARG GO_VERSION; make compliance checks it against .go-version"},
 	{"automation/images/ci-parity/metadata.env", "1.27.4", "IMAGE_TAG; make compliance checks it against .go-version"},
-	{"automation/images/ci-parity/Dockerfile", "1.5.0", "ARG PI_VERSION; make pin-sync writes it from .upstream/pin and make compliance checks it"},
-	{"automation/images/ci-parity/metadata.env", "1.5.0", "IMAGE_TAG; make pin-sync writes it from .upstream/pin and make compliance checks it"},
-	{"automation/images/ci-parity/Dockerfile", "12.1.0", "the image's npm check; make compliance checks it against NPM_VERSION"},
+	{"automation/images/ci-parity/Dockerfile", "1.6.0", "ARG PI_VERSION; make pin-sync writes it from .upstream/pin and make compliance checks it"},
+	{"automation/images/ci-parity/metadata.env", "1.6.0", "IMAGE_TAG; make compliance checks it against the pin"},
+	{"automation/images/ci-parity/Dockerfile", "12.2.1", "the image's npm check; make compliance checks it against NPM_VERSION"},
+
+	{"automation/ci/install-shellcheck.sh", "0.11.0", "the pinned ShellCheck release, kept beside the sha256 of its tarballs; pre-push-gate.sh reads it with --print-version"},
 
 	// Pins of tools that are not a Pi, Go, Node, Rust or npm release, kept beside the digest that pins the tool.
 	{".github/workflows/ci-images.yml", "0.114.0", "local tag of the digest-pinned grype image; the digest in seed-ci-image-bases.sh is the pin"},
@@ -63,12 +71,13 @@ var versionLiteralAllowlist = []allowedVersionLiteral{
 	{"automation/ci/seed-ci-image-bases.sh", "0.32.2", "local tag of the digest-pinned buildkit image; the digest on the line above is the pin"},
 	{"automation/ci/seed-ci-image-bases.sh", "1.45.1", "local tag of the digest-pinned syft image; the digest on the line above is the pin"},
 	{"automation/ci/seed-ci-image-bases.sh", "0.20.6", "go-containerregistry release; the sha256 on the next line is the pin"},
+	{"automation/ci/mirror-ci-tools.sh", "0.11.0", "the pinned ShellCheck release the mirror pushes, beside the sha256 of each tarball; the script fails when a digest is no longer pinned by install-shellcheck.sh"},
 	{".github/workflows/security.yml", "8.24.3", "gitleaks release the pull request scan installs, the one gitleaks-action 3.0.0 installs; the GITLEAKS_SHA256 beside it is the pin"},
 	{"automation/ci/mirror-ci-tools.sh", "0.20.6", "go-containerregistry release the mirror pushes; the sha256 on the same line is the pin, which the script requires seed-ci-image-bases.sh to still carry"},
 	{"automation/gen/vendor-typebox.sh", "1.3.27", "the typebox release the script vendors; its integrity hash is the next line"},
 	{"automation/gen/vendor-typebox.sh", "0.25.10", "the esbuild release the script bundles with"},
 	{".github/workflows/npm-publish.yml", "11.5.1", "the npm release that added trusted publishing, a registry feature floor and not a pin"},
-	{"Makefile", "0.7.4", "the version of Pi-Bolt, a different product from Pi"},
+	{"Makefile", "1.1.2", "the version of Pi-Bolt, a different product from Pi"},
 
 	// Versions of PiG's own releases and benchmark labels.
 	{".github/workflows/startup-performance.yml", "0.2.0", "the PiG release the startup benchmark measures against; the job name and the checked-out tag name the same release"},
@@ -86,7 +95,9 @@ var versionLiteralAllowlist = []allowedVersionLiteral{
 	{"automation/release/module-tags.sh", "0.2.0", "example in a comment"},
 	{"automation/release/npm/pack_npm.py", "0.2.0", "example in the usage text"},
 	{"automation/pin/pinlib.py", "1.1.0", "example in the module docstring"},
-	{"automation/pin/oracle.py", "1.3.0", "a fact about the published 1.3.0 release, which predates the facade's checkpointWhen"},
+	{"automation/gen/regenerate-observation-oracles.sh", "24.22.0", "the Node release from which a body in several socket writes reaches Pi's consumer in one macrotask: a measured fact about Node's behavior, not a pin; the oracle Node itself is read from ai/testdata/node-microtasks/oracle-node-version"},
+	{"automation/gen/regenerate-observation-oracles.sh", "24.14.1", "the oldest Node release of the range measured to give one macrotask per socket write (five recordings of each release): a fact about Node's behavior, not a pin"},
+	{"automation/gen/regenerate-observation-oracles.sh", "24.21.0", "the newest Node release of the range measured to give one macrotask per socket write (five recordings of each release): a fact about Node's behavior, not a pin"},
 	{"automation/pin/oracle.py", "0.0.0", "placeholder version of a generated private package"},
 	{"automation/dev/goproxy-github.py", "0.0.0", "the module version of a probe request"},
 	{"automation/dev/setup.sh", "0.0.0", "the module version of a probe request"},

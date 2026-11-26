@@ -40,7 +40,7 @@
 
 (defun events-on (bus channel handler)
   "Subscribe HANDLER, (lambda (ctx data)), to CHANNEL and return the idempotent unsubscribe function. A handler runs in a request of its own, so it may call
-EVENTS-EMIT while the host waits for its answer; its error fails only that delivery, which the host reports as `Event handler error`."
+EVENTS-EMIT while the host waits for its answer; its error fails only that delivery, which the host reports as an error of this extension (event `events:<channel>`)."
   (unless (stringp channel) (error "event channel must be a string"))
   (unless (functionp handler) (error "event handler must be a function"))
   (let* ((hub (event-hub (event-bus-extension bus)))
@@ -69,7 +69,7 @@ EVENTS-EMIT while the host waits for its answer; its error fails only that deliv
             (when sent
               ;; EventEmitter.off never throws: a failed off is reported
               (handler-case (event-bus-call bus "events.off" (obj "handlerId" (event-sub-id sub)))
-                (error (e) (format *error-output* "extension: pi.events unsubscribe ~S: ~A~%" channel e))))))
+                (error (e) (diagnose "extension: pi.events unsubscribe ~S: ~A~%" channel e))))))
         nil))))
 
 (defun events-emit (bus channel &optional data)
@@ -116,8 +116,12 @@ that no listener handles, as EventEmitter throws."
                    (when (hash-table-p err) (error 'host-call-error :message (frame-error-message err)))
                    (return)))
                 ((equal type "shutdown") (helper-note-shutdown conn))
+                ((refused-request-p env) (refuse-request conn env))
+                ((equal type "refused") (note-dropped-frame))
                 ((and (equal type "request") (equal (jget (or (jget env "request") (obj)) "method") "events.dispatch"))
                  (push env (extension-early-dispatches ext)))
+                ;; a notify ahead of the result is applied as the main loop applies it (a state the host pushed to a connection that had not registered)
+                ((equal type "notify") (handle-notify ext env))
                 (t (error "expected a ~A result, got ~A" method type))))))))
 
 (def-register-contributor "event-bus" (ext payload)

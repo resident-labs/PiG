@@ -15,7 +15,7 @@
 let
   root = ../.;
 
-  # The pig release line and the full version `pig --version` prints, read from the file `make set-version` and the upstream pin write.
+  # The pig release line (the `pig:` field of `pig version`) and the Pi package version `pig --version` prints, read from the file `make set-version` and the upstream pin write.
   pigversion = builtins.readFile (root + "/internal/coding/pigversion/pigversion.go");
   constant =
     name: pattern:
@@ -27,7 +27,7 @@ let
     else
       builtins.head match;
   version = constant "PigVersion" ''"([^"]+)"'';
-  fullVersion = version + constant "Version" ''PigVersion \+ "([^"]+)"'';
+  upstreamPackageVersion = constant "UpstreamPackageVersion" ''"([^"]+)"'';
 
   # The build reads Go sources, embedded files, and the workspace modules. Tests, parity fixtures, and
   # documentation are left out, so editing them does not rebuild the package.
@@ -79,7 +79,7 @@ buildGo127Module {
   # `go mod vendor` refuses workspaces, and `go work vendor` also vendors every `go tool` dependency. The module
   # cache below holds exactly the modules cmd/pig links on each supported platform.
   proxyVendor = true;
-  vendorHash = "sha256-JQRrkSgCeQDFAa1iSCvKNTU/hRLmTJStxubAYbY5AW8=";
+  vendorHash = "sha256-eAlMjzUfa2sxMMgs5Hdt85jx38BCtJTfiloQjk4TMck=";
   modBuildPhase = ''
     runHook preBuild
     export GIT_SSL_CAINFO=$NIX_SSL_CERT_FILE
@@ -116,7 +116,9 @@ buildGo127Module {
   installCheckPhase = ''
     runHook preInstallCheck
     export HOME="$TMPDIR/check-home" PIG_HOME="$TMPDIR/check-pig-home"
-    test "$($out/bin/pig --version)" = "${fullVersion}"
+    # `pig --version` prints Pi's package version, as `pi --version` does; the PiG release is the first field of `pig version`.
+    test "$($out/bin/pig --version)" = "${upstreamPackageVersion}"
+    test "$($out/bin/pig version | sed -n 1p)" = "pig: ${version}"
     runHook postInstallCheck
   '';
 

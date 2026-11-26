@@ -8,7 +8,7 @@ import (
 	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
-// Ports packages/chord/src/next/state/batch.ts (Batch, BatchError, Delivered). The batch (W1), one per host: a commit
+// Ports packages/chord/src/state/batch.ts (Batch, BatchError, Delivered). The batch (W1), one per host: a commit
 // adopts inside it, then every watched value that changed gets one frame, then the flushes it collected run (a link
 // sends one message); Chord calls that would reenter it are refused while it runs.
 
@@ -58,6 +58,8 @@ type Batch struct {
 	microtasks func(job func())
 	// section runs work as a synchronous section of the host (nil: inline, the caller's own).
 	section func(work func())
+	// inSection tells whether the caller runs in a section of the host (nil: it cannot tell).
+	inSection func() bool
 	// running is set while adopting, delivering or computing a derive; one flag per host.
 	running bool
 	// computing is set while a pure compute runs (a derive's, a registry's compose): nothing may change a source then.
@@ -97,10 +99,21 @@ func (b *Batch) UseMicrotasks(queue func(job func())) *Batch {
 
 // UseSection gives the batch the host's way to run work as one of its sections: what ends a watch from a goroutine of its
 // own (an aborted context's listener) runs its detach there, with the other code that touches the host's sources. It is
-// called once, right after NewBatch, and returns the batch.
-func (b *Batch) UseSection(run func(work func())) *Batch {
-	b.section = run
+// called once, right after NewBatch, and returns the batch. inSection tells whether the caller runs in a section already
+// (nil: the host's loop cannot tell, as a test's virtual-time loop cannot), so a read can run inline without making the
+// closure a section takes.
+func (b *Batch) UseSection(run func(work func()), inSection func() bool) *Batch {
+	b.section, b.inSection = run, inSection
 	return b
+}
+
+// InSection reports whether the caller runs in a section of the host (or the batch has none: everything is inline). A
+// caller that is not in one takes Section; one that is reads directly, with no closure.
+func (b *Batch) InSection() bool {
+	if b.section == nil {
+		return true
+	}
+	return b.inSection != nil && b.inSection()
 }
 
 // Section runs work as a section of the host when the batch has one (UseSection), inline otherwise.
@@ -110,6 +123,25 @@ func (b *Batch) Section(work func()) {
 		return
 	}
 	b.section(work)
+}
+
+// CheckAct runs check, and the act it returns, as ONE section of the host: acted is whether check returned an act (nil: it
+// refused, nothing ran). Pi's check and the act that depends on it are consecutive statements of one turn, with nothing
+// between them: `if (this.#generation !== generation) return undefined; site.batch.within(() => read.adopt(run), context)`
+// (store open-query.ts:206-207), `if (this.#closed) return undefined; if ("error" in compiled) { ...; site.batch.within(() =>
+// this.#sink.adopt(failed), context) }` (open-query.ts:194-198), `if (this.detached) return Promise.resolve(); ... this.#next =
+// tiling` (host list.ts:57-61). A Go section is a critical region of its own, and a goroutine that checks outside it leaves a
+// gap before the section it acts in, in which another section (a commit's adoption, a close) changes what was checked. So the
+// check is a func the section runs, not a value taken before it: it reads the state, and returns what to do about it. It must
+// not block, as nothing in a section does. The same rule for a check that follows an await is the host's awaitTail.
+func (b *Batch) CheckAct(check func() (act func())) (acted bool) {
+	b.Section(func() {
+		if act := check(); act != nil {
+			acted = true
+			act()
+		}
+	})
+	return acted
 }
 
 // ReportListener reports a failing watch listener's error (to the host's report function): what watches get as their
@@ -122,12 +154,17 @@ func (b *Batch) ReportListener(err error) {
 // batch.
 func (b *Batch) Running() bool { return b.running }
 
-// AssertOutside returns invalid/reentrant inside the batch: operation may not run during adoptions or derive computes.
+// AssertOutside returns invalid/reentrant inside the batch: operation may not run during adoptions or derive computes. The
+// flag is the host loop's: the check is a section of the host (inline when the caller is in one), so a caller's goroutine
+// that asks while a commit runs on the loop waits for it to end, as Pi's single thread has it.
 func (b *Batch) AssertOutside(operation string) error {
-	if b.running {
-		return data.Invalid(data.ReasonReentrant, operation+" inside a commit or a derive compute")
-	}
-	return nil
+	var err error
+	b.Section(func() {
+		if b.running {
+			err = data.Invalid(data.ReasonReentrant, operation+" inside a commit or a derive compute")
+		}
+	})
+	return err
 }
 
 // AssertNotComputing returns invalid/reentrant inside a pure compute (a derive's, a registry's compose): operation would
@@ -249,6 +286,9 @@ func (b *Batch) Changed(source Delivered) { b.changed = append(b.changed, source
 
 // Flushing lists flush to run at the end of the current commit, after its deliveries (a link sending what they fed it).
 func (b *Batch) Flushing(flush func(ctx context.Context) error) { b.flushes = append(b.flushes, flush) }
+
+// Metrics is the host's metrics adapter the batch counts on; nil when the host records none.
+func (b *Batch) Metrics() telemetry.TelemetryMetrics { return b.metrics }
 
 // Count counts one unit of derive or registry work on the host's metrics (a lazy read has no context to count
 // through).

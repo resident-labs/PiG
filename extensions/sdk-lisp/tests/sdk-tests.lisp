@@ -19,7 +19,7 @@ Returns the host and the register envelope."
     (sb-bsd-sockets:socket-bind listener path)
     (sb-bsd-sockets:socket-listen listener 4)
     (let* ((thread (sb-thread:make-thread (lambda () (pig::serve ext (pig::connect-unix path))) :name "test-extension"))
-           (conn (pig::socket-conn (sb-bsd-sockets:socket-accept listener)))
+           (conn (accept-host-conn listener))
            (host (make-host :listener listener :conn conn :thread thread :ext ext :path path))
            (register (pig::read-frame conn)))
       (pig::send-frame conn (pig:obj "type" "ready"
@@ -45,7 +45,8 @@ Returns the host and the register envelope."
 (defun hread (host) (pig::read-frame (host-conn host)))
 (defun hread-type (host type)
   "The next frame of TYPE, skipping request_state frames."
-  (loop (let ((frame (hread host)))
+  (loop (let ((frame (handler-case (hread host)
+                       (sb-sys:io-timeout () (error "no ~A frame arrived within ~D s: the extension is waiting for the host and the host for the extension" type *host-read-timeout*)))))
           (when (eq frame :eof) (error "end of file waiting for ~A" type))
           (when (equal (pig:jget frame "type") type) (return frame)))))
 
@@ -149,6 +150,39 @@ Returns the host and the register envelope."
       (hsend host "type" "cancel" "cancel" (pig:obj "request_id" "r"))
       (hread-type host "response")
       (check-equal "host call isIdle cancelled with its parent request" message))))
+
+(deftest signal-only-cancel-aborts-the-signal-and-leaves-host-calls-running
+  (let ((ext (pig:make-extension "signal-only")) (seen nil))
+    (pig:command ext "c" "C" (lambda (ctx args) (declare (ignore args))
+                               (let ((first (pig:ctx-call-host ctx "probe")))
+                                 (setf seen (list first (pig:ctx-cancelled-p ctx) (pig:ctx-cancellation-reason ctx)
+                                                  (pig:ctx-call-host ctx "probe"))))))
+    (with-host (host ext)
+      (request host "r" "command" "tool" "c" "args" "")
+      (let ((call (hread-type host "call")))
+        (hsend host "type" "cancel" "cancel" (pig:obj "request_id" "r" "reason" "tool done" "signal_only" t))
+        (hsend host "type" "call_result" "id" (pig:jget call "id") "call_result" (pig:obj "result" "first-answer")))
+      (let ((call (hread-type host "call")))
+        (check-equal "r" (pig:jget (pig:jget call "call") "parent_request_id"))
+        (hsend host "type" "call_result" "id" (pig:jget call "id") "call_result" (pig:obj "result" "second-answer")))
+      (hread-type host "response")
+      (check-equal '("first-answer" t "tool done" "second-answer") seen))))
+
+(deftest an-ordinary-cancel-after-a-signal-only-cancel-ends-the-request-and-its-host-calls
+  (let ((ext (pig:make-extension "signal-only-then-cancel")) (seen nil))
+    (pig:command ext "c" "C" (lambda (ctx args) (declare (ignore args))
+                               (let ((first (handler-case (pig:ctx-is-idle-p ctx)
+                                              (pig:host-call-cancelled (e) (pig:host-call-error-message e))))
+                                     (second (handler-case (pig:ctx-is-idle-p ctx)
+                                               (pig:host-call-cancelled (e) (pig:host-call-error-message e)))))
+                                 (setf seen (list first second)))))
+    (with-host (host ext)
+      (request host "r" "command" "tool" "c" "args" "")
+      (hread-type host "call")
+      (hsend host "type" "cancel" "cancel" (pig:obj "request_id" "r" "signal_only" t))
+      (hsend host "type" "cancel" "cancel" (pig:obj "request_id" "r"))
+      (hread-type host "response")
+      (check-equal '("host call isIdle cancelled with its parent request" "host call cancelled with its parent request") seen))))
 
 (deftest tool-call-event-reports-the-edited-input
   (with-host (host (simple-extension))
@@ -283,8 +317,13 @@ Returns the host and the register envelope."
         (check-equal "m" (pig:jget *thunk-result* "id"))
         (check-call (lambda (c) (pig:ctx-get-model-auth c "p" "m")) "getModelAuth" (pig:obj "provider" "p" "modelId" "m"))
         (check-call (lambda (c) (pig:ctx-get-scoped-models c)) "getScopedModels" (pig:obj))
-        (check-call (lambda (c) (pig:ctx-set-model c "p/m")) "setModel" (pig:obj "model" "p/m") (pig:obj "success" t))
+        ;; pi.setModel(model): the model object crosses as given.
+        (check-call (lambda (c) (pig:ctx-set-model c (pig:obj "provider" "p" "id" "m" "contextWindow" 4321))) "setModel"
+                    (pig:obj "model" (pig:obj "provider" "p" "id" "m" "contextWindow" 4321)) (pig:obj "success" t))
         (check-equal t *thunk-result*)
+        ;; The string form asks the host for the model object of the name first; an error of that call is the answer and no setModel follows.
+        (check-call (lambda (c) (multiple-value-list (pig:ctx-set-model c "p/m"))) "resolveModel" (pig:obj "spec" "p/m") (pig:obj "error" "no such model"))
+        (check-equal (list nil "no such model") *thunk-result*)
         (check-call (lambda (c) (pig:ctx-set-thinking-level c "high")) "setThinkingLevel" (pig:obj "level" "high"))
         (check-call (lambda (c) (pig:ctx-set-label c "e1" "L")) "setLabel" (pig:obj "entryId" "e1" "label" "L"))
         (check-call (lambda (c) (pig:ctx-wait-for-idle c)) "waitForIdle" (pig:obj))
@@ -329,3 +368,44 @@ Returns the host and the register envelope."
       (hsend host "type" "notify" "notify" (pig:obj "method" "width_change" "args" (pig:obj "width" 140)))
       (sleep 0.2)
       (check-equal '(100 120) *widths*))))
+
+;;; An SDK diagnostic goes to the log the host names in PIG_EXT_LOG and not to stderr, which the host forwards to the terminal (Go's sdk/diagnostic_test.go).
+
+(defun call-with-diagnostic-log (path body)
+  "Run BODY with PIG_EXT_LOG naming PATH (unset when PATH is NIL) and the byte counter at zero; return what BODY wrote to stderr."
+  (let ((old (sb-posix:getenv "PIG_EXT_LOG")) (pig::*diagnostic-written* 0))
+    (unwind-protect
+         (progn (if path (sb-posix:setenv "PIG_EXT_LOG" path 1) (sb-posix:unsetenv "PIG_EXT_LOG"))
+                (with-output-to-string (*error-output*) (funcall body)))
+      (if old (sb-posix:setenv "PIG_EXT_LOG" old 1) (sb-posix:unsetenv "PIG_EXT_LOG")))))
+
+(defun diagnostic-log-file ()
+  (let ((path (format nil "/tmp/pig-lisp-diag-~D-~D.log" (sb-posix:getpid) (random 1000000))))
+    (with-open-file (out path :direction :output :if-exists :supersede) (write-line "host wrote this line" out))
+    path))
+
+(deftest diagnostics-go-to-the-extension-log-and-not-to-stderr
+  (let* ((path (diagnostic-log-file))
+         (stderr (call-with-diagnostic-log path (lambda () (pig::diagnose "pig: on-loaded handler failed: ~A~%" "probe-panic-boom")))))
+    (unwind-protect
+         (progn (check-equal "" stderr)
+                (check-equal (format nil "host wrote this line~%pig: on-loaded handler failed: probe-panic-boom~%") (read-text-file path)))
+      (delete-file path))))
+
+(deftest diagnostics-fall-back-to-stderr-without-a-writable-log
+  (check-equal (format nil "pig: no host~%") (call-with-diagnostic-log nil (lambda () (pig::diagnose "pig: no host~%"))))
+  (check-equal (format nil "pig: unwritable~%") (call-with-diagnostic-log "/nonexistent-dir/ext.log" (lambda () (pig::diagnose "pig: unwritable~%")))))
+
+(defun count-substring (needle text)
+  (loop with start = 0 for found = (search needle text :start2 start) while found count t do (setf start (1+ found))))
+
+(deftest the-diagnostic-log-is-bounded
+  (let* ((path (diagnostic-log-file))
+         (chunk (format nil "~A~%" (make-string 65536 :initial-element #\x)))
+         (stderr (call-with-diagnostic-log path (lambda () (dotimes (i (floor (* 2 pig::+diagnostic-log-max+) (length chunk))) (pig::diagnose "~A" chunk))))))
+    (unwind-protect
+         (let ((text (read-text-file path)))
+           (check-equal "" stderr)
+           (check (<= (length text) (+ pig::+diagnostic-log-max+ 1024)))
+           (check-equal 1 (count-substring "further SDK diagnostics dropped" text)))
+      (delete-file path))))

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 
@@ -167,6 +168,12 @@ type transactionTask struct {
 	writeKind                 taskWriteKind
 	write                     *AnyTaskRecord
 	publicationConversationId *durable.ConversationId
+
+	// signalTickets is how many signal deliveries to the task have taken their place in line in this transaction, and
+	// signalsServed how many of those have had their turn. The delivery whose ticket equals signalsServed decides next.
+	// Every way out of a delivery after it took its ticket, a failed read and a panic included, serves it, so none holds
+	// back the deliveries behind it. Both are read and written under Transaction.mu.
+	signalTickets, signalsServed int
 }
 
 // TransactionScope holds the defaults a commit binds to.
@@ -278,6 +285,9 @@ type Transaction struct {
 	pendingIdle   *sync.Cond
 	sealed        bool
 	hasTableWrite bool
+	// afterSignalRead is called by a signal delivery with its task, key and value once it holds the committed task,
+	// before it waits for its turn. Only tests set it; it is nil in production.
+	afterSignalRead func(durable.TaskId, string, durable.JsonValue)
 
 	writes                    []durable.StorageWrite
 	createdConversationIds    map[durable.ConversationId]bool
@@ -867,7 +877,73 @@ func (tx *Transaction) PlaceSubmission(id durable.SubmissionId, entry durable.En
 	return nil
 }
 
-// SetTask replaces one task record completely. Tasks change their own state through their runtime.
+// SignalErased delivers a signal to a task (spec suspendable §3.2): a read of the task, then a write of it when the key
+// changes. The task's latest candidate is read once the committed record arrived, and the delivery is decided and staged
+// without yielding, so deliveries started together decide against each other. They decide in the order they were
+// started, as the continuations of one awaited read run in the order they registered: each takes a ticket when it starts,
+// and decides once every delivery with an earlier ticket has had its turn, whichever goroutine the runtime readies first
+// when the read returns.
+func (tx *Transaction) SignalErased(taskId durable.TaskId, token durable.AnySignalSource, key string, value durable.JsonValue) (durable.SignalResult, error) {
+	return read(tx, "signal", func() (durable.SignalResult, error) {
+		line, ticket, afterRead := tx.takeSignalTicket(taskId)
+		defer tx.serveSignalTicket(line, ticket)
+		committed, err := tx.committedTask(taskId)
+		if afterRead != nil {
+			afterRead(taskId, key, value)
+		}
+		tx.mu.Lock()
+		defer tx.mu.Unlock()
+		tx.awaitSignalTurnLocked(line, ticket)
+		if err != nil {
+			return "", err
+		}
+		record := committed
+		if task := tx.tasksById[taskId]; task != nil && task.write != nil {
+			record = task.write
+		}
+		delivered := durable.DeliverSignal(record, token, key, value, tx.host.now())
+		if delivered.Record != nil {
+			tx.hasTableWrite = true
+			if err := tx.stageTaskLocked(*delivered.Record); err != nil {
+				return "", err
+			}
+		}
+		return delivered.Result, nil
+	})
+}
+
+// takeSignalTicket puts a signal delivery to taskId in line behind the earlier ones: its ticket, the task's entry the
+// ticket counts on, and the transaction's afterSignalRead.
+func (tx *Transaction) takeSignalTicket(taskId durable.TaskId) (line *transactionTask, ticket int, afterRead func(durable.TaskId, string, durable.JsonValue)) {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	line = tx.taskEntryLocked(taskId)
+	ticket = line.signalTickets
+	line.signalTickets++
+	return line, ticket, tx.afterSignalRead
+}
+
+// awaitSignalTurnLocked blocks until every delivery with an earlier ticket has had its turn. A delivery whose turn came
+// keeps it, and may call this again, until serveSignalTicket serves it.
+func (tx *Transaction) awaitSignalTurnLocked(line *transactionTask, ticket int) {
+	for line.signalsServed < ticket {
+		tx.pendingIdle.Wait()
+	}
+}
+
+// serveSignalTicket ends the turn of the delivery that holds the ticket, after the turns of the earlier ones, and wakes
+// the deliveries waiting for theirs. It runs on every way out of a delivery, so a delivery that fails or panics before
+// it waited for its turn still passes it on, in order.
+func (tx *Transaction) serveSignalTicket(line *transactionTask, ticket int) {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	tx.awaitSignalTurnLocked(line, ticket)
+	line.signalsServed++
+	tx.pendingIdle.Broadcast()
+}
+
+// SetTask replaces one task record. Tasks change their own state through their runtime. A live replacement keeps the
+// memos an earlier write of this transaction staged, so no write erases another.
 func (tx *Transaction) SetTask(value AnyTaskRecord) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
@@ -875,6 +951,35 @@ func (tx *Transaction) SetTask(value AnyTaskRecord) error {
 		return err
 	}
 	tx.hasTableWrite = true
+	return tx.stageTaskLocked(value)
+}
+
+// notify delivers SubmissionSettledSignal for a submission this commit settles, against the transaction's latest candidate
+// of the task; a delivery the task refuses changes nothing and fails nothing.
+func (tx *Transaction) notify(record durable.SubmissionRecord, notify durable.SubmissionNotify) error {
+	committed, err := tx.committedTask(notify.TaskId)
+	if err != nil {
+		return err
+	}
+	value, err := durable.ToJsonValue(record)
+	if err != nil {
+		return err
+	}
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	target := committed
+	if task := tx.tasksById[notify.TaskId]; task != nil && task.write != nil {
+		target = task.write
+	}
+	delivered := durable.DeliverSignal(target, durable.SubmissionSettledSignal, notify.Key, value, tx.host.now())
+	if delivered.Record != nil {
+		return tx.stageTaskLocked(*delivered.Record)
+	}
+	return nil
+}
+
+// stageTaskLocked stages a task record over the transaction's candidate, also during assembly.
+func (tx *Transaction) stageTaskLocked(value AnyTaskRecord) error {
 	task := tx.taskEntryLocked(value.Id)
 	candidate := task.write
 	if candidate != nil && candidate.State.Status == durable.TaskTerminal {
@@ -882,6 +987,15 @@ func (tx *Transaction) SetTask(value AnyTaskRecord) error {
 	}
 	if candidate != nil && candidate.ConversationId != value.ConversationId {
 		return fmt.Errorf("Task %d cannot change conversations", value.Id)
+	}
+	// A live replacement keeps the memos an earlier write staged, such as a signal delivered to a task whose own commit
+	// then changes its state: no write erases another.
+	status := value.State.Status
+	if candidate != nil && candidate.Memos != nil && status != durable.TaskTerminal && status != durable.TaskCompleting {
+		memos := make(map[string]durable.JsonValue, len(candidate.Memos)+len(value.Memos))
+		maps.Copy(memos, candidate.Memos)
+		maps.Copy(memos, value.Memos)
+		value.Memos = memos
 	}
 	owned, err := copyTaskRecord(tx.stampTimes(value, candidate))
 	if err != nil {
@@ -995,7 +1109,9 @@ func (tx *Transaction) WriteKeys() []string {
 // Doc returns the document's *delta.Object draft, creating the document when
 // absent. args are the owner ID (conversation or task scope), then the
 // family key and seed (families). A family access without a seed fails as
-// upstream's undefined seed does; an explicit nil seed is JSON null.
+// upstream's undefined seed does; an explicit nil seed is JSON null. Whether a call finds the draft of an earlier call or,
+// after a retirement, starts a replacement is decided under tx.mu when the call is made; the callers of one draft wait on
+// the same future and return in the order the runtime wakes them (durable.Tx.Doc).
 func (tx *Transaction) Doc(token durable.AnyDocToken, args ...any) (*delta.Object, error) {
 	return tx.doc(token, args)
 }
@@ -1754,6 +1870,13 @@ func (tx *Transaction) assemble() ([]durable.StorageWrite, error) {
 		plan.conversationId = task.publicationConversationId
 	}
 
+	// Created settled, or settled by a change: each one with Notify signals its task (spec suspendable §4.5).
+	var settling []durable.SubmissionRecord
+	for _, id := range tx.submissionOrder {
+		if record := tx.submissions[id]; durable.IsSettled(record) {
+			settling = append(settling, record)
+		}
+	}
 	for _, staged := range tx.submissionChanges {
 		current, ok := tx.submissions[staged.id]
 		if !ok {
@@ -1772,6 +1895,16 @@ func (tx *Transaction) assemble() ([]durable.StorageWrite, error) {
 		}
 		if changed {
 			tx.setSubmissionLocked(next)
+			if durable.IsSettled(next) {
+				settling = append(settling, next)
+			}
+		}
+	}
+	for _, record := range settling {
+		if record.Notify != nil {
+			if err := tx.notify(record, *record.Notify); err != nil {
+				return nil, err
+			}
 		}
 	}
 

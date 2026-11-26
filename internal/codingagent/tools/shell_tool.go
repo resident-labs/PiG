@@ -63,7 +63,7 @@ type PowerShellSpawnHook = BashSpawnHook
 
 // shellToolSchema mirrors createShellToolDefinition's name, description,
 // parameters, guidelines, and constrained sampling request.
-func shellToolSchema(name, shellName string, exposeSessionEnvironment bool) ai.ToolSchema {
+func shellToolSchema(name, shellName string, exposeSessionEnvironment, borrow bool) ai.ToolSchema {
 	var guidelines []string
 	if exposeSessionEnvironment {
 		guidelines = []string{sessionGuideline}
@@ -79,7 +79,7 @@ func shellToolSchema(name, shellName string, exposeSessionEnvironment bool) ai.T
 	}, `{"type":"object","required":["command"],"properties":{
 		"command":{"type":"string","description":"Shell command to execute"},
 		"timeout":{"type":"number","description":"Timeout in seconds (optional, no default timeout)"}
-	}}`)
+	}}`, borrow)
 }
 
 // shellOutputSchema mirrors upstream bashOutputSchema (bash.ts:56-62): the result
@@ -212,7 +212,13 @@ func executeShellTool(ctx context.Context, cwd string, cfg shellToolConfig, rawP
 		case msg == "aborted":
 			return shellToolError(appendShellStatus(text, "Command aborted")), nil
 		case strings.HasPrefix(msg, "timeout:"):
-			return shellToolError(appendShellStatus(text, "Command timed out after "+strings.TrimPrefix(msg, "timeout:")+" seconds")), nil
+			status := "Command timed out after " + strings.TrimPrefix(msg, "timeout:") + " seconds"
+			if timeoutErr, ok := errors.AsType[*ShellTimeoutError](err); ok && timeoutErr.ShellExit != nil {
+				// Both facts matter, the command's real result and that
+				// its background processes were still writing when the timeout hit.
+				status += ". The shell exited with code " + strconv.Itoa(timeoutErr.ShellExit.ExitCode) + " after " + jsNumber(timeoutErr.ShellExit.AfterSeconds) + " seconds, but background processes it started kept writing output until the timeout."
+			}
+			return shellToolError(appendShellStatus(text, status)), nil
 		default:
 			return shellToolError(msg), nil
 		}
@@ -267,7 +273,7 @@ func formatShellOutput(snapshot OutputSnapshot, lastLineBytes int, emptyText str
 	}
 	tr := snapshot.Truncation
 	if !tr.Truncated {
-		return text, nil
+		return sharedOutput(nil, text), nil
 	}
 	details := &BashDetails{Truncation: &tr, FullOutputPath: snapshot.FullOutputPath}
 	startLine := tr.TotalLines - tr.OutputLines + 1

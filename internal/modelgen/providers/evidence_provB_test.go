@@ -185,8 +185,8 @@ func TestProvBMoonshotai(t *testing.T) {
 		t.Fatal(err)
 	}
 	models := provBModelsOf(catalog)
-	k2Compat := `{"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","supportsStrictMode":false,"thinkingFormat":"deepseek"`
-	k3Compat := `{"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false,"thinkingFormat":"openai","requiresReasoningContentOnAssistantMessages":true,"supportsMidConvoSystemMessages":true,"supportsMidConvoToolAdditions":true}`
+	k2Compat := `{"supportsStore":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","supportsStrictMode":false,"thinkingFormat":"deepseek"`
+	k3Compat := `{"supportsStore":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false,"thinkingFormat":"openai","requiresReasoningContentOnAssistantMessages":true,"supportsMidConvoSystemMessages":true,"supportsMidConvoToolAdditions":true}`
 	provBCheck(t, models, []provBWant{
 		{"kimi-k3.1-pro-highspeed", "reasoning", "true"},
 		{"kimi-k3.1-pro-highspeed", "cost", `{"input":6,"output":30,"cacheRead":0.6,"cacheWrite":0}`},
@@ -236,7 +236,7 @@ func TestProvBNvidia(t *testing.T) {
 	}
 	provBIDsEqual(t, provBIDs(catalog), "acme/Model.One", "acme/named", "acme/plain")
 	models := provBModelsOf(catalog)
-	compat := `{"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","supportsLongCacheRetention":false,"supportsStrictMode":false}`
+	compat := `{"supportsStore":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","supportsLongCacheRetention":false,"supportsStrictMode":false}`
 	provBCheck(t, models, []provBWant{
 		{"acme/Model.One", "name", `"acme/Model.One"`},
 		{"acme/named", "name", `"Pretty Name"`},
@@ -254,13 +254,17 @@ func TestProvBOpenAICodex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	provBIDsEqual(t, provBIDs(catalog), "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra")
+	provBIDsEqual(t, provBIDs(catalog), "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra")
 	models := provBModelsOf(catalog)
 	provBCheck(t, models, []provBWant{
 		{"gpt-6.1-sol", "name", `"GPT-6.1 Sol"`},
 		{"gpt-6.1-sol", "contextWindow", "500000"},
 		{"gpt-6.1-terra", "contextWindow", "500000"},
 		{"gpt-6-astra", "contextWindow", "272000"},
+		{"gpt-6.2-astra", "name", `"GPT-6.2 Astra"`},
+		{"gpt-6.2-astra", "contextWindow", "272000"},
+		{"gpt-6.2-sol", "name", `"GPT-6.2 Sol"`},
+		{"gpt-6.2-sol", "contextWindow", "500000"},
 		{"gpt-5.6-terra", "contextWindow", "272000"},
 		{"gpt-6-sol", "maxTokens", "128000"},
 		{"gpt-6-sol", "api", `"openai-codex-responses"`},

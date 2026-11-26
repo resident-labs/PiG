@@ -90,6 +90,28 @@ func TestRootCausePrefersALabelThenCauseWordsThenTheFirstParagraph(t *testing.T)
 	}
 }
 
+func TestDivergenceSymptomSkipsAPiBugThatOnlyCitesPiSource(t *testing.T) {
+	d := divergence{
+		Title:      "A title",
+		PiBug:      "Pi 1.5.0 (`agent-session.ts` `_queueSteer`), fixed by Pi main 4cf69332c.",
+		Observable: "A queued image reaches the model at full size.",
+		What:       "PiG ports a change.",
+	}
+	if got := d.symptom(); got != d.Observable {
+		t.Errorf("symptom() = %q, want the observable effect %q", got, d.Observable)
+	}
+	d.Observable = ""
+	if got := d.symptom(); got != d.What {
+		t.Errorf("symptom() = %q, want What %q", got, d.What)
+	}
+	if got := (divergence{Title: "A title"}).symptom(); got != "A title" {
+		t.Errorf("symptom() = %q, want the title", got)
+	}
+	if got := (divergence{PiBug: "A bug.", Observable: "Seen."}).symptom(); got != "A bug." {
+		t.Errorf("symptom() = %q, want the public Pi bug paragraph", got)
+	}
+}
+
 func TestImpactAndPlatformComeFromTheWording(t *testing.T) {
 	cases := []struct{ note, impact, platform string }{
 		{"A deadlock froze the UI on macOS.", "Crash, hang or runaway process", "macOS"},
@@ -151,6 +173,7 @@ type testRepo struct {
 
 func (r testRepo) run(args ...string) string {
 	r.t.Helper()
+	requirePinnedDates(r.t)
 	cmd := exec.Command("git", append([]string{"-C", r.root, "-c", "user.name=T", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"}, args...)...)
 	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
 	out, err := cmd.CombinedOutput()
@@ -182,6 +205,7 @@ const divergenceFixture = "# DIVERGENCES\n\n## D1 Old\n\nWhat: old.\n\nRemove wh
 
 func newFixture(t *testing.T) testRepo {
 	t.Helper()
+	fixedGitDates(t)
 	r := testRepo{t: t, root: t.TempDir()}
 	r.run("init", "-q", "-b", "main")
 	r.write("CHANGELOG.md", "# Changelog\n\n## [Unreleased]\n\n## [0.4.1] - 2026-01-01\n")
@@ -417,6 +441,7 @@ func TestAFixTitledSquashWithNoNoteIsRefusedNotAttributed(t *testing.T) {
 }
 
 func TestBuildNeedsTheReleaseCommit(t *testing.T) {
+	fixedGitDates(t)
 	r := testRepo{t: t, root: t.TempDir()}
 	r.run("init", "-q", "-b", "main")
 	r.write("CHANGELOG.md", "# Changelog\n")
@@ -957,6 +982,22 @@ func TestTheLedgerWaitsForAPendingMergeToBeCommitted(t *testing.T) {
 	}
 }
 
+// A shallow clone shows its oldest commit as a root that adds every file, so a small fix reads as a squash; the tool says the clone is shallow instead.
+func TestTheLedgerRefusesAShallowClone(t *testing.T) {
+	r := newFixture(t)
+	r.write("a.go", "package x\n")
+	r.commit("Add a", "a.go")
+	r.write("b.go", "package x\n")
+	r.commit("Add b", "b.go")
+	dst := filepath.Join(t.TempDir(), "shallow")
+	r.run("clone", "-q", "--depth=1", "file://"+r.root, dst)
+	for _, check := range []bool{false, true} {
+		if err := run(dst, "0.4.1", check, false); err == nil || !strings.Contains(err.Error(), "shallow clone") {
+			t.Fatalf("check=%v on a shallow clone: err = %v", check, err)
+		}
+	}
+}
+
 // A fix committed on the first-parent line and followed directly by a merge keeps its fix commit: the merge's first parent is the fix itself, so the merge did not bring it in.
 func TestAFixFollowedByAMergeKeepsItsCommit(t *testing.T) {
 	r := newFixture(t)
@@ -1217,12 +1258,63 @@ func TestAReachableFixMarkerIgnoresFixCommitTrailers(t *testing.T) {
 	}
 }
 
-// fixedGitDates makes every commit of a test repository reproducible: a commit hash is the ID of its entries, and a test about where an
-// entry lands among the others must not depend on the clock.
+// fixedGitDates makes every commit of a test repository reproducible: a commit hash is the ID of its entries, and a rule of the check
+// starts on a day (causeRequiredFrom), so no test may depend on the clock. newFixture pins this date, a day before that rule; a test
+// about a later day names it with commitAt.
 func fixedGitDates(t *testing.T) {
 	t.Helper()
 	t.Setenv("GIT_AUTHOR_DATE", "2026-02-03T04:05:06Z")
 	t.Setenv("GIT_COMMITTER_DATE", "2026-02-03T04:05:06Z")
+}
+
+// gitDateVars are the variables that pin the dates of the commits git writes.
+var gitDateVars = []string{"GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"}
+
+// TestMain drops the commit dates the caller's environment pins, so that only a test's own pin (fixedGitDates, commitAt) satisfies
+// requirePinnedDates.
+func TestMain(m *testing.M) {
+	for _, name := range gitDateVars {
+		if err := os.Unsetenv(name); err != nil {
+			panic(err)
+		}
+	}
+	os.Exit(m.Run())
+}
+
+// unpinnedDates names the commit dates the test has left to the clock, or returns "".
+func unpinnedDates() string {
+	var missing []string
+	for _, name := range gitDateVars {
+		if os.Getenv(name) == "" {
+			missing = append(missing, name)
+		}
+	}
+	return strings.Join(missing, ", ")
+}
+
+// requirePinnedDates fails a test that runs git in a test repository without pinning the author and committer dates: such a commit
+// is dated by the clock, and the seven tests that made one failed from the first day of the cause rule on.
+func requirePinnedDates(t *testing.T) {
+	t.Helper()
+	if missing := unpinnedDates(); missing != "" {
+		t.Fatalf("the test runs git in a test repository without pinning %s: call fixedGitDates or commitAt first, a commit must not be dated by the clock", missing)
+	}
+}
+
+// The guard names each date a test leaves to the clock.
+func TestAnUnpinnedCommitDateIsNamed(t *testing.T) {
+	fixedGitDates(t)
+	if got := unpinnedDates(); got != "" {
+		t.Fatalf("with both dates pinned the guard names %q", got)
+	}
+	t.Setenv("GIT_COMMITTER_DATE", "")
+	if got := unpinnedDates(); got != "GIT_COMMITTER_DATE" {
+		t.Fatalf("the guard names %q, want the committer date", got)
+	}
+	t.Setenv("GIT_AUTHOR_DATE", "")
+	if got := unpinnedDates(); got != "GIT_AUTHOR_DATE, GIT_COMMITTER_DATE" {
+		t.Fatalf("the guard names %q, want both dates", got)
+	}
 }
 
 // addFix writes a changelog fragment for one fix, adds its entry to the ledger the way a contributor does (make bug-ledger), and commits.
@@ -1251,6 +1343,7 @@ func ledgerIDs(t *testing.T, r testRepo) []string {
 // merge merges branch into the checked-out branch, failing the test on a conflict.
 func merge(t *testing.T, r testRepo, branch string) {
 	t.Helper()
+	requirePinnedDates(t)
 	cmd := exec.Command("git", "-C", r.root, "-c", "user.name=T", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "merge", "-q", "--no-ff", "--no-edit", branch)
 	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -1948,5 +2041,75 @@ func TestACorrectionAndTheCommitItReplacesShareTheCorrectionsEntry(t *testing.T)
 	}
 	if len(l.Entries) != 1 || !strings.Contains(l.Entries[0].Title, "by hiding it") {
 		t.Fatalf("entries = %+v, want one titled after the first commit", l.Entries)
+	}
+}
+
+// A commit that names a divergence only to mark its call site, and that a "Bug-Ledger: exempt" trailer or an exempt.txt line excuses, is not a fix commit of the divergence's entry.
+func TestADivergenceEntryOmitsAnExemptMarkerCommit(t *testing.T) {
+	r := newFixture(t)
+	r.write("docs/parity/DIVERGENCES.md", divergenceFixture+"\n## D2 Aborted tools\n\nWhat: PiG stops.\n\nPi bug: Pi waits forever.\n\nPi issue: https://example.com/pi/issues/1\n\nRemove when: Pi stops waiting.\n\nSCRUTINIZED:approved\n")
+	r.write("loop.go", "package x\n")
+	fix := r.commit("Record D2 and stop on abort", "docs/parity/DIVERGENCES.md", "loop.go")
+	r.write("loop.go", "package x\n\n// pig divergence (D2): stops on abort.\n")
+	trailer := r.commit("loop: mark D2\n\nBug-Ledger: exempt Follow-up to unreleased work: comment-only marker", "loop.go")
+	r.write("loop.go", "package x\n\n// pig divergence (D2): stops on abort.\n// D2 again.\n")
+	listed := r.commit("loop: mark D2 again", "loop.go")
+	r.write("loop.go", "package x\n\n// pig divergence (D2): stops on abort.\n// D2 again.\n// and again, D2.\n")
+	plain := r.commit("loop: mark D2 a third time", "loop.go")
+	r.write("automation/ci/bugledger/exempt.txt", listed[:10]+" Follow-up to unreleased work: comment-only marker\n")
+
+	l, err := build(r.root, "0.4.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hashes []string
+	for _, e := range l.Entries {
+		if e.Divergence == "D2" {
+			for _, c := range e.Commits {
+				hashes = append(hashes, c.Hash)
+			}
+		}
+	}
+	slices.Sort(hashes)
+	want := []string{fix[:10], plain[:10]}
+	slices.Sort(want)
+	if !slices.Equal(hashes, want) {
+		t.Errorf("D2 commits = %v, want %v (not the exempt %s and %s)", hashes, want, trailer[:10], listed[:10])
+	}
+}
+
+// A test a fix commit edits in place is one of the fix's tests unless uncredited-tests.txt says that it does not guard the bug.
+func TestAnUncreditedTestIsNotOneOfTheFixCommitsTests(t *testing.T) {
+	r := newFixture(t)
+	r.write("loop.go", "package x\n")
+	r.write("edit_test.go", "package x\n\nfunc TestEdited(t *testing.T) {\n\tone()\n}\n\nfunc TestGuard(t *testing.T) {\n\tone()\n}\n")
+	r.commit("add tests", "loop.go", "edit_test.go")
+	r.write("loop.go", "package x\n\nvar fixed = 1\n")
+	r.write("edit_test.go", "package x\n\nfunc TestEdited(t *testing.T) {\n\tone()\n\ttwo()\n}\n\nfunc TestGuard(t *testing.T) {\n\tone()\n\ttwo()\n}\n")
+	fix := r.commit("Fix a loop crash", "loop.go", "edit_test.go")
+	tests := func() []string {
+		t.Helper()
+		l, err := build(r.root, "0.4.1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range l.Entries {
+			if slices.ContainsFunc(e.Commits, func(c Commit) bool { return c.Hash == fix[:10] }) {
+				return e.Tests
+			}
+		}
+		t.Fatalf("no entry lists the fix commit %s", fix[:10])
+		return nil
+	}
+	if got, want := tests(), []string{"edit_test.go::TestEdited", "edit_test.go::TestGuard"}; !slices.Equal(got, want) {
+		t.Fatalf("tests = %v, want %v", got, want)
+	}
+	r.write("automation/ci/bugledger/uncredited-tests.txt", "# not guards\n"+fix[:10]+" edit_test.go::TestEdited: edited for a new argument\n")
+	if got, want := tests(), []string{"edit_test.go::TestGuard"}; !slices.Equal(got, want) {
+		t.Errorf("tests = %v, want %v (the listed test does not guard the fix)", got, want)
+	}
+	r.write("automation/ci/bugledger/uncredited-tests.txt", fix[:10]+" edit_test.go::TestEdited\n")
+	if _, err := build(r.root, "0.4.1"); err == nil || !strings.Contains(err.Error(), "uncredited-tests.txt") {
+		t.Errorf("a line without a reason: err = %v, want the line refused", err)
 	}
 }

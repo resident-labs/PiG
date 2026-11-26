@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 	"unicode/utf16"
 
@@ -50,7 +51,7 @@ text("x".repeat(100))`,
 	if err := os.MkdirAll(filepath.Join(cache, "quickjs-wasi"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	wasm, err := filepath.Abs("../../../../codemode/assets/quickjs.wasm")
+	wasm, err := filepath.Abs("../../../../codemode/assets/raw/quickjs.wasm")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +144,7 @@ emit(JSON.parse(child.stdout));
 	}
 }
 
-// execute.ts truncateText is `text.slice(0, maxChars - 3) + "..."`: a cut inside a surrogate pair leaves the high half.
+// execute.ts truncateText is `sliceHead(text, maxChars - 3) + "..."` (Pi 9e870f6f0): a cut inside a surrogate pair drops the pair.
 func TestTruncateTextCutsAtCodeUnits(t *testing.T) {
 	text := "aaaaa😀bbbb"
 	for _, tc := range []struct {
@@ -153,12 +154,25 @@ func TestTruncateTextCutsAtCodeUnits(t *testing.T) {
 		{20, text},
 		{11, text},
 		{10, "aaaaa😀..."},
-		{9, "aaaaa" + jsstring.FromUTF16([]uint16{0xd83d}) + "..."},
+		{9, "aaaaa..."},
 		{8, "aaaaa..."},
 		{3, "..."},
 	} {
 		if got := truncateText(text, tc.max); got != tc.want {
 			t.Errorf("truncateText(%q, %d) = %q, want %q", text, tc.max, got, tc.want)
+		}
+	}
+}
+
+// Pi 9e870f6f0: truncateOutput's head and tail never end in half of a surrogate pair. A budget of 1000 tokens keeps 2000 units at each end; a
+// leading "x" puts the head cut inside an emoji, a trailing "x" puts the tail cut inside one, and the plain text cuts at pair boundaries.
+func TestTruncateOutputKeepsSurrogatePairsWhole(t *testing.T) {
+	emoji := strings.Repeat("😀", 30000)
+	for name, text := range map[string]string{"boundaries": emoji, "head cut inside a pair": "x" + emoji, "tail cut inside a pair": emoji + "x"} {
+		out, _ := truncateOutput([]ai.ToolResultMessageContent{ai.TextContent{Text: text}}, 1000)
+		got := out[0].(ai.TextContent).Text
+		if strings.Contains(got, "\xed") || !strings.Contains(got, "tokens truncated") {
+			t.Fatalf("%s: output holds a lone surrogate or is not truncated: %.80q", name, got)
 		}
 	}
 }

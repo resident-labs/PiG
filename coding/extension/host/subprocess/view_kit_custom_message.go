@@ -13,12 +13,12 @@ import (
 )
 
 func init() {
-	registerViewWidget(ViewKindCustomMessage, &viewWidget{build: buildCustomMessage})
+	registerViewWidget(ViewKindCustomMessage, &viewWidget{})
 }
 
 func buildCustomMessage(b *viewBuilder, n *ViewNode, out *frontend.ViewNode) (tui.Component, error) {
 	out.Name, out.Text = n.CustomType, n.Text
 	return b.expandableMessage(n, out, widgetCtorKey(n, func(c *ViewNode) { c.Expanded, c.OutputPad = false, nil }), func(pad int) expandableComponent {
-		return tui.NewCustomMessageComponent(&tui.CustomMessage{CustomType: n.CustomType, Content: n.Text}, nil, nil, pad)
+		return tui.NewCustomMessageComponent(&tui.CustomMessage{CustomType: n.CustomType, Content: n.Text}, nil, nil, pad, nil, "", "")
 	}), nil
 }

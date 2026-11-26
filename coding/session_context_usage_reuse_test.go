@@ -9,7 +9,7 @@ import (
 	"github.com/MichaelKinsy/PiG/ai"
 )
 
-// getContextUsage (agent-session.ts getContextUsage) is a function of the context window and the current branch. The Session reuses its estimate while neither changes, because the state pushed to a subprocess extension before each event carries it, and recomputes it after every change of the log, the leaf or the window.
+// getContextUsage (agent-session.ts getContextUsage) is a function of the context window and the current branch. The Session reuses its estimate while neither changes, because an extension reads it through the ctx.getContextUsage() host call, and recomputes it after every change of the log, the leaf or the window.
 func TestContextUsageReusesTheEstimateUntilTheLogOrWindowChanges(t *testing.T) {
 	t.Setenv("PIG_HOME", t.TempDir())
 	services, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: t.TempDir()})
@@ -44,7 +44,7 @@ func TestContextUsageReusesTheEstimateUntilTheLogOrWindowChanges(t *testing.T) {
 	})
 	fresh := func() *SessionContextUsage {
 		window := s.limitsModel().Capabilities.ContextWindow
-		return s.projectedContextUsage(s.inner, window)
+		return s.projectedContextUsage(s.inner.Load(), window)
 	}
 	check := func(step string) *SessionContextUsage {
 		t.Helper()
@@ -56,9 +56,9 @@ func TestContextUsageReusesTheEstimateUntilTheLogOrWindowChanges(t *testing.T) {
 	}
 
 	first := check("first call")
-	projections := s.inner.BuildSessionProjectionCalls()
+	projections := s.inner.Load().BuildSessionProjectionCalls()
 	second := s.ContextUsage()
-	if calls := s.inner.BuildSessionProjectionCalls() - projections; calls != 0 {
+	if calls := s.inner.Load().BuildSessionProjectionCalls() - projections; calls != 0 {
 		t.Fatalf("a second call with an unchanged log projected the branch %d times", calls)
 	}
 	if !reflect.DeepEqual(first, second) || first.Tokens == second.Tokens {

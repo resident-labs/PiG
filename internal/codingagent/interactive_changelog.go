@@ -54,7 +54,11 @@ func getExtensionChangelogUpdates(sm *SettingsManager, sourceInfos []PiSourceInf
 			_ = sm.SetExtensionChangelogVersion(key, pkgVersion)
 			continue
 		}
-		newEntries := GetNewEntries(parseChangelogFile(sourceInfo.ChangelogPath), lastVersion)
+		newEntries, ok := GetNewEntries(parseChangelogFile(sourceInfo.ChangelogPath), lastVersion)
+		if !ok {
+			_ = sm.SetExtensionChangelogVersion(key, pkgVersion)
+			continue
+		}
 		if len(newEntries) == 0 {
 			continue
 		}
@@ -73,7 +77,7 @@ func getExtensionChangelogUpdates(sm *SettingsManager, sourceInfos []PiSourceInf
 	return updates
 }
 
-// parseChangelogFile is parseChangelog(changelogPath) (utils/changelog.ts): the entries of the file, none when it cannot be read.
+// parseChangelogFile is parseChangelog(changelogPath) (utils/changelog.ts): the entries of the file, none when it cannot be read, and nothing printed: the caller draws the TUI, where a direct write lands over the screen (Pi ac78a6068b38, #11264).
 func parseChangelogFile(path string) []ChangelogEntry {
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -101,17 +105,31 @@ func readPackageJson(packageRoot string) (name, version string) {
 	return name, version
 }
 
-// getExtensionChangelogUpdates is the update list for this run: the source infos of every loaded extension, and no updates for a resumed session.
-func (m *InteractiveMode) getExtensionChangelogUpdates() []extensionChangelogUpdate {
-	if m.opts.SettingsManager == nil || m.newRunner == nil {
+// sessionHasMessages is Pi's `this.session.state.messages.length > 0`: the Session this mode binds already holds conversation messages.
+func (m *InteractiveMode) sessionHasMessages() bool {
+	return m.opts.SessionHandle != nil && len(m.opts.SessionHandle.Agent().Messages()) > 0
+}
+
+// getChangelogForDisplay is interactive-mode.ts getChangelogForDisplay: the What's New entries of a Session without messages, recording the version
+// and sending the install-telemetry ping on a first start and on an update with new entries (startupChangelog).
+func (m *InteractiveMode) getChangelogForDisplay() []ChangelogEntry {
+	if m.opts.SettingsManager == nil || m.opts.AppVersion == "" || m.sessionHasMessages() {
 		return nil
 	}
-	sources := m.newRunner.ExtensionSources()
+	return startupChangelog(m.opts.SettingsManager, m.opts.AppVersion)
+}
+
+// getExtensionChangelogUpdates is the update list for this run: the source infos of every loaded extension, and no updates for a Session with messages.
+func (m *InteractiveMode) getExtensionChangelogUpdates() []extensionChangelogUpdate {
+	if m.opts.SettingsManager == nil || m.opts.ExtensionRunner == nil {
+		return nil
+	}
+	sources := m.opts.ExtensionRunner.ExtensionSources()
 	infos := make([]PiSourceInfo, len(sources))
 	for i, extensionSource := range sources {
 		infos[i] = extensionSource.SourceInfo
 	}
-	return getExtensionChangelogUpdates(m.opts.SettingsManager, infos, m.opts.ResumePath != "")
+	return getExtensionChangelogUpdates(m.opts.SettingsManager, infos, m.sessionHasMessages())
 }
 
 // showStartupChangelog is showStartupNoticesIfNeeded's changelog block (interactive-mode.ts) for the entries newer than the last version seen, in file order with their links
@@ -143,7 +161,7 @@ func (m *InteractiveMode) showStartupChangelog(newEntries []ChangelogEntry, exte
 				return tui.ChalkBold(tui.ActiveTheme().Fg("accent", "What's New"))
 			}, 1, 0))
 			m.chatContainer.Add(tui.NewSpacer(1))
-			m.chatContainer.Add(tui.NewMarkdownWithOptions(jsstring.Trim(changelog), 1, 0, m.markdownThemeWithSettings(), nil, nil))
+			m.chatContainer.Add(m.newChangelogMarkdown(jsstring.Trim(changelog), 1, 0, nil))
 			m.chatContainer.Add(tui.NewSpacer(1))
 		}
 	}
@@ -166,7 +184,7 @@ func (m *InteractiveMode) showStartupChangelog(newEntries []ChangelogEntry, exte
 			for i, update := range extensionUpdates {
 				markdowns[i] = update.Markdown
 			}
-			m.chatContainer.Add(tui.NewMarkdownWithOptions(strings.Join(markdowns, "\n\n"), 1, 0, m.markdownThemeWithSettings(), nil, nil))
+			m.chatContainer.Add(m.newChangelogMarkdown(strings.Join(markdowns, "\n\n"), 1, 0, nil))
 			m.chatContainer.Add(tui.NewSpacer(1))
 		}
 	}
@@ -177,7 +195,7 @@ func (m *InteractiveMode) showStartupChangelog(newEntries []ChangelogEntry, exte
 // handleChangelogCommand appends every released entry oldest-first, with a separate title and borders. CollapseChangelog controls startup notices only.
 func (m *InteractiveMode) handleChangelogCommand() {
 	body := tui.NewPaddedBox(1, 1, nil)
-	changelogBody := tui.NewMarkdownWithOptions(changelogMarkdown(ParseChangelog(bundledChangelog())), 0, 0, m.markdownThemeWithSettings(), nil, nil)
+	changelogBody := m.newChangelogMarkdown(changelogMarkdown(ParseChangelog(bundledChangelog())), 0, 0, nil)
 	changelogBody.FinishStreaming()
 	body.AddChild(changelogBody)
 	m.chatContainer.Add(tui.NewSpacer(1))

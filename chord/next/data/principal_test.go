@@ -13,7 +13,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/internal/nexttest"
 )
 
-// Ports packages/chord/test/next/data/principal.test.ts.
+// Ports packages/chord/test/data/principal.test.ts.
 
 func user(id string) data.Principal { return delta.JsonObjectOf("kind", "user", "id", id) }
 
@@ -131,5 +131,86 @@ func TestPrincipalKey(t *testing.T) {
 		}()
 		nexttest.ExpectCollected(t, ref)
 		runtime.KeepAlive(custom)
+	})
+}
+
+// Ports packages/chord/test/data/principal.test.ts, "samePrincipal" (Pi main de229e073): the kit's owner is a principal the
+// app chooses, recognized by canonical JSON.
+func TestSamePrincipal(t *testing.T) {
+	bg := chordctx.Background()
+	ada := user("u1")
+
+	t.Run("matches the same canonical JSON, whatever the property order; nothing else", func(t *testing.T) {
+		for _, c := range []struct {
+			name      string
+			principal data.Principal
+			want      bool
+		}{
+			{"the same members in another order", delta.JsonObjectOf("id", "u1", "kind", "user"), true},
+			{"an extra member", delta.JsonObjectOf("kind", "user", "id", "u1", "name", "Ada"), false},
+			{"another kind", delta.JsonObjectOf("kind", "guest", "id", "u1"), false},
+			{"no principal", nil, false},
+		} {
+			if got := data.SamePrincipal(c.principal, ada, bg); got != c.want {
+				t.Fatalf("%s: SamePrincipal = %v, want %v", c.name, got, c.want)
+			}
+		}
+	})
+
+	t.Run("computes each principal's key once (cost guard)", func(t *testing.T) {
+		owner := user("owner")
+		caller := user("owner")
+		walks := func(work func(ctx context.Context)) int { return nexttest.Counted(t, work).Walks }
+		if got := walks(func(ctx context.Context) {
+			data.SamePrincipal(caller, owner, ctx)
+			data.SamePrincipal(caller, owner, ctx)
+		}); got != 2 {
+			t.Fatalf("walks = %d, want 2 (the owner's and the caller's key, once each)", got)
+		}
+		if got := walks(func(ctx context.Context) { data.SamePrincipal(user("owner"), owner, ctx) }); got != 1 {
+			t.Fatalf("walks for a new principal object = %d, want 1", got)
+		}
+	})
+}
+
+// Ports packages/chord/test/data/principal.test.ts, "principalJson" (Pi main 47e9d74f9): the caller part of the key under
+// which the references of a host share one wire hold.
+func TestPrincipalJson(t *testing.T) {
+	bg := chordctx.Background()
+
+	t.Run("is the principal's own JSON, its fields in insertion order: equal only when they serialize equally", func(t *testing.T) {
+		if got, want := data.PrincipalJson(user("u1"), bg), `{"kind":"user","id":"u1"}`; got != want {
+			t.Fatalf("PrincipalJson = %s, want %s", got, want)
+		}
+		if data.PrincipalJson(delta.JsonObjectOf("id", "u1", "kind", "user"), bg) == data.PrincipalJson(user("u1"), bg) {
+			t.Fatal("another property order gave the same JSON")
+		}
+		if first, second := data.PrincipalJson(user("u1"), bg), data.PrincipalJson(user("u1"), bg); first != second {
+			t.Fatalf("two principals that serialize equally gave different JSON: %s, %s", first, second)
+		}
+	})
+
+	t.Run("caches per principal object: one walk per object (cost guard)", func(t *testing.T) {
+		principal := user("u1")
+		walks := nexttest.Counted(t, func(ctx context.Context) {
+			data.PrincipalJson(principal, ctx)
+			data.PrincipalJson(principal, ctx)
+		}).Walks
+		if walks != 1 {
+			t.Fatalf("walks = %d, want 1", walks)
+		}
+		walks += nexttest.Counted(t, func(ctx context.Context) { data.PrincipalJson(user("u1"), ctx) }).Walks
+		if walks != 2 {
+			t.Fatalf("walks = %d, want 2", walks)
+		}
+	})
+
+	t.Run("does not retain dropped principals", func(t *testing.T) {
+		ref := func() weak.Pointer[delta.JsonObject] {
+			principal := user("dropped")
+			data.PrincipalJson(principal, bg)
+			return weak.Make(principal)
+		}()
+		nexttest.ExpectCollected(t, ref)
 	})
 }

@@ -86,15 +86,22 @@ func untilKind(t testing.TB, ref *Reference, kind RefStateKind) *RefState {
 	return untilState(t, ref, func(s *RefState) bool { return s.Kind == kind })
 }
 
-// receive waits for the next value of ch (a handler's signal) and fails the test when none comes (an error, not Fatal: it
-// may be called from a handler's task).
+// receive waits for the next value of ch on the test's own goroutine (a handler's signal) and stops the test when none comes:
+// a caller that went on with the zero value of a signal that never arrived would fail on that value (a nil Reference
+// dereferenced), not on the missing signal. A handler's task waits with signal.wait, which cannot stop the test from there.
 func receive[T any](t testing.TB, ch <-chan T) T {
+	t.Helper()
+	return receiveWithin(t, ch, hangGuard)
+}
+
+// receiveWithin is receive with the bound it fails after (the test of the helper itself waits for less than hangGuard).
+func receiveWithin[T any](t testing.TB, ch <-chan T, bound time.Duration) T {
 	t.Helper()
 	select {
 	case value := <-ch:
 		return value
-	case <-time.After(hangGuard):
-		t.Error("the awaited signal never came")
+	case <-time.After(bound):
+		t.Fatal("the awaited signal never came")
 		var zero T
 		return zero
 	}
@@ -114,24 +121,38 @@ func (s signal) fire() {
 	}
 }
 
-// wait blocks until the signal fired.
+// wait blocks until the signal fired, on a handler's task: it fails the test when the signal never comes (an error, not
+// Fatal: FailNow stops only the goroutine of the test, and the task is not that).
 func (s signal) wait(t testing.TB) {
 	t.Helper()
-	receive(t, (<-chan struct{})(s))
+	select {
+	case <-s:
+	case <-time.After(hangGuard):
+		t.Error("the awaited signal never came")
+	}
 }
 
 // await is `await promise` in a handler: the handler suspends (its call's section goes on) and waits until the signal fired,
-// whatever its context does.
+// whatever its context does. The wait is chordctx.Receive's, so an awaited task (a native's open) that waits here is parked, not
+// one the loop's join (deliveredOn) waits for; its bound is a fault detector only, as receive's. The bound is a dropTimer that
+// cancels a context of its own: a stopped time.Timer stays in the runtime's timer heap with its callback until the heap drops
+// it, and a callback that held the handler's context (context.WithTimeout over it) kept what the call carries reachable
+// (TestSignalAwaitKeepsNothingOfTheCallContextInTheTimerHeapOnceItReturned).
 func (s signal) await(t testing.TB, ctx context.Context) {
 	t.Helper()
-	chordctx.Suspend(ctx)
-	s.wait(t)
+	bounded, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
+	guard := newDropTimer(hangGuard, func() { cancel(context.DeadlineExceeded) })
+	defer guard.Stop()
+	defer cancel(nil)
+	if _, err := chordctx.Receive(bounded, (<-chan struct{})(s)); err != nil {
+		t.Error("the awaited signal never came")
+	}
 }
 
-// waitMain blocks the test's own goroutine until the signal fired.
+// waitMain blocks the test's own goroutine until the signal fired; the test stops when it never does.
 func (s signal) waitMain(t testing.TB) {
 	t.Helper()
-	s.wait(t)
+	receive(t, (<-chan struct{})(s))
 }
 
 // refCall is `await ref.method(args, context)`.

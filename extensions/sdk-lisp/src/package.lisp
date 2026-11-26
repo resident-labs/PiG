@@ -63,7 +63,7 @@
    #:type-exclude #:type-extract #:type-extends #:type-function #:type-generic #:type-identifier #:type-index #:type-infer #:type-instantiate
    #:type-interface #:type-key-of #:type-mapped #:type-module #:type-non-nullable #:type-omit #:type-pick #:type-parameter #:type-partial
    #:type-required #:type-readonly-object #:type-readonly-type #:type-record-key #:type-record-pattern #:type-record-value #:type-rest
-   #:type-script #:type-template-literal #:type-this #:type-tuple
+   #:type-script #:type-template-literal #:type-this #:type-tuple #:value-check #:value-errors
    #:type-extends-true #:type-extends-union #:type-extends-false #:type-extends-true-p #:type-extends-union-p #:type-extends-false-p
    #:type-extends-true-like-p #:type-extends-match #:running-extension
    #:+default-max-agent-retry-delay-ms+ #:string-enum #:get-supported-thinking-levels #:clamp-thinking-level #:calculate-cost #:content-text
@@ -114,7 +114,7 @@
    #:resized-image-data #:resized-image-mime-type #:format-dimension-note #:parsed-frontmatter #:parsed-frontmatter-frontmatter
    #:parsed-frontmatter-body #:parse-frontmatter #:strip-frontmatter #:parse-date #:diff-string #:diff-string-diff #:diff-string-first-changed-line
    #:generate-diff-string #:generate-unified-patch #:copy-to-clipboard #:converted-image #:converted-image-data #:converted-image-mime-type
-   #:convert-to-png #:image-resize-options #:make-image-resize-options #:resize-image #:read-stored-credential #:with-file-mutation-queue
+   #:convert-to-png #:image-resize-options #:make-image-resize-options #:resize-image #:read-stored-credential #:with-file-mutation-queue #:ctx-with-file-mutation-queue
    ;; model calls and streams, model types
    #:ctx-complete #:registry-stream #:registry-stream-simple #:registry-complete #:registry-classify #:registry-generate-images
    #:registry-get-all #:registry-get-available #:registry-get-error #:registry-get-models-of-type #:registry-get-model-of-type
@@ -232,7 +232,7 @@
     #:runtime-get-error #:runtime-get-model #:runtime-get-model-of-type #:runtime-get-models #:runtime-get-models-of-type #:runtime-get-physical-model
     #:runtime-get-provider #:runtime-get-provider-auth-status #:runtime-get-providers #:runtime-get-registered-native-provider
     #:runtime-get-registered-provider-config #:runtime-get-registered-provider-ids #:runtime-has-configured-auth-p #:runtime-is-using-oauth-p
-    #:runtime-is-using-subscription-p #:runtime-list-credentials #:runtime-login #:runtime-logout #:runtime-provider-display-name #:runtime-refresh
+    #:runtime-is-using-subscription-p #:runtime-list-credentials #:runtime-login #:runtime-logout #:runtime-provider-display-name #:runtime-refresh #:runtime-settle-credential-writes
     #:runtime-register-native-provider #:runtime-register-provider #:runtime-register-virtual-model #:runtime-registry #:runtime-registry-classify
     #:runtime-registry-complete #:runtime-registry-find #:runtime-registry-find-of-type #:runtime-registry-generate-images #:runtime-registry-get-all
     #:runtime-registry-get-api-key-and-headers #:runtime-registry-get-api-key-for-provider #:runtime-registry-get-available
@@ -254,7 +254,24 @@
    #:agent-session-bind-extensions #:agent-session-state #:agent-session-messages #:agent-session-refresh-context
    #:agent-session-session-manager #:agent-session-subscribe #:agent-session-dispose
    #:agent-session-session-id #:agent-session-session-file #:agent-session-model #:agent-session-thinking-level
-   #:agent-session-active-tools #:agent-session-system-prompt #:agent-session-model-fallback-message #:agent-session-extension-errors
+   #:agent-session-system-prompt #:agent-session-active-tools #:agent-session-model-fallback-message #:agent-session-extension-errors
+    #:agent-session-current-session-id #:agent-session-current-session-file #:agent-session-current-model #:agent-session-current-thinking-level
+    #:agent-session-current-system-prompt #:agent-session-streaming-p #:agent-session-idle-p #:agent-session-compacting-p #:agent-session-retrying-p #:agent-session-bash-running-p
+    #:agent-session-has-pending-bash-messages-p #:agent-session-retry-attempt #:agent-session-pending-message-count #:agent-session-session-name
+    #:agent-session-routed-model #:agent-session-scoped-models #:agent-session-steering-mode #:agent-session-follow-up-mode
+    #:agent-session-auto-compaction-enabled-p #:agent-session-auto-retry-enabled-p #:agent-session-supports-thinking-p
+    #:agent-session-get-available-thinking-levels #:agent-session-get-last-assistant-text #:agent-session-get-active-tool-names
+    #:agent-session-get-callable-tool-names #:agent-session-get-steering-messages #:agent-session-get-follow-up-messages #:agent-session-get-all-tools
+    #:agent-session-get-tool-definition #:agent-session-get-context-usage #:agent-session-get-session-stats
+    #:agent-session-get-user-messages-for-forking #:agent-session-prompt-templates #:agent-session-cache-warming-status
+    #:agent-session-has-extension-handlers-p #:agent-session-cycle-model #:agent-session-set-thinking-level #:agent-session-cycle-thinking-level
+    #:agent-session-set-scoped-models #:agent-session-set-active-tools-by-name #:agent-session-set-steering-mode #:agent-session-set-follow-up-mode
+    #:agent-session-set-auto-compaction-enabled #:agent-session-set-auto-retry-enabled #:agent-session-set-cache-warming-mode
+    #:agent-session-set-session-name #:agent-session-clear-queue #:agent-session-abort-bash #:agent-session-abort-branch-summary
+    #:agent-session-abort-compaction #:agent-session-abort-retry #:agent-session-record-bash-result #:agent-session-export-to-jsonl
+    #:agent-session-set-model #:agent-session-wait-for-idle #:agent-session-reload #:agent-session-compact #:agent-session-navigate-tree
+    #:agent-session-execute-bash #:agent-session-export-to-html #:agent-session-summarize-for-bug-report #:agent-session-send-custom-message
+    #:agent-session-send-user-message
    #:agent-session-services #:make-agent-session-services #:agent-session-services-cwd #:agent-session-services-agent-dir
    #:agent-session-services-model-runtime #:agent-session-services-settings-manager #:agent-session-services-resource-loader
    #:agent-session-services-diagnostics #:create-agent-session-services #:create-agent-session-from-services
@@ -262,7 +279,7 @@
    #:session-runtime-options-session-manager #:session-runtime-options-session-start-event
    #:session-runtime-result #:make-session-runtime-result
    #:agent-session-runtime #:create-agent-session-runtime #:agent-session-runtime-session #:agent-session-runtime-services
-   #:agent-session-runtime-cwd #:agent-session-runtime-diagnostics #:agent-session-runtime-model-fallback-message
+   #:agent-session-runtime-cwd #:agent-session-runtime-diagnostics #:agent-session-runtime-take-unreported-diagnostics #:agent-session-runtime-model-fallback-message
    #:agent-session-runtime-set-rebind-session #:agent-session-runtime-set-before-session-invalidate
    #:agent-session-runtime-switch-session #:agent-session-runtime-new-session #:agent-session-runtime-fork
    #:agent-session-runtime-import-from-jsonl #:agent-session-runtime-dispose
@@ -276,7 +293,11 @@
    #:oauth-on-prompt #:oauth-on-select #:oauth-on-manual-code-input #:register-virtual-model #:unregister-virtual-model
    #:ctx-register-virtual-model #:ctx-unregister-virtual-model #:register-mcp-server #:unregister-mcp-server
    #:ctx-register-mcp-server #:ctx-unregister-mcp-server #:ctx-get-mcp-servers #:tool-renderer #:message-renderer
-   #:message-view-renderer #:entry-renderer #:entry-view-renderer #:markdown-transformer #:own-thinking-runs #:ctx-own-thinking-runs #:ctx-set-login #:ctx-register-sprite
+   #:view-ref #:view-ref-p #:view-ref-key #:view-ref-epoch #:view-ref-rev #:view-status #:view-status-p #:view-status-mount #:view-status-state #:view-status-reason #:view-status-result #:view-clause #:view-when #:view-alternative #:ctx-view-diagnostics
+   #:view-shape #:view-intent #:view-asset #:view-target #:ctx-view-abilities #:ctx-mount-view #:ctx-update-view #:ctx-hide-view #:ctx-show-view
+   #:ctx-finish-view #:ctx-remove-view #:ctx-view-state #:on-view-intent #:on-view-abilities #:view-intent-result
+   #:message-view-renderer #:entry-renderer #:entry-view-renderer #:message-view-event #:entry-view-event
+   #:message-render-options-state #:entry-render-options-state #:markdown-transformer #:own-thinking-runs #:ctx-own-thinking-runs #:ctx-set-login #:ctx-register-sprite
    #:auth-context #:make-auth-context #:auth-context-p #:auth-context-env #:auth-context-file-exists #:api-key-auth-input
    #:make-api-key-auth-input #:api-key-auth-input-p #:api-key-auth-input-ctx #:api-key-auth-input-credential
    #:api-key-auth-input-signal #:auth-result #:make-auth-result #:auth-result-p #:auth-result-auth #:auth-result-env
@@ -296,7 +317,7 @@
    #:refresh-models-context-stored #:refresh-models-context-allow-network #:refresh-models-context-force
    #:refresh-models-context-signal #:refresh-models-context-base-url #:provider #:make-provider #:provider-p #:provider-id
    #:provider-name #:provider-auth #:provider-get-models #:provider-stream #:provider-stream-simple #:provider-base-url
-   #:provider-headers #:provider-filter-models #:provider-get-all-models #:provider-filter-all-models #:provider-refresh-models
+   #:provider-headers #:provider-refresh-models-auth #:provider-filter-models #:provider-get-all-models #:provider-filter-all-models #:provider-refresh-models
    #:provider-fetch-deferred #:provider-cancel-deferred #:provider-generate-images #:provider-classify #:provider-handle
    #:oauth-auth-info #:make-oauth-auth-info #:oauth-auth-info-p #:oauth-auth-info-url #:oauth-auth-info-instructions
    #:oauth-device-code-info #:make-oauth-device-code-info #:oauth-device-code-info-p #:oauth-device-code-info-user-code
@@ -311,7 +332,8 @@
    #:oauth-credential-store-credential-status #:oauth-credential-store-store-credentials
    #:oauth-credential-store-delete-credentials #:oauth-provider #:make-oauth-provider #:oauth-provider-p #:oauth-provider-name
    #:oauth-provider-login #:oauth-provider-refresh-token #:oauth-provider-get-api-key #:oauth-provider-credential-store
-   #:oauth-provider-is-subscription #:virtual-model #:make-virtual-model #:virtual-model-p #:virtual-model-provider
+   #:oauth-provider-is-subscription #:oauth-provider-modify-models #:oauth-provider-uses-callback-server
+   #:virtual-model #:make-virtual-model #:virtual-model-p #:virtual-model-provider
    #:virtual-model-id #:virtual-model-name #:virtual-model-route #:virtual-model-thinking-levels #:virtual-model-context-window
    #:virtual-model-max-tokens #:virtual-model-input #:tool-renderers #:make-tool-renderers #:tool-renderers-p
    #:tool-renderers-render-call #:tool-renderers-render-result #:tool-renderers-render-shell #:tool-renderers-call-view
@@ -319,7 +341,7 @@
    #:tool-render-context-args #:tool-render-context-tool-call-id #:tool-render-context-cwd #:tool-render-context-execution-started
    #:tool-render-context-args-complete #:tool-render-context-is-partial #:tool-render-context-expanded
    #:tool-render-context-show-images #:tool-render-context-is-error #:tool-render-context-output-pad
-   #:tool-render-context-duration-ms #:tool-render-context-state #:tool-render-context-invalidate
+   #:tool-render-context-duration-ms #:tool-render-context-last-component #:tool-render-context-state #:tool-render-context-invalidate
    #:tool-render-context-key-text #:tool-render-context-key-hint #:message-render-options-key-text #:message-render-options-key-hint
    #:entry-render-options-key-text #:entry-render-options-key-hint #:login-definition
    #:make-login-definition #:login-definition-p #:login-definition-brand #:login-definition-hero #:login-definition-mascot
@@ -347,7 +369,7 @@
    #:kit-skill-invocation #:kit-skill-invocation-set-expanded #:kit-skill-invocation-set-output-pad
    #:kit-custom-message #:kit-custom-message-set-expanded #:kit-custom-message-set-output-pad
    #:kit-cancellable-loader #:kit-bordered-loader #:kit-input #:kit-slash-command #:kit-autocomplete #:kit-editor
-   #:kit-scroll-view #:kit-mouse-region
+   #:kit-scroll-view #:kit-mouse-region #:kit-grid #:kit-grid-cell #:kit-grid-chip
    ;; kit: views, events and the view renderers' result
    #:kit-view #:kit-render-result #:kit-event-node #:kit-event-type #:kit-event-index #:kit-event-item #:kit-event-id #:kit-event-value
    #:kit-event-cursor #:kit-event-mouse

@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"math"
 	"slices"
 	"time"
 
 	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/internal/jsloop"
 )
 
 // DefaultAgentIdentity is the request identity of agent loops: the ai package's defaults with provider attribution to PiG. The loop config's Identity overrides it field by field (agent-loop.ts DEFAULT_AGENT_IDENTITY).
@@ -42,7 +42,7 @@ func (a *Agent) createLoopConfig(skipInitialSteeringPoll bool) AgentLoopConfig {
 	beforeToolCall, afterToolCall := a.BeforeToolCall, a.AfterToolCall
 	finishTurn, prepareRequest, prepareNextTurn := a.opts.FinishTurn, a.opts.PrepareRequest, a.nextTurnHook()
 	transformLLMMessages, prepareToolResult, sessionFile := a.opts.TransformLLMMessages, a.opts.PrepareToolResult, a.opts.SessionFile
-	resolveUnloadedTool := a.opts.ResolveUnloadedTool
+	resolveUnloadedTool, beforeRequest := a.opts.ResolveUnloadedTool, a.opts.BeforeRequest
 	a.stateMu.RUnlock()
 	if prepareNextTurn != nil {
 		// agent.ts:484-492 builds the closure only when a hook is set now, then reads both properties on every call: an assignment during the run redirects or clears what later turns call.
@@ -74,7 +74,7 @@ func (a *Agent) createLoopConfig(skipInitialSteeringPoll bool) AgentLoopConfig {
 		GetFollowUpMessages: a.followUpQueue.Drain,
 		FinishTurn:          finishTurn,
 		PrepareRequest:      prepareRequest,
-		BeforeRequest:       a.opts.BeforeRequest,
+		BeforeRequest:       beforeRequest,
 		PrepareNextTurn:     prepareNextTurn,
 		ToolExecution:       toolExecution,
 		BeforeToolCall:      beforeToolCall,
@@ -132,10 +132,32 @@ type loopRun struct {
 	// toolResultsEndRun is set when the run legitimately ends on tool results:
 	// the whole batch asked to terminate, or FinishTurn ended the run.
 	toolResultsEndRun bool
+	// task is the owner's view of the tasks of Pi's event loop this run executes (jsloop.Task); nil for an owner that asked for none.
+	task *jsloop.Task
+	// reader is the context the run reads its responses with (readerContext), built once.
+	reader context.Context
 }
 
 func newLoopRun(ctx context.Context, host *loopHost, messages, newMessages []AgentMessage) *loopRun {
-	return &loopRun{h: host, ctx: ctx, context: messages, newMessages: newMessages, model: host.cfg.Model, thinking: ai.ModelThinkingLevel(host.cfg.Thinking)}
+	return &loopRun{h: host, ctx: ctx, context: messages, newMessages: newMessages, model: host.cfg.Model, thinking: ai.ModelThinkingLevel(host.cfg.Thinking), task: jsloop.TaskFrom(ctx)}
+}
+
+// readerContext returns the context the run hands to consumeStream. consumeStream iterates a response on the context of the run's caller (runDeadlineContext.parent), so that context names the iteration to the stream as the run's reader, and the stream reports the tasks of Pi's loop the reader runs (jsloop.WithTaskReader). Only consumeStream is given it: a stream that forwards another reads on the run's own context and reports nothing. A run whose owner asked for no tasks reads on its own context.
+func (r *loopRun) readerContext() context.Context {
+	if r.task == nil {
+		return r.ctx
+	}
+	if r.reader == nil {
+		if signal, ok := r.ctx.(*runDeadlineContext); ok {
+			reader := &runDeadlineContext{Context: signal.Context, parent: jsloop.WithTaskReader(signal.parent, r.task), deadline: signal.deadline, hasDeadline: signal.hasDeadline}
+			// The run is active for as long as it reads a response.
+			reader.active.Store(true)
+			r.reader = reader
+		} else {
+			r.reader = jsloop.WithTaskReader(r.ctx, r.task)
+		}
+	}
+	return r.reader
 }
 
 // Ports packages/agent/src/agent-loop.ts.
@@ -167,6 +189,8 @@ func (a *Agent) runLoop(ctx context.Context, cfg AgentLoopConfig, prompts []Agen
 	run := newLoopRun(ctx, host, slices.Concat(a.messages, prompts), slices.Clone(prompts))
 	a.stateMu.Unlock()
 	err, failure := run.execute(prompts, nil)
+	// A run that ended any other way than by agent_end leaves no task open.
+	run.task.End()
 	// Awaited callback failures enter the same failed-turn lifecycle as persistence and provider-preparation failures.
 	if failure != nil {
 		return a.messages, a.handleRunFailure(failure, ctx.Err() != nil, run.model)
@@ -202,11 +226,17 @@ func endsOnToolResult(messages []AgentMessage) bool {
 func (r *loopRun) loop() error {
 	var lastCompletedTurn *AgentTurnContext
 	explicitContinuation := false
-	// Check for steering messages at start (user may have typed while waiting).
+	gate := r.h.cfg.BeforeRequest
 	var pendingMessages []AgentMessage
+	if gate == nil {
+		// With no gate, Pi polls once at the start, before entering the loop.
+		pendingMessages = r.h.steering()
+	}
 	for {
 		hasMoreToolCalls := true
 		for hasMoreToolCalls || len(pendingMessages) > 0 {
+			// Another turn follows. Its preparation may await real work (a compaction, a credential, the request), which is where Pi's loop turns: the task the last response began ends here.
+			r.task.End()
 			if limit := r.h.cfg.MaxTurns; limit > 0 && r.turnIndex >= limit {
 				// A pig-only safety cap. Stopping here leaves tool results or
 				// queued messages unanswered, so it must not look like a
@@ -214,14 +244,11 @@ func (r *loopRun) loop() error {
 				r.endRun()
 				return fmt.Errorf("%w (%d turns)", ErrMaxTurnsReached, limit)
 			}
-			if gate := r.h.cfg.BeforeRequest; gate != nil {
+			if gate != nil {
 				if err := gate(r.ctx); err != nil {
 					r.endRun()
 					return err
 				}
-			}
-			// Without a gate keep the old single poll; with a gate read steering after the hold.
-			if len(pendingMessages) == 0 || r.h.cfg.BeforeRequest != nil {
 				pendingMessages = append(pendingMessages, r.h.steering()...)
 			}
 			var preparedMessages []AgentMessage
@@ -349,9 +376,19 @@ func (r *loopRun) turnContext(assistant *AssistantMessage, toolResults []ToolRes
 	return AgentTurnContext{
 		Message:     assistant,
 		ToolResults: toolResults,
-		Context:     AgentContext{Messages: slices.Clone(r.context), Tools: r.h.tools()},
-		NewMessages: slices.Clone(r.newMessages),
+		Context:     AgentContext{Messages: hookView(r.context), Tools: r.h.tools()},
+		NewMessages: hookView(r.newMessages),
 	}
+}
+
+// hookView is the run's messages as a hook receives them: the run's own array, cut at its length. Pi hands its hooks the live context
+// and new-message arrays (agent-loop.ts runLoop: prepareRequest, finishTurn and prepareNextTurn receive currentContext and newMessages;
+// executeToolCalls gives beforeToolCall and afterToolCall currentContext), so a hook that replaces a message in place changes the run,
+// as it does there. The run only ever appends to the array or replaces it whole (applyUpdate), so a view a hook keeps does not change
+// under it, and a hook's append goes to an array of its own: the cut leaves it no room in the run's. The calls of a parallel tool
+// batch all receive this one view (executeToolCallsParallel).
+func hookView(messages []AgentMessage) []AgentMessage {
+	return messages[:len(messages):len(messages)]
 }
 
 func (r *loopRun) finishTurn(turn AgentTurnContext) *AgentTurnDecision {
@@ -389,7 +426,7 @@ func (r *loopRun) prepareRequest() {
 		thinking = ai.ThinkingOff
 	}
 	update, err := r.h.cfg.PrepareRequest(r.ctx, PrepareRequestContext{
-		Context:       AgentContext{Messages: slices.Clone(r.context), Tools: r.h.tools()},
+		Context:       AgentContext{Messages: hookView(r.context), Tools: r.h.tools()},
 		Model:         r.model,
 		ThinkingLevel: thinking,
 	})
@@ -419,30 +456,11 @@ func (r *loopRun) applyUpdate(context *AgentContext, model *ai.Model, thinking *
 // appendMessage emits a message's lifecycle and adds it to the transcript, the
 // loop context, and the run's new messages.
 func (r *loopRun) appendMessage(msg AgentMessage) {
-	r.h.emit(MessageStartEvent{Message: startEventMessage(msg)})
+	msg = msg.WithOrderRecord()
+	r.h.emit(MessageStartEvent{Message: msg.EventView()})
 	r.context = append(r.context, msg)
 	r.newMessages = append(r.newMessages, msg)
 	r.h.emit(MessageEndEvent{Message: msg})
-}
-
-// startEventMessage gives message_start its own envelope: a message_end
-// replacement overwrites the message the transcript and message_end share,
-// and must not reach a message_start a listener may still be reading.
-func startEventMessage(msg AgentMessage) AgentMessage {
-	out := msg
-	switch {
-	case msg.System != nil:
-		out.System = new(*msg.System)
-	case msg.User != nil:
-		out.User = new(*msg.User)
-	case msg.Assistant != nil:
-		out.Assistant = new(*msg.Assistant)
-	case msg.ToolResult != nil:
-		out.ToolResult = new(*msg.ToolResult)
-	case msg.Custom != nil:
-		out.Custom = maps.Clone(msg.Custom)
-	}
-	return out
 }
 
 // appendAssistant records a streamed assistant message; consumeStream already
@@ -461,6 +479,7 @@ func (r *loopRun) emitTurnEnd(assistant *AssistantMessage, toolResults []ToolRes
 
 func (r *loopRun) endRun() {
 	r.h.emit(AgentEndEvent{Messages: slices.Clone(r.newMessages)})
+	r.task.End()
 }
 
 // streamAssistantResponse transforms the loop context, converts it for the
@@ -595,7 +614,7 @@ func (r *loopRun) requestStream(observation *ai.StreamObservation, streamFn Stre
 		}
 		return errorAssistant, nil, nil, nil
 	}
-	message, calls, err = h.consumeStream(r.ctx, stream, r.model, r.thinking)
+	message, calls, err = h.consumeStream(r.readerContext(), stream, r.model, r.thinking)
 	return message, calls, nil, err
 }
 

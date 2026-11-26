@@ -34,6 +34,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -56,11 +57,12 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/extension/pigsdk"
 	piglet "github.com/MichaelKinsy/PiG/coding/piglet"
 	"github.com/MichaelKinsy/PiG/coding/pigletbuild/binarypiglet"
+	"github.com/MichaelKinsy/PiG/extensions/sdk/clihook"
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/prompts"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/timings"
 	"github.com/MichaelKinsy/PiG/internal/frontendpack"
-	"github.com/MichaelKinsy/PiG/internal/gcpolicy"
+	_ "github.com/MichaelKinsy/PiG/internal/memprofrate" // pig additive (D627): its init turns heap-profile sampling off
 	"github.com/MichaelKinsy/PiG/internal/nativeplatform"
 	"github.com/MichaelKinsy/PiG/internal/packagemanager"
 	"github.com/MichaelKinsy/PiG/internal/pigstrip"
@@ -123,13 +125,10 @@ func selfUpdateVersion() string {
 	return PigVersion
 }
 
-// cliVersionString is the `pig --version` output.
+// cliVersionString is the `pig --version` output: what `pi --version` prints, the package version of the pinned Pi build.
+// PiG's own release is in `pig version`, the help and diagnostics banner and the interactive startup line.
 func cliVersionString() string {
-	// pig divergence (D63): --version defaults to PiG's composite version; the product-neutral PIG_VERSION_FORMAT=pi opt-in exposes the pinned Pi package version, which is what `pi --version` prints, for Pi-compatible launchers.
-	if os.Getenv("PIG_VERSION_FORMAT") == "pi" { //perf:ok --version runs once at process start
-		return UpstreamPackageVersion
-	}
-	return Version
+	return UpstreamPackageVersion
 }
 
 // versionString returns pig's self-identification string for help
@@ -697,12 +696,17 @@ var processCwd = nodepath.Cwd
 
 // Main runs the pig command line for args, the arguments after the program name, as Pi's main(args, options) does (main.ts:573). The default and experimental executables call it with args and no options.
 func Main(args []string, options *MainOptions) {
+	// The first thing of every mode and command: the Node extension runtime and every child process (bash tool, package commands, subagents)
+	// read only PI_TELEMETRY, so it holds PiG's resolved choice before anything can start one (TestMainExportsTheResolvedTelemetryBeforeAnyCommand).
+	exportTelemetryOverride()
 	// pig additive (D174): at most procpolicy.Cap Ps unless the environment sets GOMAXPROCS; set before anything reads the width.
 	procpolicy.Apply()
 	// Upstream's theme.bold, italic, underline, inverse and strikethrough are chalk calls: they draw only when chalk's stdout color level is above zero.
 	tui.SetChalkModifiers(chalkStdoutColor())
 	// The pig command serves the test-only test-faux provider under PIG_TEST_FAUX=1; an embedder that leaves the call out does not link it.
 	coding.EnableTestFauxProvider()
+	// Every command of pig may load an extension, whose views the host then builds: a session's host, a renderer of a host without a UI bridge, preview-login, validation.
+	enableViews()
 	// upstream: packages/coding-agent/src/main.ts:574 resetTimings(); PI_TIMING=1 prints the report before the mode runs.
 	timings.ResetTimings()
 	// main.ts:575: the built-in extensions, then the program's own.
@@ -725,6 +729,7 @@ func Main(args []string, options *MainOptions) {
 	defer nativeplatform.ShutdownClipboard()
 	defer exitOnRenderOverflow()
 	defer exitOnConfigRootFailure()
+	defer codingagent.FlushSettingsWrites()
 
 	termuxenv.Configure()
 	// pig additive (D95): record the executable before anything can replace it, so an error can report that this process runs a replaced install.
@@ -751,6 +756,44 @@ func Main(args []string, options *MainOptions) {
 		if p := binarypiglet.Default(); p != nil {
 			pigstrip.SetPiglet(p.Name)
 			undoBinaryStrip = p.Strip.Record()
+		}
+	}
+
+	// pig additive (D653): a fused member's CLI hook owns the command line before PiG parses any of it (extensions/sdk/clihook).
+	var ownPrintOutput bool
+	if hook := clihook.Registered(); hook != nil {
+		res := hook(clihook.Env{Args: args, Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr, Getenv: os.Getenv, Chdir: os.Chdir,
+			StdinTTY: term.IsTerminal(int(os.Stdin.Fd())), StdoutTTY: term.IsTerminal(int(os.Stdout.Fd()))})
+		if res.Handled {
+			exitProcess(res.Exit)
+		}
+		args = res.Args
+		ownPrintOutput = res.OwnPrintOutput
+		if res.Retry != nil {
+			// pig additive (D653): the member's retry defaults; settings.json `retry` still overrides each field.
+			codingagent.SetDefaultRetryConfig(codingagent.RetryConfig{Enabled: true, MaxRetries: res.Retry.MaxRetries,
+				BaseDelayMs: res.Retry.BaseDelayMs, MaxAgentDelayMs: res.Retry.MaxAgentDelayMs})
+			var decider ai.RetryDecider
+			if decide := res.Retry.Decide; decide != nil {
+				decider = func(attempt, maxAttempts int, response ai.AssistantMessage) ai.RetryDecision {
+					failure := clihook.RetryFailure{
+						Attempt:      attempt,
+						MaxRetries:   maxAttempts,
+						ErrorMessage: response.ErrorMessage,
+					}
+					if response.FailureResponse != nil {
+						failure.Status = response.FailureResponse.Status
+						failure.Headers = response.FailureResponse.Headers
+						failure.StreamStarted = response.FailureResponse.StreamStarted
+					}
+					d := decide(failure)
+					return ai.RetryDecision{Retry: d.Retry, DelayMs: d.DelayMs}
+				}
+			}
+			codingagent.SetDefaultRetryDecider(decider, res.Retry.Silent)
+		}
+		if res.HTTPIdleTimeoutMs != nil {
+			codingagent.SetDefaultHTTPIdleTimeoutMs(res.HTTPIdleTimeoutMs)
 		}
 	}
 
@@ -819,7 +862,7 @@ func Main(args []string, options *MainOptions) {
 			runDiagnose(os.Stdout, binaryPath)
 			exitProcess(0)
 		case "provider-bridge":
-			exitProcess(runProviderBridge(os.Stdin, os.Stdout, ""))
+			exitProcess(runProviderBridge(os.Stdin, os.Stdout))
 		case "version":
 			fmt.Println(detailedVersionString())
 			exitProcess(0)
@@ -889,13 +932,20 @@ func Main(args []string, options *MainOptions) {
 	}
 
 	runMode := processAppMode(flags)
-	if runMode == appModePrint || runMode == appModeJSON || runMode == appModeRPC {
+	if flags.Listen != "" {
+		// pig additive (D232): a --listen server runs many sessions, so it ends D174's cap of 2 Ps: sessions that start together do their server-side work on every P.
+		procpolicy.Release()
+	}
+	// pig additive (D232): a --listen server skips D175's GOGC 400 start, because resident memory across many sessions is its objective.
+	if policy, ok := gcPolicyFor(runMode, flags.Listen); ok {
 		// pig additive (D175): print, json and rpc runs collect at GOGC 400 unless the environment sets GOGC, and at 100 again past 64 MiB live.
-		stopGCPolicy = gcpolicy.Apply()
+		// pig additive (D621): an interactive run keeps a heap goal of at least 16 MiB, at GOGC 150 until 8 MiB are live and at 100 from then on, unless the environment sets GOGC or GOMEMLIMIT; its watcher ends at 100 after 2 seconds without a collection.
+		stopGCPolicy = policy.Apply()
 		// Deferred after stopProfiles, so it runs first: the exit record counts no watcher.
 		defer stopGCPolicy()
 	}
-	if runMode == appModeRPC {
+	// pig additive (D232): a --listen server skips the rpc cap of 1 P, because one process runs many sessions.
+	if runMode == appModeRPC && flags.Listen == "" {
 		// pig additive (D174): an rpc run schedules on procpolicy.RPCCap Ps unless the environment sets GOMAXPROCS.
 		procpolicy.ApplyRPC()
 	}
@@ -952,6 +1002,10 @@ func Main(args []string, options *MainOptions) {
 	signal.Notify(sigCh, syscall.SIGTERM)
 	if runtime.GOOS != "windows" {
 		signal.Notify(sigCh, syscall.SIGHUP)
+	}
+	if flags.Listen != "" {
+		// pig additive (D232): Ctrl+C ends a --listen server like SIGTERM, so the sessions shut down and the socket file is removed.
+		signal.Notify(sigCh, os.Interrupt)
 	}
 	defer signal.Stop(sigCh)
 	go func() {
@@ -1036,7 +1090,7 @@ func Main(args []string, options *MainOptions) {
 	// Run one-shot config migrations before loading services/resources so
 	// renamed directories (e.g. commands/ → prompts/) are visible on the
 	// current startup path. Mirrors upstream startup ordering.
-	migratedProviders, _, err := codingagent.RunMigrations(cwd, agentDir)
+	migratedProviders, deprecationWarnings, err := codingagent.RunMigrations(cwd, agentDir)
 	if err != nil {
 		printCLIError("%v", err)
 		exitProcess(1)
@@ -1135,21 +1189,27 @@ func Main(args []string, options *MainOptions) {
 			fmt.Fprintf(os.Stderr, "%s\n", issue.Error())
 			exitProcess(1)
 		}
-		selected, ok, selectErr := codingagent.ShowStartupSelector(
-			issue.prompt(),
-			[]string{"Continue", "Cancel"},
-			startupUIOpts,
-		)
+		options := issue.options()
+		labels := make([]string, len(options))
+		for i, option := range options {
+			labels[i] = option.Label
+		}
+		selected, ok, selectErr := codingagent.ShowStartupSelector(issue.prompt(), labels, startupUIOpts)
 		if selectErr != nil {
 			printCLIError("select session cwd: %v", selectErr)
 			exitProcess(1)
 		}
-		if !ok || selected != 0 {
+		if !ok || selected < 0 || selected >= len(options) {
 			exitProcess(0)
 		}
-		startupSession.runtimeCWD = issue.fallbackCWD
-		startupSession.missingCWD = nil
-		flags.sessionCwdOverride = new(startupSession.runtimeCWD)
+		choice := options[selected].Value
+		if choice == "" {
+			exitProcess(0)
+		}
+		if applyErr := startupSession.applyMissingCWDChoice(choice, &flags, sessionDir); applyErr != nil {
+			printCLIError("%v", applyErr)
+			exitProcess(1)
+		}
 	}
 	cwd = startupSession.runtimeCWD
 	// upstream: packages/coding-agent/src/main.ts:autoTrustOnReloadCwd
@@ -1173,11 +1233,15 @@ func Main(args []string, options *MainOptions) {
 	flags.Name = sessionName
 	// pig additive (D211): the active Piglet decides whether an untrusted project loads its context files.
 	flags.ContextFilesTrustedOnly = activePiglet.WithholdsUntrustedContextFiles()
+	// pig additive (D614): the active Piglet decides whether the TUI draws the views extensions mount.
+	flags.TerminalViewClient = activePiglet.TerminalViewClient()
+	// pig additive (D614): the active Piglet decides whether an interactive session serves its view carrier on a Unix socket. Stock PiG has no Piglet key, so nothing listens.
+	flags.ViewEndpoint = activePiglet.ViewEndpointSocket()
 	timings.Time("createSessionManager")
 	// The builder is Pi's createRuntime closure: every mode builds its first Session
 	// and every replacement Session from the same process-fixed inputs.
 	builder := &cliRuntimeBuilder{
-		mode: processAppMode(flags), flags: flags, agentDir: agentDir, launchCWD: initialCWD,
+		mode: processAppMode(flags), packages: newPackageRun(processAppMode(flags)), flags: flags, agentDir: agentDir, launchCWD: initialCWD,
 		activePiglet: activePiglet, activePigletBaked: activePigletBaked, activePigletOpen: activePigletOpen,
 		shadowedPiglet:  piglet.ShadowedWorkspacePiglet(requestedPigletName(flags.UnknownFlags), flags.ProjectTrustOverride),
 		settingsManager: startupSettingsManager, settingsDiagnostics: startupSettingsDiagnostics,
@@ -1189,6 +1253,13 @@ func Main(args []string, options *MainOptions) {
 			// writes one. A failure is not fatal, but it must be visible, because it is otherwise untraceable from the running process.
 			return stageExtensionSDKsFor(ctx, codingagent.ConfigRoot(), startupSDKLockTimeout)
 		},
+	}
+	if flags.Listen != "" {
+		// pig additive (D232): with --listen-share-extensions the server's Hosts share cell processes through one registry and its builds run one at a time. Otherwise every session's Host spawns its own processes, as a process per session would, and sessions build concurrently.
+		if flags.ListenShareExtensions {
+			builder.buildMu = &sync.Mutex{}
+			builder.cellRegistry = subprocess.NewCellRegistry()
+		}
 	}
 	startupExtensions := &startupExtensionSet{}
 	stopStartupExtensions = startupExtensions.close
@@ -1207,7 +1278,6 @@ func Main(args []string, options *MainOptions) {
 		exitProcess(1)
 	}
 	extensionDiagnostics := build.ExtensionDiagnostics
-	startupDiagnostics := slices.Concat(build.StartupDiagnostics, extensionDiagnostics)
 	// pig additive (D109): extensions written for an older SDK are upgraded here, before piped input is read. When every one of them builds, this process loads the resources again: the Session selection, its fork and name, and the project trust answer stay as they were made.
 	if len(build.SDKDrift) > 0 && !flags.Help && flags.ListModels == "" && !flags.ListModelsAll {
 		interactive := processAppMode(flags) == appModeInteractive && term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stderr.Fd()))
@@ -1220,7 +1290,6 @@ func Main(args []string, options *MainOptions) {
 				exitProcess(1)
 			}
 			extensionDiagnostics = build.ExtensionDiagnostics
-			startupDiagnostics = slices.Concat(build.StartupDiagnostics, extensionDiagnostics)
 		}
 	}
 
@@ -1240,19 +1309,10 @@ func Main(args []string, options *MainOptions) {
 	}
 	timings.Time("createAgentSessionRuntime")
 	flags = build.Flags
-	selected, modelErr := build.Selected, build.ModelErr
-	// resolveModelScope reports immediately; buildSessionOptions diagnostics follow extension errors in the runtime's report.
-	for _, warning := range selected.ScopeWarnings {
-		printModelDiagnostic(warning)
-	}
+	modelErr := build.ModelErr
+	// Pi bacd45b9c (#11973, #11264): the model scope warnings are diagnostics of the runtime, after the extension diagnostics and before buildSessionOptions' diagnostics. The factory does not print them: it runs again on /new, /resume and /fork while the interactive TUI draws on the terminal. The runtime holds them and its mode reports each once (TakeUnreportedDiagnostics).
 	timings.Time("resolveModelScope")
-	for _, warning := range selected.Warnings {
-		startupDiagnostics = append(startupDiagnostics, codingagent.AgentSessionRuntimeDiagnostic{Type: "warning", Message: warning})
-	}
-	for _, diagnosticErr := range selected.Errors {
-		startupDiagnostics = append(startupDiagnostics, codingagent.AgentSessionRuntimeDiagnostic{Type: "error", Message: diagnosticErr.Error()})
-	}
-	startupDiagnostics = codingagent.DeduplicateDiagnostics(startupDiagnostics)
+	startupDiagnostics := build.runtimeDiagnostics()
 
 	// upstream: main.ts applies the runtime settings' httpProxy and HTTP idle timeout after createAgentSessionRuntime, before help, --list-models and every mode.
 	if err := configureHTTPDispatcherFromSettings(build.Services.SettingsManager()); err != nil {
@@ -1263,14 +1323,18 @@ func Main(args []string, options *MainOptions) {
 	// Metadata reports the startup settings diagnostics and the runtime diagnostics, such as the warning of a package that could not be installed, and never their failure status (main.ts, Pi 6dfb54678).
 	metadataDiagnostics := codingagent.DeduplicateDiagnostics(slices.Concat(startupSettingsDiagnostics, startupDiagnostics))
 	if flags.Help {
-		codingagent.ReportDiagnostics(metadataDiagnostics)
+		codingagent.WriteDiagnosticsToStderr(metadataDiagnostics)
 		// upstream: cli/args.ts printHelp styles with chalk.bold, whose level is chalk's stdout supports-color level (FORCE_COLOR, --no-color, TERM, CI), not only whether stdout is a terminal.
 		printHelp(os.Stdout, chalkStdoutColor(), extensionHelpFlags(build.Extensions)...)
 		exitProcess(0)
 	}
 	if flags.ListModels != "" || flags.ListModelsAll {
-		codingagent.ReportDiagnostics(metadataDiagnostics)
-		printModelList(build.Services.Registry().ModelRegistry, flags.ListModels)
+		codingagent.WriteDiagnosticsToStderr(metadataDiagnostics)
+		// main.ts:951 leaves a rejection of listModels uncaught: Node reports the error and exits with status 1.
+		if err := listModels(ctx, build.Services.ModelRuntime(), build.Services.Registry().ModelRegistry, flags.ListModels); err != nil {
+			fmt.Fprintln(os.Stderr, uncaughtListModelsError(err))
+			exitProcess(1)
+		}
 		exitProcess(0)
 	}
 	// RPC owns stdin as JSONL. Other modes read piped input before runtime diagnostics, and metadata commands above never consume it.
@@ -1305,6 +1369,13 @@ func Main(args []string, options *MainOptions) {
 		initTheme(configuredThemeName(build.Services.SettingsManager()), false)
 	}
 	timings.Time("initTheme")
+	// main.ts:970-973 prints the deprecated-extension-directory warnings of an interactive start and waits for a key before the TUI starts.
+	if processAppMode(flags) == appModeInteractive {
+		if err := showDeprecationWarnings(os.Stdout, os.Stdin, deprecationWarnings); err != nil {
+			printCLIError("%v", err)
+			exitProcess(1)
+		}
+	}
 	// Only an error diagnostic stops startup; warnings are reported and startup goes on (main.ts:908-916).
 	hasRuntimeErrors := modelErr != nil || slices.ContainsFunc(extensionDiagnostics, func(diagnostic codingagent.AgentSessionRuntimeDiagnostic) bool { return diagnostic.Type == "error" })
 	if hasRuntimeErrors {
@@ -1374,9 +1445,18 @@ func Main(args []string, options *MainOptions) {
 		if startupSession.forkPath != "" {
 			resumePath = startupSession.forkPath
 		}
-		codingagent.ReportDiagnostics(startupDiagnostics)
+		// The runtime holds the startup diagnostics, and the mode writes them to stderr once it has created the runtime and takes them (c47ad0432bb8). --listen has no Pi counterpart: it reports them when the server starts, and the first connection, which serves this build, does not report them again.
+		if flags.Listen != "" {
+			codingagent.WriteDiagnosticsToStderr(startupDiagnostics)
+		}
 		timings.PrintTimings()
 		startAutomaticExtensionCacheGC(ctx)
+		if flags.Listen != "" {
+			// pig additive (D232): --listen serves one rpc session per connection.
+			exitProcess(runRPCListen(ctx, flags, activePiglet, rpcModeResources{
+				Builder: builder, Build: build, SessionManager: startupSession.manager, ResumePath: resumePath,
+			}))
+		}
 		exitProcess(runRPCMode(ctx, flags, activePiglet, rpcModeResources{
 			Builder: builder, Build: build, SessionManager: startupSession.manager, ResumePath: resumePath,
 		}))
@@ -1393,7 +1473,7 @@ func Main(args []string, options *MainOptions) {
 	// Mirrors upstream main.ts resolveAppMode: --print, --mode json, or a
 	// stdin or stdout that is not a terminal runs print mode.
 	if processAppMode(flags) != appModeInteractive {
-		codingagent.ReportDiagnostics(startupDiagnostics)
+		// The runtime holds the startup diagnostics; startPrintMode writes them once it has created the runtime and takes them (c47ad0432bb8).
 		if subprocHost != nil {
 			defer subprocHost.Shutdown("quit")
 		}
@@ -1412,7 +1492,7 @@ func Main(args []string, options *MainOptions) {
 		})
 		timings.PrintTimings()
 		startAutomaticExtensionCacheGC(ctx)
-		if exitCode, err := startPrintMode(ctx, host, printModeOptions{Mode: mode, Messages: extraMessages, InitialMessage: initialMessage, InitialImages: initialImages}); err != nil {
+		if exitCode, err := startPrintMode(ctx, host, printModeOptions{Mode: mode, Messages: extraMessages, InitialMessage: initialMessage, InitialImages: initialImages, ownOutput: ownPrintOutput}); err != nil {
 			// A run stopped by a termination signal reports 128+signum and
 			// stays quiet, matching upstream's print-mode signal handlers.
 			if signalErr, ok := errors.AsType[*signalExitError](err); ok {
@@ -1422,6 +1502,10 @@ func Main(args []string, options *MainOptions) {
 				printCLIError("%v", err)
 			}
 			exitProcess(exitCode)
+		}
+		// pig additive (D653): a fused member's status after a print run that succeeded in PiG's terms; a failed run keeps PiG's 1.
+		if code, ok := clihook.ExitCode(); ok && code != 0 {
+			exitProcess(code)
 		}
 		return
 	}
@@ -1441,8 +1525,8 @@ func Main(args []string, options *MainOptions) {
 	// Create or reopen the Session with the resolved CLI thinking override before binding interactive presentation.
 	startOpts := startupSession.startOptions(flags)
 	interactiveInputs := builder.interactiveInputs(build, startOpts)
-	// The first construction carries the diagnostics startup already merged with the model selection's.
-	interactiveInputs.Diagnostics, interactiveInputs.ModelFallbackMessage = startupDiagnostics, noModelWarning
+	// The first construction carries the model fallback message startup resolved; its diagnostics are the build's (cliSessionInputs.Diagnostics).
+	interactiveInputs.ModelFallbackMessage = noModelWarning
 	sessionFactory := newCLISessionFactory(ctx, interactiveInputs, build, func(ctx context.Context, options coding.CreateAgentSessionRuntimeOptions) (cliSessionInputs, *cliBuild, error) {
 		next, err := builder.rebuild(ctx, options)
 		if err != nil {
@@ -1451,6 +1535,7 @@ func Main(args []string, options *MainOptions) {
 		return builder.interactiveInputs(next, coding.SessionStartOptions{}), next, nil
 	})
 	defer sessionFactory.Close()
+	terminateSessionExtensions = sessionFactory.TerminateProcesses
 	trace.Mark("pre-session")
 	startManager, err := coding.SessionManagerFor(services, interactiveInputs.Start)
 	if err != nil {
@@ -1500,10 +1585,10 @@ func Main(args []string, options *MainOptions) {
 		AgentDir:               agentDir,
 		SessionDir:             sessionDir,
 		Model:                  model,
-		ModelFallbackMessage:   rt.ModelFallbackMessage(),
+		ModelFallbackMessage:   noModelFallbackMessage(codingSess, rt.ModelFallbackMessage()),
 		MigratedProviders:      migratedProviders,
 		AutoTrustOnReloadCwd:   autoTrustOnReloadCwd,
-		StartupDiagnostics:     rt.Diagnostics(),
+		StartupDiagnostics:     rt.TakeUnreportedDiagnostics(),
 		Settings:               settings,
 		SettingsManager:        settingsManager,
 		SystemPrompt:           systemPrompt,
@@ -1525,6 +1610,8 @@ func Main(args []string, options *MainOptions) {
 		InitialImages:          initialImages,
 		InitialMessages:        extraMessages,
 		AppVersion:             UpstreamPackageVersion,
+		// A frame comes due between the stream's wake-ups; the runtime's timer would draw it up to a millisecond late (codingagent kernelFrameTimer).
+		KernelFrameDeadline: true,
 		// pig additive (D91): a Piglet Binary's fused frontend member.
 		// pig additive (D202): an overlay that removes the frontend slot starts the Binary without it.
 		Frontend: frontendpack.SelectedIf(!overlayRemovedFrontend(activePiglet)),
@@ -1541,6 +1628,7 @@ func Main(args []string, options *MainOptions) {
 		BinaryUpdateChecker:        binaryUpdateChecker(),
 		ResourceSourceInfoProvider: resourceSourceInfoProvider(cwd, agentDir, services.SettingsManager(), flags, startupSourceResolver.Resolve),
 		ReloadResourceProvider:     reloadResourceSnapshotProvider(cwd, agentDir, services.SettingsManager(), resourceFlags, skillScopes),
+		ExtensionWarnings:          build.ExtensionWarnings,
 		Verbose:                    flags.Verbose,
 		Skills:                     skillDefs,
 		SkillDiagnostics:           slr.Diagnostics,
@@ -1557,6 +1645,7 @@ func Main(args []string, options *MainOptions) {
 			return coding.BuildModel(spec, services)
 		},
 		DefaultModelPerProvider: codingagent.DefaultModelPerProvider(),
+		ModelBinder:             codingSess.ModelRuntime().BindModelObject,
 		ModelLookup:             codingSess.ModelRuntime().GetModel,
 		ModelCatalog:            codingSess.ModelRuntime().GetModels,
 		ModelClassify:           codingSess.ModelRuntime().Classify,
@@ -1593,6 +1682,8 @@ func Main(args []string, options *MainOptions) {
 	if subprocBridge != nil {
 		iopts.SubprocessUIBridge = subprocBridge
 	}
+	iopts.TerminalViewClient = flags.TerminalViewClient
+	iopts.ViewEndpoint = flags.ViewEndpoint
 	if subprocHost != nil {
 		iopts.SubprocessHost = subprocHost
 		// /reload recompiles these, and it is the command reached for after
@@ -1607,12 +1698,21 @@ func Main(args []string, options *MainOptions) {
 	iopts.InitialThemeSetting = flags.UseTheme
 	iopts.TerminateExtensionProcesses = sessionFactory.TerminateProcesses
 	interactive := codingagent.NewInteractiveMode(interactiveRuntime{rt}, iopts)
+	// main.ts: the TUI draws from here on, so an install is no longer announced on stderr.
+	builder.packages.stopAnnouncing()
 	// SIGTERM must reach extensions before the root context is cancelled.
-	setTerminationShutdownHook(interactive.ShutdownFromSignal)
+	setTerminationShutdownHook(func() {
+		// A quit by keys that waits for its dispose has stopped the TUI: the signal ends the process at once, as Pi's does after its stop().
+		interactive.ExitIfQuitting(128 + int(receivedTerminationSignal.Load()))
+		interactive.ShutdownFromSignal()
+		// Pi's signal shutdown awaits runtimeHost.dispose(), which waits for a started OAuth refresh to be saved. Main cancels the root context, which owns the extension processes, as soon as this hook returns.
+		//portlint:allow ctxbackground Pi's signal shutdown awaits dispose() with no signal (interactive-mode.ts shutdown); this signal hook has no caller context
+		_ = rt.SettleCredentialWrites(context.Background())
+	})
 	defer setTerminationShutdownHook(nil)
 
 	if startupBenchmark {
-		runStartupBenchmark(ctx, interactive)
+		runStartupBenchmark(ctx, interactive, rt.Close)
 		return
 	}
 
@@ -1628,11 +1728,21 @@ func Main(args []string, options *MainOptions) {
 	}
 }
 
+// startupBenchmarkMode is the part of interactive mode the startup benchmark drives.
+type startupBenchmarkMode interface {
+	Init(ctx context.Context) error
+	Stop(fullscreenExitOutput ...codingagent.FullscreenExitOutput) error
+}
+
 // runStartupBenchmark initializes interactive mode, gives the terminal input reader 150 ms to consume the terminal's query
-// replies, and stops it without entering the input loop.
+// replies, and stops it without entering the input loop. It then disposes the session runtime, as a normal interactive quit does after it stops
+// the TUI, so extensions receive session_shutdown and release what they hold.
+//
+// Pi disposes the runtime right after interactiveMode.stop() and before the timings print.
+// The error path disposes too, where the process would otherwise exit without session_shutdown.
 //
 // upstream: packages/coding-agent/src/main.ts:964-978 (startupBenchmark)
-func runStartupBenchmark(ctx context.Context, interactive *codingagent.InteractiveMode) {
+func runStartupBenchmark(ctx context.Context, interactive startupBenchmarkMode, dispose func() error) {
 	err := interactive.Init(ctx)
 	if err == nil {
 		trace.Mark("interactiveMode.init")
@@ -1641,6 +1751,9 @@ func runStartupBenchmark(ctx context.Context, interactive *codingagent.Interacti
 	}
 	if stopErr := interactive.Stop(); stopErr != nil {
 		err = errors.Join(err, stopErr)
+	}
+	if disposeErr := dispose(); disposeErr != nil {
+		err = errors.Join(err, disposeErr)
 	}
 	timings.PrintTimings()
 	if err != nil {
@@ -1765,9 +1878,27 @@ func exportOfflineMode(flagOffline bool) {
 	}
 }
 
+// exportTelemetryOverride gives the resolved telemetry override to the processes that read Pi's name: the Node extension runtime runs Pi's
+// own isInstallTelemetryEnabled, which reads only PI_TELEMETRY, so PI_TELEMETRY becomes what PiG decided (PIG_TELEMETRY when it is set,
+// even beside a PI_TELEMETRY of the opposite value). PIG_TELEMETRY itself stays in the environment as it was.
+// pig divergence (D2): PIG_TELEMETRY is PiG's name beside Pi's PI_TELEMETRY and wins when both are set ("Product name in messages").
+func exportTelemetryOverride() {
+	if value, ok := codingagent.InstallTelemetryEnvOverride(); ok { //perf:ok cold: read once per process start (Main)
+		_ = os.Setenv("PI_TELEMETRY", value)
+	}
+}
+
 // truthyEnvFlag mirrors upstream main.ts isTruthyEnvFlag: "1", "true" or
 // "yes", case-insensitively.
 func truthyEnvFlag(value string) bool {
 	lower := strings.ToLower(value)
 	return value == "1" || lower == "true" || lower == "yes"
+}
+
+// noModelFallbackMessage is the message interactive mode shows through its option: the login guidance of a runtime without any model. A fallback to another model is a diagnostic of the runtime, so it is not shown twice (main.ts:1023-1024).
+func noModelFallbackMessage(session *coding.Session, message string) string {
+	if session.Model() != nil {
+		return ""
+	}
+	return message
 }

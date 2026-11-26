@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -157,7 +156,7 @@ func (e *Extension) unsubscribe(sub *busSub) func() {
 			return
 		}
 		if err := (EventBus{ext: e}).call(callEventsOff, busCallArgs{HandlerID: sub.id}); err != nil {
-			fmt.Fprintf(os.Stderr, "extension: pi.events unsubscribe %q: %v\n", sub.channel, err)
+			diagnosticf("extension: pi.events unsubscribe %q: %v\n", sub.channel, err)
 		}
 	})
 }
@@ -266,8 +265,11 @@ func (p *factoryPump) serve(e *Extension, c *conn) {
 	}
 }
 
-// serveLoadingEnvelope answers what the Host sends a connection whose extension has not registered: listener dispatches, each on its own goroutine so that a listener's nested emit does not stop the next dispatch, and the release of a listener a dispatch unsubscribed. A request the extension cannot serve yet is refused, so the Host does not wait for it.
+// serveLoadingEnvelope answers what the Host sends a connection whose extension has not registered: listener dispatches, each on its own goroutine so that a listener's nested emit does not stop the next dispatch, and notifies, which it applies and counts as the main loop does (the release of a listener a dispatch unsubscribed, a state the Host pushed). A request the extension cannot serve yet is refused, so the Host does not wait for it.
 func (e *Extension) serveLoadingEnvelope(c *conn, env envelope) {
+	if env.Type == msgRequest {
+		c.dropQueuedRequest(env.ID)
+	}
 	switch {
 	case env.Type == msgRequest && env.Request != nil && env.Request.Method == methodEventsDispatch:
 		ctx := Context{ext: e, ctx: context.Background(), loading: c}
@@ -279,9 +281,8 @@ func (e *Extension) serveLoadingEnvelope(c *conn, env envelope) {
 			}()
 			e.dispatchEventBus(ctx, env.ID, env.Request)
 		})
-	case env.Type == msgNotify && env.Notify != nil && env.Notify.Method == notifyEventsRelease:
-		e.releaseEventListener(env.Notify.Args)
-		e.markNotifyHandled()
+	case env.Type == msgNotify:
+		e.applyQueuedNotify(env)
 	case env.Type == msgShutdown:
 		e.shutdownInFactory.Store(true)
 	case env.Type == msgRequest:
@@ -354,7 +355,7 @@ func (e *Extension) dispatchEventBus(ctx Context, id string, req *requestMsg) {
 		Channel   string          `json:"channel"`
 		JSON      json.RawMessage `json:"json"`
 	}
-	if err := json.Unmarshal(req.Args, &args); err != nil {
+	if err := unmarshalFrameMember(req.Args, &args); err != nil {
 		_ = ctx.hostConnection().respond(id, nil, fmt.Errorf("parse %s: %w", methodEventsDispatch, err))
 		return
 	}

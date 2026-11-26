@@ -237,6 +237,8 @@ func resolveModelFromItems(input string, items []tui.ModelSelectorItem) (string,
 // Accessors capture references to interactive state so handlers see
 // live values.
 func (m *InteractiveMode) buildSlashContext(ctx context.Context) *SlashContext {
+	// holdFor is the arrangement HoldFramesOnChoice sets: the dialogs this context opens after it hold the frames of their close for the choices it accepts.
+	var holdFor func(choice string) bool
 	var sc *SlashContext
 	sc = &SlashContext{
 		Append: func(s string) {
@@ -251,6 +253,7 @@ func (m *InteractiveMode) buildSlashContext(ctx context.Context) *SlashContext {
 			m.disposeArminComponents()
 			m.disposeMarkdownBlocks()
 			m.chatContainer.Clear()
+			m.transcriptEmptied()
 		},
 		// Snapshot prompt templates so /help can list them.
 		PromptTemplates: m.promptTemplates,
@@ -350,7 +353,7 @@ func (m *InteractiveMode) buildSlashContext(ctx context.Context) *SlashContext {
 			return m.currentSession().ID(), m.currentSession().CWD(), n
 		},
 		LastAssistant: m.lastAssistantMessageText,
-		CopyClipboard: copyToClipboard,
+		CopyClipboard: m.effectiveCopyClipboard(),
 		CostSummary: func() string {
 			if m.agent == nil {
 				return "No agent activity yet."
@@ -405,13 +408,13 @@ func (m *InteractiveMode) buildSlashContext(ctx context.Context) *SlashContext {
 		// Update terminal title + status-line name
 		// whenever /name sets a new session name.
 		OnNameChange: func(name string) {
-			tui.SetTerminalTitle(tui.BuildTerminalTitle(name, m.opts.CWD))
+			m.setTerminalTitle(tui.BuildTerminalTitle(name, m.opts.CWD))
 			m.statusLine.SetName(name)
 		},
 		FlushCompactionQueue: func() {
 			// Navigation runs on the input loop, so the flush and any turn it
 			// starts stay single-threaded with editor state.
-			m.flushCompactionQueue(m.runCtx, true)
+			m.flushCompactionQueue(m.runCtx, false)
 		},
 		ForkAtEntry: func(entryID string) error {
 			if m.currentSession() == nil {
@@ -479,9 +482,19 @@ func (m *InteractiveMode) buildSlashContext(ctx context.Context) *SlashContext {
 		// import confirmation and the missing-cwd confirmation (interactive-mode.ts:5565, 5580, 6547,
 		// promptForMissingSessionCwd). Each is a dialog on the extension dialog stack, so it stacks with the dialogs an
 		// extension opens meanwhile and reports its blocked status.
-		ShowExtensionSelector: func(title string, options []string) (string, bool) { return m.askSelector(ctx, title, options) },
-		ShowExtensionConfirm:  func(title, message string) bool { return m.askConfirm(ctx, title, message) },
-		ShowExtensionEditor:   func(title, prefill string) (string, bool) { return m.askEditor(ctx, title, prefill) },
+		ShowExtensionSelector: func(title string, options []string) (string, bool) {
+			return m.askSelectorCommit(ctx, title, options, holdCommit(m, holdFor))
+		},
+		ShowExtensionConfirm: func(title, message string) bool { return m.askConfirm(ctx, title, message) },
+		ShowExtensionEditor: func(title, prefill string) (string, bool) {
+			return m.askEditorCommit(ctx, title, prefill, holdCommit(m, holdFor))
+		},
+		HoldFramesOnChoice: func(holds func(choice string) bool) {
+			holdFor = holds
+			if holds == nil {
+				m.releaseFrames()
+			}
+		},
 		// Pi's /bug does not use the dialog stack: bug-report.ts builds its own ExtensionSelectorComponent and
 		// ExtensionEditorComponent, puts them in the editor slot with focus and puts the editor back when each closes
 		// (showOverlay, restoreEditor). It reports no blocked status, as it never touches the program status.
@@ -691,6 +704,19 @@ func (m *InteractiveMode) buildSlashContext(ctx context.Context) *SlashContext {
 			m.renderCurrentSessionState()
 			return false, nil
 		},
+		ForkSession: func(sourcePath, cwd string) (string, bool, error) {
+			if m.runtimeHost == nil {
+				return "", false, errors.New("Session fork is not available in this context.")
+			}
+			m.invalidatePostLoginSelection()
+			m.clearStatusIndicator("")
+			result, status, err := m.switchToForkedSession(ctx, m.commandResumeHost(), sourcePath, cwd, nil)
+			if err != nil || result.Cancelled {
+				return "", result.Cancelled, err
+			}
+			m.renderCurrentSessionState()
+			return status, false, nil
+		},
 		SwitchModel: func(spec string, settled func(error)) {
 			// An accepted pick stays focused until its change settles; then Pi's selectModel calls done() (interactive-mode.ts:5313-5325).
 			done := sc.modelSelectorDone
@@ -725,7 +751,7 @@ func (m *InteractiveMode) buildSlashContext(ctx context.Context) *SlashContext {
 		// re-fire session_start for extensions.
 		// Mirrors upstream handleReloadCommand (interactive-mode.ts:6223)
 		// and session.reload() (agent-session.ts:3291).
-		Reload: func() error {
+		Reload: func() (reloadErr error) {
 			// upstream: packages/coding-agent/src/modes/interactive/interactive-mode.ts:handleReloadCommand
 			if m.runStreaming() {
 				m.showWarning("Wait for the current response to finish before reloading.")
@@ -738,14 +764,20 @@ func (m *InteractiveMode) buildSlashContext(ctx context.Context) *SlashContext {
 			if err := m.settleUserBash(); err != nil {
 				return err
 			}
-			// upstream: handleReloadCommand calls resetExtensionUI before it shows the reload box, which disposes every stacked extension dialog.
-			m.resetExtensionDialogs()
-			m.setRemoteEditor(nil)
-			m.resetAutocompleteWrappers()
+			// upstream: handleReloadCommand calls resetExtensionUI before it shows the reload box.
+			m.resetExtensionUI()
 			dismiss := m.beginReloadBlocker()
 			defer dismiss()
+			// Pi captured the editor it had when the box appeared (the default editor, after resetExtensionUI) and a failed reload focuses that one, not the
+			// editor a session_start handler installed meanwhile (dismissReloadBox(previousEditor), interactive-mode.ts:6702).
+			defer func() {
+				if reloadErr != nil && !m.tuiTornDown && !errors.Is(reloadErr, errInteractiveShutdown) && m.remoteEditor != nil {
+					m.setRemoteEditor(nil)
+				}
+			}()
 			m.reloadIssues = nil
 			m.extensionConflicts = nil
+			m.extensionWarnings = nil
 			runner := m.newRunner
 			if err := m.awaitReloadStep(ctx, func(ctx context.Context) error {
 				if runner == nil {
@@ -755,6 +787,22 @@ func (m *InteractiveMode) buildSlashContext(ctx context.Context) *SlashContext {
 				return err
 			}); err != nil {
 				return err
+			}
+			// upstream: agent-session.ts:3825-3826 invalidates the old runner right after session_shutdown, before the steps that can throw, and builds the new one only at _buildRuntime (:3844); interactive-mode.ts:6670-6704 catches the throw and shows it. A reload that fails in between leaves the old instance stale: its runner and its runtime (runner.ts:729-735, loader.ts:198-210), so the API the old extensions captured throws the stale message and their event-bus subscriptions end. When this reload ends with the old runner still current, the extension processes get the stale message too, as after a failed reload in print, JSON and RPC mode (their Runtime.SetReload). The runtime stays active while the reload runs, because the next runner is built over it (replaceExtensionRunner), and a runtime an earlier failed reload invalidated is made active again for this one.
+			// A mode with no extension host and no reloadable built-in extensions rebuilds no runner on /reload, so its runner stays in service.
+			if runner != nil && (m.opts.SubprocessHost != nil || m.opts.ReloadBuiltinExtensions != nil) {
+				previous := runner
+				previous.Runtime().Reactivate()
+				previous.InvalidateForReload("")
+				defer func() {
+					if m.newRunner != previous {
+						return
+					}
+					previous.Runtime().Invalidate(previous.StaleMessage())
+					if host, ok := m.opts.SubprocessHost.(interface{ Invalidate(message string) }); ok {
+						host.Invalidate(previous.StaleMessage())
+					}
+				}()
 			}
 
 			// 2. Reload settings.
@@ -870,8 +918,8 @@ func (m *InteractiveMode) buildSlashContext(ctx context.Context) *SlashContext {
 				if reloadErr != nil {
 					// The rebuild does not run, so the staged tools must not activate when a handler of this reload registers a tool below.
 					discardStagedTools()
-					m.reloadIssues = append(m.reloadIssues, "[extension] reload failed: "+reloadErr.Error())
-					fmt.Fprintf(os.Stderr, "extension reload: %v\n", reloadErr)
+					// upstream: a throw of _resourceLoader.reload() rejects session.reload() (agent-session.ts:3838): no runner is built and no session_start is emitted, and the mode shows "Reload failed: <message>".
+					return fmt.Errorf("extension reload: %w", reloadErr)
 				} else {
 					resetLogin = true
 					if m.opts.ReloadBuiltinExtensions != nil {
@@ -921,6 +969,9 @@ func (m *InteractiveMode) buildSlashContext(ctx context.Context) *SlashContext {
 					return nil
 				}
 				_, err := runner.Emit(ctx, extension.SessionStartEvent{Type: EventSessionStart, Reason: "reload"})
+				if err == nil {
+					err = m.awaitInstalledEditor(ctx)
+				}
 				// upstream: agent-session.ts:3620 (reload)
 				runner.ReportUnhandledMcpServers()
 				return err
@@ -940,16 +991,21 @@ func (m *InteractiveMode) buildSlashContext(ctx context.Context) *SlashContext {
 			m.ensurePngTranscoder()
 			m.applyThemeFromSettings(ctx)
 
+			// Upstream's handleReloadCommand calls setupAutocompleteProvider here (interactive-mode.ts, after themeController.applyFromSettings and before
+			// showLoadedResources), so that the commands the reload added complete. It runs inside the try of the reload: an installed editor that refuses the
+			// rebuilt provider ends the reload as "Reload failed: <message>", and nothing after it runs. The rebuild is awaited off the loop.
+			if rebuilt := m.setAutocompleteAwaiting(m.buildAutocompleteProvider()); rebuilt != nil {
+				if err := m.awaitReloadStep(ctx, func(ctx context.Context) error { return awaitAutocompleteRebuild(ctx, rebuilt) }); err != nil {
+					return err
+				}
+			}
+
 			// 8c. Upstream rebuilds the loaded-resources listing from the
 			//     reloaded resources (showLoadedResources after reload).
 			m.showLoadedResources(false, true)
 			// upstream: packages/coding-agent/src/modes/interactive/interactive-mode.ts:handleReloadCommand saves an implicit project trust, then reports a models.json error, before its status.
 			m.reloadSavedProjectTrust = m.maybeSaveImplicitProjectTrustAfterReload()
 			m.showModelsJSONError()
-
-			// 9. Rebuild autocomplete (may have new slash commands from
-			//    reloaded extensions).
-			m.editor.SetAutocomplete(m.buildAutocompleteProvider())
 			return nil
 		},
 		ReloadSavedProjectTrust: func() bool {
@@ -984,6 +1040,10 @@ func (m *InteractiveMode) buildSlashContext(ctx context.Context) *SlashContext {
 					if rep.Error != "" {
 						diag.Diagnostics = append(diag.Diagnostics, "[extension] "+rep.Error)
 					}
+					// pig additive (D19): an extension whose runtime did not acknowledge the reload was ended and loaded again; the reload says so in one line (subprocess.ReloadReport.Unacknowledged).
+					for _, line := range rep.Unacknowledged {
+						diag.Diagnostics = append(diag.Diagnostics, "[extension] "+line)
+					}
 					diag.ReloadDuration = rep.Duration
 					for _, c := range rep.Cells {
 						if c.Quarantined {
@@ -1016,7 +1076,7 @@ func (m *InteractiveMode) buildSlashContext(ctx context.Context) *SlashContext {
 		OnSettingApplied: func(id, value string) {
 			switch id {
 			case "skill-commands":
-				m.editor.SetAutocomplete(m.buildAutocompleteProvider())
+				m.setAutocompleteUncaught(m.buildAutocompleteProvider())
 			case "transport":
 				m.agent.SetTransport(ai.Transport(value))
 			case "cache-miss-notices":
@@ -1151,14 +1211,15 @@ func (m *InteractiveMode) buildSlashContext(ctx context.Context) *SlashContext {
 		SelectAuthMethod:       m.showLoginAuthTypeSelector,
 		SelectAuthProvider: func(mode string, providers []tui.OAuthProvider, initialSearch string) (tui.OAuthProvider, bool) {
 			var chosen tui.OAuthProvider
-			sel := tui.NewOAuthSelectorComponent(mode, providers, func(providerID, authType string) {
+			sel := tui.NewOAuthSelectorComponentAnimated(mode, providers, func(providerID, authType string) {
 				for _, provider := range providers {
 					if provider.ID == providerID && provider.AuthType == authType {
 						chosen = provider
 						return
 					}
 				}
-			}, nil, initialSearch)
+			}, nil, initialSearch, currentRendererTUI{TUI: m.tuiInst, m: m})
+			defer sel.Dispose()
 			_, ok := m.runEditorSlotOAuthSelector(sel)
 			return chosen, ok
 		},
@@ -1199,4 +1260,16 @@ func (m *InteractiveMode) newSessionTreeSelect(roots []*SessionTreeNode, lt *laz
 		selectedID = &initialSelectedID
 	}
 	return newLazyTreeSelectorComponent(roots, lt, currentLeafID, m.tuiInst.Height(), selectedID, settings.GetTreeFilterMode())
+}
+
+// holdCommit is the ExtUIContext.commit that holds the owner loop's frames for the choices holds accepts; nil when nothing is armed.
+func holdCommit(m *InteractiveMode, holds func(choice string) bool) func(choice string) {
+	if holds == nil {
+		return nil
+	}
+	return func(choice string) {
+		if holds(choice) {
+			m.holdFrames()
+		}
+	}
 }

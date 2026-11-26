@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -243,6 +244,63 @@ func TestPortWave10PackageCommandPaths(t *testing.T) {
 		assert.ErrorIs(t, creationContext.Err(), context.Canceled)
 	})
 
+	// pi-mono 6382d870 packages/coding-agent/test/package-command-paths.test.ts "warns about a stale provider login during update --models and keeps the refresh successful".
+	t.Run("warns about a stale provider login during update --models and keeps the refresh successful", func(t *testing.T) {
+		newPackageCommandPathsFixture(t)
+		original := createPackageModelRuntime
+		t.Cleanup(func() { createPackageModelRuntime = original })
+		createPackageModelRuntime = func(context.Context, coding.CreateModelRuntimeOptions) (packageModelRuntime, error) {
+			return packageRefreshSpy{refresh: func(context.Context, ai.ModelsRefreshOptions) ai.ModelsRefreshResult {
+				return ai.ModelsRefreshResult{
+					Errors:     map[string]error{"radius": ai.NewModelsError(ai.ModelsErrorOAuth, "OAuth refresh failed for radius", errors.New("invalid_grant"))},
+					ErrorOrder: []string{"radius"},
+				}
+			}}, nil
+		}
+
+		stdout, stderr, code := capturePackageCommand(t, "update", "--models")
+
+		// console.warn writes to stderr, so the warning is the whole of it: upstream's error spy sees no call.
+		assert.Contains(t, stderr, "skipped model catalog for radius: OAuth refresh failed for radius: invalid_grant")
+		// D2 changes only the application name in the upstream login hint.
+		assert.Contains(t, stderr, "pig auth login radius")
+		assert.Equal(t, chalkYellow("Warning: skipped model catalog for radius: OAuth refresh failed for radius: invalid_grant\nLog in again with `pig auth login radius` to refresh it.")+"\n", stderr)
+		assert.Contains(t, stdout, "Model catalogs refreshed")
+		assert.NotContains(t, stderr, "Could not refresh")
+		assert.Equal(t, 0, code)
+	})
+
+	// pi-mono 6382d870 packages/coding-agent/test/package-command-paths.test.ts "fails update --models when a catalog refresh fails for a reason other than a stale login".
+	t.Run("fails update --models when a catalog refresh fails for a reason other than a stale login", func(t *testing.T) {
+		newPackageCommandPathsFixture(t)
+		original := createPackageModelRuntime
+		t.Cleanup(func() { createPackageModelRuntime = original })
+		createPackageModelRuntime = func(context.Context, coding.CreateModelRuntimeOptions) (packageModelRuntime, error) {
+			return packageRefreshSpy{refresh: func(context.Context, ai.ModelsRefreshOptions) ai.ModelsRefreshResult {
+				return ai.ModelsRefreshResult{
+					Errors: map[string]error{
+						"radius":     ai.NewModelsError(ai.ModelsErrorOAuth, "OAuth refresh failed for radius", nil),
+						"openrouter": errors.New("OpenRouter model list request failed: 500"),
+					},
+					ErrorOrder: []string{"radius", "openrouter"},
+				}
+			}}, nil
+		}
+
+		_, stderr, code := capturePackageCommand(t, "update", "--models")
+
+		// Upstream's console.error spy sees only the failure; the warning for radius shares stderr here, so the failure is the line that names it.
+		var failure string
+		for line := range strings.SplitSeq(stderr, "\n") {
+			if strings.Contains(line, "Could not refresh model catalogs") {
+				failure = line
+			}
+		}
+		assert.Contains(t, failure, "Could not refresh model catalogs: openrouter: OpenRouter model list request failed: 500")
+		assert.NotContains(t, failure, "radius")
+		assert.Equal(t, 1, code)
+	})
+
 	// upstream: packages/coding-agent/test/package-command-paths.test.ts:484
 	t.Run("rejects update --models combined with another update target", func(t *testing.T) {
 		newPackageCommandPathsFixture(t)
@@ -318,6 +376,46 @@ func TestPortWave10PackageCommandPaths(t *testing.T) {
 	})
 
 	// upstream: packages/coding-agent/test/package-command-paths.test.ts:952
+	// Pi 342514bdf (#11707): update does not call packages up to date when npm left an older version installed or when offline.
+	prepareStaleNpmPackage := func(t *testing.T, f packageCommandPathsFixture) {
+		t.Helper()
+		installed := filepath.Join(f.agentDir, "npm", "node_modules", "fake-package")
+		require.NoError(t, os.MkdirAll(installed, 0o755))
+		writeStartupFixtureFile(t, filepath.Join(installed, "package.json"), `{"name":"fake-package","version":"1.2.0"}`)
+		// `npm view` reports the newer version, but `npm install` succeeds without changing anything.
+		fakeNpmPath := filepath.Join(f.root, "fake-stale-npm.cjs")
+		writeStartupFixtureFile(t, fakeNpmPath, `if (process.argv.includes("view")) console.log(JSON.stringify("1.3.0"));`)
+		writePackageCommandSettings(t, filepath.Join(f.agentDir, "settings.json"), map[string]any{
+			"packages": []string{"npm:fake-package"}, "npmCommand": []string{nodeExecutableForPackageCommand(t), fakeNpmPath},
+		})
+	}
+	// upstream: packages/coding-agent/test/package-command-paths.test.ts "does not report packages as up to date when npm left an older version installed"
+	t.Run("does not report packages as up to date when npm left an older version installed", func(t *testing.T) {
+		f := newPackageCommandPathsFixture(t)
+		prepareStaleNpmPackage(t, f)
+
+		stdout, _, code := capturePackageCommand(t, "update", "--extensions")
+
+		assert.Equal(t, 0, code)
+		assert.Contains(t, stdout, "npm:fake-package is still 1.2.0 (registry reports 1.3.0)")
+		assert.Contains(t, stdout, "No packages were updated, see the warnings above")
+		assert.NotContains(t, stdout, "up to date")
+	})
+
+	// upstream: packages/coding-agent/test/package-command-paths.test.ts "does not report packages as up to date in offline mode"
+	t.Run("does not report packages as up to date in offline mode", func(t *testing.T) {
+		f := newPackageCommandPathsFixture(t)
+		prepareStaleNpmPackage(t, f)
+		t.Setenv("PI_OFFLINE", "1")
+		t.Setenv("PI_SKIP_VERSION_CHECK", "1")
+
+		stdout, _, code := capturePackageCommand(t, "update", "--extensions")
+
+		assert.Equal(t, 0, code)
+		assert.Contains(t, stdout, "Skipped package updates (offline mode)")
+		assert.NotContains(t, stdout, "up to date")
+	})
+
 	t.Run("suggests the configured source when update input omits the npm prefix", func(t *testing.T) {
 		f := newPackageCommandPathsFixture(t)
 		settingsPath := filepath.Join(f.agentDir, "settings.json")

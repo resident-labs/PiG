@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/MichaelKinsy/PiG/internal/nodeerrno"
+	"github.com/MichaelKinsy/PiG/internal/noderealpath"
 )
 
 // Pi 1.2.0 auth-storage.ts:81-95,117-155, settings-manager.ts:195-215 and trust-manager.ts:137-164.
@@ -28,7 +29,10 @@ const (
 	// proper-lockfile 4.1.2 lib/lockfile.js:208.
 	SyncStale  = 10 * time.Second
 	asyncStale = 30 * time.Second
-	maxDelay   = 2 * time.Second
+	// asyncUpdate is the heartbeat of an async lock. Pi's is proper-lockfile's stale/2 = 15 s, longer than the 10 s after which a sync acquirer takes any lock, so a refresh that outlasts 10 s loses its lock to the next process that opens a store. A tick every 5 s keeps the lock's mtime fresher than SyncStale.
+	// pig divergence (D651): the async lock is renewed every 5 s where Pi renews every 15 s, so a live refresher is never taken over by a sync acquirer.
+	asyncUpdate = 5 * time.Second
+	maxDelay    = 2 * time.Second
 )
 
 // The platform and the waits of the retry loops. Tests replace them as Pi's tests replace process.platform, Math.random and the clock.
@@ -79,12 +83,21 @@ type Lock struct {
 // AcquireSync is the settings and trust loop, settings-manager.ts acquireLockSyncWithRetry and trust-manager.ts acquireTrustLockSync: ten attempts 20 ms apart that retry only ELOCKED. It reclaims stale idle legacy sidecars.
 // Ports packages/coding-agent/src/core/settings-manager.ts
 func AcquireSync(path string) (*Lock, error) {
-	return acquireSyncWithRetry(path, func(err error) bool { return errors.Is(err, ErrLocked) })
+	return acquireSyncWithRetry(path, func(err error) bool { return errors.Is(err, ErrLocked) }, nil)
 }
 
 // AcquireAuthSync is FileAuthStorageBackend.acquireLockSyncWithRetry (auth-storage.ts:81-95), the synchronous auth loop: ten attempts 20 ms apart that retry ELOCKED and, on Windows, EPERM. It reclaims stale idle legacy sidecars.
 func AcquireAuthSync(path string) (*Lock, error) {
-	return acquireSyncWithRetry(path, func(err error) bool { return retryableLockErrorCode(err) != "" })
+	return acquireSyncWithRetry(path, func(err error) bool { return retryableLockErrorCode(err) != "" }, realpathLockTarget)
+}
+
+// realpathLockTarget is proper-lockfile's default realpath option (lib/lockfile.js resolveCanonicalPath): the lock guards fs.realpath(file), and each attempt resolves it again. fs.realpath is Node's JS walk, not realpath.native: on Windows it keeps the case and the 8.3 short names (RUNNER~1) of the components that are not links, so the lock error names the path as the caller spelled it, as Pi's does. The file must exist; a missing file or a link loop fails the attempt with the Node fs error (ENOENT: no such file or directory, lstat 'path'), which no retry loop retries.
+func realpathLockTarget(path string) (string, error) {
+	resolved, err := noderealpath.Sync(path)
+	if err != nil {
+		return "", nodeerrno.FromPathError(err)
+	}
+	return resolved, nil
 }
 
 // maxEPERMRetries is auth-storage.ts MAX_EPERM_RETRIES: acquireLockAsync's cap on EPERM retries, apart from the 30 s deadline that bounds waiting for another holder.
@@ -101,14 +114,27 @@ func retryableLockErrorCode(err error) string {
 	return ""
 }
 
-func acquireSyncWithRetry(path string, retryable func(error) bool) (*Lock, error) {
+// acquireSyncWithRetry runs the synchronous retry loop. A non-nil resolve maps the path to the file whose lock is taken on every attempt (lockSync's realpath); nil locks the path as given (realpath: false).
+func acquireSyncWithRetry(path string, retryable func(error) bool, resolve func(string) (string, error)) (*Lock, error) {
 	for attempt := 1; ; attempt++ {
-		lock, err := acquire(path, SyncStale)
+		lock, err := acquireResolved(path, resolve)
 		if err == nil || !retryable(err) || attempt == SyncAttempts {
 			return lock, err
 		}
 		syncSleep(SyncDelay)
 	}
+}
+
+// acquireResolved is one lockSync attempt.
+func acquireResolved(path string, resolve func(string) (string, error)) (*Lock, error) {
+	if resolve != nil {
+		resolved, err := resolve(path)
+		if err != nil {
+			return nil, err
+		}
+		path = resolved
+	}
+	return acquire(path, SyncStale)
 }
 
 // Acquire follows Pi's cancellable auth acquisition loop, FileAuthStorageBackend.acquireLockAsync (auth-storage.ts:117-155), reclaiming stale idle legacy sidecars. It retries ELOCKED until its 30 s deadline and, on Windows, EPERM at most maxEPERMRetries times; both share one backoff. The caller owns the returned lock until Release.
@@ -120,7 +146,7 @@ func Acquire(ctx context.Context, path string) (*Lock, error) {
 		if err := context.Cause(ctx); err != nil {
 			return nil, err
 		}
-		lock, err := tryAcquire(ctx, path, asyncStale)
+		lock, err := tryAcquireResolved(ctx, path)
 		if err == nil {
 			return lockUnlessAborted(ctx, lock)
 		}
@@ -185,6 +211,16 @@ func AcquireWithOptions(ctx context.Context, path string, options AcquireOptions
 	}
 }
 
+// tryAcquireResolved is one lockfile.lock attempt on the resolved file; a realpath failure is the attempt's error.
+func tryAcquireResolved(ctx context.Context, path string) (*Lock, error) {
+	resolved, err := realpathLockTarget(path)
+	if err != nil {
+		return nil, err
+	}
+	// pig divergence (D651): the lock held across an OAuth refresh is renewed every asyncUpdate (5 s), not stale/2 (15 s); a store opened meanwhile waits on the fresh lock instead of taking it.
+	return tryAcquireWithUpdate(ctx, resolved, asyncStale, asyncUpdate, nil)
+}
+
 // attemptErrors is the retry module 0.13.1's error record (lib/retry_operation.js retry and mainError), kept as counts per message: main is the error whose message is most frequent, and a message that reaches the current maximum count again replaces it.
 type attemptErrors struct {
 	counts   map[string]int
@@ -246,6 +282,7 @@ func acquireWithProbe(ctx context.Context, path string, stale, update time.Durat
 	ctx, cancel := context.WithCancelCause(ctx)
 	lock := &Lock{path: path, mtime: mtime, precision: precision, ctx: ctx, cancel: cancel, stop: make(chan struct{}), done: make(chan struct{}), onCompromised: onCompromised}
 	held.add(lock)
+	//portlint:allow asyncorder the heartbeat is proper-lockfile's update timer of the lock lockfile.lockSync returns (settings-manager.ts:204); Release joins it (close(stop), <-done) before it removes the directory
 	go lock.heartbeat(stale, update)
 	return lock, nil
 }

@@ -16,7 +16,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/store"
 )
 
-// Ports packages/chord/src/next/host/staging.ts. Staging (slice 7b §2, per plugin since slice 7c): one plugin's setup run and
+// Ports packages/chord/src/host/staging.ts. Staging (slice 7b §2, per plugin since slice 7c): one plugin's setup run and
 // checked (`stagePlugin`), staged plugins merged into one table (`addStaged`), and a recording `self` that runs an object's
 // new factory with every declaration check an attempt makes and no effect (`recordFactory`).
 //
@@ -105,19 +105,27 @@ type staged struct {
 	plugins    *namedMap[*stagedPlugin]
 }
 
+// checkPluginNames is the error for the first plugin of facets whose name is no npm package name: a programming error, so
+// `load` and `reload` fail before they change anything (decision "Mistakes that wait are reported at once" (d)).
+func checkPluginNames(facets []HostFacet) error {
+	for _, facet := range facets {
+		if !IsPluginName(facet.Name) {
+			return fmt.Errorf("%q is not a valid plugin name", facet.Name)
+		}
+	}
+	return nil
+}
+
 // emptyStaged is a staged table with nothing in it.
 func emptyStaged() *staged {
 	return &staged{types: newNamedMap[*served](), registries: newNamedMap[stagedRegistry](), plugins: newNamedMap[*stagedPlugin]()}
 }
 
-// stagePlugin runs one plugin's setup and checks what it declared: its name (an npm name), a type or registry it serves
+// stagePlugin runs one plugin's setup and checks what it declared: its name (an npm name, checked by checkPluginNames before), a type or registry it serves
 // twice, a remote type on a host without a principal or address, every provider's `accepts` (`checkAccepts`) and every
 // registry provider's shape. It returns the first error, naming the plugin.
 func stagePlugin(plugin HostFacet, host *chordHost) (*stagedPlugin, error) {
 	name := plugin.Name
-	if !IsPluginName(name) {
-		return nil, fmt.Errorf("%q is not a valid plugin name", name)
-	}
 	types := newNamedMap[*served]()
 	registryTable := newNamedMap[stagedRegistry]()
 	var contributions []facetContribution
@@ -200,16 +208,28 @@ func stageEntry(plugin string, entry servedEntry, types *namedMap[*served], regi
 	if err != nil {
 		return err
 	}
+	admission, err := servedAdmissionOf(contract, contractData.Admission, entry.options.Admit)
+	if err != nil {
+		return err
+	}
 	var local LocalFactory
 	var remote RemoteFactory
+	var admitted AdmittedFactory
 	kind := servedLocal
-	if contract.Kind == contracts.KindLocal {
+	switch {
+	case contract.Kind == contracts.KindLocal:
 		factory, ok := entry.factory.(LocalFactory)
 		if !ok {
 			return fmt.Errorf("%s: a local type is served with a LocalFactory, not %T", contract.Name, entry.factory)
 		}
 		local = factory
-	} else {
+	case admission != nil:
+		factory, ok := entry.factory.(AdmittedFactory)
+		if !ok {
+			return fmt.Errorf("%s: an admitted type is served with an AdmittedFactory, not %T", contract.Name, entry.factory)
+		}
+		kind, admitted = servedRemote, factory
+	default:
 		factory, ok := entry.factory.(RemoteFactory)
 		if !ok {
 			return fmt.Errorf("%s: a remote type is served with a RemoteFactory, not %T", contract.Name, entry.factory)
@@ -221,18 +241,38 @@ func stageEntry(plugin string, entry servedEntry, types *namedMap[*served], regi
 		plugin:       plugin,
 		provider:     provider,
 		linger:       durationOr(entry.options.Linger, 0),
+		traced:       !entry.options.Untraced,
 		contract:     contract,
 		local:        local,
 		remote:       remote,
+		admitted:     admitted,
+		admission:    admission,
 		hostLifetime: contract.Kind == contracts.KindLocal && len(contractData.Params.Fields) == 0,
 	})
 	return nil
 }
 
+// servedAdmissionOf is a served type's admission (slice 14 §2.1; declaration policy): a remote contract that declares an
+// `admission` is served with `admit`, and only such a contract is; anything else refuses the plugin.
+func servedAdmissionOf(contract *contracts.Contract, declared *contracts.AdmissionData, admit Admit) (*servedAdmission, error) {
+	if declared == nil && admit == nil {
+		return nil, nil
+	}
+	if contract.Kind == contracts.KindLocal {
+		return nil, fmt.Errorf("%s: only a remote type takes an admission (admit)", contract.Name)
+	}
+	if declared == nil {
+		return nil, fmt.Errorf("%s: admit needs the contract to declare its admission", contract.Name)
+	}
+	if admit == nil {
+		return nil, fmt.Errorf("%s: its contract declares an admission: serve it with admit", contract.Name)
+	}
+	// Plugin code: what it returns is checked when an attempt runs it.
+	return &servedAdmission{admit: admit, fingerprint: declared.Fingerprint}, nil
+}
+
 // Recorded is what a recorded factory declared: what a reload's fate and checks need, nothing activated.
 type Recorded struct {
-	// natives is how many natives it opens (`self.open`).
-	natives       int
 	documents     []documents.AnyDefinition
 	tables        []*store.TableDefinition
 	jobs          []*JobDefinition
@@ -275,7 +315,20 @@ func recordFactory(object *chordObject, entry *served, ctx context.Context) (Rec
 			return entry.local(object.params, recording)
 		}
 		// A remote object's identity has its principal.
-		return entry.remote(object.params, object.principal, recording)
+		if entry.admission == nil {
+			return entry.remote(object.params, object.principal, recording)
+		}
+		// An admitted type (slice 14 §2.5): its new `admit` runs first, against what an admission declares with; its new factory
+		// is rehearsed with the object's admitted value only when it was decided under an admission schema of the new one's
+		// fingerprint (otherwise a limit accepted: its declaration errors appear at its activation, its requests are not
+		// recorded).
+		if _, err := entry.admission.admit(object.params, object.principal, recording); err != nil {
+			return nil, err
+		}
+		if admitted := object.admittedValue(); admitted != nil && admitted.fingerprint == entry.admission.fingerprint {
+			return entry.admitted(object.params, object.principal, admitted.value, recording)
+		}
+		return nil, nil
 	})
 	if err != nil {
 		return Recorded{}, named(err, fmt.Sprintf("plugin %q, %s", entry.plugin, object.text))
@@ -303,12 +356,13 @@ type recordingSelf struct {
 	object        *chordObject
 	served        *served
 	ctx           context.Context
-	natives       int
 	documents     *namedMap[documents.AnyDefinition]
 	tables        *namedMap[*store.TableDefinition]
 	jobs          *namedMap[*JobDefinition]
 	contributions *namedMap[registries.Registry[any, any]]
 	requests      []request
+	// listed are the names of the lists the factory declared; made by the first.
+	listed map[string]struct{}
 	// inert are the documents of the handles State returns and token their seal token; made by the first.
 	inert *documents.Documents
 	token *documents.SealToken
@@ -317,7 +371,7 @@ type recordingSelf struct {
 var _ StoreSelf = (*recordingSelf)(nil)
 
 func (r *recordingSelf) recorded() Recorded {
-	out := Recorded{natives: r.natives, requests: r.requests}
+	out := Recorded{requests: r.requests}
 	for _, name := range r.documents.keys() {
 		definition, _ := r.documents.get(name)
 		out.documents = append(out.documents, definition)
@@ -402,7 +456,7 @@ func (o inertTableOwner) AssertLive() error     { return errInert }
 func (o inertTableOwner) Fail(*data.ChordError) {}
 
 // Table implements StoreSelf.
-func (r *recordingSelf) Table(definition *store.TableDefinition) *store.TableHandle {
+func (r *recordingSelf) Table(definition *store.TableDefinition) store.Table {
 	r.assertDeclaring("table")
 	chordStore := r.assertPersistable(`table "` + definition.Name + `"`)
 	if r.tables.has(definition.Name) {
@@ -413,9 +467,113 @@ func (r *recordingSelf) Table(definition *store.TableDefinition) *store.TableHan
 	if err := chordStore.Claims.AssertTable(sqlName, object); err != nil {
 		panic(err)
 	}
+	exposers := make([]store.Exposer, 0, r.tables.len())
+	for _, name := range r.tables.keys() {
+		declared, _ := r.tables.get(name)
+		exposers = append(exposers, store.Exposer{Name: declared.Name, Exposes: declared.Exposes})
+	}
+	if err := store.CheckExposedOnce(store.Exposer{Name: definition.Name, Exposes: definition.Exposes}, exposers, object.text); err != nil {
+		panic(err)
+	}
 	r.tables.set(definition.Name, definition)
 	// A handle whose reads and queries return errInert (its owner is never live): nothing reaches the store.
 	return store.NewTableHandle(definition, sqlName, chordStore, inertTableOwner{label: object.text})
+}
+
+// Query implements StoreSelf: a live query over a table this factory declared (its handle is inert: the query names the
+// table), limited.
+func (r *recordingSelf) Query(_ store.Table, q *store.Query, limit int64) chord.Watchable[delta.JsonValue] {
+	r.assertDeclaring("query")
+	label := r.object.text
+	table, declared := r.tables.get(q.Table.Name)
+	if !declared || table != q.Table {
+		panic(undeclaredTable(label, "query"))
+	}
+	if err := store.CheckLiveQuery(table, q, limit, label); err != nil {
+		panic(err)
+	}
+	return state.ConstantOf[delta.JsonValue](nil)
+}
+
+// inertNamed is what a recording's `self.queries` returns for each name: what readers take, and `self.query` does not (Pi's
+// INERT_NAMED). A page of it reads nothing.
+type inertNamed struct{}
+
+func (inertNamed) Page(delta.JsonValue, int64, context.Context, contracts.QueryPageOptions) (contracts.QueryPage[delta.JsonValue], error) {
+	return contracts.QueryPage[delta.JsonValue]{}, errInert
+}
+
+// Queries implements StoreSelf: the checks an attempt makes on its declarations (`read-declarations.ts`), then inert named
+// queries. Staging has no effects: nothing is compiled, read or bound.
+func (r *recordingSelf) Queries(given store.Table, _ QueriesOptions, builders map[string]QueryBuilder) map[string]contracts.NamedQuery[delta.JsonValue, delta.JsonValue] {
+	r.assertDeclaring("queries")
+	label := r.object.text
+	handle, _ := given.(*store.TableHandle)
+	// A recorded handle says what it stands for: a table this recording declared.
+	if handle == nil {
+		panic(undeclaredTable(label, "queries"))
+	}
+	if _, recorded := handle.Owner.(inertTableOwner); !recorded || !r.tables.has(handle.Definition.Name) {
+		panic(undeclaredTable(label, "queries"))
+	}
+	checked, err := namedBuilders(label, builders)
+	if err != nil {
+		panic(err)
+	}
+	named := make(map[string]contracts.NamedQuery[delta.JsonValue, delta.JsonValue], len(checked))
+	for _, each := range checked {
+		named[each.name] = inertNamed{}
+	}
+	return named
+}
+
+// LiveQuery implements Self: the checks an attempt makes on its declaration (the page size, the query given), no read.
+func (r *recordingSelf) LiveQuery(query contracts.NamedQuery[delta.JsonValue, delta.JsonValue], _ any, first int64) chord.Watchable[delta.JsonValue] {
+	r.assertDeclaring("liveQuery")
+	if err := firstOf(r.object.text, "liveQuery", first); err != nil {
+		panic(err)
+	}
+	r.checkNamed(query, "liveQuery")
+	return state.ConstantOf[delta.JsonValue](nil)
+}
+
+// Count implements Self.
+func (r *recordingSelf) Count(query contracts.NamedQuery[delta.JsonValue, delta.JsonValue], _ any) chord.Watchable[delta.JsonValue] {
+	r.assertDeclaring("count")
+	r.checkNamed(query, "count")
+	return state.ConstantOf[delta.JsonValue](nil)
+}
+
+// List implements Self: the checks an attempt makes on its declaration (the page size, the one source, the name, the query
+// given), no read, no bookmark touched.
+func (r *recordingSelf) List(name string, sources []ListSource, options ListOptions) *ListHandle {
+	r.assertDeclaring("list")
+	label := r.object.text
+	if err := firstOf(label, "list", int64(options.First)); err != nil {
+		panic(err)
+	}
+	source, err := oneSource(label, sources)
+	if err != nil {
+		panic(err)
+	}
+	if r.listed == nil {
+		r.listed = map[string]struct{}{}
+	}
+	if err := listName(label, name, r.listed); err != nil {
+		panic(err)
+	}
+	r.checkNamed(source.Query, `list "`+name+`"`)
+	return &ListHandle{value: state.ConstantOf[delta.JsonValue](nil), more: func(context.Context) error { return errInert }}
+}
+
+// checkNamed refuses what a reader was given when it cannot be a named query: a table, or no handle of this recording (a
+// recorded `Queries`' or an inert reference's).
+func (r *recordingSelf) checkNamed(query contracts.NamedQuery[delta.JsonValue, delta.JsonValue], declaration string) {
+	switch query.(type) {
+	case inertNamed, *ReferenceQuery:
+		return
+	}
+	panic(namedQueryExpected(r.object.text, declaration))
 }
 
 // Derive implements Self.
@@ -432,9 +590,9 @@ func (r *recordingSelf) Get(typ *contracts.Contract, params *delta.JsonObject) *
 		panic(err)
 	}
 	r.requests = append(r.requests, request{kind: requestType, contract: typ, params: checked.params})
-	// A reference nothing binds and nothing indexes: inert, whatever its members are asked.
+	// A reference nothing binds and nothing indexes: inert, whatever its members are asked (its `at(key)` too: Pi's INERT takes any call).
 	host := r.object.host
-	inert, err := host.reference(typ, nil, host.own(), GetOptions{})
+	inert, err := host.reference(typ, r.object, host.own(), GetOptions{})
 	if err != nil {
 		panic(err)
 	}
@@ -453,6 +611,25 @@ func (r *recordingSelf) Writable(any) state.Writable[any] {
 	r.assertDeclaring("writable")
 	return inertWritable{}
 }
+
+// Events implements Self: an inert event source (Pi's INERT): Emit does nothing, On gives a subscription that stops nothing.
+func (r *recordingSelf) Events() contracts.EventSource[delta.JsonValue] {
+	r.assertDeclaring("events")
+	return inertEvents{}
+}
+
+// inertEvents is a recording's event source: nothing is emitted or delivered.
+type inertEvents struct{}
+
+func (inertEvents) Emit(delta.JsonValue) error { return nil }
+
+func (inertEvents) On(func(contracts.EventDelivery[delta.JsonValue]), context.Context) (contracts.EventSubscription, error) {
+	return inertEventSubscription{}, nil
+}
+
+type inertEventSubscription struct{}
+
+func (inertEventSubscription) Stop() {}
 
 // RetryOn implements Self.
 func (r *recordingSelf) RetryOn(sources ...any) {
@@ -486,7 +663,6 @@ func (r *recordingSelf) Open(
 	...NativeOptions,
 ) Native[any] {
 	r.assertDeclaring("open")
-	r.natives++
 	return inertNative{}
 }
 
@@ -513,6 +689,9 @@ func (r *recordingSelf) OnLive(OnLiveHandler) { r.assertDeclaring("onLive") }
 // Job implements Self.
 func (r *recordingSelf) Job(definition *JobDefinition, _ JobImplementation) JobHandle {
 	r.assertDeclaring("job")
+	if err := refuseAdmittedJob(r.served, r.object.text); err != nil {
+		panic(err)
+	}
 	if r.jobs.has(definition.Name) {
 		panic(declarationError(`%s: job "%s" is declared twice`, r.object.text, definition.Name))
 	}
@@ -557,22 +736,6 @@ func (r *recordingSelf) assertDeclaring(declaration string) {
 	if !r.declaring {
 		panic(declarationError("%s: self.%s is valid only in the factory", r.object.text, declaration))
 	}
-}
-
-// migratesTables reports whether recorded's tables are at a version newer than object's store has them: their eager
-// migration runs at an activation, so the object restarts instead of swapping (§4).
-func migratesTables(object *chordObject, recorded Recorded) bool {
-	chordStore := object.host.store
-	if chordStore == nil {
-		return false
-	}
-	owner := object.served.contract.Name
-	for _, table := range recorded.tables {
-		if version, ok := chordStore.TableVersion(store.TableSqlName(owner, table.Name)); ok && version < table.Version {
-			return true
-		}
-	}
-	return false
 }
 
 // errInert is what an inert handle's operations return: nothing runs while a factory is recorded.

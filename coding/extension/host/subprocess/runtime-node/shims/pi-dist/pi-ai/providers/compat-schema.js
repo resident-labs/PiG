@@ -110,12 +110,15 @@ function optionalCompatBoolean(options) {
 function optionalSessionAffinityFormat(options) {
     return opt(sessionAffinityFormat(options));
 }
+function optionalPromptCacheKeyMode(options) {
+    return opt(union([stringLiteral("auto"), stringLiteral("enabled"), stringLiteral("disabled")], options));
+}
 const OpenAICompletionsCompatProperties = {
     supportsStore: opt(bool({
         description: "Whether the provider supports the store field. Default: auto-detected from URL.",
     })),
     supportsDeveloperRole: optionalCompatBoolean({
-        description: "Whether the provider supports the developer role instead of system. Default: auto-detected from URL.",
+        description: "Whether to send system messages of reasoning models (the system prompt and mid-conversation system messages) with the developer role instead of system. Default: true only for api.openai.com.",
     }),
     supportsReasoningEffort: opt(bool({
         description: "Whether the provider supports reasoning_effort. Default: auto-detected from URL.",
@@ -134,6 +137,12 @@ const OpenAICompletionsCompatProperties = {
     requiresToolResultName: opt(bool({ description: "Whether tool results require the name field. Default: auto-detected from URL." })),
     requiresAssistantAfterToolResult: opt(bool({
         description: "Whether a user message after tool results requires an assistant message in between. Default: auto-detected from URL.",
+    })),
+    requiresNonNullAssistantContent: opt(bool({
+        description: 'Whether replayed assistant messages with no text (e.g. tool-call-only messages) must send "" instead of null content. Default: false.',
+    })),
+    requiresToolsWithToolHistory: opt(bool({
+        description: 'Whether requests without tools must send "tools": [] when the conversation contains tool calls or tool results. Needed by some proxies in front of Anthropic, such as older LiteLLM versions. Default: false, the field is omitted.',
     })),
     requiresThinkingAsText: opt(bool({
         description: "Whether thinking blocks must be converted to text blocks with <thinking> delimiters. Default: auto-detected from URL.",
@@ -200,6 +209,9 @@ const OpenAICompletionsCompatProperties = {
     sessionAffinityFormat: optionalSessionAffinityFormat({
         description: "Session-affinity header format. openai sends session_id, x-client-request-id, and x-session-affinity; openai-nosession sends x-client-request-id and x-session-affinity; openrouter sends x-session-id. Does not affect prompt_cache_key. Default: auto-detected.",
     }),
+    promptCacheKeyMode: optionalPromptCacheKeyMode({
+        description: "Controls the prompt_cache_key request field. auto sends it to api.openai.com, or with long cache retention when supportsLongCacheRetention is true; enabled sends it whenever caching is active, for compatible proxies; disabled never sends it. Default: auto.",
+    }),
     supportsLongCacheRetention: optionalCompatBoolean({
         description: 'Whether the provider supports long prompt cache retention (prompt_cache_retention: "24h" or Anthropic-style cache_control.ttl: "1h", depending on format). Default: auto-detected from provider and URL.',
     }),
@@ -221,7 +233,10 @@ const OpenAIResponsesCompatProperties = {
         default: false,
     }),
     sessionAffinityFormat: optionalSessionAffinityFormat({
-        description: "Session-affinity header format. openai sends session_id and x-client-request-id; openai-nosession sends x-client-request-id; openrouter sends x-session-id. Does not affect prompt_cache_key. Default: auto-detected.",
+        description: "Session-affinity header format. openai sends session-id and x-client-request-id; openai-nosession sends x-client-request-id; openrouter sends x-session-id. Does not affect prompt_cache_key. Default: auto-detected.",
+    }),
+    promptCacheKeyMode: optionalPromptCacheKeyMode({
+        description: "Controls the prompt_cache_key request field. auto and enabled send it whenever caching is active; disabled never sends it, for compatible proxies that reject it. Default: auto.",
     }),
     supportsLongCacheRetention: optionalCompatBoolean({
         description: 'Whether the provider supports long prompt cache retention. This uses prompt_cache_options.ttl: "30m" on GPT-5.6+ and prompt_cache_retention: "24h" on earlier models.',
@@ -247,7 +262,7 @@ const OpenAIResponsesCompatProperties = {
         default: false,
     })),
     supportsMidConvoEffort: opt(bool({
-        description: "Whether thinking level changes are sent as configuration_update input items instead of changing reasoning.effort, so a change keeps the prompt cache. Only used by the openai-responses API, and ignored with Sign in with ChatGPT on the openai provider.",
+        description: "Whether thinking level changes are sent as configuration_update input items instead of changing reasoning.effort, so a change keeps the prompt cache. Used by the openai-responses and openai-codex-responses APIs, and ignored with Sign in with ChatGPT on the openai provider.",
         default: false,
     })),
     supportsMaxOutputTokens: opt(bool({
@@ -306,6 +321,9 @@ const AnthropicMessagesCompatProperties = {
         description: "Whether the exact model accepts mid-conversation tool_addition and tool_removal blocks. Requires supportsMidConvoSystemMessages.",
         default: false,
     })),
+    supportsMessageThreads: optionalCompatBoolean({
+        description: "Whether the endpoint supports Anthropic message threads, which let a request with a session id send only the new messages and continue from the previous reply. Default: true for a baseUrl on api.anthropic.com, false otherwise. Set true for gateways that forward the thread request field.",
+    }),
     allowedFallbackModels: opt(arr(AnthropicAllowedFallbackModelSchema, {
         maxItems: 3,
         description: "Models Anthropic accepts for server-side refusal fallback, with local pricing metadata for returned fallback responses. When absent or empty, callers must omit fallbacks; Anthropic rejects the field for models with no permitted fallback targets.",
@@ -330,9 +348,23 @@ const MistralConversationsCompatProperties = {
         description: "Whether the exact model accepts system messages after the conversation has started. When false, later system messages are folded into the leading system message.",
         default: false,
     }),
+    supportsStrictMode: optionalCompatBoolean({
+        description: "Whether the model supports strict (schema-constrained) function tools.",
+        default: false,
+    }),
 };
 export const MistralConversationsCompatSchema = openObject(MistralConversationsCompatProperties, {
     description: "Compatibility settings for the Mistral chat API.",
+    additionalProperties: true,
+});
+// Pi fe8a6f5dc (post-v1.5.2), backported by automation/gen/pi-post-release-backports.mjs.
+const GoogleCompatProperties = {
+    supportsStrictMode: optionalCompatBoolean({
+        description: "Whether the model enforces strict tools through Gemini's VALIDATED function-calling mode. Default: true for model IDs containing gemini-3 or a later version, such as gemini-3-pro or vendor-gemini-4-argon, false otherwise. Set true for Gemini 3+ models served under IDs without the version.",
+    }),
+};
+export const GoogleCompatSchema = openObject(GoogleCompatProperties, {
+    description: "Compatibility settings for the Google Generative AI and Vertex APIs.",
     additionalProperties: true,
 });
 const SystemOneCompatProperties = {
@@ -358,8 +390,11 @@ const ProviderCompatPropertyOverrides = {
     sessionAffinityFormat: optionalSessionAffinityFormat({
         description: "Session-affinity header format. Defaults are API-specific or auto-detected.",
     }),
+    promptCacheKeyMode: optionalPromptCacheKeyMode({
+        description: "Controls the prompt_cache_key request field for openai-completions and openai-responses: auto keeps each API's default, enabled sends it whenever caching is active, disabled never sends it. Default: auto.",
+    }),
     supportsMidConvoEffort: optionalCompatBoolean({
-        description: "Whether thinking level changes are sent inside the conversation instead of changing the request's effort, so a change keeps the prompt cache. Used by the anthropic-messages and openai-responses APIs.",
+        description: "Whether thinking level changes are sent inside the conversation instead of changing the request's effort, so a change keeps the prompt cache. Used by the anthropic-messages, openai-responses, and openai-codex-responses APIs.",
         default: false,
     }),
     supportsLongCacheRetention: optionalCompatBoolean({
@@ -411,6 +446,8 @@ export const CompatSchemasByApi = {
     "anthropic-messages": AnthropicMessagesCompatSchema,
     "bedrock-converse-stream": BedrockCompatSchema,
     "mistral-conversations": MistralConversationsCompatSchema,
+    "google-generative-ai": GoogleCompatSchema,
+    "google-vertex": GoogleCompatSchema,
     "typesafe-system-one": SystemOneCompatSchema,
     "cloudflare-workers-ai-system-one": SystemOneCompatSchema,
 };
@@ -420,6 +457,7 @@ const ProviderCompatProperties = mergeCompatProperties([
     AnthropicMessagesCompatProperties,
     BedrockCompatProperties,
     MistralConversationsCompatProperties,
+    GoogleCompatProperties,
     SystemOneCompatProperties,
 ], ProviderCompatPropertyOverrides);
 export const ProviderCompatSchema = openObject(ProviderCompatProperties, {

@@ -62,7 +62,7 @@ func TestConformance_TruncationHelpersAgreeAcrossSDKs(t *testing.T) {
 		// 10 emoji are 10 code points but 20 UTF-16 units: a limit of 16 cuts after 8 of them, which a code-point count would not.
 		{"fn": "line", "content": strings.Repeat("😀", 10), "maxChars": 16},
 		{"fn": "line", "content": strings.Repeat("😀", 10), "maxChars": 8},
-		// A cut inside a surrogate pair: Pi and Python keep the lone high surrogate, Go and Rust write U+FFFD; Go decodes the escaped lone surrogate to U+FFFD, so every SDK agrees on the host.
+		// A cut inside a surrogate pair: Pi's sliceHead (the Node reference) and every PiG SDK drop the whole pair.
 		{"fn": "line", "content": strings.Repeat("😀", 10), "maxChars": 7},
 		{"fn": "line", "content": "日本語日本語", "maxChars": 3},
 		{"fn": "line", "content": "abc", "maxChars": 0},
@@ -95,13 +95,13 @@ func TestConformance_TruncationHelpersAgreeAcrossSDKs(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		before := len(*h.notify)
+		before := len(h.ui.Recorded())
 		if !h.runner.ExecuteCommand(context.Background(), "truncate_probe", string(args)) {
 			t.Fatal("fixture has no truncate_probe command")
 		}
 		var reported string
 		pollUntilConformance(t, "truncate_probe: no report", func() bool {
-			for _, n := range (*h.notify)[before:] {
+			for _, n := range h.ui.Recorded()[before:] {
 				if rest, ok := strings.CutPrefix(n, "truncate:"); ok {
 					reported = strings.TrimSuffix(strings.TrimSuffix(rest, ":info"), ":end")
 					return true
@@ -171,9 +171,10 @@ func TestConformance_TruncationHelpersAgreeAcrossSDKs(t *testing.T) {
 			})
 			for i, c := range cases {
 				got := run(t, h, c)
-				if !reflect.DeepEqual(got, reference[i]) {
+				want := reference[i]
+				if !reflect.DeepEqual(got, want) {
 					args, _ := json.Marshal(c)
-					t.Errorf("case %d %.80s: got %v, Node (Pi) reports %v", i, args, got, reference[i])
+					t.Errorf("case %d %.80s: got %v, Node (Pi) reports %v", i, args, got, want)
 				}
 			}
 		})

@@ -269,6 +269,24 @@ defer session.Close()
 
 An explicit Services CWD wins over the manager's CWD. Without a manager override, new persisted Sessions use the selected Services agent directory. `GetSessionFile` returns nil in memory. A persisted manager selects a file path before the first user or assistant message creates it, so `IsPersisted` does not imply that the file already exists. Forks and clones keep the source persistence mode. A retained branch without a user or assistant message defers its file write. A factory-owned Runtime fork replaces the Session but retains the in-memory SessionManager object.
 
+### Read part of a long branch
+
+`SessionManager.GetBranch` reads and decodes every message of the branch it returns. A program that shows one page of a long session reads in two steps instead. `BranchRefs(fromID...)` returns the path `GetBranch` returns (the same entries, order and `fromID` rules) as `coding.BranchRef` values with the `ID`, `ParentID`, `Type`, `Role` and `Timestamp` of each entry, and reads no entry body. `ReadEntries(ctx, ids)` reads and decodes the entries with the given ids, in the order given, in one batch:
+
+```go
+manager, _ := coding.NewInMemorySessionManager(".")
+// ... append entries, or use the manager of a resumed Session
+refs := manager.BranchRefs() // the whole branch, in order, with no entry body read
+page := []string{refs[1].ID, refs[2].ID}
+entries, err := manager.ReadEntries(ctx, page)
+var changed *coding.RecordChangedError
+if errors.As(err, &changed) {
+    // the record of changed.ID cannot be read back as it was indexed
+}
+```
+
+A `BranchRef` is a plain value that holds no file handle and no part of the log. The log is append-only, so an id names the same entry for the life of the `SessionManager`: moving the leaf changes what `BranchRefs` returns, never what `ReadEntries` returns for an id. `ReadEntries` takes the session's lock only to find the entries, so an append does not wait for the read. An unknown id, a record that cannot be read back, and a `ctx` that is done before the read or between the records of two sources each return an error and no entries: there is no partial result and no panic. The error of a done `ctx` is the context's, and one for a record is a `*coding.RecordChangedError` naming the entry. `EntryReads` counts the records a read took from the log. These methods are an addition of PiG's (D655): Pi holds every entry decoded and has no such read, and the extension SDKs' `getBranch` is unchanged.
+
 Direct calls to a Session's tools receive its current identity, model and thinking state. A tool call with an explicit ToolEnvironment keeps that context instead. Clones keep separate context bindings.
 
 ### Supply an Agent or a cache warmer
@@ -357,6 +375,8 @@ Pass extension definitions through `coding.RuntimeOptions` when your application
 
 Use a Piglet when the composition should also be usable from the `pig` executable or built as a Piglet Binary.
 
+An extension shows a GUI in the terminal and in a web page with views: [Extension views](ui-views.md) (D614).
+
 ## Headless embedding and binary size
 
 A program that embeds PiG without a terminal still links everything the session API can reach. `examples/headless` is a complete small program: the session API, MCP servers from `mcp.json` and one provider (Anthropic). It has no terminal and no extension files. Build it the way PiG builds its releases:
@@ -365,23 +385,23 @@ A program that embeds PiG without a terminal still links everything the session 
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o headless ./examples/headless
 ```
 
-On linux/amd64 this is 36.7 MB, against 69.7 MB for the `pig` command. Five things are already left out of such a program without any option: the Lisp extension support (the SBCL image build, the Quicklisp resolver and the Lisp source resolver, 78 KB, package `coding/extension/host/lispcell`, which only the `pig` command imports; a program that imports it for its side effect, `import _ "github.com/MichaelKinsy/PiG/coding/extension/host/lispcell"`, can load Lisp extensions, and in any other program a Lisp extension does not load), the Amazon Bedrock provider and the AWS SDK behind it (3.3 MB, package `ai/providers/bedrock`, which only `ai/all` and the `pig` command import), the terminal MCP view and tool renderers (package `mcptui`, see below), the terminal editor with the word dictionaries behind it (6.3 MB), and the announcement image of the interactive mode (0.5 MB). The rest is features you can remove with build tags.
+On linux/amd64 at v0.7.0 this is 36.8 MB (36,815,008 bytes), against 69.2 MB (69,218,464 bytes) for the `pig` binary in the release archive. Both sizes are the uncompressed executable. Five things are already left out of such a program without any option: the Lisp extension support (the SBCL image build, the Quicklisp resolver and the Lisp source resolver, about 0.1 MB, package `coding/extension/host/lispcell`, which only the `pig` command imports; a program that imports it for its side effect, `import _ "github.com/MichaelKinsy/PiG/coding/extension/host/lispcell"`, can load Lisp extensions, and in any other program a Lisp extension does not load), the Amazon Bedrock provider and the AWS SDK behind it (3.3 MB, package `ai/providers/bedrock`, which only `ai/all` and the `pig` command import), the terminal MCP view and tool renderers (package `mcptui`, see below), the terminal editor with the word dictionaries behind it (6.6 MB, of which the dictionaries are 6.3 MB), and the announcement image of the interactive mode (0.5 MB). The rest is features you can remove with build tags.
 
 ### Strip tags
 
 Every feature that can be left out of a build has a Go build tag, `pig_strip_<id>`. They are the same tags a [Piglet Binary](piglet-binaries.md) uses, so one mechanism covers both. Pass the ones you do not need to `go build -tags`. A stripped feature is not linked and acts as if it were absent: a request for it reports that it was stripped from this build, and model lists leave out the models of a stripped API.
 
-| Tag | Leaves the binary | Saves on `examples/headless` (linux/amd64) |
+| Tag | Leaves the binary | Saves on `examples/headless` (linux/amd64, at v0.7.0) |
 | --- | --- | ---: |
 | `pig_strip_node_extensions` | The embedded Node runtime that runs TypeScript and JavaScript extensions | 5.07 MB |
-| `pig_strip_bedrock_converse_stream` | The Amazon Bedrock API and the AWS SDK | 0, already absent (3.29 MB in the `pig` command) |
+| `pig_strip_bedrock_converse_stream` | The Amazon Bedrock API and the AWS SDK | 0, already absent (3.27 MB in the `pig` command) |
 | `pig_strip_syntax_highlight` | Code highlighting grammars | 0.63 MB |
-| `pig_strip_google_vertex` | The Google Vertex API and its OAuth code | 0.46 MB |
+| `pig_strip_google_vertex` | The Google Vertex API and its OAuth code | 0.57 MB |
 | `pig_strip_mistral_conversations` | The Mistral conversations API | 0.10 MB |
-| `pig_strip_mermaid` | Mermaid diagram drawing | 0.07 MB |
+| `pig_strip_mermaid` | Mermaid diagram drawing | 0.03 MB |
 | `pig_strip_word_dictionaries` | The CJK, Thai, Lao, Khmer and Burmese word dictionaries | 0, already absent (6.3 MB in the `pig` command) |
 
-The remaining tags (`pig_strip_llama_cpp`, `pig_strip_codemode`, `pig_strip_tool_search`, `pig_strip_pig_login`, `pig_strip_docs`, `pig_strip_changelog`, `pig_strip_export_html`, `pig_strip_self_update`, `pig_strip_piglet_builder`, `pig_strip_extension_sdk_go`, `pig_strip_extension_sdk_python` and `pig_strip_extension_sdk_rust`) remove features the session API does not link by itself. They matter when your program also links the `pig` command's packages, and they do no harm here. Passing all of them except `pig_strip_mcp` takes `examples/headless` to 30.2 MB on linux/amd64, 28.8 MB on darwin/arm64 and 31.5 MB on windows/amd64.
+The remaining tags (`pig_strip_llama_cpp`, `pig_strip_codemode`, `pig_strip_tool_search`, `pig_strip_pig_login`, `pig_strip_docs`, `pig_strip_changelog`, `pig_strip_export_html`, `pig_strip_self_update`, `pig_strip_piglet_builder`, `pig_strip_extension_sdk_go`, `pig_strip_extension_sdk_python` and `pig_strip_extension_sdk_rust`) remove features the session API does not link by itself. They matter when your program also links the `pig` command's packages, and they do no harm here. Passing all of them except `pig_strip_mcp` takes `examples/headless` to 30.4 MB on linux/amd64, 29.0 MB on darwin/arm64 and 31.7 MB on windows/amd64, measured at v0.7.0.
 
 Notes:
 
@@ -394,13 +414,19 @@ Notes:
 
 `mcpext.CreateMcpExtension(mcpext.Options{...})` is the headless entry point. Leave `Options.Terminal` nil: then the extension has no `/mcp` manager view and no tool renderers, and nothing from package `mcptui` is linked. The `pig` command sets `Options.Terminal` to `mcptui.Terminal()`. `mcpext.NewHeadless` does the same for a caller that builds the extension from a `Host` of its own.
 
+### Widgets in extension views
+
+Extensions can put widgets in a view they draw: `grid`, `input`, `scroll-view`, `mouse-region`, `bordered-loader`, `cancellable-loader`, `branch-summary`, `compaction-summary`, `custom-message` and `skill-invocation`. The host builds them once the program has called `subprocess.EnableViewWidgets()`. The `pig` command calls it before it runs a command. A headless embedder that mounts widgets, for a frontend of its own or to render what an extension's message or tool renderer returns, must call `subprocess.EnableViewWidgets()` once before the first view is built. A program that does not call it links none of the widget builders. Until then a view that holds a widget is rejected with an error that names the call: the surface keeps its previous frame, a renderer's result counts as a failed render, the rejection is reported once per surface through the session's extension error listeners, and the extension is sent nothing. A widget node that is not valid is rejected as before. The call does not enable editors, which have their own.
+
 ### Editors in extension views
 
-Extensions can put an editor in a view they draw. The component that builds it uses the terminal editor, which pulls in the word dictionaries. The `pig` command enables it with `subprocess.EnableEditorViews()` where it creates the extension host. A program that never draws an extension's editor does not call it, and the editor is not linked. A program that serves extension views to its own terminal calls `subprocess.EnableEditorViews()` once before the first view is built. Until then a view with an editor fails with an error that names the call, and an editor node that is not valid is rejected as before.
+Extensions can put an editor in a view they draw. The component that builds it uses the terminal editor, which pulls in the word dictionaries. The `pig` command enables it with `subprocess.EnableEditorViews()` before it runs a command. A program that never draws an extension's editor does not call it, and the editor is not linked. A program that serves extension views to its own terminal calls `subprocess.EnableEditorViews()` once before the first view is built. Until then a view with an editor fails with an error that names the call, and an editor node that is not valid is rejected as before.
+
+A mount can show an image. In a terminal without an image protocol the terminal client draws it with half-block characters, and the pixels come from `MountImages.Decode`, which the terminal client sets to the port of Pi's Photon decode (`internal/photonimage`). The extension host imports no Go image decoder, so a program that draws no mount surface links none. A program that draws mount surfaces in its own terminal sets `MountImages.Decode`; without it such an image is one line of text that names the missing decoder and the field.
 
 ### TuiAltScreen for extensions
 
-An extension that constructs a `TuiAltScreen` (Pi's alternate-screen TUI) draws it through the host's renderer, which links the word dictionaries through its text inputs. The `pig` command enables it with `subprocess.EnableTuiAltScreens()` where it creates the extension host. A program that never serves one does not call it, and the renderer is not linked. A program that serves them to its own terminal calls `subprocess.EnableTuiAltScreens()` once before the first extension loads. Until then a `tui.alt` call fails with an error that names the call.
+An extension that constructs a `TuiAltScreen` (Pi's alternate-screen TUI) draws it through the host's renderer, which links the word dictionaries through its text inputs. The `pig` command enables it with `subprocess.EnableTuiAltScreens()` before it runs a command. A program that never serves one does not call it, and the renderer is not linked. A program that serves them to its own terminal calls `subprocess.EnableTuiAltScreens()` once before the first extension loads. Until then a `tui.alt` call fails with an error that names the call.
 
 ### The test-only test-faux provider
 
@@ -439,7 +465,7 @@ Do not replay a failed extension operation automatically unless the application 
 
 ### Contexts that print and cancel like Pi's
 
-`github.com/MichaelKinsy/PiG/chord/context` (package `chordctx`) ports Pi's `@earendil-works/chord/context` onto `context.Context`. It was `internal/chord/chordctx` before 0.5.0. An abort signal is cancellation, and the abort reason is the cancellation cause. `Background()` and `TODO()` are Pi's `BACKGROUND_CONTEXT` and `TODO_CONTEXT`, and contexts derived from them print as Pi's do. `NewKey` makes a typed key from a description that names it in diagnostics only. `WithValue` and `Value` store and read a value, and the parent is unchanged. `WithAbortSignal(parent, signal)` is cancelled by the parent or the signal, whichever is first, with that one's cause. `WithoutAbortSignal` keeps every value and ignores caller cancellation, for mandatory cleanup only. `WithCancel` returns a child and a `cancel(cause)` function. `Await[T](ctx, work)` returns the work's outcome, or the cancellation cause from this waiter only: it does not cancel the work. `Telemetry(ctx)` is Pi's `Context.telemetry`: the explicit telemetry parent, never nil, which is `telemetry.NoopTelemetryContext` for `Background()`, `TODO()`, and any context that carries none. `WithTelemetry(parent, telemetry)` derives a context with a telemetry parent and changes neither the parent, its cancellation, nor its values. `TraceIn[T](ctx, options, fn)` starts a child span of `Telemetry(ctx)` and calls `fn(child)`, where `child` is derived from `ctx` and `Telemetry(child)` is that span, so spans nest through the contexts passed down and there is no ambient current span. `fn`'s result and error pass through unchanged. Pi's callback receives one context typed with a narrowed `telemetry` member; Go cannot narrow a context's type, so the span is a second argument. These helpers do not instrument Chord hosts, methods, or network frames.
+`github.com/MichaelKinsy/PiG/chord/context` (package `chordctx`) ports Pi's `@earendil-works/chord/context` onto `context.Context`. It was `internal/chord/chordctx` before 0.5.0. An abort signal is cancellation, and the abort reason is the cancellation cause. `Background()` and `TODO()` are Pi's `BACKGROUND_CONTEXT` and `TODO_CONTEXT`, and contexts derived from them print as Pi's do. `NewKey` makes a typed key from a description that names it in diagnostics only. `WithValue` and `Value` store and read a value, and the parent is unchanged. `WithAbortSignal(parent, signal)` is cancelled by the parent or the signal, whichever is first, with that one's cause. `WithoutAbortSignal` keeps every value and ignores caller cancellation, for mandatory cleanup only. `WithCancel` returns a child and a `cancel(cause)` function. A context derived by `WithAbortSignal` from a signal made by this package is cancelled inside that signal's `cancel`, before it returns and before any abort listener of that signal runs, as `AbortSignal.any` marks its result aborted; a signal of another package cancels it on a goroutine of its own. `OnAbort(ctx, fn)` runs `fn` inside the `cancel` that aborts `ctx`, in Pi's order: the aborted context's own listeners, in the order they were added, then those of the contexts derived from it, in the order they were created. `WithAbortSignalCancel(parent, signal)` is `WithAbortSignal` and `WithCancel` in one context: its `cancel` also drops its link to the signal. `Await[T](ctx, work)` returns the work's outcome, or the cancellation cause from this waiter only: it does not cancel the work. `Telemetry(ctx)` is Pi's `Context.telemetry`: the explicit telemetry parent, never nil, which is `telemetry.NoopTelemetryContext` for `Background()`, `TODO()`, and any context that carries none. `WithTelemetry(parent, telemetry)` derives a context with a telemetry parent and changes neither the parent, its cancellation, nor its values. `TraceIn[T](ctx, options, fn)` starts a child span of `Telemetry(ctx)` and calls `fn(child)`, where `child` is derived from `ctx` and `Telemetry(child)` is that span, so spans nest through the contexts passed down and there is no ambient current span. `fn`'s result and error pass through unchanged. Pi's callback receives one context typed with a narrowed `telemetry` member; Go cannot narrow a context's type, so the span is a second argument. These helpers do not instrument Chord hosts, methods, or network frames.
 
 ## Harness events
 

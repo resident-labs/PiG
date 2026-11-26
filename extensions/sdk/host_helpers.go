@@ -11,6 +11,8 @@ import (
 	"os"
 	"slices"
 	"sync"
+
+	sdkjson "github.com/MichaelKinsy/PiG/extensions/sdk/json"
 )
 
 // Host calls for Pi's pure helpers that need the host's parsers: parseFrontmatter (the host's YAML parser, the one that reads skills and prompt templates)
@@ -380,6 +382,21 @@ func takeHelperConn(sockPath string) *conn {
 	return c
 }
 
+// ReportLoadFailure ends the host's wait for the extension that serves sockPath after its factory failed. A packed cell's runner calls it when a member's factory
+// panics or returns no extension, so the shared process lives on for the other members. A factory that called a host helper (ParseFrontmatter, ParseDate, a
+// pi.events call) before it failed left the connection that call dialled open, and the host reads the registration of the connection it accepted first: that one is
+// closed. With no such connection it is the connection of the socket that is dialled and closed, as the failure of an extension that never connected.
+func ReportLoadFailure(sockPath string) error {
+	if started := takeHelperConn(sockPath); started != nil {
+		return started.nc.Close()
+	}
+	nc, err := net.Dial("unix", sockPath)
+	if err != nil {
+		return fmt.Errorf("connect to host: %w", err)
+	}
+	return nc.Close()
+}
+
 // adoptHelperConn makes the connection of a running extension the one helpers use when they run outside a factory and a Context, so such a helper does not
 // dial a socket the host already accepted.
 func adoptHelperConn(c *conn, path string, ext *Extension) {
@@ -627,7 +644,9 @@ func highlightCodeLines(code, lang string) ([]string, error) {
 	var reply struct {
 		Lines []string `json:"lines"`
 	}
-	if err := json.Unmarshal(result.Result, &reply); err != nil {
+	// A line may hold a lone UTF-16 surrogate of the code (the host sends it as an escape, as Pi's JavaScript strings carry it): the SDK's codec keeps the
+	// unit in the Go string, where encoding/json would replace it.
+	if err := sdkjson.Unmarshal(result.Result, &reply); err != nil {
 		return nil, fmt.Errorf("decode highlightCode: %w", err)
 	}
 	return reply.Lines, nil

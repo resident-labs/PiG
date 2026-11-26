@@ -5,7 +5,6 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,6 +26,7 @@ import (
 	"golang.org/x/mod/semver"
 
 	"github.com/MichaelKinsy/PiG/automation/release/modulehash"
+	"github.com/MichaelKinsy/PiG/internal/zstdblob"
 )
 
 type options struct {
@@ -83,7 +83,7 @@ func run(root string, opt options, output io.Writer, check func(string, io.Write
 		if bytes.Equal(p.before[path], p.after[path]) {
 			continue
 		}
-		if strings.HasSuffix(path, ".gz") {
+		if strings.HasSuffix(path, ".zst") {
 			if _, err := fmt.Fprintf(output, "%s changed (regenerated from CHANGELOG.md)\n", path); err != nil {
 				return err
 			}
@@ -164,7 +164,7 @@ func prepare(root string, opt options) (*plan, error) {
 	if len(re.FindAll(data, -1)) != 1 {
 		return nil, errors.New("expected one Standard release.version")
 	}
-	p.after[standard] = re.ReplaceAll(data, []byte("${1}"+opt.version+"-dev"))
+	p.after[standard] = re.ReplaceAll(data, []byte("${1}"+opt.version))
 	data, err = p.read("CHANGELOG.md")
 	if err != nil {
 		return nil, err
@@ -173,23 +173,36 @@ func prepare(root string, opt options) (*plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	if old, err := os.ReadFile(filepath.Join(p.root, "CHANGELOG.md.gz")); err == nil {
-		p.before["CHANGELOG.md.gz"] = old
+	old, err := os.ReadFile(filepath.Join(p.root, "CHANGELOG.md.zst"))
+	if err == nil {
+		p.before["CHANGELOG.md.zst"] = old
 	}
-	var gz bytes.Buffer
-	w, _ := gzip.NewWriterLevel(&gz, gzip.BestCompression)
-	_, _ = w.Write(p.after["CHANGELOG.md"])
-	_ = w.Close()
-	p.after["CHANGELOG.md.gz"] = gz.Bytes() // embed.go embeds the compressed changelog
+	// embed.go embeds the compressed changelog.
+	frame, err := changelogFrame(old, p.after["CHANGELOG.md"])
+	if err != nil {
+		return nil, err
+	}
+	p.after["CHANGELOG.md.zst"] = frame
 	return p, nil
 }
 
-// readmeVersionExample is the README sentence that shows the composite `pig --version` value. Its Pi half is the pin's, which
+// changelogFrame returns the frame of CHANGELOG.md.zst for changelog: existing when it already holds the text, else the text written by the pinned zstd. zstdblob.Encode panics when that command is missing, so the command is looked up first and its absence is an error that names PIG_ZSTD and the provisioner.
+func changelogFrame(existing, changelog []byte) ([]byte, error) {
+	if decoded, err := zstdblob.Decode(existing); err == nil && bytes.Equal(decoded, changelog) {
+		return existing, nil
+	}
+	if _, err := zstdblob.PinnedCLI(); err != nil {
+		return nil, fmt.Errorf("cannot re-encode CHANGELOG.md.zst: %w", err)
+	}
+	return zstdblob.Encode(changelog), nil
+}
+
+// readmeVersionExample is the README sentence that shows the composite version of the help banner and the startup line. Its Pi half is the pin's, which
 // automation/pin/pin.py rewrites (readme in pin.py matches the same sentence); its PiG half is the release, which this command writes.
 // test/docs-drift TestProseNamesTheCurrentPin fails the sentence when either half disagrees with internal/coding/pigversion.
-var readmeVersionExample = regexp.MustCompile("(prints PiG's version as `<PiG release>\\+<Pi release>`, for example `)\\d+\\.\\d+\\.\\d+(\\+[^`]+`)")
+var readmeVersionExample = regexp.MustCompile("(prints? PiG's version as `<PiG release>\\+<Pi release>`, for example `)\\d+\\.\\d+\\.\\d+(\\+[^`]+`)")
 
-// updateReadmeExample writes version into the README's `pig --version` example. An absent README is skipped, so a checkout that does not
+// updateReadmeExample writes version into the README's composite version example. An absent README is skipped, so a checkout that does not
 // carry one is unaffected; a README without the sentence is an error, because the drift check would then fail the release.
 func (p *plan) updateReadmeExample(version string) error {
 	const readme = "README.md"
@@ -201,7 +214,7 @@ func (p *plan) updateReadmeExample(version string) error {
 		return err
 	}
 	if len(readmeVersionExample.FindAll(data, -1)) != 1 {
-		return fmt.Errorf("%s: expected one `pig --version` example to update", readme)
+		return fmt.Errorf("%s: expected one composite version example to update", readme)
 	}
 	p.after[readme] = readmeVersionExample.ReplaceAll(data, []byte("${1}"+version+"${2}"))
 	return nil

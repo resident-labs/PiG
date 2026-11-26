@@ -130,6 +130,10 @@ class ModelRuntime(_GraphObject):
     def logout(self, provider: str) -> None:
         self._invoke_async("logout", provider)
 
+    def settle_credential_writes(self) -> None:
+        """Wait until the credential writes already in progress finish (Pi's ``settleCredentialWrites``), e.g. an OAuth refresh a background catalog refresh started; it waits only for writes started before the call and takes no cancellation."""
+        self._invoke_async("settleCredentialWrites")
+
     def refresh(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         """``{"aborted", "errors"}``; ``options`` are Pi's ``allowNetwork``, ``providers`` and ``force``."""
         return self._invoke_async("refresh", options or {})
@@ -193,10 +197,10 @@ class ModelRuntime(_GraphObject):
 
     def stream(self, model: dict[str, Any], request: dict[str, Any], options: dict[str, Any] | None = None) -> Any:
         """Stream a model response through the runtime (``request`` and ``options`` as for ``ModelRegistry.stream``)."""
-        return self._registry()._stream(model, request, options, False, self.handle)
+        return self._registry()._stream(model, request, options, False, self)
 
     def stream_simple(self, model: dict[str, Any], request: dict[str, Any], options: dict[str, Any] | None = None) -> Any:
-        return self._registry()._stream(model, request, options, True, self.handle)
+        return self._registry()._stream(model, request, options, True, self)
 
     def complete(self, model: dict[str, Any], request: dict[str, Any], options: dict[str, Any] | None = None) -> dict[str, Any] | None:
         return self.stream(model, request, options).result()

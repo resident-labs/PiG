@@ -37,6 +37,9 @@ import (
 // dispatched here via the UIBridge.
 type ExtUIContext struct {
 	m *InteractiveMode
+	// commit, when set, runs on the owner loop as a dialog this context opens resolves with a choice, before the dialog closes and before the
+	// paint that follows the key. It belongs to those dialogs alone: a dialog another context opens, stacked over or under them, never runs it.
+	commit func(choice string)
 }
 
 type specialLinesComponent struct {
@@ -325,6 +328,10 @@ func (u *ExtUIContext) runDialog(
 				return
 			}
 			pending = false
+			// pig divergence (D270): the tree prompt's choice holds the frames of its close.
+			if commit := u.commit; commit != nil && !cancelled {
+				commit(value)
+			}
 			u.m.finishExtensionDialog(dialog)
 			resultCh <- extensionDialogResult{value: value, cancelled: cancelled}
 		}
@@ -691,9 +698,7 @@ func (m *InteractiveMode) setBuiltInHeader(expanded bool) {
 }
 
 func (u *ExtUIContext) SetTitle(title string) {
-	if u.m.tuiInst != nil {
-		u.m.tuiInst.Terminal().SetTitle(title)
-	}
+	u.m.setTerminalTitle(title)
 }
 
 // RunRemoteOverlay mounts remote custom UI as an overlay or editor-slot replacement and waits for its result. The owner loop mounts the component and transfers renderer focus; this caller drains its modal input lease off-loop while the component has focus. Normal completion restores the editor slot and focus before returning.
@@ -712,13 +717,31 @@ func (u *ExtUIContext) RunRemoteOverlay(opts extension.RemoteOverlayOptions, hos
 		if opts.Overlay || u.m.layout == nil {
 			h := u.m.tuiInst.ShowOverlay(overlay, remoteOverlayTUIOptions(opts))
 			u.bindOverlayControls(overlay, h, runOnOwner)
-			// upstream: interactive-mode.ts:2999 close() hides this overlay through its own handle, not the topmost one (Pi #10999).
-			cleanup = h.Hide
+			// upstream: interactive-mode.ts removeOverlay hides this overlay through its own handle, not the topmost one (Pi #10999),
+			// and clears the blocked status of an overlay that opted in. Reset removes it too, so a later cleanup finds it gone.
+			source := ""
+			if opts.Blocked != nil {
+				source = u.m.nextBlockingOverlaySource()
+			}
+			remove := func() {
+				if !u.m.deleteExtensionOverlay(h) {
+					return
+				}
+				h.Hide()
+				if source != "" {
+					u.m.programStatusReporter().SetBlocked(source, nil)
+				}
+			}
+			u.m.addExtensionOverlay(h, remove)
+			if source != "" {
+				u.m.programStatusReporter().SetBlocked(source, blockedStatusOf(opts.Blocked))
+			}
+			cleanup = remove
 		} else {
 			// Match upstream ctx.ui.custom(): the component joins the editor-slot dialog stack directly
 			// rather than being wrapped in a second modal shell (interactive-mode.ts pushExtensionDialog).
 			// upstream: showExtensionCustom restoreEditor puts back the editor text saved when the component opened.
-			savedText := u.m.editor.Text()
+			savedText := u.m.editor.GetExpandedText()
 			entry := &extensionDialog{component: overlay, blocked: blockedStatusOf(opts.Blocked)}
 			u.m.pushExtensionDialog(entry)
 			cleanup = func() {
@@ -736,6 +759,14 @@ func (u *ExtUIContext) RunRemoteOverlay(opts extension.RemoteOverlayOptions, hos
 	case <-ctx.Done():
 		return nil, false
 	}
+	// The call's own end and a retire of the overlay (Retire) both take the component off the screen; whichever comes first does, once.
+	cleanup = sync.OnceFunc(cleanup)
+	overlay.setRetire(func() {
+		runOnOwner(ctx, func() {
+			cleanup()
+			u.m.tuiInst.Render()
+		})
+	})
 	defer func() {
 		done := make(chan struct{})
 		runOnOwner(ctx, func() {
@@ -871,8 +902,13 @@ func (u *ExtUIContext) remoteOwnerLoop() (context.Context, func(context.Context,
 // that gains and loses it; published is the focus the extension assumes at mount.
 func (u *ExtUIContext) serveRemoteInput(ctx context.Context, runOnOwner func(context.Context, func()), overlay *customOverlay, host extension.RemoteOverlayHost, published bool) bool {
 	focusHost, _ := host.(extension.RemoteOverlayFocusHost)
+	invalidateHost, _ := host.(extension.RemoteOverlayInvalidateHost)
 	for !overlay.Done() {
 		inputCh, changed := overlay.inputRoute()
+		// Pi's TUI.invalidate reaches the component (tui.ts:951-954): each invalidation the owner loop counted is published here.
+		if n := overlay.takeInvalidations(); n > 0 && invalidateHost != nil {
+			invalidateHost.OnInvalidate(n)
+		}
 		if focused := inputCh != nil; focusHost != nil && focused != published {
 			published = focused
 			focusHost.OnFocus(focused)

@@ -112,9 +112,9 @@
   (multiple-value-bind (text was) (pig:truncate-line "short")
     (check-equal "short" text) (check (not was)))
   (let ((emoji (make-string 10 :initial-element (code-char #x1F600))))
-    ;; 10 emoji are 20 UTF-16 units: a limit of 16 keeps 8 of them, a limit of 7 cuts a pair and keeps the high surrogate
+    ;; 10 emoji are 20 UTF-16 units: a limit of 16 keeps 8 of them, a limit of 7 would cut a pair, so the whole pair is dropped (Pi 9e870f6f0)
     (check-equal (concatenate 'string (subseq emoji 0 8) "... [truncated]") (pig:truncate-line emoji 16))
-    (check-equal (concatenate 'string (subseq emoji 0 3) (string (code-char #xD83D)) "... [truncated]") (pig:truncate-line emoji 7))))
+    (check-equal (concatenate 'string (subseq emoji 0 3) "... [truncated]") (pig:truncate-line emoji 7))))
 
 (deftest truncate-surrogates-and-negative-limits-match-pi
   ;; Pi: truncateTail("ab\ud800cd", {maxBytes: 6}) keeps "b\ufffdcd" (6 bytes): Buffer.from turns the lone surrogate into one U+FFFD
@@ -129,7 +129,7 @@
     (check-equal (list "" 1 0 t "bytes")
                  (list (pig:truncation-result-content r) (pig:truncation-result-output-lines r) (pig:truncation-result-output-bytes r)
                        (pig:truncation-result-last-line-partial r) (pig:truncation-result-truncated-by r))))
-  (check-equal "abcd... [truncated]" (pig:truncate-line "abcdef" -2))
+  (check-equal "... [truncated]" (pig:truncate-line "abcdef" -2))
   (check-equal "... [truncated]" (pig:truncate-line "ab" -5)))
 
 (deftest truncate-to-visual-lines-matches-pi
@@ -172,6 +172,44 @@
     (check-equal 3 (tokens "{\"role\":\"assistant\",\"content\":[{\"type\":\"toolCall\",\"name\":\"read\",\"arguments\":{\"a\":1}}]}"))
     (check-equal 3 (tokens "{\"role\":\"bashExecution\",\"command\":\"ls\",\"output\":\"abcdefghij\"}"))
     (check-equal 0 (tokens "{\"role\":\"nobody\",\"content\":\"abcd\"}"))))
+
+(deftest ctx-file-mutation-queue-names-its-tool-call
+  ;; The Context form sends its request id in the enter only for a tool call, so the host orders the turn by the call's batch place (D187).
+  (let ((calls '()))
+    (sb-int:encapsulate 'pig::host-call 'ct-stub
+                        (lambda (f ext method &optional args parent (request-id ""))
+                          (declare (ignore f ext parent request-id))
+                          (push (cons method args) calls)
+                          (if (string= method "fileMutation.enter") (pig:obj "ticket" "t1") (pig:obj))))
+    (sb-int:encapsulate 'pig::helper-call 'ct-stub
+                        (lambda (f method &optional args)
+                          (declare (ignore f))
+                          (push (cons method args) calls)
+                          (pig:obj)))
+    (sb-int:encapsulate 'pig::send-request-state 'ct-stub (lambda (&rest args) (declare (ignore args)) nil))
+    (unwind-protect
+         (let ((tool-ctx (pig::%make-ctx nil nil "call-1" "r7" t nil nil))
+               (command-ctx (pig::%make-ctx nil nil nil "r8" nil nil nil)))
+           (check-equal :ran (pig:ctx-with-file-mutation-queue tool-ctx "/a/b/../c.txt" (lambda () :ran)))
+           (let ((enter (cdr (find "fileMutation.enter" calls :key #'car :test #'string=))))
+             (check-equal "/a/c.txt" (pig:jget enter "path"))
+             (check-equal "r7" (pig:jget enter "request")))
+           (check-equal "t1" (pig:jget (cdr (find "fileMutation.exit" calls :key #'car :test #'string=)) "ticket"))
+           (setf calls '())
+           (pig:ctx-with-file-mutation-queue command-ctx "/a/c.txt" (lambda () nil))
+           (check (null (pig:jget (cdr (find "fileMutation.enter" calls :key #'car :test #'string=)) "request"))))
+      (sb-int:unencapsulate 'pig::host-call 'ct-stub)
+      (sb-int:unencapsulate 'pig::helper-call 'ct-stub)
+      (sb-int:unencapsulate 'pig::send-request-state 'ct-stub))))
+
+(deftest estimate-tokens-counts-unpaired-surrogates-as-pi-does
+  ;; Pi 1.5.0's estimateTokens, run by node: eight unpaired surrogates are 8 units (2 tokens), and in a tool call's arguments each is the six characters of its escape.
+  (flet ((tokens (text) (pig:estimate-tokens (json-of text))))
+    (check-equal 2 (tokens "{\"role\":\"user\",\"content\":\"\\ud800\\ud800\\ud800\\ud800\\ud800\\ud800\\ud800\\ud800\"}"))
+    (check-equal 1 (tokens "{\"role\":\"user\",\"content\":\"\\ud800\"}"))
+    (check-equal 1 (tokens "{\"role\":\"user\",\"content\":\"a\\ud83db\"}"))
+    (check-equal 14 (tokens "{\"role\":\"assistant\",\"content\":[{\"type\":\"toolCall\",\"id\":\"c\",\"name\":\"\",\"arguments\":{\"k\":\"\\ud800\\ud800\\ud800\\ud800\\ud800\\ud800\\ud800\\ud800\"}}]}"))
+    (check-equal 4 (tokens "{\"role\":\"assistant\",\"content\":[{\"type\":\"toolCall\",\"id\":\"c\",\"name\":\"\",\"arguments\":{\"k\":\"\\ud800\"}}]}"))))
 
 (deftest find-cut-point-and-turn-start
   (let* ((entries (json-of "[{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"aaaaaaaa\"}},
@@ -223,9 +261,11 @@ C
                  (pig:serialize-conversation messages)))
   (check-error pig:js-type-error (pig:serialize-conversation (json-of "[{\"role\":\"user\",\"content\":5}]")))
   (check-error pig:js-type-error (pig:serialize-conversation (json-of "[null]")))
-  ;; Pi's output on unpaired surrogates (Node): JSON.stringify writes them as lowercase \uXXXX escapes, and the truncation slice keeps the high half of a cut pair
+  ;; Pi's output on unpaired surrogates (Node): JSON.stringify writes them as lowercase \uXXXX escapes, and the truncation (sliceHead) drops the high half of a cut pair but keeps an unpaired one
   (loop for (message want)
           in (list (list (concatenate 'string "{\"role\":\"toolResult\",\"content\":\"" (make-string 1999 :initial-element #\a) "\\ud83d\\ude00\"}")
+                         (concatenate 'string "\"[Tool result]: " (make-string 1999 :initial-element #\a) "\\n\\n[... 1 more characters truncated]\""))
+                   (list (concatenate 'string "{\"role\":\"toolResult\",\"content\":\"" (make-string 1999 :initial-element #\a) "\\ud83dx\"}")
                          (concatenate 'string "\"[Tool result]: " (make-string 1999 :initial-element #\a) "\\ud83d\\n\\n[... 1 more characters truncated]\""))
                    (list "{\"role\":\"assistant\",\"content\":[{\"type\":\"toolCall\",\"name\":\"t\",\"arguments\":{\"s\":\"\\udc00\",\"k\\ud83d\":1}}]}"
                          "\"[Assistant tool calls]: t(s=\\\"\\\\udc00\\\", k\\ud83d=1)\"")

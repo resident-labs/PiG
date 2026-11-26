@@ -20,7 +20,10 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/orderedjson"
 	"github.com/MichaelKinsy/PiG/internal/sessionentry"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 )
 
 // CurrentSessionVersion mirrors upstream `CURRENT_SESSION_VERSION = 3`.
@@ -136,6 +139,8 @@ func (s *Session) UndecodableCount() int {
 // become orphaned subtrees in the same file).
 type Session struct {
 	mu sync.RWMutex
+	// messageEntries records the entries message_end persisted, with the sequence their message was numbered by (NoteMessageEntry).
+	messageEntries messageEntryLog
 	// appendMu makes writing an entry's record and adding the entry one step, so the file and memory hold the same entries in the same order.
 	appendMu sync.Mutex
 	// projectionCalls counts BuildSessionProjection calls.
@@ -148,6 +153,11 @@ type Session struct {
 	// slots holds every entry in append order; byID maps an id to its newest slot (session-manager.ts byId).
 	slots []entrySlot
 	byID  idIndex
+	// ids holds the id of each slot (entrySlot.idRef), and resident the decoded entry of each slot that has one.
+	ids      idArena
+	resident residentStore
+	// searchRefs holds, by cold part, the reference of each slot's search text (searchAtOf); it is empty until a search first needs one.
+	searchRefs []uint32
 	// danglingParents holds the parentId of each slot whose parent no slot had when it was added (entrySlot.parent).
 	danglingParents map[int32]string
 	// factArena holds the /tree facts of assistant messages (entrySlot.facts, storeFactsLocked).
@@ -155,8 +165,8 @@ type Session struct {
 	// coldChunks hold the slots' cold parts (entrySlot.cold), coldCount of them.
 	coldChunks [][]slotCold
 	coldCount  uint32
-	// backing is the session file; "" keeps every entry resident. The slot offsets locate lines in snapshot, its private copy, or in the
-	// backing file when it has none.
+	// backing is the session file, set only together with a snapshot; "" keeps every entry resident. The slot offsets locate lines in snapshot,
+	// the session's private copy of it, so a change another program makes to the file reaches no read.
 	backing  string
 	snapshot *sessionSnapshot
 	// branch is the slot path of the current leaf (branchLeaf, -1 when there is none) and ctxPath its contextPathIn, maintained as the leaf moves.
@@ -171,6 +181,10 @@ type Session struct {
 	projView    *sessionProjector
 	projGen     uint64
 	projCovered int
+	// ctxEntries holds the entries of ctxPath's first len(ctxEntries) slots, resident, at generation ctxEntriesGen: a read of the current branch (GetContextBranch)
+	// decodes each entry once and extends the list as the leaf's children are appended. mu held for writing guards both.
+	ctxEntries    []SessionEntry
+	ctxEntriesGen uint64
 	// firstKept holds each compaction slot's firstKeptEntryId.
 	firstKept map[int]string
 	// labels is the label each entry carries, from the latest label entry that targets it (session-manager.ts labelsById,
@@ -228,11 +242,15 @@ type Session struct {
 	// name is the name of the newest session_info entry that parses, maintained as entries are appended or loaded, so getSessionName, which every extension event's state carries, does not scan the log.
 	name string
 
+	// renderIdentities holds the identity each custom entry an extension renders is handed, so its renderer's state survives the transcript's
+	// rebuilds as it does in Pi; replaceSessionLog drops them with the entries.
+	renderIdentities entryRenderIdentities
+
 	// revision changes, under mu, whenever the entries or the leaf change, so a caller can reuse a value derived from the branch until the log moves.
 	revision uint64
 }
 
-// sessionClock is the time a new session's header records; tests replace it to make two sessions share a timestamp, as Pi's `new Date()` does for two sessions created in one millisecond.
+// sessionClock is the time a new session's header and a compaction entry record; tests replace it to make two sessions share a timestamp, as Pi's `new Date()` does for two sessions created in one millisecond.
 var sessionClock = time.Now
 
 // NewSession creates an in-memory session with an ISO millisecond header timestamp and an optional parent session path.
@@ -369,6 +387,14 @@ func compactionWithoutRecord(entry SessionEntry, raw []byte) SessionEntry {
 // write that fails leaves memory as the file is (session-manager.ts _appendEntry): the entry is not kept and is not the parent of a later one.
 func (s *Session) appendEntryRecordOf(se SessionEntry, raw []byte, ownMessage bool) error {
 	base := se.Base()
+	if raw == nil && !s.fileless() {
+		// A session that gained a file since the caller left the record out writes it here.
+		encoded, err := marshalSessionLine(se)
+		if err != nil {
+			return fmt.Errorf("session: marshal entry: %w", err)
+		}
+		raw = encoded
+	}
 	if isUndescribed(se) {
 		var strict SessionEntryBase
 		if err := json.Unmarshal(raw, &strict); err != nil {
@@ -507,16 +533,15 @@ func writeRecord(write recordWrite) (writtenRecord, error) {
 		}
 		return writtenRecord{snapshot: snapshot, off: -1}, nil
 	}
-	end, err := appendSessionLine(write.path, write.raw)
-	if err != nil {
+	if _, err := appendSessionLine(write.path, write.raw); err != nil {
 		return writtenRecord{}, err
 	}
-	// The line's place in the snapshot locates its record; without a snapshot, its place in the file does. An entry whose line is in neither
-	// stays resident.
-	off := end - int64(len(write.raw)) - 1
+	// The line's place in the snapshot locates its record. An entry whose line is not in a snapshot (the session has none, or the write to it
+	// failed) stays resident: the file is not a place to read an entry back from, as another program can change it.
+	off := int64(-1)
 	if write.snapshot != nil {
-		if off, err = write.snapshot.add(write.raw); err != nil {
-			off = -1
+		if at, err := write.snapshot.add(write.raw); err == nil {
+			off = at
 		}
 	}
 	return writtenRecord{off: off}, nil
@@ -695,9 +720,7 @@ func (s *Session) appendAgentMessage(msg agent.AgentMessage) (string, error) {
 			}
 			return s.AppendBashExecution(bash)
 		}
-		customType, _ := msg.Custom["customType"].(string)
-		display, _ := msg.Custom["display"].(bool)
-		return s.AppendCustomMessageEntry(customType, msg.Custom["content"], display, msg.Custom["details"])
+		return s.AppendCustomMessage(msg.Custom)
 	}
 	return s.appendMessageEntry(msg)
 }
@@ -712,13 +735,20 @@ func (s *Session) appendMessageEntry(msg agent.AgentMessage) (string, error) {
 	}
 	parent := s.GetLeafID()
 	entry := MessageEntry{
-		SessionEntryBase: SessionEntryBase{
-			Type:      "message",
-			ID:        id,
-			ParentID:  parent,
-			Timestamp: RFC3339NowNano(),
-		},
-		Message: msg,
+		Type:      "message",
+		ID:        id,
+		ParentID:  parent,
+		Timestamp: RFC3339NowNano(),
+		Message:   msg,
+	}
+	// The message's decoded form is proven once: it decides both whether a record is encoded at all and which entry is held.
+	proof := proveHeldEntry(entry)
+	// pig additive (D112): a session without a file writes no record, so a message entry that is held as appended and whose encoding cannot fail is not encoded at all.
+	if s.holdsWithoutRecord(entry, proof) {
+		if err := s.appendEntryRecordOf(entry, nil, true); err != nil {
+			return "", err
+		}
+		return id, nil
 	}
 	// The entry is encoded once: its record is what the session stores, counts, decodes and writes. A message that cannot be encoded is reported as the message's own error.
 	raw, err := marshalSessionLine(entry)
@@ -731,7 +761,7 @@ func (s *Session) appendMessageEntry(msg agent.AgentMessage) (string, error) {
 	// An entry held as appended is held without its record: Pi's session holds the appended object and no encoding of it (session-manager.ts
 	// appendMessage). The record is the encoding of entry's own value, so entry encodes to it again (MessageEntry.MarshalJSON), and every reader
 	// of the entry, eviction and a first write of the file get the record's bytes.
-	held, appended := heldMessageEntry(entry, raw)
+	held, appended := heldMessageEntry(entry, raw, proof)
 	if appended {
 		held = entry
 	}
@@ -741,34 +771,160 @@ func (s *Session) appendMessageEntry(msg agent.AgentMessage) (string, error) {
 	return id, nil
 }
 
-// heldMessageEntry returns the entry the session holds for entry, whose record is raw, and whether that is entry itself (with raw as its
-// record). Pi's session holds the object the agent appended
+// fileless reports whether the session has no file to write: a session made with no path (--no-session, an in-memory manager).
+func (s *Session) fileless() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.path == ""
+}
+
+// heldProof is what a message entry proves, with no record of it decoded, about the entry a session holds for it.
+type heldProof struct {
+	// decoded is the decode of the entry's record, less the record, when the message's decoded form is proven (agent.AgentMessage.DecodedForm).
+	decoded MessageEntry
+	proven  bool
+	// appended reports that the decode holds what the entry holds, so the session holds the entry itself. besideDetails reports that this is
+	// proven apart from a tool result's Details, a Go value whose JSON the decode holds (decodedFormBesideDetails).
+	appended      bool
+	besideDetails bool
+}
+
+// proveHeldEntry is the proof for entry; the zero proof says that only a decode of the record tells what the session holds. An append makes it
+// once, before the record exists, and both holdsWithoutRecord and heldMessageEntry decide from it: the entry's record, whatever it is, sits on
+// both sides of the comparison heldMessageEntry would make, so the comparison is made without it.
+func proveHeldEntry(entry MessageEntry) heldProof {
+	bare := sessionentry.WithRecord(entry, nil)
+	if form, ok := entry.Message.DecodedForm(); ok {
+		decoded, ok := sessionentry.NewDecodedMessageEntry(entry.SessionEntryBase, form, nil)
+		if !ok {
+			return heldProof{}
+		}
+		// A proven form's Details are the message's own (nil, a scalar, canonical raw JSON), so decodesToAppended's rule for Details adds nothing here.
+		return heldProof{decoded: decoded, proven: true, appended: sameMessageEntry(decoded, bare)}
+	}
+	form, ok := decodedFormBesideDetails(entry.Message)
+	if !ok {
+		return heldProof{}
+	}
+	decoded, ok := sessionentry.NewDecodedMessageEntry(entry.SessionEntryBase, form, nil)
+	if !ok {
+		return heldProof{}
+	}
+	// The decode is form with the Details' JSON decoded into it, so it holds what entry holds exactly when form does with entry's Details
+	// left out, which is decodesToAppended's rule for Details.
+	result := *entry.Message.ToolResult
+	result.Details = nil
+	bare.Message.ToolResult = &result
+	if !sameMessageEntry(decoded, bare) {
+		return heldProof{}
+	}
+	return heldProof{appended: true, besideDetails: true}
+}
+
+// sameMessageEntry is reflect.DeepEqual of the two entries. It compares them through pointers into one allocation: an entry passed to
+// DeepEqual as an interface value is an allocation of its own.
+func sameMessageEntry(a, b MessageEntry) bool {
+	pair := &[2]MessageEntry{a, b}
+	return reflect.DeepEqual(&pair[0], &pair[1])
+}
+
+// holdsWithoutRecord reports whether the session of no file holds entry exactly as appended, with no record to write, and with the entry
+// encoding without error, which is what heldMessageEntry decides from a record's decode. It is the case heldMessageEntry returns entry for
+// (proof, the proof for entry, says its decoded form equals entry), minus the encoding that only the file needs. A message whose Details are a
+// Go value of a type that can hold a value the encoder rejects encodes them once here, because only the encoding says whether they can be
+// encoded; Details of a type whose every value encodes (alwaysEncodes: the built-in tools' details) are not encoded at all. The other
+// members are proven by decodedFormBesideDetails.
+// pig additive (D112): Pi appends the object and stringifies it only to persist (session-manager.ts _persist returns without a session file).
+func (s *Session) holdsWithoutRecord(entry MessageEntry, proof heldProof) bool {
+	if !proof.appended || !s.fileless() {
+		return false
+	}
+	if !proof.besideDetails {
+		return true
+	}
+	if alwaysEncodes(reflect.TypeOf(entry.Message.ToolResult.Details)) {
+		return true
+	}
+	_, err := jsstring.MarshalJSON(entry.Message.ToolResult.Details)
+	return err == nil
+}
+
+// encodableTypes remembers alwaysEncodes for each type asked about: reflect.Type -> bool.
+var encodableTypes sync.Map
+
+// alwaysEncodes reports whether the JSON encoder writes every value of type t without an error, decided from the type alone and once for
+// each type. It holds for a type built only from booleans, numbers, plain strings, and pointers to, slices, arrays and structs of those:
+// such a value has no number the encoder rejects, no key or member with an encoding of its own that can fail, no dynamic type to meet
+// and, as no such type holds itself, no cycle. It reports false for every other type (an interface, a map, a named string such
+// as a JSON number, a type with its own JSON or text encoding, a type that refers to itself), which is then encoded to find out.
+func alwaysEncodes(t reflect.Type) bool {
+	if t == nil {
+		return false
+	}
+	if known, ok := encodableTypes.Load(t); ok {
+		return known.(bool)
+	}
+	result := typeAlwaysEncodes(t, map[reflect.Type]bool{})
+	encodableTypes.Store(t, result)
+	return result
+}
+
+var plainStringType = reflect.TypeFor[string]()
+
+// typeAlwaysEncodes is alwaysEncodes without the memo; within holds the types the walk is inside.
+func typeAlwaysEncodes(t reflect.Type, within map[reflect.Type]bool) bool {
+	if within[t] {
+		return false
+	}
+	p := reflect.PointerTo(t)
+	if t.Implements(jsonMarshalerType) || p.Implements(jsonMarshalerType) || t.Implements(textMarshalerType) || p.Implements(textMarshalerType) {
+		return false
+	}
+	switch t.Kind() {
+	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		// A number that is not finite is written as null, as JSON.stringify writes it (jsstring.MarshalJSON).
+		return true
+	case reflect.String:
+		return t == plainStringType
+	case reflect.Pointer, reflect.Slice, reflect.Array:
+		within[t] = true
+		defer delete(within, t)
+		return typeAlwaysEncodes(t.Elem(), within)
+	case reflect.Struct:
+		within[t] = true
+		defer delete(within, t)
+		for field := range t.Fields() {
+			// A field the encoder does not write holds nothing it can reject; an embedded struct's exported fields are written.
+			if !field.IsExported() && !field.Anonymous {
+				continue
+			}
+			if _, options, _ := strings.Cut(field.Tag.Get("json"), ","); options != "" && options != "omitempty" && options != "omitzero" {
+				return false
+			}
+			if !typeAlwaysEncodes(field.Type, within) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// heldMessageEntry returns the entry the session holds for entry, whose record is raw and whose proof is proof, and whether that is entry
+// itself (with raw as its record). Pi's session holds the object the agent appended
 // (session-manager.ts appendMessage); the record's decode is held instead when it differs from that message in Go: an absent usage, a
 // streaming view. A message whose decoded form is proven, or a tool result whose decoded form is proven apart from its Details (a tool's typed
 // details), needs no decode of the record just encoded.
-func heldMessageEntry(entry MessageEntry, raw json.RawMessage) (SessionEntry, bool) {
+func heldMessageEntry(entry MessageEntry, raw json.RawMessage, proof heldProof) (SessionEntry, bool) {
 	shared := sessionentry.WithRecord(entry, raw)
-	var se SessionEntry
-	if form, ok := entry.Message.DecodedForm(); ok {
-		if decoded, ok := sessionentry.NewDecodedMessageEntry(entry.SessionEntryBase, form, raw); ok {
-			se = decoded
-		}
-	} else if form, ok := decodedFormBesideDetails(entry.Message); ok {
-		// The decode is form with the Details' JSON decoded into it, so it holds what entry holds exactly when form does with entry's Details
-		// left out, which is decodesToAppended's rule for Details.
-		if decoded, ok := sessionentry.NewDecodedMessageEntry(entry.SessionEntryBase, form, raw); ok {
-			result := *entry.Message.ToolResult
-			result.Details = nil
-			stripped := entry
-			stripped.Message.ToolResult = &result
-			if reflect.DeepEqual(SessionEntry(decoded), SessionEntry(sessionentry.WithRecord(stripped, raw))) {
-				return shared, true
-			}
-		}
+	switch {
+	case proof.appended:
+		return shared, true
+	case proof.proven:
+		return sessionentry.WithRecord(proof.decoded, raw), false
 	}
-	if se == nil {
-		se = sessionentry.DecodeSessionEntry(raw)
-	}
+	se := sessionentry.DecodeSessionEntry(raw)
 	if decodesToAppended(se, shared) {
 		return shared, true
 	}
@@ -844,29 +1000,31 @@ func decodesToAppended(decoded SessionEntry, appended MessageEntry) bool {
 // AppendCustomMessageEntry persists an extension-injected custom message as a
 // "custom_message" entry and returns the new entry id.
 func (s *Session) AppendCustomMessageEntry(customType string, content any, display bool, details any) (string, error) {
-	entry, err := s.customMessageEntry(customType, content, display, details, true)
+	entry, err := s.customMessageEntry(CustomMessageEntry{CustomType: customType, Content: content, Display: display, Details: details}, true)
 	return entry.ID, err
 }
 
-func (s *Session) customMessageEntry(customType string, content any, display bool, details any, persist bool) (CustomMessageEntry, error) {
+// AppendCustomMessage persists a custom agent message as its "custom_message" entry, with the members the message holds: Pi's
+// appendCustomMessageEntry(message.customType, message.content, message.display, message.details) stores a member the message lacks as undefined, so the
+// entry of a message without display has no display member (agent-session.ts:1217, 2499).
+func (s *Session) AppendCustomMessage(custom map[string]any) (string, error) {
+	customType, _ := custom["customType"].(string)
+	display, _ := custom["display"].(bool)
+	_, hasDisplay := custom["display"]
+	entry, err := s.customMessageEntry(CustomMessageEntry{CustomType: customType, Content: custom["content"], Display: display, DisplayAbsent: !hasDisplay, DisplayNull: orderedjson.IsNull(custom["display"]), Details: custom["details"]}, true)
+	return entry.ID, err
+}
+
+// customMessageEntry is the entry of members, which hold the customType, content, display and details; the session sets the type, the identity and the time.
+func (s *Session) customMessageEntry(members CustomMessageEntry, persist bool) (CustomMessageEntry, error) {
 	s.leafAppendMu.Lock()
 	defer s.leafAppendMu.Unlock()
 	id, err := s.generateEntryID()
 	if err != nil {
 		return CustomMessageEntry{}, err
 	}
-	entry := CustomMessageEntry{
-		SessionEntryBase: SessionEntryBase{
-			Type:      "custom_message",
-			ID:        id,
-			ParentID:  s.GetLeafID(),
-			Timestamp: RFC3339NowNano(),
-		},
-		CustomType: customType,
-		Content:    content,
-		Display:    display,
-		Details:    details,
-	}
+	entry := members
+	entry.SessionEntryBase = SessionEntryBase{Type: "custom_message", ID: id, ParentID: s.GetLeafID(), Timestamp: RFC3339NowNano()}
 	if persist {
 		if err := s.AppendEntry(entry); err != nil {
 			return CustomMessageEntry{}, err
@@ -891,7 +1049,7 @@ func (s *Session) AppendSessionInfoName(name string) (id, current string, err er
 	if err != nil {
 		return "", "", err
 	}
-	entry := SessionInfoEntry{SessionEntryBase: SessionEntryBase{Type: "session_info", ID: id, ParentID: s.GetLeafID(), Timestamp: RFC3339NowNano()}, Name: name}
+	entry := SessionInfoEntry{Type: "session_info", ID: id, ParentID: s.GetLeafID(), Timestamp: RFC3339NowNano(), Name: name}
 	if err := s.AppendEntry(entry); err != nil {
 		return "", "", err
 	}
@@ -920,7 +1078,7 @@ func (s *Session) AppendCustomEntry(customType string, data any) (string, error)
 	if err != nil {
 		return "", err
 	}
-	entry := CustomEntry{SessionEntryBase: SessionEntryBase{Type: "custom", ID: id, ParentID: s.GetLeafID(), Timestamp: RFC3339NowNano()}, CustomType: customType, Data: data}
+	entry := CustomEntry{Type: "custom", ID: id, ParentID: s.GetLeafID(), Timestamp: RFC3339NowNano(), CustomType: customType, Data: data}
 	if err := s.AppendEntry(entry); err != nil {
 		return "", err
 	}
@@ -938,12 +1096,10 @@ func (s *Session) AppendBashExecution(message BashExecutionMessage) (string, err
 	}
 	parent := s.GetLeafID()
 	entry := BashExecutionEntry{
-		SessionEntryBase: SessionEntryBase{
-			Type:      "message",
-			ID:        id,
-			ParentID:  parent,
-			Timestamp: RFC3339NowNano(),
-		},
+		Type:               "message",
+		ID:                 id,
+		ParentID:           parent,
+		Timestamp:          RFC3339NowNano(),
 		Role:               "bashExecution",
 		Command:            message.Command,
 		Output:             message.Output,
@@ -1006,14 +1162,12 @@ func (s *Session) AppendModelChange(provider, modelID string) (string, error) {
 		return "", err
 	}
 	entry := ModelChangeEntry{
-		SessionEntryBase: SessionEntryBase{
-			Type:      "model_change",
-			ID:        id,
-			ParentID:  s.GetLeafID(),
-			Timestamp: RFC3339NowNano(),
-		},
-		Provider: provider,
-		ModelID:  modelID,
+		Type:      "model_change",
+		ID:        id,
+		ParentID:  s.GetLeafID(),
+		Timestamp: RFC3339NowNano(),
+		Provider:  provider,
+		ModelID:   modelID,
 	}
 	if err := s.AppendEntry(entry); err != nil {
 		return "", err
@@ -1032,12 +1186,10 @@ func (s *Session) AppendThinkingLevelChange(level string) (string, error) {
 		return "", err
 	}
 	entry := ThinkingLevelEntry{
-		SessionEntryBase: SessionEntryBase{
-			Type:      "thinking_level_change",
-			ID:        id,
-			ParentID:  s.GetLeafID(),
-			Timestamp: RFC3339NowNano(),
-		},
+		Type:          "thinking_level_change",
+		ID:            id,
+		ParentID:      s.GetLeafID(),
+		Timestamp:     RFC3339NowNano(),
 		ThinkingLevel: level,
 	}
 	return id, s.AppendEntry(entry)
@@ -1054,17 +1206,15 @@ func (s *Session) AppendUsage(kind, provider, model string, usage ai.Usage, note
 		return UsageEntry{}, err
 	}
 	entry := UsageEntry{
-		SessionEntryBase: SessionEntryBase{
-			Type:      "usage",
-			ID:        id,
-			ParentID:  s.GetLeafID(),
-			Timestamp: RFC3339NowNano(),
-		},
-		Kind:     kind,
-		Provider: provider,
-		Model:    model,
-		Usage:    usage,
-		Note:     note,
+		Type:      "usage",
+		ID:        id,
+		ParentID:  s.GetLeafID(),
+		Timestamp: RFC3339NowNano(),
+		Kind:      kind,
+		Provider:  provider,
+		Model:     model,
+		Usage:     usage,
+		Note:      note,
 	}
 	if err := s.AppendEntry(entry); err != nil {
 		return UsageEntry{}, err
@@ -1078,25 +1228,26 @@ func (s *Session) AppendUsage(kind, provider, model string, usage ai.Usage, note
 // compaction retains no preceding entries. The entry also records the current
 // projected system state, when there is one, stamped with the entry time.
 func (s *Session) AppendCompaction(summary, firstKeptEntryID string, tokensBefore int, details any, fromHook bool, usage *ai.Usage) (string, error) {
-	return s.appendCompaction(summary, firstKeptEntryID, tokensBefore, details, fromHook, false, usage, nil, nil)
-}
-
-// AppendCompactionWithSections is AppendCompaction whose system message holds sections in place of the current system
-// message's, which the conversation after it starts from. Nil keeps the current ones. A non-nil tools, even an empty one, is
-// the tool declarations of the head in place of the transcript's; nil keeps the transcript's.
-//
-// dyna patch P7, P11 (PATCHES.md): a session with context updates folds its current sections and its executable tools into each compaction's head.
-func (s *Session) AppendCompactionWithSections(summary, firstKeptEntryID string, tokensBefore int, details any, fromHook bool, usage *ai.Usage, sections ai.OrderedSections, tools []ai.ToolSchema) (string, error) {
-	return s.appendCompaction(summary, firstKeptEntryID, tokensBefore, details, fromHook, false, usage, sections, tools)
+	return s.AppendCompactionEntry(CompactionEntry{Summary: summary, FirstKeptEntryID: firstKeptEntryID, TokensBefore: tokensBefore, Details: details, Usage: usage, FromHook: fromHook})
 }
 
 // AppendCompactionHookUndefined is AppendCompaction for a caller that leaves fromHook undefined, as an extension's SessionManager.appendCompaction may: the entry then has no fromHook member.
 func (s *Session) AppendCompactionHookUndefined(summary, firstKeptEntryID string, tokensBefore int, details any, usage *ai.Usage) (string, error) {
-	return s.appendCompaction(summary, firstKeptEntryID, tokensBefore, details, false, true, usage, nil, nil)
+	return s.AppendCompactionEntry(CompactionEntry{Summary: summary, FirstKeptEntryID: firstKeptEntryID, TokensBefore: tokensBefore, Details: details, Usage: usage, FromHookAbsent: true})
 }
 
-func (s *Session) appendCompaction(summary, firstKeptEntryID string, tokensBefore int, details any, fromHook, fromHookUndefined bool, usage *ai.Usage, sections ai.OrderedSections, tools []ai.ToolSchema) (string, error) {
-	now := time.Now().UTC()
+// AppendCompactionEntry is AppendCompaction with the members as members holds them: its summary, firstKeptEntryId, tokensBefore, details, usage and fromHook, so a
+// caller that read them from an extension's JSON keeps a usage written as null (UsageNull) and an absent fromHook (FromHookAbsent). The session sets the type,
+// the identity, the time and the system message.
+func (s *Session) AppendCompactionEntry(members CompactionEntry) (string, error) {
+	return s.AppendCompactionWithSections(members, nil, nil)
+}
+
+// AppendCompactionWithSections records a compaction with the provided system sections and tool declarations. Nil retains the corresponding transcript state.
+//
+// dyna patch P7, P11 (PATCHES.md): a session with context updates folds its current sections and its executable tools into each compaction's head.
+func (s *Session) AppendCompactionWithSections(members CompactionEntry, sections ai.OrderedSections, tools []ai.ToolSchema) (string, error) {
+	now := sessionClock().UTC()
 	// compactionSystemMessage only reads the context's latest system message, so it reads the kept projection rather than a copy of the
 	// whole context projected again.
 	systemMessage, err := compactionSystemMessage(s.BuildSessionProjectionView().Messages, now.UnixMilli(), sections, tools)
@@ -1109,25 +1260,12 @@ func (s *Session) appendCompaction(summary, firstKeptEntryID string, tokensBefor
 	if err != nil {
 		return "", err
 	}
-	if firstKeptEntryID == "" {
-		firstKeptEntryID = id
+	entry := members
+	entry.SessionEntryBase = SessionEntryBase{Type: "compaction", ID: id, ParentID: s.GetLeafID(), Timestamp: now.Format("2006-01-02T15:04:05.000Z")}
+	if entry.FirstKeptEntryID == "" {
+		entry.FirstKeptEntryID = id
 	}
-	entry := CompactionEntry{
-		SessionEntryBase: SessionEntryBase{
-			Type:      "compaction",
-			ID:        id,
-			ParentID:  s.GetLeafID(),
-			Timestamp: now.Format("2006-01-02T15:04:05.000Z"),
-		},
-		Summary:          summary,
-		FirstKeptEntryID: firstKeptEntryID,
-		TokensBefore:     tokensBefore,
-		Details:          details,
-		Usage:            usage,
-		FromHook:         fromHook,
-		FromHookAbsent:   fromHookUndefined,
-		SystemMessage:    systemMessage,
-	}
+	entry.SystemMessage = systemMessage
 	if err := s.AppendEntry(entry); err != nil {
 		return "", err
 	}
@@ -1142,6 +1280,12 @@ func (s *Session) appendCompaction(summary, firstKeptEntryID string, tokensBefor
 // Mirrors upstream branchWithSummary(branchFromId: string | null, ...) in
 // session-manager.ts.
 func (s *Session) BranchWithSummary(parentID *string, summary string, details any, fromHook bool, usage *ai.Usage) (string, error) {
+	return s.BranchWithSummaryEntry(parentID, BranchSummaryEntry{Summary: summary, Details: details, Usage: usage, FromHook: fromHook})
+}
+
+// BranchWithSummaryEntry is BranchWithSummary with the members as members holds them: its summary, details, usage and fromHook, so a caller that read them from
+// an extension's JSON keeps a usage written as null (UsageNull). The session sets the type, the identity, the time, the parent and fromId.
+func (s *Session) BranchWithSummaryEntry(parentID *string, members BranchSummaryEntry) (string, error) {
 	s.leafAppendMu.Lock()
 	defer s.leafAppendMu.Unlock()
 	s.mu.RLock()
@@ -1161,19 +1305,10 @@ func (s *Session) BranchWithSummary(parentID *string, summary string, details an
 	if err != nil {
 		return "", err
 	}
-	entry := BranchSummaryEntry{
-		SessionEntryBase: SessionEntryBase{
-			Type:      "branch_summary",
-			ID:        id,
-			ParentID:  parentID, // nil = root-level entry
-			Timestamp: RFC3339NowNano(),
-		},
-		FromID:   fromID,
-		Summary:  summary,
-		Details:  details,
-		FromHook: fromHook,
-		Usage:    usage,
-	}
+	entry := members
+	// A nil parent is a root-level entry.
+	entry.SessionEntryBase = SessionEntryBase{Type: "branch_summary", ID: id, ParentID: parentID, Timestamp: RFC3339NowNano()}
+	entry.FromID = fromID
 	if err := s.AppendEntry(entry); err != nil {
 		return "", err
 	}
@@ -1183,6 +1318,13 @@ func (s *Session) BranchWithSummary(parentID *string, summary string, details an
 // AppendLabelChange writes a label entry for targetID and returns its id. label=nil clears
 // any existing label. Mirrors upstream appendLabelChange in session-manager.ts.
 func (s *Session) AppendLabelChange(targetID string, label *string) (string, error) {
+	return s.AppendLabelEntry(LabelEntry{TargetID: targetID, Label: label})
+}
+
+// AppendLabelEntry is AppendLabelChange with the members as members holds them: its targetId and label, so a caller keeps a label written as null (LabelNull),
+// which clears the label as an absent one does. The session sets the type, the identity and the time.
+func (s *Session) AppendLabelEntry(members LabelEntry) (string, error) {
+	targetID := members.TargetID
 	s.mu.RLock()
 	_, ok := s.slotOf(targetID)
 	s.mu.RUnlock()
@@ -1195,16 +1337,8 @@ func (s *Session) AppendLabelChange(targetID string, label *string) (string, err
 	if err != nil {
 		return "", err
 	}
-	entry := LabelEntry{
-		SessionEntryBase: SessionEntryBase{
-			Type:      "label",
-			ID:        id,
-			ParentID:  s.GetLeafID(),
-			Timestamp: RFC3339NowNano(),
-		},
-		TargetID: targetID,
-		Label:    label,
-	}
+	entry := members
+	entry.SessionEntryBase = SessionEntryBase{Type: "label", ID: id, ParentID: s.GetLeafID(), Timestamp: RFC3339NowNano()}
 	return id, s.AppendEntry(entry)
 }
 
@@ -1322,7 +1456,7 @@ func (s *Session) BuildSessionProjection() SessionProjection {
 		return buildSessionProjection(nil, s.messageFor, true)
 	}
 	entries := s.entriesAtLocked(indexes)
-	if s.branchLeaf >= 0 && s.slots[s.branchLeaf].id == *s.leafID && s.slotOrZero(*s.leafID) == s.branchLeaf {
+	if s.branchLeaf >= 0 && s.idAt(s.branchLeaf) == *s.leafID && s.slotOrZero(*s.leafID) == s.branchLeaf {
 		s.retainReadLocked(indexes, entries)
 	}
 	return buildSessionProjection(entries, s.messageFor, true)
@@ -1339,7 +1473,7 @@ func (s *Session) BuildSessionProjectionView() SessionProjection {
 	if s.leafID == nil {
 		return SessionProjection{ThinkingLevel: "off"}
 	}
-	if s.branchLeaf < 0 || s.slots[s.branchLeaf].id != *s.leafID || s.slotOrZero(*s.leafID) != s.branchLeaf {
+	if s.branchLeaf < 0 || s.idAt(s.branchLeaf) != *s.leafID || s.slotOrZero(*s.leafID) != s.branchLeaf {
 		return buildSessionProjection(s.contextPathToLocked(*s.leafID), s.messageFor, false)
 	}
 	s.projMu.Lock()
@@ -1387,12 +1521,39 @@ func (s *Session) BuildContextEntries() []SessionEntry {
 // API. buildSessionProjection, getSessionContextSettings, prepareCompaction, the newest assistant usage and the newest compaction or model
 // selection read the same from it as from GetBranch, without reading history the context no longer holds. Nil when there is no leaf.
 func (s *Session) GetContextBranch() []SessionEntry {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.leafID == nil {
 		return nil
 	}
+	if s.branchLeaf >= 0 && s.idAt(s.branchLeaf) == *s.leafID && s.slotOrZero(*s.leafID) == s.branchLeaf {
+		return slices.Clone(s.currentContextEntriesLocked())
+	}
 	return s.contextPathToLocked(*s.leafID)
+}
+
+// currentContextEntriesLocked returns the entries of ctxPath, the current branch's context path. An entry is read from the backing file and made
+// resident the first time the branch is read, as a prompt's projection does (retainReadLocked), and the list is extended by the entries appended
+// to the leaf, so a turn on a resumed session reads only its own entries and not every record of the history again. The result is the cache's
+// own list, valid until s.mu is released. The caller holds s.mu for writing.
+func (s *Session) currentContextEntriesLocked() []SessionEntry {
+	if s.ctxEntriesGen != s.ctxGen || len(s.ctxEntries) > len(s.ctxPath) {
+		s.ctxEntries, s.ctxEntriesGen = nil, s.ctxGen
+	}
+	covered := len(s.ctxEntries)
+	if covered == len(s.ctxPath) {
+		return s.ctxEntries
+	}
+	indexes := s.ctxPath[covered:]
+	entries := s.entriesAtLocked(indexes)
+	s.retainReadLocked(indexes, entries)
+	for k, idx := range indexes {
+		if resident := s.resident.get(int(idx)); resident != nil {
+			entries[k] = resident
+		}
+	}
+	s.ctxEntries = append(s.ctxEntries, entries...)
+	return s.ctxEntries
 }
 
 // contextPathToLocked returns the entries of contextPathIn for the path ending at leafID. The caller holds s.mu.
@@ -1440,10 +1601,10 @@ func (s *Session) treeOfLocked(entries []SessionEntry) []*SessionTreeNode {
 	start := make([]int32, len(entries)+1)
 	var roots []*SessionTreeNode
 	for i := range entries {
-		slot := &s.slots[i]
-		node[i], parent[i] = int32(s.slotOrZero(slot.id)), -1
+		id := s.idAt(i)
+		node[i], parent[i] = int32(s.slotOrZero(id)), -1
 		parentID, has := s.parentIDLocked(i)
-		if !has || parentID == slot.id {
+		if !has || parentID == id {
 			roots = append(roots, &all[node[i]])
 			continue
 		}
@@ -1473,7 +1634,7 @@ func (s *Session) treeOfLocked(entries []SessionEntry) []*SessionTreeNode {
 			continue
 		}
 		// getTree sorts each node's children oldest first by Date.parse of their timestamps, keeping the order of unparsable ones.
-		slices.SortStableFunc(kids, func(a, b int32) int { return cmpDates(s.slots[a].ts, s.slots[b].ts) })
+		sortx.Stable(kids, func(a, b int32) int { return cmpDates(s.slots[a].ts, s.slots[b].ts) })
 		out := pointers[start[p]:start[p+1]:start[p+1]]
 		for k, c := range kids {
 			out[k] = &all[c]

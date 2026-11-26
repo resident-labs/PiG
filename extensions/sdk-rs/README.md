@@ -16,7 +16,7 @@ The crate documentation (`cargo doc`; `cargo test --doc` runs the truncation exa
 
 ## Breaking changes in 0.3.0
 
-Host-backed `Context` getters return `io::Result` and never an empty value or default; Pi's `undefined` is `Option::None` (`get_session_name`, `get_session_file`, `get_leaf_id`, `get_flag`, `get_context_usage`, `get_model_info`). `get_branch` and `get_entries` return the session-log subscription failure. `ExecOptions.timeout`, `ExecOptions.max_buffer` and `DialogOptions.timeout` are `Option<f64>` (`max_buffer` caps stdout and stderr together; past it the command is terminated and `ExecResult.truncated` is set), a command that ignores SIGTERM is killed five seconds later, and `ToolDefinition.constrained_sampling` is `Option<ToolConstrainedSampling>`. See the migration tables in `docs/site/docs/extensions.md`.
+Host-backed `Context` getters return `io::Result` and never an empty value or default; Pi's `undefined` is `Option::None` (`get_session_name`, `get_session_file`, `get_leaf_id`, `get_flag`, `get_context_usage`, `get_model_info`). `get_model_info`, `get_session_id`, `get_session_name`, `get_session_file` and the session manager's `get_session_id`, `get_session_name` and `get_session_file` are answered from the replicated state (every `ready` and `state_update` snapshot carries the model and the session object: id, name and file) and send no host call once a snapshot arrived; before the first one, and on a `with_session` replacement context, they ask the host. `get_context_usage` stays a host call: the host computes it live from the branch and pushes state only at dispatch boundaries. `get_branch` and `get_entries` return the session-log subscription failure. `ExecOptions.timeout`, `ExecOptions.max_buffer` and `DialogOptions.timeout` are `Option<f64>` (`max_buffer` caps stdout and stderr together; past it the command is terminated and `ExecResult.truncated` is set), a command that ignores SIGTERM is killed five seconds later, and `ToolDefinition.constrained_sampling` is `Option<ToolConstrainedSampling>`. See the migration tables in `docs/site/docs/extensions.md`.
 
 ## Upstream 0.99.1 extension API
 
@@ -52,6 +52,8 @@ Keep the subscription alive until you want to unsubscribe. Return promptly. The 
 
 `JsString::from_units` and `as_units` preserve every unit. `From<&str>` and `From<String>` accept ordinary Rust strings. `to_string` returns an error for unmatched units. `to_string_lossy` explicitly replaces unmatched units for display.
 
+A `String`, `&str` or `serde_json::Value` cannot hold a lone UTF-16 surrogate. A Rust extension receives U+FFFD for a lone surrogate in any frame position that is not a `JsString` and writes it back when it echoes the text, since v0.5.0 (divergence D648); the other SDKs and Pi keep the unit. Use `JsString` where the unit must survive.
+
 Serialize `JsString` directly with `serde_json::to_string` or `serde_json::to_vec`. The result is valid JSON with ordinary `\u` escapes for lone surrogates. Do not first convert it through `serde_json::Value` or `json!`: `Value::String` cannot hold a lone surrogate. The SDK's typed terminal and editor host calls avoid that conversion internally.
 
 ## Mouse input
@@ -64,4 +66,4 @@ A `RemoteComponent` or `ViewComponent` that returns `true` from `handles_mouse` 
 
 ## Child agent sessions
 
-`Context::create_agent_session(CreateAgentSessionOptions { .. })` is Pi's `createAgentSession`: a child agent session over the host's model runtime that the extension prompts (`prompt`, `steer`, `follow_up`), observes (`subscribe`), aborts (`abort`) and disposes (`dispose`), with `custom_tools` served by this extension. Calls block as Pi's Promises resolve; the session ends with the connection. See [Child agent sessions](../../docs/extension-authoring.md#child-agent-sessions-createagentsession).
+`Context::create_agent_session(CreateAgentSessionOptions { .. })` is Pi's `createAgentSession`: a child agent session over the host's model runtime that the extension prompts (`prompt`, `steer`, `follow_up`), observes (`subscribe`), aborts (`abort`) and disposes (`dispose`), with `custom_tools` served by this extension. Calls block as Pi's Promises resolve; the session ends with the connection. The rest of Pi's `AgentSession` members are methods too, read from or applied to the host's session (`current_session_id()`, `current_model()`, `is_idle()`, `get_all_tools()`, `set_model(..)`, `compact(..)`, `execute_bash(..)`, `wait_for_idle()`, the `abort_*` calls and the others, in `child_session_members.rs`); a member Pi awaits blocks, and an abort is called from another thread. See [Child agent sessions](../../docs/extension-authoring.md#child-agent-sessions-createagentsession).

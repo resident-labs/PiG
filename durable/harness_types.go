@@ -7,6 +7,7 @@ import (
 
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/durable/env"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
 // Ports the subset of packages/durable/src/harness/types.ts that packages/durable/src/types.ts references:
@@ -41,6 +42,16 @@ const (
 	WhenIdleReject WhenIdle = "reject"
 )
 
+// OnAbort is what a conversation abort does with a queued input submission (types.ts SubmissionDraft onAbort).
+type OnAbort string
+
+const (
+	// OnAbortWithdraw, the default, settles the queued input unanswered with reason aborted.
+	OnAbortWithdraw OnAbort = "withdraw"
+	// OnAbortKeep leaves the input queued through Conversation.Abort and abort cascades.
+	OnAbortKeep OnAbort = "keep"
+)
+
 // InputEntry is the entry an input is placed as, instead of pi.user: an application kind, and data the transcript shows,
 // such as its author. Its model message is still the input's user message (types.ts InputEntry).
 type InputEntry struct {
@@ -65,10 +76,19 @@ type SubmissionDraft struct {
 	// input never starts a run of its own. With WhenBusy steer it steers the current run or is refused; a run that
 	// answered and waits for its afterRun tasks is still busy, and such an input queues and starts the next run.
 	WhenIdle WhenIdle
+	// OnAbort is what Conversation.Abort and abort cascades do with the input while it is queued: OnAbortWithdraw, the
+	// default, settles it unanswered with reason aborted; OnAbortKeep leaves it queued, as a failed run leaves its queue
+	// under AfterFailedRun keep, so the next input places it and that run answers it. For input its sender cannot take
+	// back, such as another agent's message. Submission.Abort withdraws it either way. Only input submissions carry it.
+	OnAbort OnAbort
 	// InputEntry places an input as that entry; nil places it as pi.user without data. Only input submissions carry it
 	// (types.ts SubmissionDraft: an input's `entry` is an InputEntry, a write's is an EntryDraft).
 	InputEntry *InputEntry
 	Entry      *EntryDraft
+	// Notify, when the submission settles, delivers SubmissionSettledSignal (the settled record) to Notify.TaskId under
+	// Notify.Key, in the settling commit; a delivery the task refuses (closed, not_found) fails nothing. A submission that
+	// settles before the task sleeps on the key wakes the sleep at once. Nil when absent.
+	Notify *SubmissionNotify
 }
 
 // InputSubmissionDraft is a SubmissionDraft of type input.
@@ -142,7 +162,7 @@ func (control ToolControl) MarshalJSON() ([]byte, error) {
 	if control.AddTools != nil {
 		addTools = &control.AddTools
 	}
-	return json.Marshal(struct {
+	return jsstring.MarshalKeepingSurrogates(struct {
 		AddTools  *[]string `json:"addTools,omitempty"`
 		Terminate bool      `json:"terminate,omitempty"`
 		Handoff   *string   `json:"handoff,omitempty"`
@@ -185,6 +205,43 @@ type ToolExecutionResult struct {
 	// Usage is the spend of the execution itself, such as a model call; stored on the result and in pi.usage.tools.
 	Usage   *ai.Usage
 	Control *ToolControl
+	// Park, when set, parks the call instead of returning a result (spec suspendable §4): no other field may be set, and
+	// a park with one is invalid. Upstream's result and park are distinct object types, and a Go tool returns one struct.
+	Park *ToolPark
+}
+
+// ToolParkSleep is a park's sleep: until Until, for Signals, or both.
+type ToolParkSleep struct {
+	// Checkpoint is what the call parks with, given back as api.Checkpoint on the next run; set only with HasCheckpoint.
+	Checkpoint    JsonValue
+	HasCheckpoint bool
+	Until         *float64
+	Signals       []SignalKey
+}
+
+// ToolParkWait is a park's wait: for tasks the call's task owns.
+type ToolParkWait struct {
+	Checkpoint    JsonValue
+	HasCheckpoint bool
+	On            []TaskId
+	Policy        JoinPolicy
+}
+
+// ToolPark is what Execute returns instead of a result to park the call (spec suspendable §4): Sleep until Until, for
+// Signals, or both; or Wait for tasks the call's task owns; exactly one. The call holds no invocation meanwhile, then runs
+// Execute again with the same arguments, api.Wake saying why, and api.Checkpoint set to the park's checkpoint. Returned
+// by pointer: a wrapper's composite may return only a park its base returned.
+type ToolPark struct {
+	Sleep *ToolParkSleep
+	Wait  *ToolParkWait
+}
+
+// ToolTaskOptions is the options of ToolExecutionApi.CreateTaskErased: the creation options without ConversationId, and
+// the key of the task.
+type ToolTaskOptions struct {
+	TaskOptions
+	// Key records the task under a key of the call; nil when absent.
+	Key *string
 }
 
 // ToolExecutionMode is whether the tools of one round run at once or one after another in call order.
@@ -212,6 +269,10 @@ type ToolExecutionApi interface {
 	TaskId() TaskId
 	ConversationId() ConversationId
 	CallId() string
+	// Wake is why this run started after a park; nil on a fresh call, and in Cancel.
+	Wake() *WakeReason
+	// Checkpoint is what the call last parked with; ok is false on a fresh call or after a park without one.
+	Checkpoint() (value JsonValue, ok bool)
 	// Registry is the tool task's phase snapshot.
 	Registry() RegistrySnapshot
 	// Agent is the calling conversation's agent, as the tool task's phase resolved it.
@@ -243,12 +304,17 @@ type ToolExecutionApi interface {
 	Commit(ctx context.Context, change func(tx Tx) (any, error), options ...CommitOptions) (any, error)
 	// Memo reads a durable memo of the tool task; ok is false when absent.
 	Memo(ctx context.Context, name string) (value JsonValue, ok bool, err error)
-	// MemoCandidate stores candidate unless a memo already exists and returns the durable winner.
 	MemoCandidate(ctx context.Context, name string, candidate JsonValue) (JsonValue, error)
+	// ReadSignalErased is a signal key's committed state in this call's task, as TaskRuntime.ReadSignalErased; ReadSignal
+	// is the typed read.
+	ReadSignalErased(ctx context.Context, token AnySignalSource, key string) (*ErasedSignalState, error)
 	// CreateTaskErased creates a task in one commit in the calling conversation; options.ConversationId is ignored. A
 	// child task of a tool that is not replay-safe defaults to AbandonOnRestart: the tool never resumes after a restart,
-	// so nothing awaits the child then (harness/types.ts:232-234).
-	CreateTaskErased(ctx context.Context, task AnyTask, input JsonValue, options TaskOptions) (TaskId, error)
+	// so nothing awaits the child then (harness/types.ts:232-234). With a Key, validated like a nested call's, the task
+	// is recorded under it in the same commit, and a later call with the key, in this run, a rerun, or a run after a
+	// wake, returns that task; another task kind, other input, or a key a nested call uses fails. After a wake (Wake set)
+	// a key is required.
+	CreateTaskErased(ctx context.Context, task AnyTask, input JsonValue, options ToolTaskOptions) (TaskId, error)
 	// GetTask returns nil when absent.
 	GetTask(ctx context.Context, id TaskId) (*TaskRecord[JsonValue, JsonValue, JsonValue], error)
 	WaitForTask(ctx context.Context, id TaskId) (SettledTask[JsonValue], error)
@@ -261,13 +327,20 @@ type ToolExecutionApi interface {
 	// could not be made or waited for. Calls made without a key are keyed by their order, so a rerun that calls in the
 	// same order reattaches to the calls it made. Cancelling ctx stops only the wait.
 	ExecuteTool(ctx context.Context, name string, args map[string]any, options ...NestedCallOptions) (NestedToolExecutionResult, error)
+	// ExecuteToolNoWait is ExecuteTool with `wait: false`, which upstream's overload types as a call that returns
+	// a NestedToolCall (a Go method has one result type): it returns once the nested call is started or found, with a
+	// handle to its result, so a tool can park on its nested calls (a park's wait.on) and let the Session go idle.
+	// Awaiting a nested call with ExecuteTool holds this call's invocation for as long as it takes, also while it is
+	// parked.
+	ExecuteToolNoWait(ctx context.Context, name string, args map[string]any, options ...NestedCallOptions) (NestedToolCall, error)
 }
 
 // NestedCallOptions are the options of ExecuteTool (types.ts ToolExecutionApi.executeTool).
 type NestedCallOptions struct {
 	// Key names the call among this call's nested calls, so a rerun finds it. It is a path segment of the nested call's
 	// ID: non-empty, without "/", not "__proto__", and not a positive integer, which default keys use. Nil: the call's
-	// order among this call's nested calls.
+	// order among this call's nested calls. After a wake (Wake set) the same position may mean another call, so a key
+	// is required.
 	Key *string
 	// Progress false commits no running output, details, or diagnostics to the call's slot; the result still gets them.
 	Progress *bool
@@ -294,8 +367,20 @@ type NestedToolExecutionResult struct {
 	HasDetails          bool
 	Diagnostics         []ToolDiagnostic
 	Usage               *ai.Usage
-	// DurationMs is the execution time of the attempt that produced the result; nil when it never executed.
+	// DurationMs is the span from the tool task's first run (StartedAt) to its result on the Harness clock, hooks, parks,
+	// crash downtime, and reruns included; results that never executed have one too. A record written before StartedAt
+	// existed keeps the execution time of the last attempt. Nil when absent.
 	DurationMs *int64
+}
+
+// NestedToolCall is a nested call started without waiting for it (ExecuteToolNoWait, upstream's executeTool with wait
+// false).
+type NestedToolCall struct {
+	// TaskId is the nested call's tool task, for a park's wait.on.
+	TaskId TaskId
+	// Result is the stored result once the nested call is terminal; otherwise it waits for it. Cancelling ctx stops only
+	// the wait.
+	Result func(ctx context.Context) (NestedToolExecutionResult, error)
 }
 
 // ToolReplay is whether an interrupted execution may rerun on recovery.
@@ -345,7 +430,13 @@ type ToolRegistration struct {
 	// its exact list or its add, which a tool such as tool_search writes with the addTools control. Other tools can call it
 	// any time.
 	Deferred bool
-	Execute  func(ctx context.Context, args any, api ToolExecutionApi) (ToolExecutionResult, error)
+	// Execute runs the tool and returns its result, or a park (ToolExecutionResult.Park): the call then runs Execute again
+	// once woken.
+	Execute func(ctx context.Context, args any, api ToolExecutionApi) (ToolExecutionResult, error)
+	// Cancel cleans up the external work of a call that parked, when it is aborted while no code of the tool runs (spec
+	// suspendable §4.2): api.Checkpoint is the last park's, api.Wake nil, and it starts no nested calls or tasks. It may
+	// run more than once, so it is idempotent. A failure is reported and the call still ends. Nil when absent.
+	Cancel func(ctx context.Context, args any, api ToolExecutionApi) error
 }
 
 // ToolCaller is a kind of caller a tool admits (types.ts ToolRegistration.callers).
@@ -409,12 +500,24 @@ type SectionWrap struct {
 func (ToolWrap) isWrap()    {}
 func (SectionWrap) isWrap() {}
 
+// ToolNamespace is a named group of tools for code mode: the extension that brings the tools declares it (Ports
+// packages/durable/src/harness/types.ts, Pi 5e24c6b1f). Description is one line, shown in the `codemode` prompt section;
+// Instructions is the longer how-to, returned only by `describeNamespace()` (empty: none); `searchTools()` searches both.
+type ToolNamespace struct {
+	Name         string
+	Description  string
+	Instructions string
+}
+
 // Extension is a named bundle of code, installed in a registry and selected by conversations by name.
 type Extension struct {
-	Name     string
-	Tools    []*ToolRegistration
-	Sections []*PromptSection
-	Hooks    []HookRegistration
+	Name string
+	// Namespace is the code-mode namespace of this extension's tools (a tool named by several extensions belongs to the
+	// first one's). The `codemode` section lists it while the extension is selected, also before it has any tools.
+	Namespace *ToolNamespace
+	Tools     []*ToolRegistration
+	Sections  []*PromptSection
+	Hooks     []HookRegistration
 	// Wraps apply where this extension is selected, in order.
 	Wraps []Wrap
 	// Tasks are resolved by name for every task, whichever conversations select this extension.
@@ -465,12 +568,18 @@ type Agent struct {
 	// MaxTurns is the tool rounds one run takes at most (pi.live.run.turns): the round that reaches it runs its tools, then
 	// the run ends unanswered with turn_limit. An integer, 1 or more; nil, no limit. Task-owned children and forks inherit it.
 	MaxTurns *int
+	// Compaction is this conversation's compaction settings over the harness's (AgentState.compaction); nil when it has none.
+	Compaction *CompactionSettings
 }
 
 // ConversationStreamOptions holds curated pi-ai request options; absent fields use pi-ai defaults.
 type ConversationStreamOptions struct {
 	Transport ai.Transport `json:"transport,omitempty"`
 	TimeoutMs *int         `json:"timeoutMs,omitempty"`
+	// WebsocketConnectTimeoutMs is the WebSocket connection/open handshake timeout; stream idleness uses TimeoutMs.
+	WebsocketConnectTimeoutMs *int `json:"websocketConnectTimeoutMs,omitempty"`
+	// ThinkingBudgets are custom token budgets for thinking levels on token-based providers.
+	ThinkingBudgets *ai.ThinkingBudgets `json:"thinkingBudgets,omitempty"`
 	// MaxRetries is provider/SDK retries inside one request attempt.
 	MaxRetries      *int               `json:"maxRetries,omitempty"`
 	MaxRetryDelayMs *int               `json:"maxRetryDelayMs,omitempty"`
@@ -501,8 +610,8 @@ type CompactionPolicy struct {
 	BackgroundTokens int `json:"backgroundTokens"`
 	// ModelOverrides is the resolved CompactionSettings.modelOverrides, keyed by exact "provider/modelId"; nil without
 	// any. PolicyFor applies it.
-	//portlint:allow emptydrop a nil map is Pi's absent modelOverrides (Settings spreads only the keys a host set); an explicit {} is kept
-	ModelOverrides map[string]CompactionPolicyOverride `json:"modelOverrides,omitzero"`
+	//portlint:allow emptydrop an unset ModelOverrides is Pi's absent modelOverrides (Settings spreads only the keys a host set); an explicit {} is kept
+	ModelOverrides CompactionOverrides `json:"modelOverrides,omitzero"`
 }
 
 // CompactionPolicyOverride is Partial<CompactionPolicy>: one model's entry of modelOverrides; nil fields keep the
@@ -514,25 +623,63 @@ type CompactionPolicyOverride struct {
 	BackgroundTokens *int  `json:"backgroundTokens,omitempty"`
 }
 
-// PolicyFor is compaction.ts compactionPolicy: the model's modelOverrides entry over the Harness-wide policy, field by
-// field. The result carries no overrides.
-func (policy CompactionPolicy) PolicyFor(model ModelRef) CompactionPolicy {
-	resolved := CompactionPolicy{Enabled: policy.Enabled, ReserveTokens: policy.ReserveTokens, KeepRecentTokens: policy.KeepRecentTokens, BackgroundTokens: policy.BackgroundTokens}
-	override, ok := policy.ModelOverrides[model.Provider+"/"+model.ModelId]
-	if !ok {
-		return resolved
+// CompactionSettings is Pi's CompactionSettings: Partial<CompactionPolicy> plus modelOverrides, of the Harness
+// (HarnessSettings.Compaction) or of one conversation (AgentState.Compaction). Nil fields are unset. ModelOverrides is keyed
+// by exact "provider/modelId"; each field an entry sets replaces the general one for that model.
+type CompactionSettings struct {
+	Enabled          *bool `json:"enabled,omitempty"`
+	ReserveTokens    *int  `json:"reserveTokens,omitempty"`
+	KeepRecentTokens *int  `json:"keepRecentTokens,omitempty"`
+	BackgroundTokens *int  `json:"backgroundTokens,omitempty"`
+	//portlint:allow emptydrop an unset ModelOverrides is Pi's absent modelOverrides; an explicit {} is stored as {}
+	ModelOverrides CompactionOverrides `json:"modelOverrides,omitzero"`
+}
+
+// own is the settings' own fields as a layer of the resolution.
+func (settings *CompactionSettings) own() CompactionPolicyOverride {
+	return CompactionPolicyOverride{Enabled: settings.Enabled, ReserveTokens: settings.ReserveTokens, KeepRecentTokens: settings.KeepRecentTokens, BackgroundTokens: settings.BackgroundTokens}
+}
+
+// PolicyFor is compaction.ts compactionPolicy, field by field: the conversation's modelOverrides entry for the model, the
+// Harness's, the conversation's own fields, then the Harness-wide policy. A model-specific value beats a general one, and the
+// conversation beats the Harness at the same level; the exception is the conversation's own enabled: false, which also beats
+// the Harness's model override, since turning compaction off for a conversation does not depend on the model. The result
+// carries no overrides.
+func (policy CompactionPolicy) PolicyFor(model ModelRef, conversation *CompactionSettings) CompactionPolicy {
+	key := model.Provider + "/" + model.ModelId
+	var layers [3]CompactionPolicyOverride
+	var conversationModel CompactionPolicyOverride
+	if conversation != nil {
+		conversationModel, _ = conversation.ModelOverrides.Get(key)
+		layers[0], layers[2] = conversationModel, conversation.own()
 	}
-	if override.Enabled != nil {
-		resolved.Enabled = *override.Enabled
+	layers[1], _ = policy.ModelOverrides.Get(key)
+	field := func(pick func(CompactionPolicyOverride) *int, harness int) int {
+		for _, layer := range layers {
+			if value := pick(layer); value != nil {
+				return *value
+			}
+		}
+		return harness
 	}
-	if override.ReserveTokens != nil {
-		resolved.ReserveTokens = *override.ReserveTokens
+	resolved := CompactionPolicy{
+		ReserveTokens:    field(func(layer CompactionPolicyOverride) *int { return layer.ReserveTokens }, policy.ReserveTokens),
+		KeepRecentTokens: field(func(layer CompactionPolicyOverride) *int { return layer.KeepRecentTokens }, policy.KeepRecentTokens),
+		BackgroundTokens: field(func(layer CompactionPolicyOverride) *int { return layer.BackgroundTokens }, policy.BackgroundTokens),
 	}
-	if override.KeepRecentTokens != nil {
-		resolved.KeepRecentTokens = *override.KeepRecentTokens
-	}
-	if override.BackgroundTokens != nil {
-		resolved.BackgroundTokens = *override.BackgroundTokens
+	switch {
+	case conversationModel.Enabled != nil:
+		resolved.Enabled = *conversationModel.Enabled
+	case conversation != nil && conversation.Enabled != nil && !*conversation.Enabled:
+		resolved.Enabled = false
+	default:
+		resolved.Enabled = policy.Enabled
+		for _, layer := range layers {
+			if layer.Enabled != nil {
+				resolved.Enabled = *layer.Enabled
+				break
+			}
+		}
 	}
 	return resolved
 }

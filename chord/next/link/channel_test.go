@@ -16,8 +16,8 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/link"
 )
 
-// pi: packages/chord/src/next/link/channel.ts
-// Ports packages/chord/test/next/link/channel.test.ts at the channel's own level: the handshake, checks, the
+// pi: packages/chord/src/link/channel.ts
+// Ports packages/chord/test/link/channel.test.ts at the channel's own level: the handshake, checks, the
 // heartbeat, trusted links, and in-order handling while a message waits for an asynchronous inflate. The cases that
 // run a host over the channel (the queued messages before the peer's hello, the heartbeat references going loading, one timer
 // per host, the numbers from the host's options, the codec mismatch between two hosts) are in chord/next/host/host_channel_test.go;
@@ -185,6 +185,15 @@ func TestTheHandshake(t *testing.T) {
 			}
 		})
 
+		t.Run("opens on a hello without a call window (a trusted peer's), PeerCalls 0", func(t *testing.T) {
+			setup := openChannel(t, codec, false, false)
+			setup.peer.send(&link.HelloMessage{Protocol: data.ProtocolVersion, Incarnation: rawPeerIncarnation})
+			transported(setup.ends, setup.peerEnd)
+			if !setup.channel.Opened() || setup.channel.PeerCalls() != 0 || len(setup.reports.messages()) != 0 {
+				t.Fatalf("opened = %v, calls = %d, reports = %v", setup.channel.Opened(), setup.channel.PeerCalls(), setup.reports.messages())
+			}
+		})
+
 		t.Run("queues what a side sends until the peer's hello", func(t *testing.T) {
 			setup := openChannel(t, codec, false, false)
 			requireNoError(t, setup.channel.Send(&link.ReleaseMessage{Hold: 1}))
@@ -202,7 +211,12 @@ func TestTheHandshake(t *testing.T) {
 }
 
 func TestACodecMismatchOfChannels(t *testing.T) {
-	a, b := link.MemoryLinkPair()
+	// Pi's hellos are microtasks: neither is delivered before the code that started both channels finished. On the pair's own
+	// queue a delivery goroutine can run between left.Start and right.Start, or inside right.Start between its hello and its
+	// listeners, and close the link under the second channel before it listens (a test goroutine that is descheduled there
+	// reports nothing for that side): the test runs the queue itself (fifoQueue).
+	queue := &fifoQueue{}
+	a, b := link.MemoryLinkPairOn(queue.post, queue.run)
 	first, second := &reports{}, &reports{}
 	left, err := link.NewChannel(a, &recordingHandler{}, link.ChannelOptions{Codec: link.BinaryCodec, Incarnation: incarnation, Calls: 1, Report: first.add}, background)
 	requireNoError(t, err)
@@ -223,12 +237,12 @@ func TestTheHeartbeat(t *testing.T) {
 	eachCodec(t, func(t *testing.T, codec link.Codec) {
 		t.Run("closes a link whose peer never sends hello after 30 s (race 30)", func(t *testing.T) {
 			setup := openChannel(t, codec, false, false)
-			setup.channel.Tick(29_000, 15_000, 30_000)
+			setup.channel.Tick(29_000, 0, 15_000, 30_000)
 			transported(setup.ends, setup.peerEnd)
 			if setup.peer.isClosed() {
 				t.Fatal("closed at 29 s")
 			}
-			setup.channel.Tick(30_000, 15_000, 30_000)
+			setup.channel.Tick(30_000, 0, 15_000, 30_000)
 			transported(setup.ends, setup.peerEnd)
 			if !setup.peer.isClosed() || !setup.handler.isClosed() {
 				t.Fatal("not closed at 30 s")
@@ -237,13 +251,13 @@ func TestTheHeartbeat(t *testing.T) {
 
 		t.Run("pings a silent open link after 15 s once, and closes it after 30 s without an answer", func(t *testing.T) {
 			setup := openChannel(t, codec, false, true)
-			setup.channel.Tick(13_500, 15_000, 30_000)
+			setup.channel.Tick(13_500, 0, 15_000, 30_000)
 			transported(setup.ends, setup.peerEnd)
 			if slices.Contains(setup.peer.kinds(), "ping") {
 				t.Fatal("pinged at 13.5 s")
 			}
-			setup.channel.Tick(16_500, 15_000, 30_000)
-			setup.channel.Tick(18_000, 15_000, 30_000)
+			setup.channel.Tick(16_500, 0, 15_000, 30_000)
+			setup.channel.Tick(18_000, 0, 15_000, 30_000)
 			transported(setup.ends, setup.peerEnd)
 			pings := 0
 			for _, kind := range setup.peer.kinds() {
@@ -254,10 +268,45 @@ func TestTheHeartbeat(t *testing.T) {
 			if pings != 1 {
 				t.Fatalf("pings = %d", pings)
 			}
-			setup.channel.Tick(31_500, 15_000, 30_000)
+			setup.channel.Tick(31_500, 0, 15_000, 30_000)
 			transported(setup.ends, setup.peerEnd)
 			if !setup.peer.isClosed() {
 				t.Fatal("not closed after 30 s of silence")
+			}
+		})
+
+		t.Run("counts no pause of this process as silence (a sleeping laptop): pings at once, closes 15 s later unanswered", func(t *testing.T) {
+			setup := openChannel(t, codec, false, true)
+			setup.channel.Tick(3_000, 0, 15_000, 30_000)
+			// The process sleeps 10 minutes: no timer runs meanwhile, the clock jumps.
+			setup.channel.Tick(604_500, 600_000, 15_000, 30_000)
+			transported(setup.ends, setup.peerEnd)
+			if setup.peer.isClosed() || !slices.Equal(setup.peer.kinds(), []string{"hello", "ping"}) {
+				t.Fatalf("after the pause: kinds = %v, closed = %v", setup.peer.kinds(), setup.peer.isClosed())
+			}
+			setup.channel.Tick(618_000, 0, 15_000, 30_000)
+			transported(setup.ends, setup.peerEnd)
+			if setup.peer.isClosed() {
+				t.Fatal("closed 13.5 s after the pause")
+			}
+			setup.channel.Tick(619_500, 0, 15_000, 30_000)
+			transported(setup.ends, setup.peerEnd)
+			if !setup.peer.isClosed() {
+				t.Fatal("not closed 15 s after the pause")
+			}
+		})
+
+		t.Run("keeps a link through a pause when its peer answers the ping", func(t *testing.T) {
+			setup := openChannel(t, codec, false, true)
+			setup.channel.Tick(20_000, 0, 15_000, 30_000)
+			setup.channel.Tick(621_500, 600_000, 15_000, 30_000)
+			setup.clock.set(621_500)
+			setup.peer.send(&link.PongMessage{})
+			transported(setup.ends, setup.peerEnd)
+			setup.channel.Tick(646_500, 0, 15_000, 30_000)
+			transported(setup.ends, setup.peerEnd)
+			if setup.peer.isClosed() {
+				t.Fatal("closed although the peer answered")
 			}
 		})
 
@@ -267,7 +316,7 @@ func TestTheHeartbeat(t *testing.T) {
 				setup.clock.set(second * 1000)
 				setup.peer.send(&link.ReleaseMessage{Hold: 99})
 				transported(setup.ends, setup.peerEnd)
-				setup.channel.Tick(second*1000+4_999, 15_000, 30_000)
+				setup.channel.Tick(second*1000+4_999, 0, 15_000, 30_000)
 			}
 			if kinds := setup.peer.kinds(); !slices.Equal(kinds, []string{"hello"}) || setup.peer.isClosed() {
 				t.Fatalf("kinds = %v, closed = %v", kinds, setup.peer.isClosed())
@@ -280,6 +329,27 @@ func TestTheHeartbeat(t *testing.T) {
 			transported(setup.ends, setup.peerEnd)
 			if kinds := setup.peer.kinds(); !slices.Equal(kinds, []string{"hello", "pong"}) {
 				t.Fatalf("kinds = %v", kinds)
+			}
+		})
+
+		t.Run("answers each ping with a pong at once; two sides pinging at once both answer", func(t *testing.T) {
+			setup := openChannel(t, codec, false, true)
+			setup.channel.Tick(16_500, 0, 15_000, 30_000)
+			setup.clock.set(16_500)
+			// The peer pinged at the same moment: the channel answers it while its own ping is out.
+			setup.peer.send(&link.PingMessage{})
+			transported(setup.ends, setup.peerEnd)
+			if kinds := setup.peer.kinds(); !slices.Equal(kinds, []string{"hello", "ping", "pong"}) {
+				t.Fatalf("kinds = %v", kinds)
+			}
+			setup.peer.send(&link.PongMessage{})
+			transported(setup.ends, setup.peerEnd)
+			// Both answered: the channel's ping is armed again, so another 15 s of silence pings once more and the link lives.
+			setup.clock.set(32_000)
+			setup.channel.Tick(32_000, 0, 15_000, 30_000)
+			transported(setup.ends, setup.peerEnd)
+			if kinds := setup.peer.kinds(); !slices.Equal(kinds, []string{"hello", "ping", "pong", "ping"}) || setup.peer.isClosed() {
+				t.Fatalf("kinds = %v, closed = %v", kinds, setup.peer.isClosed())
 			}
 		})
 	})
@@ -308,6 +378,80 @@ func TestTrustedLinks(t *testing.T) {
 		if checks, closed := run(true); checks != 0 || !closed {
 			t.Fatalf("trusted: checks = %v, closed = %v", checks, closed)
 		}
+	})
+}
+
+// TestAFence ports `a fence (slice 14 §2.3)` of channel.test.ts. The callbacks run on the link's delivery goroutine when
+// the peer's `pong` is read, so each case settles the pair (`transported`) before it looks; nothing sleeps.
+func TestAFence(t *testing.T) {
+	var mu sync.Mutex
+	var ran []string
+	record := func(name string) func() {
+		return func() {
+			mu.Lock()
+			defer mu.Unlock()
+			ran = append(ran, name)
+		}
+	}
+	ranNow := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string{}, ran...)
+	}
+	want := func(t *testing.T, expected ...string) {
+		t.Helper()
+		if got := ranNow(); !slices.Equal(got, expected) && (len(got) != 0 || len(expected) != 0) {
+			t.Fatalf("ran %v, want %v", got, expected)
+		}
+	}
+	eachCodec(t, func(t *testing.T, codec link.Codec) {
+		mu.Lock()
+		ran = nil
+		mu.Unlock()
+		t.Run("runs after the pong of its own ping: a liveness pong in transit does not end it", func(t *testing.T) {
+			setup := openChannel(t, codec, true, true)
+			// A liveness `ping` goes out (the link was silent); its `pong` is still in transit when the fence starts.
+			setup.channel.Tick(20_000, 0, 15_000, 30_000)
+			setup.channel.Fence(record("first"))
+			setup.channel.Fence(record("second"))
+			transported(setup.ends, setup.peerEnd)
+			pings := 0
+			for _, kind := range setup.peer.kinds() {
+				if kind == "ping" {
+					pings++
+				}
+			}
+			if pings != 3 {
+				t.Fatalf("pings = %d, want 3", pings)
+			}
+			setup.peer.send(&link.PongMessage{})
+			transported(setup.ends, setup.peerEnd)
+			want(t)
+			setup.peer.send(&link.PongMessage{})
+			transported(setup.ends, setup.peerEnd)
+			want(t, "first")
+			setup.peer.send(&link.PongMessage{})
+			transported(setup.ends, setup.peerEnd)
+			want(t, "first", "second")
+		})
+
+		t.Run("is cancelled by what it returned, and runs nothing once the link closed", func(t *testing.T) {
+			mu.Lock()
+			ran = nil
+			mu.Unlock()
+			setup := openChannel(t, codec, true, true)
+			cancel := setup.channel.Fence(record("cancelled"))
+			setup.channel.Fence(record("kept"))
+			cancel()
+			setup.peer.send(&link.PongMessage{})
+			setup.peer.send(&link.PongMessage{})
+			transported(setup.ends, setup.peerEnd)
+			want(t, "kept")
+			setup.channel.Fence(record("closed"))
+			setup.channel.Close()
+			transported(setup.ends, setup.peerEnd)
+			want(t, "kept")
+		})
 	})
 }
 

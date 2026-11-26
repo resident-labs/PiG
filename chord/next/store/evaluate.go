@@ -1,13 +1,14 @@
 package store
 
 import (
+	"errors"
 	"maps"
 	"strconv"
 
 	"github.com/MichaelKinsy/PiG/chord/next/data"
 )
 
-// Ports packages/chord/src/next/store/evaluate.ts
+// Ports packages/chord/src/store/evaluate.ts
 //
 // The evaluator of the compiled table vocabulary (slice 6a §6; rule 10): the `tx.get` overlay matches `where` nodes
 // and applies `set` nodes with SQL's three-valued `NULL` rules and code point text order, as the SQL that sql.go
@@ -62,6 +63,9 @@ func truthOf(node WhereNode, row EvaluatedRow) truth {
 			return truthFalse
 		}
 		return truthTrue
+	case WhereExists:
+		// Only a read's condition tests `exists`, and reads run in the database (slice 14 §3.3: no second evaluator).
+		panic(errors.New("exists is not evaluated in memory"))
 	case WhereIsNull:
 		_, present := row[node.Column]
 		return fromBool(!present)

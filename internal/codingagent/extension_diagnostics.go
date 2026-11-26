@@ -35,6 +35,9 @@ func (m *InteractiveMode) extensionDiagnostics() []extension.ResourceDiagnostic 
 	for _, conflict := range m.extensionConflicts {
 		out = append(out, extension.ResourceDiagnostic{Type: extension.DiagnosticError, Message: conflict.Message, Path: conflict.Path})
 	}
+	for _, warning := range m.extensionWarnings {
+		out = append(out, extension.ResourceDiagnostic{Type: extension.DiagnosticWarning, Message: warning.Warning, Path: warning.Path})
+	}
 	if m.newRunner != nil {
 		out = append(out, m.newRunner.CommandDiagnostics()...)
 		out = append(out, m.builtInCommandConflictDiagnostics()...)
@@ -43,8 +46,16 @@ func (m *InteractiveMode) extensionDiagnostics() []extension.ResourceDiagnostic 
 	return out
 }
 
+// fusedCopyRunsNotice is the clause every fused-source warning of the subprocess host carries (subprocess.resolveFused).
+const fusedCopyRunsNotice = ": running the fused copy: "
+
 // extensionLoadIssueDiagnostic separates a reload issue's path from its complete loader diagnostic.
 func extensionLoadIssueDiagnostic(issue string) extension.ResourceDiagnostic {
+	// pig additive (D31): a member fused into a Piglet Binary that is loaded and runs its compiled copy although its source differs
+	// (the host's fused-source warning) is a warning, not a failed load.
+	if strings.Contains(issue, fusedCopyRunsNotice) {
+		return extension.ResourceDiagnostic{Type: extension.DiagnosticWarning, Message: issue}
+	}
 	for _, messagePrefix := range []string{"Failed to load extension: ", "Extension does not export a valid factory function: "} {
 		if path, message, ok := strings.Cut(issue, ": "+messagePrefix); ok {
 			return extension.ResourceDiagnostic{Type: extension.DiagnosticError, Message: messagePrefix + message, Path: path}
@@ -82,10 +93,14 @@ func (m *InteractiveMode) loadThemes() {
 	}
 	mode := tui.GetTerminalColorMode(tui.ApplyCapabilityOverrides(tui.DetectCapabilities(func() bool { return false }), overrides))
 	m.loadedThemes, m.themeDiagnostics = loadThemeResources(registry, m.opts.ThemePaths, mode)
+	customThemesDir := ""
 	if m.opts.AgentDir != "" {
-		addCustomDirectoryThemes(registry, filepath.Join(m.opts.AgentDir, "themes"), mode)
+		customThemesDir = filepath.Join(m.opts.AgentDir, "themes")
+		addCustomDirectoryThemes(registry, customThemesDir, mode)
 	}
 	tui.SetThemeRegistry(registry)
+	// theme.ts loadThemeJson reads an unregistered name's file from this directory; a file that fails to load there is the reason setTheme reports.
+	tui.SetCustomThemesDir(customThemesDir)
 }
 
 // addCustomDirectoryThemes mirrors Pi getCustomThemeInfos: unreadable and invalid files are ignored, and built-in or registered names keep precedence.

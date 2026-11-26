@@ -106,7 +106,11 @@ func (m *PackageManager) ResolveContext(ctx context.Context, onMissing MissingSo
 	}, nil
 }
 
-// installMissing installs each configured npm or git Package that needs it, asking onMissing first when it is set (package-manager.ts:1282-1340 resolvePackageSources, installMissing). A Package whose install fails is skipped, as offline mode skips it, and reported in the result (Pi 6dfb54678); an onMissing error, "error" decision, or cancelled context (dyna patch P9) still fails.
+// InstallMissing is the install step of resolve: it installs each configured npm or git Package that needs it, asking onMissing first when it is set (package-manager.ts:1282-1340 resolvePackageSources, installMissing). A Package whose install fails is skipped, as offline mode skips it, and reported in the result (Pi 6dfb54678); an onMissing error or "error" decision still fails.
+func (m *PackageManager) InstallMissing(onMissing MissingSourceCallback) ([]PackageInstallFailure, error) {
+	return m.installMissing(context.Background(), onMissing)
+}
+
 func (m *PackageManager) installMissing(ctx context.Context, onMissing MissingSourceCallback) ([]PackageInstallFailure, error) {
 	failures := []PackageInstallFailure{}
 	if IsOfflineModeEnabled() {
@@ -128,8 +132,9 @@ func (m *PackageManager) installMissing(ctx context.Context, onMissing MissingSo
 				return nil, errors.New("Missing source: " + pkg.Source.Source)
 			}
 		}
-		if err := InstallPackageArtifacts(m.CWD, m.agentDir(), m.SettingsManager, pkg.Source, pkg.Scope == "project", nil, WithContext(ctx)); err != nil {
-			if ctx != nil && ctx.Err() != nil {
+		// Pi's installMissing announces the install (package-manager.ts resolvePackageSources, withProgress "install"): the progress callback hears it.
+		if err := InstallPackageArtifacts(m.CWD, m.agentDir(), m.SettingsManager, pkg.Source, pkg.Scope == "project", m.progress, append(m.installOptions(), WithContext(ctx))...); err != nil {
+			if ctx.Err() != nil {
 				return nil, fmt.Errorf("install %s Package %q: %w", pkg.Scope, pkg.Source.Source, err)
 			}
 			failures = append(failures, PackageInstallFailure{Source: pkg.Source.Source, Scope: pkg.Scope, Message: err.Error()})
@@ -140,6 +145,11 @@ func (m *PackageManager) installMissing(ctx context.Context, onMissing MissingSo
 
 // ResolveExtensionSources is upstream's resolveExtensionSources: it resolves each source, an `-e` argument, into the extensions and other resources it exposes, in the scope "temporary", "project" or "user" that temporary and local select (package-manager.ts:991-1010). A `builtin:<name>` source is an enabled built-in extension. A local source that does not exist contributes nothing; an npm or git source that is not installed installs unless offline mode is on. A temporary source installs below the agent's temporary extension folder, and an unpinned cached git checkout refreshes first.
 func (m *PackageManager) ResolveExtensionSources(sources []string, local, temporary bool) (ResolvedPaths, error) {
+	return m.ResolveExtensionSourcesContext(context.Background(), sources, local, temporary)
+}
+
+// ResolveExtensionSourcesContext is ResolveExtensionSources with cancellable installs (dyna patch P9).
+func (m *PackageManager) ResolveExtensionSourcesContext(ctx context.Context, sources []string, local, temporary bool) (ResolvedPaths, error) {
 	scope := "user"
 	if temporary {
 		scope = "temporary"
@@ -156,7 +166,10 @@ func (m *PackageManager) ResolveExtensionSources(sources []string, local, tempor
 		if strings.HasPrefix(source, codingagent.BuiltinPathPrefix) {
 			continue
 		}
-		root, err := m.extensionSourceRoot(source, scope, local)
+		root, err := m.extensionSourceRoot(ctx, source, scope, local)
+		if ctx.Err() != nil {
+			return ResolvedPaths{}, ctx.Err()
+		}
 		if failed, ok := errors.AsType[*InstallFailureError](err); ok {
 			// A source that cannot be installed contributes nothing and is reported (Pi 6dfb54678).
 			resolved.InstallFailures = append(resolved.InstallFailures, PackageInstallFailure{Source: source, Scope: scope, Message: failed.Err.Error()})
@@ -198,10 +211,10 @@ func (m *PackageManager) ResolveExtensionSources(sources []string, local, tempor
 }
 
 // extensionSourceRoot is the directory or file an `-e` source resolves to, installing an npm or git source that is missing; "" means the source contributes nothing.
-func (m *PackageManager) extensionSourceRoot(source, scope string, local bool) (string, error) {
+func (m *PackageManager) extensionSourceRoot(ctx context.Context, source, scope string, local bool) (string, error) {
 	cwd, agentDir := m.CWD, m.agentDir()
 	if scope == "temporary" {
-		return ResolveTemporarySource(cwd, agentDir, m.SettingsManager, source, m.progress)
+		return ResolveTemporarySource(cwd, agentDir, m.SettingsManager, source, m.progress, append(m.installOptions(), WithContext(ctx))...)
 	}
 	root, err := SourceRootForResources(cwd, agentDir, m.SettingsManager, source, local)
 	if err != nil {
@@ -221,7 +234,7 @@ func (m *PackageManager) extensionSourceRoot(source, scope string, local bool) (
 		if IsOfflineModeEnabled() {
 			return "", nil
 		}
-		if err := InstallPackageArtifacts(cwd, agentDir, m.SettingsManager, pkg.Source, local, m.progress); err != nil {
+		if err := InstallPackageArtifacts(cwd, agentDir, m.SettingsManager, pkg.Source, local, m.progress, append(m.installOptions(), WithContext(ctx))...); err != nil {
 			return "", &InstallFailureError{Err: err}
 		}
 	}

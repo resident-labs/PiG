@@ -2,13 +2,19 @@ package documents
 
 import (
 	"context"
+	"errors"
+	"time"
 
+	chordctx "github.com/MichaelKinsy/PiG/chord/context"
+	"github.com/MichaelKinsy/PiG/chord/delta"
 	"github.com/MichaelKinsy/PiG/chord/next/data"
 	"github.com/MichaelKinsy/PiG/chord/next/state"
 	"github.com/MichaelKinsy/PiG/chord/next/store"
+	chordtelemetry "github.com/MichaelKinsy/PiG/chord/next/telemetry"
+	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
-// Ports packages/chord/src/next/documents/documents.ts
+// Ports packages/chord/src/documents/documents.ts
 //
 // An object's documents (§9, P2, slice 6a §1.2, §10): its slots across attempts, its line (its transactions and line
 // jobs run one at a time), the seal fence over the transaction holding the line, the factory's pins between attempts,
@@ -32,10 +38,26 @@ type DocumentsOwner interface {
 	// Fail fails the live object `broken` with error (a document the code cannot read, slice 6a §1.4); ignored when it
 	// is not live.
 	Fail(err *data.ChordError)
+	// Telemetry is the host's telemetry adapter: its commits are recorded when it records.
+	Telemetry() telemetry.TelemetryContext
+	// Metrics are the host's instruments (made once per adapter): commit durations go to them.
+	Metrics() *chordtelemetry.Instruments
 	// Do runs work as one section of the host's serialization: it does not block, and is inline when the caller is in
 	// a section already.
 	Do(work func())
+	// InSection reports whether the caller runs in a section of the host's serialization already: a read there takes no
+	// section (no closure to make).
+	InSection() bool
+	// Task runs fn as an owned background task of the host's loop (an unawaited promise of Pi: a sweep, a watch's close, a shared
+	// load): fn may block, and the host's join counts it until it ends or waits parked (the line's wait, chordctx.Receive).
+	Task(fn func())
 	Clock
+}
+
+// CancelReporter is a DocumentsOwner that reports a transaction that did not commit while its context was cancelled
+// (`transaction_cancelled`): an empty `catch` cannot hide a change that never happened. cause is the context's cause.
+type CancelReporter interface {
+	TransactionCancelled(cause error)
 }
 
 // DeclaredSlot is what Documents needs of a slot of either kind.
@@ -85,14 +107,17 @@ func NewDocuments(owner DocumentsOwner) *Documents {
 			return
 		}
 		place := d.line.reserve()
-		//portlint:allow asyncorder Pi fires the sweep unawaited (`void this.onLine(async () => sweep()).catch(() => {})`, documents.ts:48) and onLine's `this.line.acquire()` (documents.ts:137) takes its place at the call: the place is reserved above, so the order of the line is the order of the calls
-		go func() { //portlint:allow golifetime the sweep is a floating promise in Pi (documents.ts:48); it ends once its place on the line is handed over and the job ran or was refused `released`
+		// Pi fires the sweep unawaited (`void this.onLine(async () => sweep()).catch(() => {})`, documents.ts:48) and onLine's
+		// `this.line.acquire()` (documents.ts:137) takes its place at the call: the place is reserved above, so the order of the
+		// line is the order of the calls. The sweep is a floating promise: it ends once its place on the line is handed over and
+		// the job ran or was refused `released`.
+		d.owner.Task(func() {
 			//portlint:allow ctxbackground Pi's `onLine` takes no signal (documents.ts:135) and `line.acquire()` none (line.ts `acquire()`): a line job has no caller to cancel it
 			_ = d.runOnLine(place, context.Background(), func() error {
 				d.Do(sweep)
 				return nil
 			}, nil)
-		}()
+		})
 	})
 	return d
 }
@@ -118,6 +143,12 @@ func (d *Documents) Own() *SealToken { return d.own }
 // Do runs work as one section of the host's serialization.
 func (d *Documents) Do(work func()) { d.owner.Do(work) }
 
+// InSection reports whether the caller runs in a section of the owner's serialization already.
+func (d *Documents) InSection() bool { return d.owner.InSection() }
+
+// Task runs fn as an owned background task of the owner's loop (DocumentsOwner.Task).
+func (d *Documents) Task(fn func()) { d.owner.Task(fn) }
+
 // Declare is a handle to definition's slot for an attempt sealed by token, whose `at(key)` pins declarer takes: the slot
 // made by the first declaration of its name, checked against the values for later ones (SlotDefinition.Check). The
 // handle is a *Keyed for a keyed definition, a *Singleton otherwise. "Declared twice" is the attempt's check. A
@@ -131,7 +162,7 @@ func (d *Documents) Declare(definition AnyDefinition, token *SealToken, declarer
 	}
 	var persistence *Persistence
 	if slot == nil && definition.Persist {
-		persistence = d.persistence(definition.Name)
+		persistence = d.persistence(definition)
 	}
 	// The definition's `keyed` decides the slot's class and the handle's.
 	if definition.Keyed {
@@ -158,8 +189,19 @@ func (d *Documents) Check(definition AnyDefinition) error {
 // Hydrate takes an attempt's declarations once its factory returned: its `at(key)` pins replace the previous factory's,
 // the slots it no longer declares are dropped (their watches end; persisted ones load again when declared again),
 // every declared one hydrated (`initial()`, migrations; a failure fails the activation). declared is in declaration
-// order. A section.
+// order. Documents that ended while the attempt waited for the host data gate (its object ended: a reload no longer
+// serving its type, a close) hold none of its declared slots: Pi's `slots.get(name)!` is undefined there and `.hydrate`
+// throws a TypeError, which `#activate`'s catch hands to `#broken`; that returns the abandonment (`#abandoned ?? failed`), and the
+// object was sealed before its documents ended, so the caller sees the abandonment (ended). Go returns `released` for that,
+// which the attempt's `broken` turns into the same abandonment (`released` is never surfaced), and releases the pins the attempt took,
+// which End's release of the previous ones passed over. A section.
 func (d *Documents) Hydrate(declared []AnyDefinition, pins []func(), ctx context.Context) error {
+	if d.state == documentsEnded && len(declared) > 0 {
+		for _, release := range pins {
+			release()
+		}
+		return d.Released()
+	}
 	previous := d.pins
 	d.pins = pins
 	for _, release := range previous {
@@ -289,17 +331,71 @@ func (d *Documents) Tx(fn func(tx *Transaction) (any, error), token *SealToken, 
 	})
 	var result any
 	if err == nil {
-		result, err = fn(tx)
+		result, err = callTx(fn, tx)
 	}
 	if err == nil {
+		// Timed only when something records: the commit's duration metric, its event on the enclosing span.
+		timed := !chordtelemetry.Untraced(d.owner.Telemetry()) || !chordtelemetry.Untraced(chordctx.Telemetry(ctx))
+		var started time.Time
+		if timed {
+			started = commitNow()
+		}
 		// In-memory-only commits are synchronous (W12): the store's step is taken only for persisted writes.
 		err = tx.Commit()
+		if err == nil && timed {
+			d.recordCommit(tx, float64(commitNow().Sub(started))/float64(time.Millisecond), ctx)
+		}
 	}
 	if err != nil {
 		d.Do(tx.Discard)
+		// Only a transaction that did not commit reads this; Chord's own run under contexts that never abort.
+		if ctx.Err() != nil {
+			if reporter, ok := d.owner.(CancelReporter); ok {
+				cause := context.Cause(ctx)
+				d.Do(func() { reporter.TransactionCancelled(cause) })
+			}
+		}
 		return nil, err
 	}
 	return result, nil
+}
+
+// callTx runs fn on tx. A transaction cut at its token's seal (or discarded) aborts its drafts, and Pi's overlay proxy then
+// throws a TypeError ("Cannot use a settled overlay") inside `fn`, which rejects the transaction: the callback's goroutine goes
+// on. A Go draft panics with delta.ErrRevoked instead; that panic is returned as the transaction's error, the rejection, so a
+// callback that runs on a task of the host (a handler's blocking work) fails its handler when the object ends under it and does
+// not crash the process. Any other panic is the caller's own.
+func callTx(fn func(tx *Transaction) (any, error), tx *Transaction) (result any, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if revoked, ok := recovered.(error); ok && errors.Is(revoked, delta.ErrRevoked) {
+				result, err = nil, revoked
+				return
+			}
+			panic(recovered)
+		}
+	}()
+	return fn(tx)
+}
+
+// commitNow reads the clock a timed commit uses; a package var so a test can count its reads (as host_uuid.go's setUUIDClock).
+var commitNow = time.Now
+
+// recordCommit: a commit of tx that took duration ms (from its start to its adoption): its event on ctx's span (the method,
+// routine or job it ran in) and the host's commit duration metric; a commit that changed nothing records nothing.
+func (d *Documents) recordCommit(tx *Transaction, duration float64, ctx context.Context) {
+	var documents, ops, writes, rows int64
+	d.Do(func() { documents, ops, writes, rows = tx.Committed() })
+	if documents == 0 && writes == 0 {
+		return
+	}
+	if span := chordctx.Telemetry(ctx); !chordtelemetry.Untraced(span) {
+		span.AddEvent("chord.commit", telemetry.SpanAttributes{
+			telemetry.Attr("documents", float64(documents)), telemetry.Attr("ops", float64(ops)),
+			telemetry.Attr("rows", float64(rows)), telemetry.Attr("duration", duration),
+		})
+	}
+	d.owner.Metrics().Histogram("chord.commit.duration").Record(duration, nil, nil)
 }
 
 // Fence seals token (the seal fence): its transactions are refused from now on, and the one holding the line is
@@ -355,6 +451,19 @@ func (d *Documents) Settled() {
 	d.line.Acquire(context.Background())()
 }
 
+// HostSlots is the persisted slots keyed by addresses of host kind kind: the documents of this object belonging to such
+// hosts, in declaration order. A section.
+func (d *Documents) HostSlots(kind string) []*KeyedSlot {
+	var slots []*KeyedSlot
+	for _, name := range d.order {
+		slot, keyed := d.slots[name].(*KeyedSlot)
+		if keyed && slot.persistence != nil && hostKindName(slot.definition.current.Host) == kind {
+			slots = append(slots, slot)
+		}
+	}
+	return slots
+}
+
 // End drops every document and pin; watches end `ended`, and every later use returns `released`. A section.
 func (d *Documents) End() {
 	d.state = documentsEnded
@@ -388,8 +497,8 @@ func (d *Documents) add(slot DeclaredSlot) DeclaredSlot {
 	return slot
 }
 
-// persistence is the store side of persisted documents named name; the attempt checked the store first (P3).
-func (d *Documents) persistence(name string) *Persistence {
+// persistence is the store side of persisted definition's documents; the attempt checked the store first (P3).
+func (d *Documents) persistence(definition AnyDefinition) *Persistence {
 	chordStore, owner, _ := d.owner.Store()
-	return NewPersistence(chordStore, owner, "chord", name)
+	return NewPersistence(chordStore, owner, "chord", definition.Name, definition.Host)
 }

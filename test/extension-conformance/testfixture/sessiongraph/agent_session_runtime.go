@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	sdk "github.com/MichaelKinsy/PiG/extensions/sdk"
 )
@@ -55,7 +56,11 @@ func agentSessionRuntimeScript(ctx sdk.Context, args map[string]any) map[string]
 		if err != nil {
 			return nil, err
 		}
-		return &sdk.CreateAgentSessionRuntimeResult{Session: session, Services: services, Diagnostics: services.Diagnostics, ModelFallbackMessage: session.ModelFallbackMessage}, nil
+		diagnostics := append(append([]sdk.AgentSessionRuntimeDiagnostic{}, services.Diagnostics...), sdk.AgentSessionRuntimeDiagnostic{Type: "warning", Message: "runtime diagnostics: startup"})
+		if len(calls) > 1 {
+			diagnostics = append(diagnostics, sdk.AgentSessionRuntimeDiagnostic{Type: "error", Message: "runtime diagnostics: replaced"})
+		}
+		return &sdk.CreateAgentSessionRuntimeResult{Session: session, Services: services, Diagnostics: diagnostics, ModelFallbackMessage: session.ModelFallbackMessage}, nil
 	}
 	manager := ok(sdk.SessionManagerCreate(ctx, cwd, &sessionDir, nil))
 	runtimeFile := *ok(manager.GetSessionFile())
@@ -117,6 +122,8 @@ func agentSessionRuntimeScript(ctx sdk.Context, args map[string]any) map[string]
 		"cwd": runtime.Cwd(), "diagnostics": append([]sdk.AgentSessionRuntimeDiagnostic{}, runtime.Diagnostics()...), "fallback": nilIfEmpty(runtime.ModelFallbackMessage()),
 		"sameLog": ok(current().GetSessionID()) == ok(manager.GetSessionID()), "servicesCwd": runtimeServices.Cwd, "servicesAgentDir": runtimeServices.AgentDir == agentDir, "calls": len(calls),
 	}
+	r["takenAtStartup"] = runtime.TakeUnreportedDiagnostics()
+	r["takenAtStartupAgain"] = runtime.TakeUnreportedDiagnostics()
 	prompt("one")
 	_, statErr := os.Stat(runtimeFile)
 	r["prompted"] = map[string]any{"kinds": kinds(), "persisted": statErr == nil}
@@ -135,6 +142,8 @@ func agentSessionRuntimeScript(ctx sdk.Context, args map[string]any) map[string]
 	r["newSession"] = map[string]any{
 		"result": created, "fresh": isNew(), "parentIsFirst": parentOf() == runtimeFile, "kinds": kinds(), "roles": roles(), "calls": append([]map[string]any{}, calls[1:]...), "rebinds": rebinds, "invalidations": invalidations,
 	}
+	r["takenAfterNew"] = runtime.TakeUnreportedDiagnostics()
+	r["takenAfterNewAgain"] = runtime.TakeUnreportedDiagnostics()
 	prompt("two")
 	forkResult := func(result sdk.ForkResult) map[string]any {
 		out := map[string]any{"cancelled": result.Cancelled}
@@ -154,6 +163,7 @@ func agentSessionRuntimeScript(ctx sdk.Context, args map[string]any) map[string]
 	r["fork"] = map[string]any{
 		"result": forkResult(forked), "fresh": isNew(), "parentIsNotSecond": *ok(current().GetSessionFile()) != secondFile, "roles": roles(), "kinds": kinds(), "calls": len(calls) - 2,
 	}
+	r["takenAfterFork"] = runtime.TakeUnreportedDiagnostics()
 	prompt("three")
 	assistantID := func() string {
 		for _, entry := range ok(current().GetEntries()) {
@@ -207,11 +217,38 @@ func agentSessionRuntimeScript(ctx sdk.Context, args map[string]any) map[string]
 		}()),
 	}
 
+	// reload after BindExtensions() with no bindings (Pi e03dca7a3843): the old extensions get session_shutdown and the new ones session_start.
+	loggedBeforeReload := len(strings.Split(strings.TrimRight(string(ok(os.ReadFile(logFile))), "\n"), "\n"))
+	if err := runtime.Session().Reload(context.Background()); err != nil {
+		panic(err)
+	}
+	r["reload"] = map[string]any{"events": strings.Split(strings.TrimRight(string(ok(os.ReadFile(logFile))), "\n"), "\n")[loggedBeforeReload:]}
+
 	// A direct refresh of the live session (the runtime's own after a setup is the one the report shows); Pi's run reads nothing from it, so it adds nothing to the report.
 	if err := runtime.Session().RefreshContext(); err != nil {
 		panic(err)
 	}
+	// dispose settles a run in flight before it emits session_shutdown; the model never ends this run, so only the abort can end it.
+	observeFile := filepath.Join(cwd, "observe-run")
+	if err := os.WriteFile(observeFile, nil, 0o644); err != nil {
+		panic(err)
+	}
+	running := make(chan error, 1)
+	hung := runtime.Session()
+	go func() { running <- hung.Prompt(context.Background(), "hang-forever") }()
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if logged, _ := os.ReadFile(logFile); strings.Contains(string(logged), "agent_start") {
+			break
+		}
+		if time.Now().After(deadline) {
+			panic("the run never started")
+		}
+	}
 	if err := runtime.Dispose(); err != nil {
+		panic(err)
+	}
+	<-running
+	if err := os.Remove(observeFile); err != nil {
 		panic(err)
 	}
 	reasons := []string{}

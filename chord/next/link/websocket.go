@@ -2,7 +2,7 @@ package link
 
 import "sync"
 
-// Ports packages/chord/src/next/link/websocket.ts. WebSocket links (§3): a link over a WebSocket, the browser's or
+// Ports packages/chord/src/link/websocket.ts. WebSocket links (§3): a link over a WebSocket, the browser's or
 // `ws` in Node, typed structurally; binary frames, messages sent while it still connects buffered until it opens.
 
 // WebSocketEvent names the events a link listens for.
@@ -58,8 +58,10 @@ func WebSocketLink(socket WebSocketLike) Link {
 	end.removeMessage = socket.AddEventListener(WebSocketMessage, func(data any) {
 		if frame, ok := data.([]byte); ok {
 			end.deliver(frame)
-		} else {
-			end.Close()
+		} else if detached := end.detach(); detached != nil {
+			// A text frame closes the link as the socket's own close does: after the frames that arrived before it.
+			end.ended()
+			detached.Close()
 		}
 	})
 	// `error` and `close` stay handled until the socket's own close, after this end closed: `ws` emits an `error` for a
@@ -71,6 +73,13 @@ func WebSocketLink(socket WebSocketLike) Link {
 		end.end()
 	})
 	removeError = socket.AddEventListener(WebSocketError, func(any) { end.end() })
+	// A socket that closed between the state read above and the `close` listener reached nobody: a Go socket closes on a
+	// goroutine of its own, between any two statements of whoever made the link, where Pi's webSocketLink() runs to completion
+	// before any socket event (packages/chord/src/link/websocket.ts:52). The state is read again once the listeners are
+	// registered; a socket that closes after this read tells the listener.
+	if socket.ReadyState() > socketOpen {
+		end.end()
+	}
 	return end
 }
 
@@ -115,23 +124,28 @@ func (end *webSocketLink) Send(message []byte) {
 }
 
 func (end *webSocketLink) Close() {
-	end.mu.Lock()
-	socket := end.socket
-	end.mu.Unlock()
-	if socket == nil {
-		return
+	socket := end.detach()
+	// At once, also when the socket ended already and its end waits for a hand-over (the socket is forgotten then).
+	end.closedHere()
+	if socket != nil {
+		socket.Close()
 	}
-	end.end()
-	socket.Close()
 }
 
-// end stops listening for frames, drops what waits to be sent and closes this end.
+// end closes this end for the socket, which ended (its close, its error): after the frames that arrived before.
 func (end *webSocketLink) end() {
+	if end.detach() != nil {
+		end.ended()
+	}
+}
+
+// detach stops listening for frames and drops what waits to be sent; it returns the socket, nil once detached.
+func (end *webSocketLink) detach() WebSocketLike {
 	end.mu.Lock()
 	socket := end.socket
 	if socket == nil {
 		end.mu.Unlock()
-		return
+		return nil
 	}
 	end.socket = nil
 	end.connecting, end.connectingSet = nil, false
@@ -143,5 +157,5 @@ func (end *webSocketLink) end() {
 	if removeMessage != nil {
 		removeMessage()
 	}
-	end.ended()
+	return socket
 }

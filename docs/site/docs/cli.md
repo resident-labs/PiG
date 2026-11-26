@@ -1,6 +1,6 @@
 # Command line
 
-This page lists the `pig` command-line verbs and subcommands, and the `pig docs` commands for the embedded reference bundle. [Command line by example](/docs/latest/cli-examples) runs the common ones and shows their output. PiG follows the command line of Pi 1.5.0 ([Pi's command line reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/cli.md)). Run `pig --help` or append `--help` to a command for the exact interface of the installed binary.
+This page lists the `pig` command-line verbs and subcommands, and the `pig docs` commands for the embedded reference bundle. [Command line by example](/docs/latest/cli-examples) runs the common ones and shows their output. PiG follows the command line of Pi 1.6.0 ([Pi's command line reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/cli.md)). Run `pig --help` or append `--help` to a command for the exact interface of the installed binary.
 
 ## CLI verbs
 
@@ -20,7 +20,7 @@ pig [options] [prompt]
 | `pig --models <patterns>` | Scope Ctrl+P model cycling to comma-separated model patterns. It is not an allow list. Without `--model`, a new session starts on the saved default model when the scope includes it, and otherwise on the first matching model. |
 | `pig --session-id <id>` | Use an exact session ID; may be combined with `--no-session` for provider cache affinity without disk persistence. |
 | `pig --mode rpc` | Start the JSONL RPC command loop on stdin/stdout. |
-| `pig --version` | Print the composite version `<PiG version>+<pinned Pi version>`. Pi prints only its own version (D63). |
+| `pig --version` | Print the pinned Pi version, exactly as `pi --version` does. `pig version` prints the PiG release and the Pi version in separate fields. |
 | `pig version` | Detailed pig/pi/Go/platform/build banner. |
 | `pig diagnose` | Print resolved config + binary identity. |
 
@@ -89,6 +89,8 @@ These options apply to `pig [options] [prompt]`. Run `pig --help` for the full l
 | `--fork <path\|id>` | Fork a session by file path or full/partial ID into the current directory. |
 | `--session-dir <dir>` | Directory for session storage and lookup. |
 | `--no-session` | Do not save the session. |
+| `--listen <path>` | Serve one RPC session per connection on the Unix socket at path; requires `--mode rpc` (D232). Every session has its own extension processes, so no extension process, and none of its module-level state, is shared between sessions (extensions compiled into the host program run in the server process; see the RPC page). Nobody is authenticated: keep the socket in a directory only you can write; PiG makes it private to you, and on Windows refuses a socket other users can reach. |
+| `--listen-share-extensions` | With `--listen`, let the sessions share extension processes (D232). Warning: module-level state (Node module variables, `process.env`, `globalThis`; Go, Rust, Python and Lisp package variables) is then shared between sessions. |
 | `--name`, `-n <name>` | Set the session display name. |
 | `--no-mcp` | Turn off the built-in MCP support for this run: no servers connect, and there are no MCP tools or `/mcp`. It does not affect an extension that replaces the built-in MCP support. |
 | `--no-skills`, `-ns` | Turn off skill discovery and loading. |
@@ -105,7 +107,7 @@ These options apply to `pig [options] [prompt]`. Run `pig --help` for the full l
 | `--approve`, `-a` | Trust project-local files for this run. |
 | `--no-approve`, `-na` | Ignore project-local files for this run. |
 | `--offline` | Turn off startup network operations, as `PI_OFFLINE=1` does. |
-| `--no-stdin` | Ignore piped stdin. Use it when the process that starts PiG leaves the stdin pipe open and never closes it. Without it, PiG waits for end of input, as Pi does. Pi 1.5.0 has no such option and treats `--no-stdin` as an unknown extension flag (D150, [Pi #10415](https://github.com/earendil-works/pi/issues/10415)). |
+| `--no-stdin` | Ignore piped stdin. Use it when the process that starts PiG leaves the stdin pipe open and never closes it. Without it, PiG waits for end of input, as Pi does. Pi 1.6.0 has no such option and treats `--no-stdin` as an unknown extension flag (D150, [Pi #10415](https://github.com/earendil-works/pi/issues/10415)). |
 | `--piglet <name\|path>` | Run a named Piglet or the Piglet file at a path. A Piglet Binary lays the selected Piglet over its own, unless it was built with `build.closed: true`, which makes it refuse the option ([Accept overlay Piglets](/docs/latest/piglet-binaries#accept-overlay-piglets)). See [Piglets](/docs/latest/piglets). |
 
 Extensions can register their own options, such as `--plan` from a plan-mode extension.
@@ -176,15 +178,15 @@ pig --exclude-tools bash
 
 ## Custom update command
 
-When a wrapper or another package manager provides PiG, set `PI_SELF_UPDATE_COMMAND` (or `PIG_SELF_UPDATE_COMMAND`) so `pig update` runs its update command:
+When a wrapper or another package manager provides PiG, set `PIG_SELF_UPDATE_COMMAND` (or Pi's name, `PI_SELF_UPDATE_COMMAND`) so `pig update` runs its update command:
 
 ```sh
-export PI_SELF_UPDATE_COMMAND="mise use -g npm:{packageName}@{version}"
+export PIG_SELF_UPDATE_COMMAND="mise use -g npm:{packageName}@{version}"
 ```
 
 `pig update` checks the signed release manifest first and runs the command only when the release is newer (or with `--force`), after printing the release note. `{packageName}`, `{version}` and `{installSpec}` (`{packageName}@{version}`) come from that release. The value is split on whitespace. For arguments with spaces, use the `selfUpdateCommand` setting in `~/.pig/agent/settings.json`, an argv array such as `["nix", "profile", "upgrade", "pig"]`. A project's settings file is never read for it.
 
-The configured command is your explicit choice of the one owner of the update. It replaces PiG's own tier selection (standalone replace, package manager, immutable Piglet Binary, container image) and never falls through to one of them. Without an update source there is no release to fill the placeholders from, so the command does not run. Exit code 0 does not prove an update: `pig update` prints `Updated pig from X to Y` when `pig --version` reports Y (from the replaced executable, else from `PATH`), and otherwise warns with the version it found.
+The configured command is your explicit choice of the one owner of the update. It replaces PiG's own tier selection (standalone replace, package manager, immutable Piglet Binary, container image) and never falls through to one of them. Without an update source there is no release to fill the placeholders from, so the command does not run. Exit code 0 does not prove an update: `pig update` prints `Updated pig from X to Y` when `pig version` reports Y (from the replaced executable, else from `PATH`), and otherwise warns with the version it found.
 
 ## `pig docs`
 

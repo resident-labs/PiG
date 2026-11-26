@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"golang.org/x/mod/semver"
+
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 )
 
 // RecordKind is the closed vocabulary for first-production Piglet records.
@@ -225,7 +227,7 @@ func NewBinaryRecord(piglet, releaseVersion string, createdAt time.Time, resolut
 	}
 	if len(input.Strip) > 0 {
 		binary.Strip = slices.Clone(input.Strip)
-		slices.SortFunc(binary.Strip, compareStripEntries)
+		sortx.Func(binary.Strip, compareStripEntries)
 	}
 	binary.StripKeep = canonicalStripIDs(input.StripKeep)
 	binary.StripTable = canonicalStripIDs(input.StripTable)
@@ -354,7 +356,7 @@ func validateBinary(binary Binary) error {
 		{"graph", binary.GraphDigest},
 		{"Resource closure", binary.ResourceClosureDigest},
 		{"component plan", binary.ComponentPlanDigest},
-		{"Pig source", binary.PigSourceDigest},
+		{"PiG source", binary.PigSourceDigest},
 		{"artifact", binary.Artifact.Digest},
 	} {
 		if err := validateDigest(check.digest); err != nil {
@@ -368,10 +370,10 @@ func validateBinary(binary Binary) error {
 		return fmt.Errorf("Piglet Binary target %q must be os/arch", binary.Target)
 	}
 	if binary.PigVersion == "" || binary.PigSourceRevision == "" || binary.Builder == "" || binary.BuilderIdentity == "" {
-		return fmt.Errorf("Piglet Binary Pig and builder identities are required")
+		return fmt.Errorf("Piglet Binary PiG and builder identities are required")
 	}
 	if binary.PigVersion != strings.TrimSpace(binary.PigVersion) || binary.PigSourceRevision != strings.TrimSpace(binary.PigSourceRevision) || binary.Builder != strings.TrimSpace(binary.Builder) || binary.BuilderIdentity != strings.TrimSpace(binary.BuilderIdentity) {
-		return fmt.Errorf("Piglet Binary Pig or builder identity is not canonical")
+		return fmt.Errorf("Piglet Binary PiG or builder identity is not canonical")
 	}
 	for name, version := range binary.Toolchains {
 		if name == "" || version == "" || name != strings.TrimSpace(name) || version != strings.TrimSpace(version) {
@@ -439,7 +441,7 @@ func canonicalStripIDs(lists []StripIDs) []StripIDs {
 		out[i] = StripIDs{Kind: list.Kind, IDs: append([]string{}, list.IDs...)}
 		slices.Sort(out[i].IDs)
 	}
-	slices.SortFunc(out, func(a, b StripIDs) int { return cmp.Compare(a.Kind, b.Kind) })
+	sortx.Func(out, func(a, b StripIDs) int { return cmp.Compare(a.Kind, b.Kind) })
 	return out
 }
 
@@ -479,7 +481,7 @@ func canonicalResolution(input ResolutionInput) (Resolution, error) {
 		inputs[i].Package = strings.TrimSpace(inputs[i].Package)
 		inputs[i].Plugin = strings.TrimSpace(inputs[i].Plugin)
 	}
-	slices.SortFunc(inputs, compareInputPins)
+	sortx.Func(inputs, compareInputPins)
 	componentPlan := input.ComponentPlan
 	componentPlan.Components = slices.Clone(input.ComponentPlan.Components)
 	resolution := Resolution{

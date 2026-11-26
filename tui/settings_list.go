@@ -162,11 +162,13 @@ func (s *SettingsList) Reset() {
 	s.ChangedValue = ""
 }
 
-// UpdateValue sets a new current value for the item with the given ID.
+// UpdateValue sets a new current value for the item with the given ID. Pi's updateValue only assigns the value, because Pi's Container renders every child on every frame; the Invalidate is what a Go
+// parent's per-child cache needs to draw it.
 func (s *SettingsList) UpdateValue(id, newValue string) {
 	for i := range s.items {
 		if s.items[i].ID == id {
 			s.items[i].CurrentValue = newValue
+			s.Invalidate()
 			break
 		}
 	}
@@ -396,7 +398,7 @@ func (s *SettingsList) HandleMouse(event TuiMouseEvent) *TuiMouseDispatchResult 
 		if changed {
 			s.Invalidate()
 		}
-		return &TuiMouseDispatchResult{TuiMouseEventResult: TuiMouseEventResult{Handled: true, Render: new(changed)}}
+		return &TuiMouseDispatchResult{Handled: true, Render: new(changed)}
 	}
 	if event.Button != MouseButtonLeft || (event.Type != MousePress && event.Type != MouseClick) {
 		return nil
@@ -414,7 +416,7 @@ func (s *SettingsList) HandleMouse(event TuiMouseEvent) *TuiMouseDispatchResult 
 		s.mousePressedIndex = itemIndex
 		s.cursor = itemIndex
 		s.Invalidate()
-		return &TuiMouseDispatchResult{TuiMouseEventResult: TuiMouseEventResult{Handled: true, Focus: true}}
+		return &TuiMouseDispatchResult{Handled: true, Focus: true}
 	}
 	if s.mousePressedIndex >= 0 {
 		s.cursor = s.mousePressedIndex
@@ -424,7 +426,7 @@ func (s *SettingsList) HandleMouse(event TuiMouseEvent) *TuiMouseDispatchResult 
 	s.mousePressedIndex = -1
 	s.activateItem()
 	s.Invalidate()
-	return &TuiMouseDispatchResult{TuiMouseEventResult: TuiMouseEventResult{Handled: true}}
+	return &TuiMouseDispatchResult{Handled: true}
 }
 
 func (s *SettingsList) visibleRange(display []int) (start, end int) {
@@ -472,9 +474,13 @@ func (s *SettingsList) HandleInput(data string) {
 		s.cancelled = true
 		s.done = true
 	case s.searchEnabled:
-		// Every other key belongs to the search Input, and the list refilters after it even when the value is unchanged.
+		// Every other key belongs to the search Input. Ports settings-list.ts handleInput (Pi 5bcf370a5, #12334): the list
+		// refilters only when the query changed, so a cursor key keeps the selection.
+		previousQuery := s.searchInput.GetValue()
 		s.searchInput.HandleInput(data)
-		s.applyFilter()
+		if s.searchInput.GetValue() != previousQuery {
+			s.applyFilter()
+		}
 	}
 	s.Invalidate()
 }

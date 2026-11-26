@@ -4,10 +4,13 @@ package atomicfile
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
+
+	"github.com/MichaelKinsy/PiG/internal/nodeerrno"
 )
 
 func isSymlink(t *testing.T, path string) bool {
@@ -100,4 +103,230 @@ func TestWriteFileFailsLikeWriteFileSyncForALinkItCannotFollow(t *testing.T) {
 		}
 	}
 	noTemporaryFile(t, dir)
+}
+
+// WriteFile follows symlinks to write the target file, but any *fs.PathError it returns for the target names the path the caller gave, as os.WriteFile and Node's writeFileSync do.
+func TestWriteFileErrorsNameTheGivenPathThroughSymlinks(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes any file")
+	}
+	t.Run("read-only file under linked parent directory", func(t *testing.T) {
+		root := t.TempDir()
+		realDir := filepath.Join(root, "real")
+		linkDir := filepath.Join(root, "link")
+		if err := os.Mkdir(realDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(realDir, linkDir); err != nil {
+			t.Fatal(err)
+		}
+		target := filepath.Join(realDir, "store.json")
+		if err := os.WriteFile(target, []byte("kept"), 0o400); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(target, 0o600) })
+
+		given := filepath.Join(linkDir, "store.json")
+		err := WriteFile(given, []byte("lost"), 0o600)
+		var pathErr *fs.PathError
+		if !errors.As(err, &pathErr) {
+			t.Fatalf("WriteFile(%s) = %T (%v), want *fs.PathError", given, err, err)
+		}
+		if !errors.Is(err, syscall.EACCES) {
+			t.Fatalf("WriteFile(%s) = %v, want EACCES", given, err)
+		}
+		if pathErr.Path != given {
+			t.Fatalf("PathError.Path = %q, want given path %q", pathErr.Path, given)
+		}
+		if data, readErr := os.ReadFile(target); readErr != nil || string(data) != "kept" {
+			t.Fatalf("target = %q, %v; want kept", data, readErr)
+		}
+		noTemporaryFile(t, realDir)
+	})
+	t.Run("read-only file through file symlink", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "target.json")
+		if err := os.WriteFile(target, []byte("kept"), 0o400); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(target, 0o600) })
+		given := filepath.Join(root, "store.json")
+		if err := os.Symlink(target, given); err != nil {
+			t.Fatal(err)
+		}
+
+		err := WriteFile(given, []byte("lost"), 0o600)
+		var pathErr *fs.PathError
+		if !errors.As(err, &pathErr) {
+			t.Fatalf("WriteFile(%s) = %T (%v), want *fs.PathError", given, err, err)
+		}
+		if !errors.Is(err, syscall.EACCES) {
+			t.Fatalf("WriteFile(%s) = %v, want EACCES", given, err)
+		}
+		if pathErr.Path != given {
+			t.Fatalf("PathError.Path = %q, want given path %q", pathErr.Path, given)
+		}
+		if data, readErr := os.ReadFile(target); readErr != nil || string(data) != "kept" {
+			t.Fatalf("target = %q, %v; want kept", data, readErr)
+		}
+		noTemporaryFile(t, root)
+	})
+	t.Run("dangling symlink into missing directory", func(t *testing.T) {
+		root := t.TempDir()
+		given := filepath.Join(root, "dangling.json")
+		if err := os.Symlink(filepath.Join(root, "missing", "store.json"), given); err != nil {
+			t.Fatal(err)
+		}
+		err := WriteFile(given, []byte("new"), 0o600)
+		var pathErr *fs.PathError
+		if !errors.As(err, &pathErr) {
+			t.Fatalf("WriteFile(%s) = %T (%v), want *fs.PathError", given, err, err)
+		}
+		if !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("WriteFile(%s) = %v, want ENOENT", given, err)
+		}
+		if pathErr.Path != given {
+			t.Fatalf("PathError.Path = %q, want given path %q", pathErr.Path, given)
+		}
+		if !isSymlink(t, given) {
+			t.Fatal("dangling link was replaced by a regular file")
+		}
+	})
+	t.Run("new file in read-only linked directory", func(t *testing.T) {
+		root := t.TempDir()
+		realDir := filepath.Join(root, "real")
+		linkDir := filepath.Join(root, "link")
+		if err := os.Mkdir(realDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(realDir, linkDir); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(realDir, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(realDir, 0o700) })
+
+		given := filepath.Join(linkDir, "new.json")
+		err := WriteFile(given, []byte("new"), 0o600)
+		var pathErr *fs.PathError
+		if !errors.As(err, &pathErr) {
+			t.Fatalf("WriteFile(%s) = %T (%v), want *fs.PathError", given, err, err)
+		}
+		if !errors.Is(err, syscall.EACCES) {
+			t.Fatalf("WriteFile(%s) = %v, want EACCES", given, err)
+		}
+		if pathErr.Path != given {
+			t.Fatalf("PathError.Path = %q, want given path %q", pathErr.Path, given)
+		}
+	})
+}
+
+// TestWriteFileRewrittenPathPreservesErrorChain proves that rewriting a resolved
+// target PathError back to the given path keeps both the portable fs sentinel
+// (fs.ErrPermission / fs.ErrNotExist) and the kernel syscall.Errno intact, both
+// directly from WriteFile and after nodeerrno.FromPathError wraps it.
+func TestWriteFileRewrittenPathPreservesErrorChain(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes any file")
+	}
+	refErrno := func(t *testing.T, target string, flag int) syscall.Errno {
+		t.Helper()
+		f, err := os.OpenFile(target, flag, 0o600)
+		if err == nil {
+			_ = f.Close()
+			t.Fatalf("reference OpenFile(%q) unexpectedly succeeded", target)
+		}
+		errno, ok := errors.AsType[syscall.Errno](err)
+		if !ok {
+			t.Fatalf("reference OpenFile(%q) error %T (%v) has no syscall.Errno", target, err, err)
+		}
+		return errno
+	}
+	for _, tc := range []struct {
+		name     string
+		setup    func(*testing.T) (given, target string)
+		wantSent error
+		refFlag  int
+	}{
+		{
+			name: "read-only file under linked parent directory",
+			setup: func(t *testing.T) (string, string) {
+				root := t.TempDir()
+				realDir := filepath.Join(root, "real")
+				linkDir := filepath.Join(root, "link")
+				if err := os.Mkdir(realDir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(realDir, linkDir); err != nil {
+					t.Fatal(err)
+				}
+				target := filepath.Join(realDir, "store.json")
+				if err := os.WriteFile(target, []byte("kept"), 0o400); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(target, 0o600) })
+				return filepath.Join(linkDir, "store.json"), target
+			},
+			wantSent: fs.ErrPermission,
+			refFlag:  os.O_WRONLY,
+		},
+		{
+			name: "read-only file through file symlink",
+			setup: func(t *testing.T) (string, string) {
+				root := t.TempDir()
+				target := filepath.Join(root, "target.json")
+				if err := os.WriteFile(target, []byte("kept"), 0o400); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(target, 0o600) })
+				given := filepath.Join(root, "store.json")
+				if err := os.Symlink(target, given); err != nil {
+					t.Fatal(err)
+				}
+				return given, target
+			},
+			wantSent: fs.ErrPermission,
+			refFlag:  os.O_WRONLY,
+		},
+		{
+			name: "dangling symlink into missing directory",
+			setup: func(t *testing.T) (string, string) {
+				root := t.TempDir()
+				target := filepath.Join(root, "missing", "store.json")
+				given := filepath.Join(root, "dangling.json")
+				if err := os.Symlink(target, given); err != nil {
+					t.Fatal(err)
+				}
+				return given, target
+			},
+			wantSent: fs.ErrNotExist,
+			refFlag:  os.O_WRONLY | os.O_CREATE | os.O_EXCL,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			given, target := tc.setup(t)
+			wantErrno := refErrno(t, target, tc.refFlag)
+
+			err := WriteFile(given, []byte("new"), 0o600)
+			var pathErr *fs.PathError
+			if !errors.As(err, &pathErr) || pathErr.Path != given {
+				t.Fatalf("WriteFile(%q) = %T (%v), want *fs.PathError with Path=%q", given, err, err, given)
+			}
+			if !errors.Is(err, tc.wantSent) {
+				t.Fatalf("WriteFile(%q) = %v, want %v", given, err, tc.wantSent)
+			}
+			if !errors.Is(err, wantErrno) {
+				t.Fatalf("WriteFile(%q) = %v, want kernel errno %d (%v)", given, err, wantErrno, wantErrno)
+			}
+
+			nodeErr := nodeerrno.FromPathError(err)
+			if !errors.Is(nodeErr, tc.wantSent) {
+				t.Fatalf("FromPathError(%v) = %v, want %v", err, nodeErr, tc.wantSent)
+			}
+			if !errors.Is(nodeErr, wantErrno) {
+				t.Fatalf("FromPathError(%v) = %v, want kernel errno %d (%v)", err, nodeErr, wantErrno, wantErrno)
+			}
+		})
+	}
 }

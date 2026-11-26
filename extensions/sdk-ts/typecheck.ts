@@ -30,7 +30,15 @@ import type {
   ProviderConfig as AdapterProviderConfig,
   PiGLoginDefinition,
   PiGSpriteDefinition,
+  PiGViewAbilities,
+  PiGViewClaim,
+  PiGViewGrid,
+  PiGViewImage,
+  PiGViewImageNode,
+  PiGViewNode,
+  PiGViewNotice,
   PiGViewLines,
+  PiGViewStatus,
   PiGViewTheme,
 } from "@michaelkinsy/pig-extension-types";
 
@@ -60,6 +68,89 @@ export default function extension(pi: ExtensionAPI): void {
     await ctx.ui.setLogin(login);
     await ctx.ui.registerSprite(sprite);
     ctx.ui.notify("ready", "info");
+    const abilities: PiGViewAbilities | null = ctx.ui.viewAbilities();
+    const mounted: PiGViewStatus = await ctx.ui.mountView({ key: "k", slot: "panel", title: "K", intents: [{ name: "x.open", arg: { type: "object" }, whenHidden: true }, { name: "x.close", arg: { type: "object" }, dismiss: true }], view: { root: { kind: "text", text: String(abilities?.limits.mounts) } } });
+    await ctx.ui.updateView(mounted.mount, { title: "K2", view: { root: { kind: "box", id: "b", bg: "selectedBg", children: [{ kind: "text", id: "t", text: "next" }] } }, a11y: [{ node: "b", name: "Next" }], focus: [{ node: "t", request: "update" }] });
+    await ctx.ui.updateView(mounted.mount, {
+      view: { root: { kind: "text", id: "t", text: "next" } },
+      alternatives: [{ when: { any: [{ all: [{ claim: "display.colors", op: "atLeast", value: 256 }] }] }, view: { root: { kind: "text", text: "rich" } } }],
+      drawing: { profile: "scene", shapes: [{ kind: "rect", width: 1, height: 1 }], regions: [{ key: "r", shape: { kind: "rect", width: 1, height: 1 }, gestures: ["activate"], intent: "x.go", name: "Go" }] },
+      a11y: [{ node: "t", name: "Next", role: "status" }],
+      focus: [{ node: "t", request: "mount" }],
+      bindings: [{ key: "shift+left", intent: "x.go", arg: {}, name: "Back" }, { gesture: "swipe-left", intent: "x.go" }],
+    });
+    const grid: PiGViewGrid = {
+      kind: "grid",
+      id: "month",
+      columns: 7,
+      head: ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"],
+      chipRows: 2,
+      selected: "d2",
+      cells: [{ label: "30", dim: true }, { value: "d2", label: "2", mark: "current", color: "accent", chips: [{ text: "standup", color: "#3366cc" }], more: 2 }],
+    };
+    await ctx.ui.updateView(mounted.mount, {
+      view: { root: { kind: "container", children: [{ kind: "text", text: "November" }, grid] } },
+      intents: [{ name: "x.day", nodeKey: grid.id, arg: { type: "object", properties: { value: { type: "string" } }, required: ["value"] } }],
+      fallback: { kind: "text", text: "November" },
+    });
+    await ctx.ui.updateView(mounted.mount, { view: { root: grid } });
+    const photo: PiGViewImageNode = { kind: "image", id: "photo", ref: "a".repeat(64), mimeType: "image/jpeg", maxWidthCells: 66, maxHeightCells: 20, filename: "r1.jpg", fallbackColor: "muted" };
+    const photoBytes: PiGViewImage = { ref: photo.ref, mimeType: photo.mimeType, data: "AAAA" };
+    await ctx.ui.updateView(mounted.mount, { view: { root: { kind: "container", children: [photo] }, images: [photoBytes] } });
+    // A later view names the image by its ref alone.
+    await ctx.ui.updateView(mounted.mount, { view: { root: photo } });
+    // @ts-expect-error an image record carries ref, mimeType and data: the bytes are required
+    const noBytes: PiGViewImage = { ref: photo.ref, mimeType: "image/png" };
+    // @ts-expect-error the member of an image record is `data`, not `bytes`
+    const wrongField: PiGViewImage = { ref: photo.ref, mimeType: "image/png", data: "AAAA", bytes: "AAAA" };
+    // @ts-expect-error a view's images is a list of records
+    await ctx.ui.updateView(mounted.mount, { view: { root: photo, images: photoBytes } });
+    // @ts-expect-error an image node needs its ref
+    const noRef: PiGViewImageNode = { kind: "image", mimeType: "image/png" };
+    // The root is the host's view contract: a node of every kind the host builds, with the members of its kind.
+    const kinds: PiGViewNode = { kind: "container", id: "all", children: [
+      { kind: "text", text: "t", bg: "selectedBg" },
+      { kind: "markdown", text: "m", defaultTextStyle: { color: "accent", bold: true }, renderLatex: false },
+      { kind: "hstack", gap: 1, align: "center", children: [{ kind: "spacer", lines: 1, stack: { grow: 1 } }, { kind: "dynamic-border", color: "border" }] },
+      { kind: "select-list", id: "pick", items: [{ value: "a", label: "A" }], selectedIndex: 0 },
+      { kind: "settings-list", id: "set", items: [{ id: "s", label: "S", values: ["on", "off"], submenu: { kind: "text", text: "sub" } }], enableSearch: true },
+      { kind: "image", ref: "a".repeat(64), mimeType: "image/png", imageId: 4242 },
+      { kind: "loader", message: "Working", indicator: { frames: ["a", "b"], intervalMs: 80 }, frame: 0 },
+      { kind: "lines", content: ["a"], list: { items: [{ label: "a" }], selectedIndex: -1 } },
+      { kind: "assistant-message", message: { content: [{ type: "text", text: "hi" }], stopReason: "stop" } },
+      { kind: "tool-execution", toolName: "read", args: { path: "x" }, result: { content: [{ type: "text", text: "ok" }] } },
+      { kind: "scroll-view", follow: "end", children: [{ kind: "input", value: "v", cursor: { line: 0, col: 1 } }] },
+      grid,
+    ] };
+    await ctx.ui.updateView(mounted.mount, { view: { root: kinds } });
+    // @ts-expect-error a node kind the host does not build
+    const unknownKind: PiGViewNode = { kind: "carousel" };
+    // @ts-expect-error a text node has no children
+    const textChildren: PiGViewNode = { kind: "text", text: "t", children: [] };
+    // @ts-expect-error a select-list needs its id
+    const noId: PiGViewNode = { kind: "select-list", items: [] };
+    // @ts-expect-error the Kitty image id is a number
+    const idString: PiGViewNode = { kind: "image", ref: "a", mimeType: "image/png", imageId: "4242" };
+    // @ts-expect-error imageId belongs to the image node
+    const idOnText: PiGViewNode = { kind: "text", text: "t", imageId: 1 };
+    // @ts-expect-error a stack's align is one of stretch, start, center and end
+    const badAlign: PiGViewNode = { kind: "hstack", align: "middle" };
+    // @ts-expect-error a tool-execution needs its toolName
+    const noTool: PiGViewNode = { kind: "tool-execution" };
+    // @ts-expect-error a scroll-view holds exactly one child
+    const twoChildren: PiGViewNode = { kind: "scroll-view", children: [{ kind: "text" }, { kind: "text" }] };
+    // @ts-expect-error a view's root is a node, not any object
+    await ctx.ui.updateView(mounted.mount, { view: { root: { text: "no kind" } } });
+    void [noBytes, wrongField, noRef, unknownKind, textChildren, noId, idString, idOnText, badAlign, noTool, twoChildren];
+    const notices: PiGViewNotice[] = await ctx.ui.viewDiagnostics("k");
+    const colors = abilities?.claims?.find((claim: PiGViewClaim) => claim.name === "display.colors")?.value;
+    const finished: PiGViewStatus = await ctx.ui.finishView(mounted.mount, { colors, notices: notices.length });
+    void finished.result;
+  });
+  pi.onViewIntent((invocation) => ({ outcome: "done", answer: { echo: invocation.intent, aborted: invocation.signal.aborted } }));
+  pi.onViewAbilities(async (abilities, ctx) => {
+    const arrived: PiGViewAbilities | null = abilities;
+    if (arrived?.slots.includes("panel")) await ctx.ui.mountView({ key: "arrived", slot: "panel", view: { root: { kind: "text", text: "hello" } } });
   });
   // PiG emits Pi's UI prompt lifecycle for every SDK; the kinds and the
   // optional title come from the pinned Pi declarations.
@@ -344,3 +435,14 @@ export const clampedThinkingLevel: string = clampThinkingLevel(
   { reasoning: false } as Parameters<typeof clampThinkingLevel>[0],
   "high",
 );
+
+// Pi eebd5d90: a Markdown transformer lists the surfaces it runs on and sees their message types.
+export function markdownTransformerSurfaces(pi: ExtensionAPI): void {
+  pi.registerMarkdownTransformer(
+    (markdown, context) => (context.messageType === "changelog" ? markdown.trim() : markdown),
+    { messageTypes: ["custom", "summary", "changelog"] },
+  );
+  pi.registerMarkdownTransformer((markdown) => markdown, { messageTypes: [] });
+  // @ts-expect-error messageTypes names the closed set of surfaces
+  pi.registerMarkdownTransformer((markdown) => markdown, { messageTypes: ["footer"] });
+}

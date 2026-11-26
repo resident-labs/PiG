@@ -122,6 +122,11 @@ source-hygiene-full: check-scratch-paths
 fixture-guard: ## Refuse captured provider data in test fixtures and any private term from PIG_PRIVATE_TERMS_FILE
 	@go run ./automation/ci/fixtureguard
 
+# module-pins refuses an in-tree Go module that replaces the PiG or SDK module with local source and requires either at a version other than the root's SDK requirement (a stale pin fails every strict and packed Go conformance cell with "updates to go.mod needed").
+.PHONY: module-pins
+module-pins: ## Fail when an in-tree Go module pins the PiG or SDK module at a version other than the root's SDK requirement
+	@go run ./automation/ci/modulepins
+
 # check-scratch-paths rejects a tracked file outside delivery/ that leaks an
 # internal scratch-cache path or this operator's absolute machine path into
 # the public tree (see RELEASE-DRYRUN.md blocker 4).
@@ -190,7 +195,7 @@ custom-factory-ledger-drift: ## Validate the checked-in internal draft
 	@go test $(GO_TEST_CI_COUNT) ./test/parity/cmd/customfactoryledger
 	@go run ./test/parity/cmd/customfactoryledger -check
 
-check-contracts-fast: closure-check correspondence-check porter-check interface-inventory interface-inventory-test interface-go-drift interface-recommendations-drift interface-mapping-quality interface-delta interface-gaps portmap-check behavior-contracts test-inventory-drift test-inventory test-porting-release known-gaps-drift format-version-inventory custom-factory-ledger-drift sdk-surface-drift sdk-apidiff piglet-strip-ids-drift sdk-bundles-drift piglet-strip-build ## Local generated contract validation and drift gates
+check-contracts-fast: closure-check correspondence-check porter-check interface-inventory interface-inventory-test interface-go-drift interface-recommendations-drift interface-mapping-quality interface-delta interface-gaps portmap-check behavior-contracts test-inventory-drift test-inventory test-porting-release known-gaps-drift format-version-inventory custom-factory-ledger-drift sdk-surface-drift sdk-apidiff piglet-strip-ids-drift sdk-bundles-drift piglet-strip-build piglet-strip-guard ## Local generated contract validation and drift gates
 
 check-contracts: check-contracts-fast interface-inventory-drift ## Fast contracts + exact published-package inventory regeneration
 
@@ -207,7 +212,7 @@ parity-bin: parity-deps node-runtime
 	@go list -deps -test ./... >/dev/null
 	CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags "-s -w -X github.com/MichaelKinsy/PiG/coding/cli.Build=$$(git rev-parse --short HEAD 2>/dev/null || echo dev)" -o $(PARITY_PIG_BIN) ./cmd/pig
 	@[ "$$(uname -s)" = "Darwin" ] && command -v codesign >/dev/null 2>&1 && codesign --force --sign - $(PARITY_PIG_BIN) >/dev/null 2>&1 || true
-	@echo "parity pig: $$($(PARITY_PIG_BIN) --version) → $(PARITY_PIG_BIN)"
+	@echo "parity pig: $$($(PARITY_PIG_BIN) version | sed -n 1p) → $(PARITY_PIG_BIN)"
 
 # require-parity-ran is the loud-fail counterpart to TestParity's quiet
 # skips. ResolvePigBin/ResolveUpstreamPiBin (test/parity/runner/binaries.go) call
@@ -377,7 +382,7 @@ parity-flow-coverage: parity-deps
 		go tool covdata textfmt -i="$$covdir" -o="$(PARITY_FLOW_COVERAGE)"; \
 		echo "$(PARITY_FLOW_COVERAGE)"
 
-# Regenerate test/parity/coverage.md from the latest results, and patch the
+# Regenerate test/parity/generated/coverage.md from the latest results, and patch the
 # condensed coverage block in AGENTS.md.
 coverage: ## Regenerate coverage.md from PORT_MAP + scenarios
 	@set -eu; mkdir -p tmp; tmp=$$(mktemp -d tmp/coverage.XXXXXXXX); trap 'rm -rf "$$tmp"' EXIT; \
@@ -388,11 +393,11 @@ coverage: ## Regenerate coverage.md from PORT_MAP + scenarios
 	    -scenarios test/parity/scenarios \
 	    -agents-md "$$tmp/AGENTS.md" \
 	    -badge "$$tmp/badge.svg" -out "$$tmp/coverage.md"; \
-	    mv "$$tmp/coverage.md" test/parity/coverage.md; \
+	    mv "$$tmp/coverage.md" test/parity/generated/coverage.md; \
 	    mv "$$tmp/AGENTS.md" AGENTS.md; \
 	    mv "$$tmp/badge.svg" .github/badges/parity-coverage.svg
-	@echo "wrote test/parity/coverage.md + AGENTS.md coverage block + Pi port progress badge"
-	@grep '^- \*\*' test/parity/coverage.md
+	@echo "wrote test/parity/generated/coverage.md + AGENTS.md coverage block + Pi port progress badge"
+	@grep '^- \*\*' test/parity/generated/coverage.md
 
 # The extractor's own tests run before each extraction; INTERFACE_EXTRACTOR_TEST=true skips them where another gate already ran them (pin-bump, a loaded host).
 INTERFACE_EXTRACTOR_TEST ?= npm test >/dev/null
@@ -489,8 +494,8 @@ interface-gaps: ## Decide NOT-A-GAP or GAP(reason) for every interface ID with f
 
 # The evidence tests of oracle-backed rows run Pi's code, so portmap-check installs the same oracle dependencies as test-fast; without them
 # every such row reads as COVERAGE failed.
-portmap-check: test-prereqs interface-deps parity-deps durable-interop-deps ## Derive the PORT_MAP ticks from the interface ledger; fail on a tick the ledger does not prove that the committed baseline does not list (PORTMAP_SHARD=N/M checks one shard of the rows)
-	@go run ./test/parity/cmd/portmapcheck $(if $(PORTMAP_SHARD),-shard $(PORTMAP_SHARD))
+portmap-check: test-prereqs interface-deps parity-deps durable-interop-deps ## Derive the PORT_MAP ticks from the interface ledger; fail on a tick the ledger does not prove that the committed baseline does not list (PORTMAP_SHARD=N/M checks one shard; PORTMAP_COLD=1 ignores build/portmap-coverage)
+	@go run ./test/parity/cmd/portmapcheck $(if $(PORTMAP_SHARD),-shard $(PORTMAP_SHARD)) $(if $(filter 1 true yes,$(PORTMAP_COLD)),-no-cache)
 
 portmap-check-update: ## Rewrite the unproven-tick baseline after a reviewed shrink
 	@go run ./test/parity/cmd/portmapcheck -update-baseline
@@ -498,16 +503,16 @@ portmap-check-update: ## Rewrite the unproven-tick baseline after a reviewed shr
 portmap-report: ## List every PORT_MAP tick the interface ledger does not prove
 	@go run ./test/parity/cmd/portmapcheck -report
 
-interface-gaps-update: ## Rewrite the committed interface gap baseline after a reviewed change
-	@go run ./test/parity/interface-closure/autobind -update -out build/interface-gaps
+interface-gaps-update: ## Rewrite the committed interface gap baseline: drop the closed gaps, refuse a gap it does not list (ALLOW_NEW="reason" lists new gaps on purpose)
+	@go run ./test/parity/interface-closure/autobind -update $(if $(ALLOW_NEW),-allow-new '$(ALLOW_NEW)') -out build/interface-gaps
 
 # The lane loop. ledger-check and ledger-update derive exactly what interface-gaps and interface-gaps-update derive, but read the reach graph and the decisions from the shared content-addressed cache (PIG_LEDGER_CACHE, else build/ledger-cache) when a tree with the same inputs was derived before, and publish what they compute. They also write build/interface-gaps/ledger-frontier.tsv, the root gaps of this tree ranked by the rows they unblock. CI keeps the uncached interface-gaps gate.
 ledger-check: ## Cached, exact interface gap check for lanes (same verdict as interface-gaps); writes build/interface-gaps/ledger-frontier.tsv
 	@go run ./test/parity/interface-closure/autobind -check -cache auto -out build/interface-gaps -frontier build/interface-gaps/ledger-frontier.tsv
 	@python3 test/parity/interface-closure/breakdown/proofclass.py build/ledger-proof-classes
 
-ledger-update: ## Cached rewrite of the committed interface gap baseline and mapping (same result as interface-gaps-update)
-	@go run ./test/parity/interface-closure/autobind -update -cache auto -out build/interface-gaps -frontier build/interface-gaps/ledger-frontier.tsv
+ledger-update: ## Cached rewrite of the committed interface gap baseline and mapping (same result and same refusal of a new gap as interface-gaps-update; ALLOW_NEW="reason")
+	@go run ./test/parity/interface-closure/autobind -update $(if $(ALLOW_NEW),-allow-new '$(ALLOW_NEW)') -cache auto -out build/interface-gaps -frontier build/interface-gaps/ledger-frontier.tsv
 
 # The integrator runs ledger-frontier after appending each TOTALS line; lanes read the shared file instead of deriving their own ranking.
 LEDGER_LOGS ?= build/interface-gaps
@@ -628,7 +633,7 @@ async-contracts: ## Audit Promise/async semantics across the pinned upstream tre
 # parity runs so reviewers see "ported AND verified" in one column.
 port-map: coverage ## Rewrite docs/parity/PORT_MAP.md with coverage column merged
 	@echo "docs/parity/PORT_MAP.md = code mapping (human mental model)"
-	@echo "test/parity/coverage.md = verification truth (machine-generated)"
+	@echo "test/parity/generated/coverage.md = verification truth (machine-generated)"
 	@echo "(use 'make coverage' to refresh the latter)"
 
 # Scenario quality lint. Enforces rules from AGENTS.md that were
@@ -662,7 +667,7 @@ port-map-drift: pin-check ## PORT_MAP completeness gate. Coverage uses docs/pari
 # scenario-derived facts are compared; the "last run" column comes from a
 # transient parity results file and is excluded.
 coverage-drift: ## Generated-report freshness gate. A scenario added without regenerating
-	@./automation/ci/check-coverage-drift.py --coverage test/parity/coverage.md
+	@./automation/ci/check-coverage-drift.py --coverage test/parity/generated/coverage.md
 
 # Family scope report. Lists, for each behavior family declared in
 # test/parity/families.toml, which PORT_MAP entries are covered by in-family

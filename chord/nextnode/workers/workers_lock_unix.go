@@ -2,6 +2,8 @@
 
 package workers
 
+// Ports packages/chord/src/node/workers/lock.ts
+
 import (
 	"context"
 	"errors"
@@ -17,6 +19,9 @@ import (
 // platformLockLocation is `processLock`'s choice of where the lock lives: Linux and Android an abstract socket (Node's
 // `\0chord-lock-<key>`, written @ by Go), elsewhere a socket file.
 func platformLockLocation(key string) (lockLocation, error) {
+	if loc, forced := forcedLockFileLocation(key); forced {
+		return loc, nil
+	}
 	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 		return lockLocation{kind: lockAbstract, address: "@chord-lock-" + key}, nil
 	}
@@ -34,6 +39,7 @@ const maxSocketPathBytes = 103
 // in a private per-user directory under /tmp that only its owner can reach.
 func socketPath(file string) (string, error) {
 	preferred := filepath.Join(os.TempDir(), file)
+	//portlint:allow utf16units lock.ts measures the same unit: Buffer.byteLength(preferred) <= MAX_SOCKET_PATH_BYTES, the sun_path limit is in bytes
 	if len(preferred) <= maxSocketPathBytes {
 		return preferred, nil
 	}
@@ -64,8 +70,7 @@ func platformDialLock(location lockLocation, ctx context.Context) (net.Conn, err
 
 func lockInUse(err error) bool { return errors.Is(err, syscall.EADDRINUSE) }
 
-// lockRefused: a connect's errors that mean nobody accepts on the path: a socket file nobody listens on, or no socket there (a
-// regular file at the path is ENOTSOCK on macOS, ECONNREFUSED on Linux; retrying would spin).
+// lockRefused reports that nobody accepts on the lock's address: connect(2) fails with ECONNREFUSED to a socket file nothing listens on, and to a plain file (a crashed holder's leftover) with ECONNREFUSED on Linux and ENOTSOCK on macOS and the BSDs. Any other error means the holder is gone or going, so the waiter takes the lock again.
 func lockRefused(err error) bool {
 	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOTSOCK)
 }

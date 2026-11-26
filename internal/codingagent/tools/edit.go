@@ -8,7 +8,6 @@ import (
 
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
-	"github.com/MichaelKinsy/PiG/internal/jsdiff"
 	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
 	"github.com/MichaelKinsy/PiG/internal/nodefs"
 	"github.com/MichaelKinsy/PiG/internal/orderedjson"
@@ -44,6 +43,9 @@ type EditTool struct {
 	Operations *EditOperations
 }
 
+// computeEditDiff is generateEditDiff; tests replace it to fail the diff.
+var computeEditDiff = generateEditDiff
+
 func (t *EditTool) operations() EditOperations {
 	if t.Operations != nil {
 		return *t.Operations
@@ -54,7 +56,12 @@ func (t *EditTool) operations() EditOperations {
 func (t *EditTool) Name() string  { return "edit" }
 func (t *EditTool) Label() string { return "" }
 
-func (t *EditTool) Schema() ai.ToolSchema {
+func (t *EditTool) Schema() ai.ToolSchema { return t.schema(false) }
+
+// BorrowedSchema is Schema with the parameters shared, not copied: the caller reads them and never modifies them.
+func (t *EditTool) BorrowedSchema() ai.ToolSchema { return t.schema(true) }
+
+func (t *EditTool) schema(borrow bool) ai.ToolSchema {
 	return toolSchemaWithParameters(ai.ToolSchema{
 		Name:                "edit",
 		Description:         "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
@@ -69,7 +76,7 @@ func (t *EditTool) Schema() ai.ToolSchema {
 			"oldText":{"type":"string","description":"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."},
 			"newText":{"type":"string","description":"Replacement text for this targeted edit."}
 		}},"description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead."}
-	}}`)
+	}}`, borrow)
 }
 
 // ExecutionMode is parallel: upstream's edit definition sets no
@@ -306,28 +313,30 @@ func (t *EditTool) editLocked(ctx context.Context, absPath string, p editParams)
 	}
 	var decoder utf8stream.Decoder
 	bom, content := text.SplitBom(decoder.Decode(data, false))
-	originalEnding := detectLineEnding(content)
 	normalized := normalizeToLF(content)
 	applied, err := applyEditsToNormalizedContent(normalized, p.Edits, p.Path)
 	if err != nil {
 		return editError(err.Error())
 	}
+	// Diff before writing, so diff computation cannot fail after the write.
+	editDiff := computeEditDiff(p.Path, applied.baseContent, applied.newContent, applied.replacements, 4)
 	if aborted() {
 		return editError("Operation aborted")
 	}
-	final := bom + restoreLineEndings(applied.newContent, originalEnding)
+	// Splice into the original text, so untouched lines keep their line endings. Without any CR the original is the normalized text,
+	// and the normalized result is already final.
+	final := bom + applied.newContent
+	if content != normalized {
+		final = bom + applyReplacementsToOriginal(content, applied.replacements)
+	}
 	if err := ops.WriteFile(absPath, final); err != nil {
 		return editError(NodeFSError(err, "open", absPath))
 	}
 	if aborted() {
 		return editError("Operation aborted")
 	}
-	// One line diff serves the display diff and the patch, which upstream computes separately over the same pair.
-	lineDiff := jsdiff.DiffLineRuns(applied.baseContent, applied.newContent)
-	diff, firstChangedLine := diffStringOf(lineDiff, applied.baseContent, applied.newContent, 4)
-	patch := unifiedPatchOf(p.Path, lineDiff, 4)
 	return agent.AgentToolResult{
 		Content: []ai.ToolResultMessageContent{ai.TextContent{Text: fmt.Sprintf("Successfully replaced %d block(s) in %s.", len(p.Edits), p.Path)}},
-		Details: &EditToolDetails{Diff: diff, Patch: patch, FirstChangedLine: firstChangedLine},
+		Details: &EditToolDetails{Diff: editDiff.diff, Patch: editDiff.patch, FirstChangedLine: editDiff.firstChangedLine},
 	}
 }

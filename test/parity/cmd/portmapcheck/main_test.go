@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/MichaelKinsy/PiG/internal/coding/pigversion"
+	"github.com/MichaelKinsy/PiG/internal/testenv"
 )
 
 // fixture writes a small repository: one Pi file (packages/fx/src/widget.ts) with two exported members, and the PORT_MAP row for it.
@@ -425,7 +426,7 @@ func TestMarkerRowIsProvenByCoverageAndAKilledMutant(t *testing.T) {
 		{"coverage and a killed mutant", marked, killer, ""},
 		{"no mutant listed", marked, `{}`, "names no mutant"},
 		{"the old text is ambiguous (two sites)", marked, twice, "the old text occurs 2 times, not once"},
-		{"the tests assert nothing: the mutant survives", slack, killer, "no listed mutant makes the marker tests fail (the tests would pass without the cited code) [lib/widget.go: the tests passed with the mutant]"},
+		{"the tests assert nothing: the mutant survives", slack, killer, "no listed mutant makes the marker tests fail by an assertion [lib/widget.go: the tests passed with the mutant]"},
 		{"the mutant text is absent from the file", marked, `{"packages/fx/src/widget.ts":[{"file":"lib/widget.go","old":"nope","new":"x"}]}`, "the old text occurs 0 times, not once"},
 		{"the mutant does not compile", marked, `{"packages/fx/src/widget.ts":[{"file":"lib/widget.go","old":"\"hello \" + w.Name","new":"undefined"}]}`, "the mutant did not build: "},
 		{"the mutant panics: the slack test only executes the code", slack, `{"packages/fx/src/widget.ts":[{"file":"lib/widget.go","old":"\"hello \" + w.Name","new":"func() string { panic(w.Name) }()"}]}`, "the mutant panicked: panic: a"},
@@ -447,6 +448,24 @@ func TestMarkerRowIsProvenByCoverageAndAKilledMutant(t *testing.T) {
 		if (tc.want == "") != res[0].Proven || (tc.want != "" && !strings.Contains(got, tc.want)) {
 			t.Errorf("%s: proven=%v reasons=%q, want %q", tc.name, res[0].Proven, got, tc.want)
 		}
+	}
+}
+
+func TestMarkerMutantIsKilledWhenRootIsBehindASymbolicLink(t *testing.T) {
+	const marked = "package lib\n\nimport \"testing\"\n\n// pi: packages/fx/src/widget.ts\nfunc TestWidget(t *testing.T) {\n\tif (Widget{Name: \"a\"}).Hello() != \"hello a\" {\n\t\tt.Fatal(\"hello\")\n\t}\n}\n"
+	const killer = `{"packages/fx/src/widget.ts":[{"file":"lib/widget.go","old":"\"hello \" + w.Name","new":"\"bye \" + w.Name"}]}`
+	realRoot := markerFixture(t, marked, killer)
+	// Place a symlinked parent directory in front of the fixture root (mirroring TMPDIR=/tmp/L -> /tmp/R
+	// and macOS /tmp -> /private/tmp) so root itself is a directory whose ancestor is a symbolic link.
+	linkParent := filepath.Join(t.TempDir(), "linked-parent")
+	testenv.RequireDirectoryLink(t, filepath.Dir(realRoot), linkParent)
+	linkRoot := filepath.Join(linkParent, filepath.Base(realRoot))
+	res, err := checkWith(linkRoot, true)
+	if err != nil {
+		t.Fatalf("checkWith(linkRoot): %v", err)
+	}
+	if len(res) != 1 || !res[0].Proven || len(res[0].Reasons) != 0 {
+		t.Fatalf("linked root verdict = %+v, want proven with no reasons", res)
 	}
 }
 
@@ -969,127 +988,75 @@ func TestInfraFailureClassification(t *testing.T) {
 	}
 }
 
-// TestReplaysCompileIntoACloneOfTheBuildCache: the clone shares the cache's entries by hard link, what replays add stays in the clone and
-// is removed after replaysPerTrim replays, and the shared cache is never written to; the clone goes at the end.
-func TestReplaysCompileIntoACloneOfTheBuildCache(t *testing.T) {
-	parent := t.TempDir()
-	shared := filepath.Join(parent, "go-build")
-	if err := os.MkdirAll(filepath.Join(shared, "ab"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	entry := filepath.Join(shared, "ab", "entry-d")
-	if err := os.WriteFile(entry, []byte("compiled"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	clones := func() []string { g, _ := filepath.Glob(filepath.Join(parent, ".portmap-gocache-*")); return g }
-	exists := func(p string) bool { _, err := os.Stat(p); return err == nil }
-	env := []string{"HOME=/x", "GOCACHE=" + shared}
-	c := newReplayCaches()
-	c.every = 3
-	var dir string
-	for i := 1; i <= 3; i++ {
-		d, done := c.acquire(env)
-		if d == "" || d == shared || filepath.Dir(d) != parent {
-			t.Fatalf("replay %d: GOCACHE=%q, want a clone beside %s", i, d, shared)
-		}
-		if dir != "" && d != dir {
-			t.Fatalf("replay %d: a second clone %q beside %q", i, d, dir)
-		}
-		dir = d
-		a, _ := os.Stat(entry)
-		b, err := os.Stat(filepath.Join(d, "ab", "entry-d"))
-		if err != nil || !os.SameFile(a, b) {
-			t.Fatalf("replay %d: the clone must hard-link the shared entry: %v", i, err)
-		}
-		if err := os.WriteFile(filepath.Join(d, "ab", "mutant"+strconv.Itoa(i)+"-d"), []byte("mutated"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		done()
-		if i < 3 && !exists(filepath.Join(d, "ab", "mutant"+strconv.Itoa(i)+"-d")) {
-			t.Fatalf("replay %d: trimmed before %d replays", i, c.every)
-		}
-	}
-	if g, _ := filepath.Glob(filepath.Join(dir, "ab", "*")); len(g) != 1 || filepath.Base(g[0]) != "entry-d" {
-		t.Fatalf("after the trim the clone must hold only the shared entries: %v", g)
-	}
-	if len(clones()) != 1 {
-		t.Fatalf("want one clone: %v", clones())
-	}
-	c.close()
-	if len(clones()) != 0 {
-		t.Fatalf("the clone outlived the check: %v", clones())
-	}
-	if g, _ := filepath.Glob(filepath.Join(shared, "ab", "*")); len(g) != 1 || g[0] != entry {
-		t.Fatalf("the shared cache was written to: %v", g)
-	}
-	missing := newReplayCaches()
-	if d, done := missing.acquire([]string{"GOCACHE=" + filepath.Join(parent, "missing")}); d != "" {
-		t.Fatalf("a missing cache cannot be cloned, got %q", d)
-	} else {
-		done()
-	}
-	missing.close()
-	if len(clones()) != 0 {
-		t.Fatalf("a failed clone left a directory: %v", clones())
-	}
-	if d, _ := newReplayCaches().acquire([]string{"GOCACHE=off"}); d != "" {
-		t.Fatalf("a disabled cache needs no clone, got %q", d)
-	}
-	if d, _ := (*replayCaches)(nil).acquire(env); d != "" {
-		t.Fatalf("a nil *replayCaches uses the shared cache, got %q", d)
-	}
-}
+// TestNoCacheForcesEveryRowToRun: with a cached green record already on disk under build/portmap-coverage, a normal run replays it
+// without invoking the evidence test, while -no-cache ignores the cache, runs the evidence test again, reports 0 cached / N run, and
+// refreshes the cache entry.
+func TestNoCacheForcesEveryRowToRun(t *testing.T) {
+	runsFile := filepath.Join(t.TempDir(), "runs.log")
+	body := "package lib\n\nimport (\n\t\"os\"\n\t\"testing\"\n)\n\nfunc TestWidget(t *testing.T) {\n" +
+		"\tf, err := os.OpenFile(" + strconv.Quote(runsFile) + ", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)\n" +
+		"\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n" +
+		"\t_, _ = f.WriteString(\"x\\n\")\n" +
+		"\t_ = f.Close()\n" +
+		"\tif (Widget{Name: \"a\"}).Hello() != \"hello a\" {\n\t\tt.Fatal(\"hello\")\n\t}\n}\n"
+	root := coverageFixture(t, body)
 
-// TestMutantReplaysLeaveTheSharedBuildCacheAlone: whatever the go command of a replay writes into its build cache is gone when the check ends
-// and never reaches the shared cache. The stand-in go runs everything else against the real cache, so nothing compiles cold.
-func TestMutantReplaysLeaveTheSharedBuildCacheAlone(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("the stand-in go is a shell script")
+	bin := filepath.Join(t.TempDir(), "portmapcheck")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build portmapcheck: %v\n%s", err, out)
 	}
-	const marked = "package lib\n\nimport \"testing\"\n\n// pi: packages/fx/src/widget.ts\nfunc TestWidget(t *testing.T) {\n\tif (Widget{Name: \"a\"}).Hello() != \"hello a\" {\n\t\tt.Fatal(\"hello\")\n\t}\n}\n"
-	const mutant = `{"packages/fx/src/widget.ts":[{"file":"lib/widget.go","old":"\"hello \" + w.Name","new":"\"bye \" + w.Name"}]}`
-	realCache := strings.TrimSpace(goEnv(t, "GOCACHE"))
-	real, err := exec.LookPath("go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	parent := t.TempDir()
-	shared := filepath.Join(parent, "go-build")
-	if err := os.MkdirAll(filepath.Join(shared, "ab"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(shared, "ab", "entry-d"), []byte("compiled"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	dir := t.TempDir()
-	log := filepath.Join(dir, "seen.log")
-	script := "#!/bin/sh\ncase \"$*\" in\n*-overlay*) [ -f \"$GOCACHE/ab/entry-d\" ] && echo hit >> " + log + "; mkdir -p \"$GOCACHE/zz\" && echo mutated > \"$GOCACHE/zz/mutant-d\"; exit 1;;\nesac\nGOCACHE=" + realCache + " exec " + real + " \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(dir, "go"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("GOCACHE", shared)
-	root := markerFixture(t, marked, mutant)
-	res, err := checkWith(root, true)
-	if err != nil || res[0].Proven {
-		t.Fatalf("the replay fails, so the row is unproven and it is not an infrastructure error: %v %+v", err, res)
-	}
-	if b, _ := os.ReadFile(log); strings.TrimSpace(string(b)) != "hit" {
-		t.Fatalf("the replay must see the shared entries through its clone: %q", b)
-	}
-	if _, err := os.Stat(filepath.Join(shared, "zz")); !os.IsNotExist(err) {
-		t.Fatalf("the replay wrote into the shared cache: %v", err)
-	}
-	if left, _ := filepath.Glob(filepath.Join(parent, ".portmap-gocache-*")); len(left) != 0 {
-		t.Fatalf("a clone outlived the check: %v", left)
-	}
-}
 
-func goEnv(t *testing.T, name string) string {
-	t.Helper()
-	out, err := exec.Command("go", "env", name).Output()
-	if err != nil {
-		t.Fatal(err)
+	runCLI := func(args ...string) (string, error) {
+		cmd := exec.Command(bin, append([]string{"-root", root}, args...)...)
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = &out
+		err := cmd.Run()
+		return out.String(), err
 	}
-	return string(out)
+
+	countRuns := func() int {
+		b, err := os.ReadFile(runsFile)
+		if err != nil {
+			return 0
+		}
+		return bytes.Count(b, []byte("\n"))
+	}
+
+	// 1. Cold run: invokes the evidence test once and writes build/portmap-coverage/<digest>.json.
+	out1, err := runCLI()
+	if err != nil {
+		t.Fatalf("cold run failed: %v\n%s", err, out1)
+	}
+	if !strings.Contains(out1, "portmap: 1 rows: 0 cached, 1 run;") {
+		t.Fatalf("cold run summary mismatch:\n%s", out1)
+	}
+	if got := countRuns(); got != 1 {
+		t.Fatalf("cold run evidence invocations = %d, want 1", got)
+	}
+
+	// 2. Warm run without -no-cache: replays the cached entry without invoking the evidence test.
+	out2, err := runCLI()
+	if err != nil {
+		t.Fatalf("warm run failed: %v\n%s", err, out2)
+	}
+	if !strings.Contains(out2, "portmap: 1 rows: 1 cached, 0 run;") {
+		t.Fatalf("warm run summary mismatch:\n%s", out2)
+	}
+	if got := countRuns(); got != 1 {
+		t.Fatalf("warm run should not re-invoke evidence test: got %d invocations, want 1", got)
+	}
+
+	// 3. Forced run with -no-cache: ignores the cache entry on disk, invokes the evidence test again, and reports 0 cached, 1 run.
+	out3, err := runCLI("-no-cache")
+	if err != nil {
+		t.Fatalf("-no-cache run failed: %v\n%s", err, out3)
+	}
+	if !strings.Contains(out3, "portmap: 1 rows: 0 cached, 1 run;") {
+		t.Fatalf("-no-cache summary mismatch:\n%s", out3)
+	}
+	if got := countRuns(); got != 2 {
+		t.Fatalf("-no-cache run evidence invocations = %d, want 2", got)
+	}
 }

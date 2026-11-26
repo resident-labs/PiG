@@ -19,8 +19,10 @@ import (
 	"unicode/utf16"
 
 	"github.com/MichaelKinsy/PiG/internal/jsjson"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 
 	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
+	"github.com/MichaelKinsy/PiG/internal/jsonwire"
 	"github.com/MichaelKinsy/PiG/internal/orderedjson"
 )
 
@@ -107,19 +109,26 @@ type anthRequest struct {
 	Stream    bool          `json:"stream"`
 	// Betas is visible to OnPayload as upstream params.betas. The wire body
 	// omits it and sends it as the anthropic-beta header instead.
-	Betas      []string          `json:"betas,omitempty" requestsplice:"read"`
-	System     []anthSystemBlock `json:"system,omitempty"`
-	Tools      []anthTool        `json:"tools,omitempty"`
-	ToolChoice any               `json:"tool_choice,omitempty"`
-	Metadata   *anthMetadata     `json:"metadata,omitempty"`
-	Thinking   *anthThinking     `json:"thinking,omitempty"`
+	//portlint:allow emptydrop buildParams adds betas only when there is a beta feature (anthropic-messages.ts:1487): Pi sends no empty array
+	Betas []string `json:"betas,omitempty" requestsplice:"read"`
+	// The members below follow in the order buildParams assigns them to the literal of the members above (anthropic-messages.ts:1487-1597):
+	// JSON.stringify writes an object's members in the order they were created.
+	//portlint:allow emptydrop buildParams sets system only to a non-empty array, the OAuth identity block or a non-empty prompt (anthropic-messages.ts:1491-1508)
+	System []anthSystemBlock `json:"system,omitempty"`
+	// Temperature is incompatible with extended thinking.
+	Temperature *float64 `json:"temperature,omitempty"`
+	//portlint:allow emptydrop buildParams sets tools to the definitions and the placeholder, or only when there is a tool (anthropic-messages.ts:1533-1537)
+	Tools    []anthTool    `json:"tools,omitempty"`
+	Thinking *anthThinking `json:"thinking,omitempty"`
 	// OutputConfig controls output quality knobs like thinking effort.
 	// Used with adaptive thinking (Opus 4.6+, Sonnet 4.6) to set effort level.
 	// Mirrors upstream anthropic.ts output_config.
 	OutputConfig *anthOutputConfig `json:"output_config,omitempty"`
-	// Temperature is incompatible with extended thinking.
-	Temperature *float64       `json:"temperature,omitempty"`
-	Fallbacks   []anthFallback `json:"fallbacks,omitempty"`
+	Metadata     *anthMetadata     `json:"metadata,omitempty"`
+	// ToolChoice is { type } for a named choice, or the caller's object as the caller wrote it.
+	ToolChoice any `json:"tool_choice,omitempty"`
+	//portlint:allow emptydrop buildParams sets fallbacks only when the model allows a fallback model (anthropic-messages.ts:1593-1594)
+	Fallbacks []anthFallback `json:"fallbacks,omitempty"`
 }
 
 type anthFallback struct {
@@ -151,6 +160,13 @@ type anthMessage struct {
 	OutputConfig *anthOutputConfig `json:"output_config,omitempty"`
 }
 
+// anthImageSource is the source of an image block, with its members in the order convertImageBlock writes them (anthropic-messages.ts:150-154).
+type anthImageSource struct {
+	Type      string `json:"type"` // "base64"
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
+}
+
 // anthContentBlock is the union type for Anthropic content blocks.
 // Fields are selectively present depending on Type.
 type anthContentBlock struct {
@@ -165,8 +181,8 @@ type anthContentBlock struct {
 	ToolUseID string `json:"tool_use_id,omitempty"`
 	Content   any    `json:"content,omitempty"` // string | []block for tool_result
 	IsError   *bool  `json:"is_error,omitempty"`
-	// image (base64 source: {type, media_type, data})
-	Source any `json:"source,omitempty"`
+	// image
+	Source *anthImageSource `json:"source,omitempty"`
 	// thinking
 	Thinking  string `json:"thinking,omitempty"`
 	Signature string `json:"signature,omitempty"`
@@ -185,17 +201,21 @@ func (anthRequest) encodesRequestStrings() {}
 
 // Text and thinking blocks retain their required string fields, including explicit empty values.
 func (block anthContentBlock) MarshalJSON() ([]byte, error) {
-	return json.Marshal(block.wire())
+	// A block can name a tool, and a name can hold a lone UTF-16 surrogate that Pi does not sanitize (anthropic-messages.ts convertMessages
+	// sanitizes text and thinking only): the block is written as JSON.stringify writes it.
+	return jsstring.MarshalKeepingSurrogates(block.wire())
 }
 
 // wire is the value MarshalJSON writes.
 func (block anthContentBlock) wire() any {
 	type payload anthContentBlock
 	if block.Type == "text" {
+		// A text block is the literal { type, text }, and the conversation's cache breakpoint is assigned to the built block, so cache_control follows text (anthropic-messages.ts:1811, :1815-1819).
 		return struct {
-			payload
-			Text string `json:"text"`
-		}{payload: payload(block), Text: block.Text}
+			Type         string            `json:"type"`
+			Text         string            `json:"text"`
+			CacheControl *anthCacheControl `json:"cache_control,omitempty"`
+		}{block.Type, block.Text, block.CacheControl}
 	}
 	if block.Type != "thinking" {
 		return payload(block)
@@ -239,7 +259,8 @@ func (t anthTool) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(wire)
+	// The name and the description are written as JSON.stringify writes them: a lone UTF-16 surrogate as its escape (anthropic-messages.ts:1925-1936).
+	return jsstring.MarshalKeepingSurrogates(wire)
 }
 
 // anthToolWire is the value anthTool's MarshalJSON writes.
@@ -264,8 +285,8 @@ func (t anthTool) wire() (anthToolWire, error) {
 // anthLegacyInputSchemaOrder is the member order of the literal { type, properties, required } (anthropic-messages.ts:1589-1593, :207).
 var anthLegacyInputSchemaOrder = []string{"type", "properties", "required"}
 
-// anthLegacyDefinitionKeys are the root members the legacy literal appends after required, in order, when present (anthropic-messages.ts convertTools).
-var anthLegacyDefinitionKeys = []string{"$defs", "definitions"}
+// anthLegacyOptionalRootKeys are the root members the legacy literal appends after required, in order, when present: additionalProperties, $defs and definitions (anthropic-messages.ts convertTools).
+var anthLegacyOptionalRootKeys = []string{"additionalProperties", "$defs", "definitions"}
 
 // deferredToolPlaceholder mirrors upstream DEFERRED_TOOL_PLACEHOLDER: a stable
 // deferred tool declared whenever native tool changes are in use. Anthropic adds
@@ -421,10 +442,8 @@ func normalizeAnthropicToolCallID(id string) string {
 // anthImageBlock is convertImageBlock: a base64 image block.
 func anthImageBlock(image ImageContent) anthContentBlock {
 	return anthContentBlock{
-		Type: "image",
-		Source: map[string]any{
-			"type": "base64", "media_type": image.MimeType, "data": image.Data,
-		},
+		Type:   "image",
+		Source: &anthImageSource{Type: "base64", MediaType: image.MimeType, Data: image.Data},
 	}
 }
 
@@ -583,9 +602,7 @@ func anthConvertMessagesDetailed(messages []Message, isOAuthToken, allowEmptySig
 							blocks = append(blocks, anthContentBlock{Type: "text", Text: text})
 						}
 					case ImageContent:
-						blocks = append(blocks, anthContentBlock{Type: "image", Source: map[string]any{
-							"type": "base64", "media_type": content.MimeType, "data": content.Data,
-						}})
+						blocks = append(blocks, anthImageBlock(content))
 					}
 				}
 				if len(blocks) > 0 {
@@ -871,12 +888,12 @@ func anthConvertTools(tools []ToolSchema, isOAuthToken, supportsEagerToolInputSt
 	return out, nil
 }
 
-// anthKeepsLegacySchemaOrder reports whether the object at path survives into the legacy input_schema: properties and the root definitions.
+// anthKeepsLegacySchemaOrder reports whether the object at path survives into the legacy input_schema: properties, additionalProperties and the root definitions.
 func anthKeepsLegacySchemaOrder(path string) bool {
 	if anthIsOrIsUnder(path, "properties") {
 		return true
 	}
-	for _, key := range anthLegacyDefinitionKeys {
+	for _, key := range anthLegacyOptionalRootKeys {
 		if anthIsOrIsUnder(path, key) {
 			return true
 		}
@@ -918,11 +935,12 @@ func anthInputSchema(parameters map[string]any, parameterOrder schemaObjectOrder
 		}
 		order[""] = root
 	} else {
-		// Shared definitions stay so property $refs resolve; other root keywords stay out because Anthropic rejects root
-		// anyOf/oneOf/allOf with a 400 (Pi 4a6a58eb5, #9557). A key the schema lacks is omitted, not written as null.
-		schema = make(map[string]any, len(anthLegacyInputSchemaOrder)+len(anthLegacyDefinitionKeys))
+		// Shared definitions stay so property $refs resolve, and additionalProperties stays so the model knows whether extra arguments are allowed.
+		// Other root keywords stay out because Anthropic rejects root
+		// anyOf/oneOf/allOf with a 400 (Pi 4a6a58eb5, #9557; aa47cedce, #12100). A key the schema lacks is omitted, not written as null.
+		schema = make(map[string]any, len(anthLegacyInputSchemaOrder)+len(anthLegacyOptionalRootKeys))
 		root := slices.Clone(anthLegacyInputSchemaOrder)
-		for _, key := range anthLegacyDefinitionKeys {
+		for _, key := range anthLegacyOptionalRootKeys {
 			if definitions, ok := parameters[key]; ok {
 				schema[key] = definitions
 				root = append(root, key)
@@ -1080,6 +1098,8 @@ type anthropicParams struct {
 	cacheControl        *anthCacheControl
 	allowEmptySignature bool
 	nativeToolChanges   bool
+	// threadSession is the session whose requests use message threads; empty when threads don't apply.
+	threadSession string
 	// toolDefinitions converts tools for native tool_addition blocks; nil
 	// unless nativeToolChanges.
 	toolDefinitions anthToolDefinitions
@@ -1134,6 +1154,7 @@ func (p *anthropicProvider) Stream(ctx context.Context, transcript TranscriptCon
 	model := p.resolveModel()
 	// upstream: packages/ai/src/api/anthropic-messages.ts:stream
 	builder := newObservedProviderBuilder(ctx, outputAPI(p.cfg.ModelMetadata, APIAnthropicMessages), p.cfg.ProviderID, p.cfg.Model)
+	builder.causeDetail = true
 	builder.modelCost = opts.ModelCost
 	builder.setProviderEventObserver(opts, model)
 	// buildParams records the effort of the final effort marker on the reply once it has built the request (anthropic-messages.ts:647), so a failure
@@ -1150,6 +1171,7 @@ func (p *anthropicProvider) Stream(ctx context.Context, transcript TranscriptCon
 	}
 	requestContext, abort := context.WithCancel(ctx)
 	builder.abort = abort
+	//portlint:allow asyncorder Pi's stream() starts a detached async IIFE and returns the stream (anthropic-messages.ts:820, :1178); the stream owns this goroutine, which sends the request and runs the body pipeline as a turn of the stream's continuation executor (responseTurn in streamResponse), the ordering point with the consumer; TestAnthropicMicrotaskTrace holds each delivery's macrotask and microtask position to Pi's
 	go builder.runResponse(func() error { return p.streamResponse(ctx, requestContext, request, opts, model, builder) })
 	return builder.stream, nil
 }
@@ -1171,6 +1193,8 @@ type anthropicOutgoing struct {
 	body   *requestBody
 	betas  *string
 	params anthropicParamHeaders
+	// thread is the message-threads request this request is, nil when it is sent without a thread.
+	thread *anthThreadRequest
 }
 
 func (p *anthropicProvider) prepareStream(ctx context.Context, transcript TranscriptContext, opts StreamOptions, model *Model, recordLevel func(AnthropicEffort)) (*anthropicStreamRequest, error) {
@@ -1212,14 +1236,14 @@ func (p *anthropicProvider) prepareStream(ctx context.Context, transcript Transc
 		lease.release()
 		return nil, AbortReason(ctx)
 	}
-	params, err := p.buildParams(model, transcript, client.isOAuthToken, modelHeaders, optionsHeaders, opts, requestEnv, false)
+	params, err := p.buildParams(model, transcript, client.isOAuthToken, modelHeaders, optionsHeaders, opts, requestEnv, hasExceededStrictToolLimits(opts.SessionID))
 	if err != nil {
 		lease.release()
 		return nil, fmt.Errorf("anthropic: build params: %w", err)
 	}
 	recordLevel(params.providerThinkingLevel)
 	prepared := &anthropicStreamRequest{baseURL: baseURL, client: client, params: params}
-	prepared.first, err = p.prepareRequest(ctx, baseURL, client, params.request, model, opts)
+	prepared.first, err = p.prepareParams(ctx, baseURL, client, params, model, opts)
 	if err != nil {
 		lease.release()
 		return nil, err
@@ -1233,7 +1257,7 @@ func (p *anthropicProvider) prepareStream(ctx context.Context, transcript Transc
 			}
 			recordLevel(retryParams.providerThinkingLevel)
 			prepared.params = retryParams
-			return p.prepareRequest(ctx, baseURL, client, retryParams.request, model, opts)
+			return p.prepareParams(ctx, baseURL, client, retryParams, model, opts)
 		}
 	}
 	return prepared, nil
@@ -1263,7 +1287,7 @@ func (p *anthropicProvider) send(ctx, requestContext context.Context, client ant
 // streamResponse sends the request, handles a non-success status, and runs the body pipeline on the provider's executor turn. The request context is canceled with the caller's and when the pipeline ends.
 func (p *anthropicProvider) streamResponse(ctx, requestContext context.Context, request *anthropicStreamRequest, opts StreamOptions, model *Model, builder *assistantStreamBuilder) error {
 	defer request.client.federation.release()
-	resp, err := p.send(ctx, requestContext, request.client, request.first, opts)
+	resp, thread, err := p.sendThreaded(ctx, requestContext, request, request.first, opts, builder.partial)
 	if err != nil {
 		return err
 	}
@@ -1282,26 +1306,29 @@ func (p *anthropicProvider) streamResponse(ctx, requestContext context.Context, 
 				Error:     &DiagnosticErrorInfo{Message: strictLimitMessage},
 				Details:   map[string]any{"reason": "strict_tool_limits_exceeded"},
 			})
+			markStrictToolLimitsExceeded(opts.SessionID)
 			retry, err = request.withoutStrict()
 		case resp.StatusCode == http.StatusBadRequest && isThinkingSignatureError(b):
 			request.params.request.Messages, err = request.params.convertMessages(stripThinkingSignatures(request.params.conversation), request.client.isOAuthToken)
 			if err != nil {
 				return err
 			}
-			retry, err = p.prepareRequest(ctx, request.baseURL, request.client, request.params.request, model, opts)
+			retry, err = p.prepareParams(ctx, request.baseURL, request.client, request.params, model, opts)
 		default:
+			noteFailureResponse(ctx, resp)
 			return anthHTTPError(resp.StatusCode, b)
 		}
 		if err != nil {
 			return err
 		}
-		resp, err = p.send(ctx, requestContext, request.client, retry, opts)
+		resp, thread, err = p.sendThreaded(ctx, requestContext, request, retry, opts, builder.partial)
 		if err != nil {
 			return err
 		}
 		if resp.StatusCode != http.StatusOK {
 			b2, _ := readWebText(resp.Body)
 			_ = resp.Body.Close()
+			noteFailureResponse(ctx, resp)
 			return anthHTTPError(resp.StatusCode, b2)
 		}
 	}
@@ -1318,7 +1345,11 @@ func (p *anthropicProvider) streamResponse(ctx, requestContext context.Context, 
 			defer func() { _ = native.Close() }()
 			body = native
 		}
-		p.parseAnthropicSSE(ctx, body, builder, anthropicStreamNames{isOAuthToken: request.client.isOAuthToken, currentTools: request.params.tools})
+		p.parseAnthropicSSE(ctx, body, builder, anthropicStreamNames{isOAuthToken: request.client.isOAuthToken, currentTools: request.params.tools, replied: func(output *AssistantMessage) {
+			if thread != nil {
+				p.recordThreadReply(model, thread, request.params, request.client.isOAuthToken, output)
+			}
+		}})
 		return nil
 	})
 }
@@ -1485,6 +1516,16 @@ func anthSystemBlocks(systemPrompt string, isOAuthToken bool, cc *anthCacheContr
 	return blocks
 }
 
+// supportsMessageThreads reports whether the endpoint supports message threads. Gateways that drop unknown request fields would silently turn a
+// continue into a request without the earlier conversation, so the default is limited to Anthropic's own endpoint, whatever the provider id (anthropic-messages.ts
+// getAnthropicCompat). Widen or remove this restriction once proxies generally forward the thread field.
+func (p *anthropicProvider) supportsMessageThreads(model *Model) bool {
+	if compat := model.ProviderMeta.Compat; compat != nil && compat.SupportsMessageThreads != nil {
+		return *compat.SupportsMessageThreads
+	}
+	return strings.Contains(p.cfg.BaseURL, "api.anthropic.com")
+}
+
 // anthropicCompatFlag reads an opt-in model compat flag (default false).
 func anthropicCompatFlag(model *Model, flag func(*ModelCompat) *bool) bool {
 	if compat := model.ProviderMeta.Compat; compat != nil {
@@ -1549,6 +1590,9 @@ func (p *anthropicProvider) buildParams(model *Model, transcript TranscriptConte
 			len(initialTools) > 0,
 	}
 	params.disablePreferredStrictTools, params.preferredStrict = disablePreferredStrictTools, new(bool)
+	if opts.SessionID != "" && resolveAnthropicCacheRetention(opts.CacheRetention, env) != CacheRetentionNone && p.supportsMessageThreads(model) {
+		params.threadSession = opts.SessionID
+	}
 	params.activeEffort = anthropicProviderEffort(model, opts)
 	maxTokens := opts.MaxTokens
 	if maxTokens <= 0 {
@@ -1593,6 +1637,7 @@ func (p *anthropicProvider) buildParams(model *Model, transcript TranscriptConte
 		hasFallbacks:                    len(allowedFallbackModels) > 0,
 		supportsMidConvoEffort:          params.activeEffort != "",
 		nativeToolChanges:               params.nativeToolChanges,
+		messageThreads:                  params.threadSession != "",
 	})
 	// pig divergence (D130): Pi #10759. An explicit anthropic-beta header can drop the managed-effort betas, so each managed body field is sent only with its beta: the mid-conversation output_config markers with mid-conversation-output-config-2026-07-01 and block_binding with thinking-binding-controls-2026-08-01 (applySampling). Pi sends both regardless and the API rejects the request with 400.
 	params.effortMarkers = effortMessages && slices.Contains(betas, midConversationEffortBeta)
@@ -1720,16 +1765,58 @@ func (p *anthropicProvider) applySampling(req *anthRequest, model *Model, transc
 
 // prepareRequest runs OnPayload with the selected model and current request, then builds the streaming POST. Upstream calls the payload hook synchronously, before its first await.
 func (p *anthropicProvider) prepareRequest(ctx context.Context, baseURL string, client anthropicClient, req anthRequest, model *Model, opts StreamOptions) (*anthropicOutgoing, error) {
-	payload := any(req)
-	if opts.OnPayload != nil {
-		next, err := opts.OnPayload(req, model)
-		if err != nil {
-			return nil, err
-		}
-		if next != nil {
-			payload = next
-		}
+	payload, err := runAnthropicPayloadHook(req, model, opts)
+	if err != nil {
+		return nil, err
 	}
+	return p.outgoing(ctx, baseURL, client, payload, opts, false)
+}
+
+// prepareParams prepares the built request like prepareRequest, as a message-threads request when the session uses threads: the hook runs once
+// on the full request, and the thread request is derived from what it left.
+func (p *anthropicProvider) prepareParams(ctx context.Context, baseURL string, client anthropicClient, params anthropicParams, model *Model, opts StreamOptions) (*anthropicOutgoing, error) {
+	payload, err := runAnthropicPayloadHook(params.request, model, opts)
+	if err != nil {
+		return nil, err
+	}
+	if params.threadSession == "" || opts.DisableContinuation {
+		return p.outgoing(ctx, baseURL, client, payload, opts, false)
+	}
+	thread, err := p.prepareThread(params.threadSession, payload)
+	if err != nil {
+		return nil, err
+	}
+	if thread == nil {
+		return p.outgoing(ctx, baseURL, client, payload, opts, false)
+	}
+	if thread.continues {
+		checkAnthropicPayload(ctx, APIAnthropicMessages, payload)
+	}
+	outgoing, err := p.outgoing(ctx, baseURL, client, thread.body, opts, thread.continues)
+	if err != nil {
+		return nil, err
+	}
+	outgoing.thread = thread
+	return outgoing, nil
+}
+
+// runAnthropicPayloadHook runs OnPayload with the selected model and current request; the request it returns replaces it unless nil.
+func runAnthropicPayloadHook(req anthRequest, model *Model, opts StreamOptions) (any, error) {
+	if opts.OnPayload == nil {
+		return req, nil
+	}
+	next, err := opts.OnPayload(req, model)
+	if err != nil {
+		return nil, err
+	}
+	if next != nil {
+		return next, nil
+	}
+	return req, nil
+}
+
+// outgoing builds the streaming POST of a payload. checked reports that the caller validated the full request this body continues: a continue sends only the new messages, which do not stand alone.
+func (p *anthropicProvider) outgoing(ctx context.Context, baseURL string, client anthropicClient, payload any, opts StreamOptions, checked bool) (*anthropicOutgoing, error) {
 	var betas *string
 	var params anthropicParamHeaders
 	var body *requestBody
@@ -1756,7 +1843,9 @@ func (p *anthropicProvider) prepareRequest(ctx context.Context, baseURL string, 
 	if err != nil {
 		return nil, fmt.Errorf(p.cfg.ProviderID+": marshal request: %w", err)
 	}
-	checkRequestSegments(ctx, APIAnthropicMessages, body)
+	if !checked {
+		checkRequestSegments(ctx, APIAnthropicMessages, body)
+	}
 	// Upstream calls client.beta.messages.create (anthropic-messages.ts:1065,
 	// 588), which the Anthropic SDK's beta namespace routes to
 	// /v1/messages?beta=true rather than /v1/messages. This is the single
@@ -1803,7 +1892,7 @@ func (p *anthropicProvider) do(ctx context.Context, httpReq *http.Request, opts 
 				}
 			}
 			if _, ok := errors.AsType[*nodeTransportError](err); ok {
-				return nil, errors.New("Connection error.")
+				return nil, &nodeTransportError{message: "Connection error.", cause: err}
 			}
 		}
 	}
@@ -1820,6 +1909,8 @@ var anthropicBodyReadHops = bodyReadHops{buffered: 2, data: 3, end: 1, endAfterD
 type anthropicStreamNames struct {
 	isOAuthToken bool
 	currentTools []ToolSchema
+	// replied runs once the stream ended with a clean reply, before the diagnostics are attached (anthropic-messages.ts recordThreadReply); nil records nothing.
+	replied func(output *AssistantMessage)
 }
 
 func (names anthropicStreamNames) toolName(name string) string {
@@ -1849,10 +1940,11 @@ func decodeAnthropicDeltaEvent(sse anthropicStreamEvent, ev *anthEventContentBlo
 	return decodeAnthropicDeltaEventReflect(sse, ev)
 }
 
-// decodeAnthropicDeltaEventReflect is the decode with json.Unmarshal and the second look, for every record the fast decode leaves.
+// decodeAnthropicDeltaEventReflect is the decode by reflection and the second look, for every record the fast decode leaves. JSON.parse keeps a lone
+// UTF-16 surrogate of a string (the half of a character a server split over two deltas), so the decode does.
 func decodeAnthropicDeltaEventReflect(sse anthropicStreamEvent, ev *anthEventContentBlockDelta) error {
 	text := sse.JSON
-	err := json.Unmarshal([]byte(text), ev)
+	err := jsstring.UnmarshalKeepingSurrogates(jsonwire.Bytes(text), ev)
 	if _, ok := errors.AsType[*json.UnmarshalTypeError](err); ok {
 		if coerced, ok := coerceAnthropicDelta([]byte(text)); ok {
 			*ev, err = coerced, nil
@@ -2135,13 +2227,13 @@ func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, 
 				if block, ok := output.Content[index].(TextContent); ok {
 					block.Text = builder.appendContent(index, block.Text, ev.Delta.Text)
 					output.Content[index] = block
-					builder.push(TextDeltaEvent{ContentIndex: index, Delta: ev.Delta.Text, Partial: output})
+					builder.pushView(TextDeltaEvent{ContentIndex: index, Delta: ev.Delta.Text, Partial: builder.publishedView()})
 				}
 			case "thinking_delta":
 				if block, ok := output.Content[index].(ThinkingContent); ok {
 					block.Thinking = builder.appendContent(index, block.Thinking, ev.Delta.Thinking)
 					output.Content[index] = block
-					builder.push(ThinkingDeltaEvent{ContentIndex: index, Delta: ev.Delta.Thinking, Partial: output})
+					builder.pushView(ThinkingDeltaEvent{ContentIndex: index, Delta: ev.Delta.Thinking, Partial: builder.publishedView()})
 				}
 			case "input_json_delta":
 				if block, ok := output.Content[index].(ToolCall); ok && open.args != nil {
@@ -2152,7 +2244,7 @@ func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, 
 					arguments, order := open.args.Append(ev.Delta.PartialJSON)
 					builder.showStreamedArguments(index, &block, open.args, arguments, order)
 					output.Content[index] = block
-					builder.push(ToolCallDeltaEvent{ContentIndex: index, Delta: ev.Delta.PartialJSON, Partial: output})
+					builder.pushView(ToolCallDeltaEvent{ContentIndex: index, Delta: ev.Delta.PartialJSON, Partial: builder.publishedView()})
 				}
 			case "signature_delta":
 				if block, ok := output.Content[index].(ThinkingContent); ok {
@@ -2284,6 +2376,9 @@ func (p *anthropicProvider) parseAnthropicSSE(ctx context.Context, r io.Reader, 
 		}
 		fail(errors.New(message))
 		return
+	}
+	if names.replied != nil {
+		names.replied(output)
 	}
 	if len(inputTransformations) > 0 {
 		transformations := make([]any, len(inputTransformations))

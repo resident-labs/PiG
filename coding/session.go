@@ -11,7 +11,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -30,6 +29,7 @@ import (
 	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/compaction"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
+	"github.com/MichaelKinsy/PiG/internal/compactprogress"
 	"github.com/MichaelKinsy/PiG/internal/imageprocessing"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
@@ -56,9 +56,10 @@ type Session struct {
 	rebindSession            func(context.Context, extension.SessionStartEvent) error
 	beforeSessionReplacement func(context.Context) error
 	services                 *AgentSessionServices
-	inner                    *icodingagent.Session
-	contextUsageMu           sync.Mutex
-	contextUsageMemo         contextUsageMemo
+	// inner is the session log. ReplaceInner stores it under mu, while ID, Path, CWD and Inner read it from any goroutine without mu (a host call reads the id while a swap holds mu through the host report), so it is read and stored atomically.
+	inner            atomic.Pointer[icodingagent.Session]
+	contextUsageMu   sync.Mutex
+	contextUsageMemo contextUsageMemo
 	// boundaryRecords are the entry records the latest boundary projection handed its dispatch.
 	boundaryRecords boundaryRecords
 	agent           *agent.Agent
@@ -72,13 +73,17 @@ type Session struct {
 	//
 	// upstream: agent-session.ts _pendingToolNames
 	pendingToolNames []string
-	modelRuntime     *ModelRuntime
-	modelRegistry    *ModelRegistry
-	sessionDir       string
-	noSession        bool
-	scopedModels     sessionScopedModels
-	runnerMu         sync.RWMutex
-	runner           *inproc.Runner // extension runner for event dispatch
+	// restoredToolNames is the restored or reloaded loadout that pendingToolNames belongs to. toolRegistryMu guards it.
+	//
+	// upstream: agent-session.ts _restoredToolNames
+	restoredToolNames []string
+	modelRuntime      *ModelRuntime
+	modelRegistry     *ModelRegistry
+	sessionDir        string
+	noSession         atomic.Bool // whether the installed log has no file: ReplaceInner stores it under mu, /new, /fork and Clone read it without mu
+	scopedModels      sessionScopedModels
+	runnerMu          sync.RWMutex
+	runner            *inproc.Runner // extension runner for event dispatch
 	// sharedRunner is the Runtime- or Clone-source-owned runner this Session borrowed; its owner invalidates it.
 	sharedRunner *inproc.Runner
 	// extensionHost is the extension host of the Runtime that created the Session (Session.ExtensionHost).
@@ -98,6 +103,9 @@ type Session struct {
 	closeDone         chan struct{}
 	closeOnce         sync.Once
 	replicatedState   changeobservers.Observers
+	// replicatedBegin and replicatedEnd bracket a change of the identity state (model, session id, name, file): the first runs before the change is visible, the second after replicatedState reported it (beginReplicatedChange).
+	replicatedBegin changeobservers.Observers
+	replicatedEnd   changeobservers.Observers
 	// successorOwnsResources makes Close leave the session-ID keyed provider resources alone: the Session that replaced this one carries the same ID and owns them now.
 	successorOwnsResources atomic.Bool
 	// eventsDone ends the Session event executor: the forwarder stops, the
@@ -118,6 +126,8 @@ type Session struct {
 	detachAgentEvents   func()
 	// agentEventHold holds the Agent at its next event while a termination signal's disposal runs; see HoldAgentEvents.
 	agentEventHold agentEventHold
+	// eventRegions reports the tasks of Pi's event loop that a run of the interactive mode executes, as markers on Events; see sessionEventRegions.
+	eventRegions sessionEventRegions
 
 	// Only the admitted Agent run reads or changes actionable-boundary state.
 	boundaryTurnIndex         int
@@ -126,22 +136,29 @@ type Session struct {
 	lastAssistantMessage      *agent.AssistantMessage
 	// boundaryEncodings keeps the encodings of the latest boundary preview's messages for the next dispatch.
 	boundaryEncodings boundarywire.Encodings
+	// contextEncodings and contextWithSystemEncodings keep the encodings of the conversation's messages from one model request to the next, for the context and the context_with_system dispatch.
+	contextEncodings, contextWithSystemEncodings boundarywire.Encodings
 
 	mu sync.Mutex // protects Session state
 
 	// runState is the active run's streaming, abort, and idle state.
 	runState sessionRunState
 
-	resourceLoader atomic.Pointer[resourceLoaderRef]
-	// extensionBindings are the mode bindings the last BindExtensions call supplied; a reload applies them to the rebuilt runner (agent-session.ts hasBindings).
-	extensionBindings         atomic.Pointer[ExtensionBindings]
+	resourceLoader  atomic.Pointer[resourceLoaderRef]
+	ownedLoaderOnce sync.Once
+	// extensionBindings are the mode bindings the last BindExtensions call supplied; a reload applies them to the rebuilt runner.
+	extensionBindings atomic.Pointer[ExtensionBindings]
+	// extensionsBound is set by BindExtensions, with any bindings: a reload restarts the extensions only for a host that bound them (agent-session.ts _extensionsBound).
+	extensionsBound           atomic.Bool
 	extensionBindingsMu       sync.Mutex
 	extensionErrorUnsubscribe func()
 	baseSystemPrompt          atomic.Pointer[string]
 	baseSystemPromptOptions   atomic.Pointer[extension.BuildSystemPromptOptions]
+	systemPromptOptionsWatch  systemPromptOptionsWatch
 	systemPromptResources     atomic.Pointer[SystemPromptResources]
 	baseSystemSections        ai.OrderedSections
 	runPrompt                 atomic.Pointer[icodingagent.BeforeAgentStartRun]
+	runSystemPromptMemo       runSystemPromptMemo
 	structuredSystemPrompt    bool
 	// defaultSystemPrompt reports that the Session built its own prompt,
 	// which it rebuilds when the active tools change.
@@ -165,13 +182,14 @@ type Session struct {
 	// Compaction state.
 	// compacting is true while any compaction (manual or auto) is in flight.
 	manualCompacting      bool
-	compacting            atomic.Bool        // true while Compact() or runAutoCompaction() is in flight
-	compactMu             sync.Mutex         // protects compaction and tree-navigation ownership
-	compactCancel         context.CancelFunc // non-nil while Compact() or runAutoCompaction() is in flight
-	compactDone           chan struct{}      // closed when the current compaction releases ownership
-	compactAbortRequested bool               // cancellation arrived before compactCancel was installed
-	branchSumCancel       context.CancelFunc // non-nil while tree navigation owns its abortable operation
-	branchSumDone         chan struct{}      // closed when the current tree navigation releases ownership
+	compacting            atomic.Bool                              // true while Compact() or runAutoCompaction() is in flight
+	compactMu             sync.Mutex                               // protects compaction and tree-navigation ownership
+	compactCancel         context.CancelFunc                       // non-nil while Compact() or runAutoCompaction() is in flight
+	compactionProgress    atomic.Pointer[compactprogress.Progress] // the streamed-summary counter of the compaction in flight
+	compactDone           chan struct{}                            // closed when the current compaction releases ownership
+	compactAbortRequested bool                                     // cancellation arrived before compactCancel was installed
+	branchSumCancel       context.CancelFunc                       // non-nil while tree navigation owns its abortable operation
+	branchSumDone         chan struct{}                            // closed when the current tree navigation releases ownership
 
 	// overflowRecoveryAttempted prevents recursive overflow compaction.
 	// Set to true on the first overflow recovery attempt; any subsequent
@@ -183,10 +201,13 @@ type Session struct {
 
 	// retryAttempt counts committed automatic retries of the current retry
 	// sequence (agent-session.ts _retryAttempt).
-	retryAttempt  atomic.Int32
-	retryMu       sync.Mutex
-	retryCancel   *sessionRetryWait
-	retrySchedule func(func())
+	retryAttempt atomic.Int32
+	// retryPendingDecision caches what DefaultRetryDecider returned at noteAssistantMessageEnd for prepareRetry.
+	retryPendingMsg      *agent.AssistantMessage
+	retryPendingDecision *ai.RetryDecision
+	retryMu              sync.Mutex
+	retryCancel          *sessionRetryWait
+	retrySchedule        func(func())
 
 	// assistantEnds carries, in message_end order, what the agent goroutine
 	// decided when each assistant message persisted, for forwardAgentEvents to
@@ -203,10 +224,14 @@ type Session struct {
 	// messages persisted since.
 	entryIDsMu        sync.Mutex
 	entryIDsByMessage map[any]string
+	// messageSeqs numbers the messages extension events carry, so an extension process shares one object between the events and the session entry a message persists, as Pi does.
+	messageSeqs messageSequences
 
 	queueMu        sync.Mutex
 	queuedSteering []string
-	queuedFollowUp []string
+	// queuedImageMessages holds the queued user messages that carry images, keyed by the first block of their content, until delivery normalizes them (agent-session.ts _queuedMessagesWithImages).
+	queuedImageMessages sync.Map
+	queuedFollowUp      []string
 
 	// completer is the SimpleCompleter used by Compact and NavigateTree.
 	// nil → compaction.ProviderCompleter{} (real LLM call via s.Model()).
@@ -469,6 +494,13 @@ func NewSession(svcs *AgentSessionServices, opts SessionOptions) (*Session, erro
 			return nil, err
 		}
 	}
+	// If NewSession returns an error after acquiring an owned loader reference, release it so its Extension Host does not leak (D19).
+	var constructed *Session
+	defer func() {
+		if constructed == nil && resourceLoader.owned != nil {
+			resourceLoader.owned.release()
+		}
+	}()
 	if opts.Runner == nil {
 		// upstream: agent-session.ts _buildRuntime builds the ExtensionRunner over resourceLoader.getExtensions().
 		loaded := resourceLoader.loader.GetExtensions()
@@ -499,6 +531,11 @@ func NewSession(svcs *AgentSessionServices, opts SessionOptions) (*Session, erro
 		if thinkingBudgets == nil {
 			thinkingBudgets = &ai.ThinkingBudgets{}
 		}
+	}
+	// sdk.ts:435 gives the Agent settingsManager.getTransport(), which is "auto" unless the settings name one (settings-defaults.ts:5); a Transport the caller names takes its place.
+	transport := opts.Transport
+	if transport == "" {
+		transport = ai.Transport(svcs.SettingsManager().GetTransport())
 	}
 
 	settings := svcs.Settings()
@@ -606,7 +643,7 @@ func NewSession(svcs *AgentSessionServices, opts SessionOptions) (*Session, erro
 			FollowUpMode:               agent.QueueMode(svcs.SettingsManager().GetFollowUpMode()),
 			BeforeToolCallHooks:        opts.BeforeToolCall,
 			AfterToolCallHooks:         append([]agent.AfterToolCallHook(nil), opts.AfterToolCall...),
-			Transport:                  opts.Transport,
+			Transport:                  transport,
 			PreparePrompt:              preparePrompt,
 			PrepareToolResult:          prepareToolResult,
 			DefaultStreamFn:            cacheWarmingStreamFn(func() *Session { return sess }),
@@ -746,7 +783,6 @@ func NewSession(svcs *AgentSessionServices, opts SessionOptions) (*Session, erro
 	sess = &Session{
 		processImage:            imageprocessing.ProcessImage,
 		services:                svcs,
-		inner:                   inner,
 		agent:                   agent,
 		previousPrepareRequest:  previousRequest,
 		previousPrepareNextTurn: previousNextTurn,
@@ -757,7 +793,6 @@ func NewSession(svcs *AgentSessionServices, opts SessionOptions) (*Session, erro
 		sessionDir:              opts.SessionDir,
 		contextUpdates:          opts.ContextUpdates,
 		activeEffortAtTopLevel:  opts.ActiveEffortAtTopLevel,
-		noSession:               opts.NoSession,
 		runner:                  opts.Runner,
 		extensionHost:           opts.extensionHost,
 		sharedRunner:            sharedRunner(opts),
@@ -773,6 +808,8 @@ func NewSession(svcs *AgentSessionServices, opts SessionOptions) (*Session, erro
 			transport:       opts.Transport,
 		},
 	}
+	sess.inner.Store(inner)
+	sess.noSession.Store(opts.NoSession)
 	sess.resourceLoader.Store(resourceLoader)
 	agent.SetResolveUnloadedTool(sess.loadDeferredTool)
 	sess.SetScopedModels(opts.ScopedModels)
@@ -802,6 +839,7 @@ func NewSession(svcs *AgentSessionServices, opts SessionOptions) (*Session, erro
 		return sess.hasListeners() || sess.eventsSubscribed.Load() || sess.agentEventHold.held() || sess.HasExtensionHandlers(icodingagent.EventMessageUpdate)
 	})
 	sess.installAgentBoundaryHooks()
+	sess.eventRegions.init(sess)
 	sess.installExtensionHooks(opts.Agent != nil)
 	if opts.existing == nil {
 		// A clone shares its source's runner; the source keeps the binding.
@@ -814,7 +852,9 @@ func NewSession(svcs *AgentSessionServices, opts SessionOptions) (*Session, erro
 	sess.initSystemPrompt(opts)
 	sess.refreshContext()
 	sess.installCacheWarmer(inner, opts.CacheWarmer)
+	//portlint:allow asyncorder forwardAgentEvents is the Session's event executor: rawEvents is a FIFO and the ordering point, as agent.subscribe(_handleAgentEvent) (agent-session.ts:546, 1164) runs its listeners in emission order; it ends by closing events once the Session closes
 	go sess.forwardAgentEvents()
+	constructed = sess
 	return sess, nil
 }
 
@@ -842,14 +882,15 @@ func (s *Session) persistMessage(msg agent.AgentMessage) error {
 		s.overflowRecoveryAttempted.Store(false)
 	}
 	var err error
-	if in := s.inner; in != nil {
+	if in := s.inner.Load(); in != nil {
 		var id string
 		if msg.Custom != nil {
-			customType, _ := msg.Custom["customType"].(string)
-			display, _ := msg.Custom["display"].(bool)
-			id, err = in.AppendCustomMessageEntry(customType, msg.Custom["content"], display, msg.Custom["details"])
+			id, err = in.AppendCustomMessage(msg.Custom)
 		} else {
 			id, err = in.AppendMessage(msg)
+			if err == nil {
+				in.NoteMessageEntry(id, s.messageSeqs.Numbered(msg))
+			}
 		}
 		if err == nil {
 			s.rememberMessageEntry(msg, id)
@@ -890,9 +931,8 @@ func restoreSessionRuntimeState(inner *icodingagent.Session, services *AgentSess
 	// Assistant messages name the physical model that answered, so a virtual selection is only in model_change entries. upstream: sdk.ts:201-205
 	// sdk.ts:224-231 keeps the saved model only while its provider has configured auth; otherwise the session keeps the model it had (none at startup).
 	if selected := GetBranchSelection(branch, services.ModelRuntime().GetModel); restoreModel && selected != nil && !selected.Unresolvable && selected.Provider != "" && selected.ModelID != "" && services.ModelRuntime().HasConfiguredAuth(selected.Provider) {
-		if restored := services.ModelRuntime().GetModel(selected.Provider, selected.ModelID); IsVirtualModel(restored) {
-			model = restored
-		} else if restored, err := BuildModel(selected.Provider+"/"+selected.ModelID, services); err == nil {
+		// sdk.ts:224-231 restores only a model modelRuntime.getModel finds, and that is the model the session takes: the object the registry lists, not a second lookup of its id. One no catalog describes leaves the session its model.
+		if restored := services.ModelRuntime().GetModel(selected.Provider, selected.ModelID); restored != nil {
 			model = restored
 		}
 	}
@@ -1117,6 +1157,7 @@ func (s *Session) CheckPromptCompaction(ctx context.Context) error {
 func (s *Session) RunAgentPrompt(ctx context.Context, start func(context.Context) ([]agent.AgentMessage, error)) ([]agent.AgentMessage, error) {
 	ctx, cancelRun := s.beginAgentRun(ctx)
 	defer s.endAgentRun(cancelRun)
+	ctx = s.eventRegions.runContext(ctx)
 	messages, runErr := start(ctx)
 	s.mu.Lock()
 	messages, runErr = s.runPostAgentRunsWith(ctx, messages, runErr, func(ctx context.Context) ([]agent.AgentMessage, error) {
@@ -1144,6 +1185,8 @@ func (s *Session) RunAgentPrompt(ctx context.Context, start func(context.Context
 // Delivery begins with the first call, as a Pi session notifies only the listeners it has when an event happens (agent-session.ts _emit, subscribe): an event emitted before the first call is not buffered or replayed, and a Session whose Events is never called never waits on it. Call Events before Send to see every event of a turn; Subscribe listeners are unaffected.
 //
 // Once called, the channel is buffered and a consumer that falls behind makes the agent loop block until it catches up, as a slow synchronous Pi listener does; drain it in a dedicated goroutine, passing each event to AcknowledgeEvent first so the end-of-turn FlushEvents inside Send is answered. It carries every event in order. Every call returns the same channel and keeps delivery on.
+//
+// The message of a message_end or turn_end event is the message as it was when the event was published (agent.AgentMessage.EventView), which Pi's listeners, running at the event, see: a handler of a later event that edits the message in place (turn_end's, agent_end's) changes the transcript, the saved entry and the events published after it, and not an event a consumer still holds. The view has the Identity of the message it stands for. Subscribe listeners run at the event and receive the message itself.
 //
 // The channel is closed when the Session is Closed. A consumer that stops reading calls DiscardEvents. A Session returned by Clone has its own channel, delivering nothing until its own Events call.
 func (s *Session) Events() <-chan agent.AgentEvent {
@@ -1196,13 +1239,13 @@ func providerID(m *ai.Model) string {
 
 // ID returns the session identifier (the part after the timestamp in
 // the JSONL filename).
-func (s *Session) ID() string { return s.inner.ID() }
+func (s *Session) ID() string { return s.inner.Load().ID() }
 
 // Path returns the absolute path to the session's JSONL file on disk.
-func (s *Session) Path() string { return s.inner.Path() }
+func (s *Session) Path() string { return s.inner.Load().Path() }
 
 // CWD returns the working directory the session was created with.
-func (s *Session) CWD() string { return s.inner.CWD() }
+func (s *Session) CWD() string { return s.inner.Load().CWD() }
 
 // Tools returns a defensive copy of the active loadout. Use GetAllTools for admitted definitions that are currently inactive.
 func (s *Session) Tools() []agent.AgentTool {
@@ -1227,11 +1270,11 @@ func (s *Session) refreshCurrentModelFromRegistry() {
 	if refreshed == nil {
 		return
 	}
-	if s.modelRuntime.sameBoundModelMetadata(current, refreshed) {
+	if s.modelRuntime.sameBoundModelMetadata(current, refreshed) || s.modelRuntime.keepsModelObject(current, refreshed) {
 		return
 	}
+	defer s.beginReplicatedChange()()
 	s.agent.SetModel(refreshed)
-	s.notifyReplicatedState()
 }
 
 // sameBoundModelMetadata retains an unchanged runtime-bound model instead of replacing it with another equivalent adapter. A changed catalog still replaces the model, and concrete caller providers are never treated as runtime adapters.
@@ -1248,9 +1291,7 @@ func (runtime *ModelRuntime) sameBoundModelMetadata(current, refreshed *ai.Model
 	default:
 		return false
 	}
-	left, right := *current, *refreshed
-	left.Provider, right.Provider = nil, nil
-	return reflect.DeepEqual(left, right)
+	return sameModelMetadata(current, refreshed)
 }
 
 // ModelRuntime returns this Session's mode-independent model execution path.
@@ -1294,7 +1335,7 @@ func (s *Session) CheckModelAuth(m *ai.Model) error {
 }
 
 func (s *Session) checkModelAuth(ctx context.Context, m *ai.Model) error {
-	if m != nil && m.ProviderMeta.ProviderID != "" && modelRuntimeRequiresAuth(providerID(m)) {
+	if m != nil && m.ProviderMeta.ProviderID != "" {
 		check, err := s.modelRuntime.CheckAuth(ctx, providerID(m))
 		if err != nil {
 			return err
@@ -1378,15 +1419,15 @@ func (s *Session) beginModelChangeState(ctx context.Context, m *ai.Model, source
 	if explicit != nil {
 		thinkingLevel = *explicit
 	}
+	// The change is reported once the whole synchronous mutation, including the thinking level the model implies, has run, and on the error paths after the agent holds the model.
+	defer s.beginReplicatedChange()()
 	s.modelChangeMu.Lock()
 	if s.agent != nil {
 		s.agent.SetModel(m)
 	}
 	s.modelChangeMu.Unlock()
-	// The change is reported once the whole synchronous mutation, including the thinking level the model implies, has run, and on the error paths after the agent holds the model.
-	defer s.notifyReplicatedState()
-	if s.inner != nil {
-		if _, err := s.inner.AppendModelChange(providerID(m), m.ID); err != nil {
+	if in := s.inner.Load(); in != nil {
+		if _, err := in.AppendModelChange(providerID(m), m.ID); err != nil {
 			return nil, fmt.Errorf("coding: SetModel: persist audit: %w", err)
 		}
 	}
@@ -1452,7 +1493,26 @@ func (s *Session) Agent() *agent.Agent { return s.agent }
 // though it is exported. Likely to be removed once F4–F5 finalise
 // the public API surface; SDK consumers should use the public
 // Session methods (Path, ID, CWD, Messages, Send, etc.) instead.
-func (s *Session) Inner() *icodingagent.Session { return s.inner }
+func (s *Session) Inner() *icodingagent.Session { return s.inner.Load() }
+
+// CompactionStreamedTokens is the size in tokens of the summary the compaction in flight has streamed so far, 0 when none runs.
+//
+// pig divergence (D652): the interactive compaction line shows how much of the summary has streamed.
+func (s *Session) CompactionStreamedTokens() int64 {
+	if progress := s.compactionProgress.Load(); progress != nil {
+		return int64(progress.Tokens())
+	}
+	return 0
+}
+
+// withCompactionProgress is ctx carrying a fresh Progress, which CompactionStreamedTokens reads until the compaction ends.
+//
+// pig divergence (D652): the summary requests count what they stream into it.
+func (s *Session) withCompactionProgress(ctx context.Context) context.Context {
+	progress := new(compactprogress.Progress)
+	s.compactionProgress.Store(progress)
+	return compactprogress.With(ctx, progress)
+}
 
 // ReplaceInner aborts work owned by the old Session, then installs the new
 // Session state, including whether its manager persists to a file.
@@ -1464,12 +1524,15 @@ func (s *Session) ReplaceInner(sess *icodingagent.Session) {
 	s.installCacheWarmer(sess, nil)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.inner = sess
+	defer s.beginReplicatedChange()()
+	s.inner.Store(sess)
+	// The messages of the session left are no message of the one installed: the numbering does not hold them.
+	s.messageSeqs.reset()
 	// upstream: runner.ts:889-891. Extensions see the log the Session now owns, and nothing keeps the replaced one alive.
 	if runner := s.currentRunner(); runner != nil {
 		runner.BindSessionManager(sess)
 	}
-	s.noSession = sess.Path() == ""
+	s.noSession.Store(sess.Path() == "")
 	s.agent.SetSessionID(sess.ID())
 	s.refreshReplacementContext()
 	model, thinking := restoreSessionRuntimeState(sess, s.services, s.Model(), s.agent.ThinkingLevel(), true)
@@ -1478,7 +1541,6 @@ func (s *Session) ReplaceInner(sess *icodingagent.Session) {
 		thinking = ai.ClampThinkingLevel(model, thinking)
 	}
 	s.agent.SetThinkingLevel(thinking)
-	s.notifyReplicatedState()
 }
 
 // EmitSessionStart dispatches a session_start event to extension handlers.
@@ -1605,6 +1667,8 @@ func (s *Session) Close() error {
 	// upstream: packages/coding-agent/src/core/agent-session.ts:dispose invalidates the runner the session built; a borrowed Runtime or Clone-source runner stays live for its owner.
 	if runner := s.currentRunner(); runner != nil && runner != s.sharedRunner {
 		runner.Invalidate("")
+		// The mcp_servers_change emissions the runner started end with its background context; Close joins them.
+		defer runner.DrainMcpServersChanges()
 	}
 	s.shutdownRuns()
 	if s.detachAgentEvents != nil {
@@ -1617,6 +1681,12 @@ func (s *Session) Close() error {
 	if !s.successorOwnsResources.Load() {
 		_ = ai.CleanupSessionResources(s.ID())
 	}
+	// Release this Session's reference to an owned DefaultResourceLoader last, after runner invalidation and run drain, so extensions stay reachable during shutdown and close once the last sharer closes (D19).
+	s.ownedLoaderOnce.Do(func() {
+		if ref := s.resourceLoader.Load(); ref != nil && ref.owned != nil {
+			ref.owned.release()
+		}
+	})
 	if s.ownedServices != nil {
 		s.ownedServices.Close()
 	}
@@ -1628,16 +1698,19 @@ func (s *Session) Close() error {
 // SessionName returns the current user-defined session name (set via /name
 // or SetSessionName), or "" if none has been set.
 // Mirrors upstream session.sessionName getter (agent-session.ts:849).
-func (s *Session) SessionName() string { return s.inner.GetSessionName() }
+func (s *Session) SessionName() string { return s.inner.Load().GetSessionName() }
 
-// SetSessionName persists the sanitized Session name, immediately notifies subscribers, and admits the extension handler's synchronous prefix before returning. Suspended extension work belongs to the Session lifetime. An empty name clears the current name; RPC and slash-command boundaries validate their own non-empty input.
+// SetSessionName persists the sanitized Session name, immediately notifies subscribers, and admits the extension handler's synchronous prefix before returning; a caller on the interactive owner loop starts the handler and returns without waiting for the prefix (dispatchUnawaitedEvent). Suspended extension work belongs to the Session lifetime. An empty name clears the current name; RPC and slash-command boundaries validate their own non-empty input.
 func (s *Session) SetSessionName(name string) error {
 	// Pi reads the name synchronously after its own append (agent-session.ts:3559-3560); a concurrent caller's later append cannot change the name this call publishes.
-	_, current, err := s.inner.AppendSessionInfoName(name)
+	s.replicatedBegin.Notify()
+	_, current, err := s.inner.Load().AppendSessionInfoName(name)
 	if err != nil {
+		s.replicatedEnd.Notify()
 		return fmt.Errorf("coding: SetSessionName: append: %w", err)
 	}
 	s.notifyReplicatedState()
+	s.replicatedEnd.Notify()
 	// upstream: packages/coding-agent/src/core/agent-session.ts:setSessionName
 	event := agent.SessionInfoChangedEvent{Name: current}
 	s.notifyAgentEventListeners(event)
@@ -1648,8 +1721,10 @@ func (s *Session) SetSessionName(name string) error {
 
 // ─── Message helpers ─────────────────────────────────────────────────────────
 
-// LastAssistantText returns the trimmed text of the most recent assistant message, or nil when there is none or its text is empty. An aborted
-// message without content is skipped; the text joins every text block, and trimming follows JavaScript's String.prototype.trim.
+// LastAssistantText returns the trimmed text of the last assistant reply, or nil when there is none or the last reply has no text. An
+// assistant message without text from a turn that did not end normally (a stop reason other than "stop": aborted, failed, only calling
+// tools, cut at the length limit, or none) is skipped (Pi #12119); a reply that ended normally stays the last reply even without text.
+// The text joins every text block, and trimming follows JavaScript's String.prototype.trim.
 // Ports packages/coding-agent/src/core/agent-session.ts getLastAssistantText.
 func (s *Session) LastAssistantText() *string {
 	msgs := s.Messages()
@@ -1658,7 +1733,10 @@ func (s *Session) LastAssistantText() *string {
 			continue
 		}
 		a := msg.Assistant
-		if a.StopReason == "aborted" && len(a.Content) == 0 {
+		if a.StopReason != ai.StopReasonStop && !slices.ContainsFunc(a.Content, func(b ai.AssistantContentBlock) bool {
+			tc, ok := b.(ai.TextContent)
+			return ok && jsstring.Trim(tc.Text) != ""
+		}) {
 			continue
 		}
 		var sb strings.Builder
@@ -1689,7 +1767,7 @@ type ForkMessage struct {
 // IDs, suitable for presenting fork targets to the user.
 // Mirrors upstream getUserMessagesForForking (agent-session.ts:2856).
 func (s *Session) UserMessagesForForking() []ForkMessage {
-	entries := s.inner.GetMessageEntriesWithRole("user")
+	entries := s.inner.Load().GetMessageEntriesWithRole("user")
 	out := make([]ForkMessage, 0, len(entries))
 	for _, e := range entries {
 		me, ok := icodingagent.AsMessage(e)
@@ -1755,7 +1833,7 @@ type SessionContextUsage struct {
 // GetSessionStats returns aggregate stats for this session.
 // Mirrors upstream getSessionStats (agent-session.ts:2887-2935).
 func (s *Session) GetSessionStats() SessionStats {
-	accounting := s.inner.Accounting()
+	accounting := s.inner.Load().Accounting()
 	return SessionStats{
 		SessionFile:       s.Path(),
 		SessionID:         s.ID(),
@@ -1788,7 +1866,7 @@ func (s *Session) ContextUsage() *SessionContextUsage {
 		return nil
 	}
 	contextWindow := model.Capabilities.ContextWindow
-	log := s.inner
+	log := s.inner.Load()
 	revision := log.Revision()
 	s.contextUsageMu.Lock()
 	memo := s.contextUsageMemo
@@ -1889,6 +1967,7 @@ func (s *Session) queueInput(text string, images []ai.ImageContent, members map[
 	if err != nil {
 		return err
 	}
+	s.trackQueuedImageMessage(message.User, images)
 	s.queueMu.Lock()
 	if behavior == extension.DeliverAsSteer {
 		s.queuedSteering = append(s.queuedSteering, text)
@@ -1910,6 +1989,50 @@ func (s *Session) QueueFollowUp(text string, images []ai.ImageContent) {
 	_ = s.queueInput(text, images, nil, extension.DeliverAsFollowUp)
 }
 
+// QueuedUserMessage is the user message QueueSteer and QueueFollowUp admit. A message with images is marked, and its images are
+// normalized when it is delivered ([Session.normalizeDeliveredImages]). A mode that queues on the Agent itself (the interactive
+// mode, which shows the pending messages from the Agent's queues) builds its message here so its images are normalized too.
+func (s *Session) QueuedUserMessage(text string, images []ai.ImageContent) agent.AgentMessage {
+	message := &agent.UserMessage{
+		Role:      agent.RoleUser,
+		Content:   BuildUserContent(text, images),
+		Timestamp: time.Now().UnixMilli(),
+	}
+	s.trackQueuedImageMessage(message, images)
+	return agent.AgentMessage{User: message}
+}
+
+func (s *Session) trackQueuedImageMessage(message *agent.UserMessage, images []ai.ImageContent) {
+	if len(images) > 0 {
+		s.queuedImageMessages.Store(&message.Content.(ai.UserContentBlocks)[0], message)
+	}
+}
+
+// normalizeDeliveredImages replaces the images of a delivered queued message with normalized ones in place, appending the resize hints
+// to its text (agent-session.ts _normalizeQueuedMessageImages). The Agent's message_start carries a copy of the message that shares its
+// content array, so the transcript's message and the event both change, before listeners and persistence see either. It runs after the
+// queue entry was matched by its original text. It does nothing for a message that was not queued with images.
+func (s *Session) normalizeDeliveredImages(event agent.MessageStartEvent) {
+	user := event.Message.User
+	if user == nil {
+		return
+	}
+	blocks, isBlocks := user.Content.(ai.UserContentBlocks)
+	if !isBlocks || len(blocks) == 0 {
+		return
+	}
+	stored, ok := s.queuedImageMessages.LoadAndDelete(&blocks[0])
+	if !ok {
+		return
+	}
+	if _, isText := blocks[0].(ai.TextContent); !isText {
+		return
+	}
+	content := ai.UserContentBlocks(icodingagent.NormalizePromptContent(blocks, s.SettingsManager().GetImageAutoResize(), s.limitsModel(), s.processImage))
+	user.Content = content
+	stored.(*agent.UserMessage).Content = content
+}
+
 // GetSteeringMessages returns queued steering text in admission order.
 func (s *Session) GetSteeringMessages() []string {
 	s.queueMu.Lock()
@@ -1928,6 +2051,7 @@ func (s *Session) GetFollowUpMessages() []string {
 // pig divergence (D135): upstream clearQueue also destroys custom messages queued by sendMessage(deliverAs) without returning them (Pi #9886).
 func (s *Session) ClearQueue() (steering, followUp []string) {
 	s.agent.ClearQueuedUserMessages()
+	s.queuedImageMessages.Clear()
 	s.queueMu.Lock()
 	steering = append([]string{}, s.queuedSteering...)
 	followUp = append([]string{}, s.queuedFollowUp...)
@@ -1949,12 +2073,14 @@ func (s *Session) PendingMessageCount() int {
 // SetSteeringMode updates the active queue and persists its drain mode.
 func (s *Session) SetSteeringMode(mode agent.QueueMode) error {
 	s.agent.SetSteeringMode(mode)
+	// pig divergence (D633): a failed save of the mode is returned; Pi's setSteeringMode (agent-session.ts:2859-2862) returns nothing.
 	return s.SettingsManager().SetSteeringMode(string(mode))
 }
 
 // SetFollowUpMode updates the active queue and persists its drain mode.
 func (s *Session) SetFollowUpMode(mode agent.QueueMode) error {
 	s.agent.SetFollowUpMode(mode)
+	// pig divergence (D633): a failed save of the mode is returned; Pi's setFollowUpMode (agent-session.ts:2868-2871) returns nothing.
 	return s.SettingsManager().SetFollowUpMode(string(mode))
 }
 
@@ -1973,10 +2099,8 @@ func (s *Session) consumeQueuedMessage(message agent.AgentMessage) (agent.QueueU
 	if message.User == nil {
 		return agent.QueueUpdateEvent{}, false
 	}
+	// An image-only message has empty text and still leaves the queue display (Pi main a63c4ec5c, #8612).
 	queuedText := extractUserMessageText(message.User.Content)
-	if queuedText == "" {
-		return agent.QueueUpdateEvent{}, false
-	}
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
 	removed := removeQueuedText(&s.queuedSteering, queuedText)
@@ -2015,7 +2139,7 @@ func (s *Session) ThinkingLevel() ai.ModelThinkingLevel {
 
 // SetThinkingLevel records a changed, clamped level in the Session transcript.
 // With Persist, it saves the requested level as the global default even when the effective level is unchanged.
-// A change admits the thinking_level_select handlers' synchronous prefix before returning; Pi does not await them (agent-session.ts:2629).
+// A change admits the thinking_level_select handlers' synchronous prefix before returning; Pi does not await them (agent-session.ts:2629). A caller on the interactive owner loop starts them and returns without waiting for the prefix (dispatchUnawaitedEvent).
 // Suspended handler work belongs to the Session lifetime.
 func (s *Session) SetThinkingLevel(level ai.ModelThinkingLevel, options ...ModelMutationOptions) error {
 	notify, err := s.setThinkingLevelState(level, options...)
@@ -2064,7 +2188,7 @@ func (s *Session) setThinkingLevelState(level ai.ModelThinkingLevel, options ...
 	if effective == previous {
 		return nil, nil
 	}
-	if _, err := s.inner.AppendThinkingLevelChange(string(effective)); err != nil {
+	if _, err := s.inner.Load().AppendThinkingLevelChange(string(effective)); err != nil {
 		return nil, err
 	}
 	runner := s.currentRunner()
@@ -2148,7 +2272,7 @@ func (s *Session) executeBash(ctx context.Context, command string, excludeFromCo
 	// The awaited executor can publish output through the Session event funnel, so release notification admission after setup rather than after Bash completion.
 	invocation.Acknowledge(ctx)
 	// upstream: packages/coding-agent/src/core/agent-session.ts:executeBash
-	shared, err := tools.ExecuteBashWithOperations(bashCtx, resolvedCommand, s.inner.CWD(), operations, tools.BashExecOptions{OnChunk: func(delta string) {
+	shared, err := tools.ExecuteBashWithOperations(bashCtx, resolvedCommand, s.inner.Load().CWD(), operations, tools.BashExecOptions{OnChunk: func(delta string) {
 		if onChunk != nil {
 			onChunk(delta)
 		}
@@ -2227,7 +2351,7 @@ func (s *Session) appendBashLocked(rec pendingBashRecord) error {
 }
 
 func (s *Session) appendBashEntry(rec pendingBashRecord) error {
-	_, err := s.inner.AppendBashExecution(icodingagent.BashExecutionMessage{
+	_, err := s.inner.Load().AppendBashExecution(icodingagent.BashExecutionMessage{
 		Role: "bashExecution", Command: rec.command, Output: rec.result.Output,
 		ExitCode: rec.result.ExitCode, Cancelled: rec.result.Cancelled,
 		Truncated: rec.result.Truncated, FullOutputPath: rec.result.FullOutputPath,
@@ -2383,6 +2507,11 @@ func (s *Session) Subscribe(listener AgentSessionEventListener) func() {
 		}
 		s.listenersMu.Unlock()
 	}
+}
+
+// SubscribeFunc is Subscribe for a caller that cannot name AgentSessionEventListener: the interactive mode's Session handle.
+func (s *Session) SubscribeFunc(listener func(agent.AgentEvent)) func() {
+	return s.Subscribe(listener)
 }
 
 // notifyListeners walks the listener list as it is at each step, as agent-session.ts:1039-1043 _emit iterates the live _eventListeners array: a listener
@@ -2704,6 +2833,8 @@ func (s *Session) dispatchSessionNameEvent(event agent.SessionInfoChangedEvent) 
 }
 
 // dispatchUnawaitedEvent is Pi's `void runner.emit(event)`: it admits the first handler's synchronous prefix on the initiating call, without awaiting suspended extension work. The Session cancels and joins the emissions on Close and reports a dispatch failure under eventType.
+//
+// A caller on the interactive owner loop starts the emission and does not wait for the prefix: the prefix of a subprocess handler ends with a report from the extension process, and the loop that takes input and renders waits for no extension. The handler then runs beside the caller's next step, as a handler in another process always does once it is suspended.
 func (s *Session) dispatchUnawaitedEvent(runner *inproc.Runner, eventType string, event extension.ExtensionEvent) {
 	invoked := make(chan struct{})
 	ctx := invocation.WithAcknowledgment(s.backgroundContext(), func() { close(invoked) })
@@ -2713,6 +2844,9 @@ func (s *Session) dispatchUnawaitedEvent(runner *inproc.Runner, eventType string
 		s.reportRuntimeError(eventType, ignoreCancellation(err))
 	}); err != nil {
 		return // Session shutdown rejects new notifications.
+	}
+	if runner.CallerOnOwnerLoop() {
+		return
 	}
 	select {
 	case <-invoked:
@@ -2729,7 +2863,7 @@ func (s *Session) dispatchAgentEventToExtensions(ev agent.AgentEvent) {
 			s.reportAgentEventPanic(ev, recovered)
 		}
 	}()
-	icodingagent.DispatchAgentLoopEvent(s.currentRunner(), ev, &s.extCurrentMessage)
+	icodingagent.DispatchAgentLoopEvent(s.currentRunner(), ev, &s.extCurrentMessage, &s.messageSeqs)
 }
 
 // notifyAgentEventListeners delivers ev to the session's subscribers; a
@@ -2813,8 +2947,21 @@ func (s *Session) willRetryAfterAgentEnd(message *agent.AssistantMessage) bool {
 		return false
 	}
 	retryCfg := s.SettingsManager().GetRetrySettings()
-	if !retryCfg.Enabled || int(s.retryAttempt.Load()) >= retryCfg.MaxRetries {
+	nextAttempt := int(s.retryAttempt.Load()) + 1
+	if !retryCfg.Enabled || nextAttempt > retryCfg.MaxRetries {
 		return false
+	}
+	// pig additive (D654): an installed decider replaces Pi's retry rule (agent-session.ts:3871 _isRetryableError) for this failed message.
+	if decider := icodingagent.DefaultRetryDecider(); decider != nil {
+		if message == nil || message.StopReason != ai.StopReasonError || icodingagent.IsContextOverflow(message, s.contextWindowFor(message)) {
+			return false
+		}
+		decision := decider(nextAttempt, retryCfg.MaxRetries, message.LLMMessage())
+		s.retryMu.Lock()
+		s.retryPendingMsg = message
+		s.retryPendingDecision = &decision
+		s.retryMu.Unlock()
+		return decision.Retry
 	}
 	return icodingagent.IsRetryableError(message, s.contextWindowFor(message))
 }
@@ -2860,7 +3007,7 @@ func (s *Session) compact(ctx context.Context, customInstructions string) (*Comp
 	entries := s.currentBranch()
 	s.mu.Unlock()
 
-	compactCtx, cancel := context.WithCancel(ctx)
+	compactCtx, cancel := context.WithCancel(s.withCompactionProgress(ctx))
 	s.compactMu.Lock()
 	s.compactCancel = cancel
 	abortRequested := s.compactAbortRequested
@@ -2872,6 +3019,7 @@ func (s *Session) compact(ctx context.Context, customInstructions string) (*Comp
 		cancel()
 		s.compactMu.Lock()
 		s.compactCancel = nil
+		s.compactionProgress.Store(nil)
 		s.compactMu.Unlock()
 		s.finishCompaction()
 	})
@@ -2932,14 +3080,14 @@ func (s *Session) compact(ctx context.Context, customInstructions string) (*Comp
 	}
 
 	s.mu.Lock()
-	entryID, err := s.appendCompaction(s.inner, result.Summary, result.FirstKeptEntryID, result.TokensBefore, result.Details, fromExtension, result.Usage)
+	entryID, err := s.appendCompaction(s.inner.Load(), icodingagent.CompactionEntry{Summary: result.Summary, FirstKeptEntryID: result.FirstKeptEntryID, TokensBefore: result.TokensBefore, Details: result.Details, Usage: result.Usage, UsageNull: result.UsageNull, UsageRaw: result.UsageRaw, FromHook: fromExtension})
 	if err != nil {
 		s.mu.Unlock()
 		return fail(fmt.Errorf("coding: Compact: persist: %w", err), false)
 	}
 	s.refreshContext()
 	estimatedTokensAfter := estimateMessagesTokens(s.agent.Messages())
-	entry, haveEntry := s.inner.GetEntry(entryID)
+	entry, haveEntry := s.inner.Load().GetEntry(entryID)
 	s.mu.Unlock()
 
 	if haveEntry {
@@ -2949,6 +3097,7 @@ func (s *Session) compact(ctx context.Context, customInstructions string) (*Comp
 	finish()
 	s.emitCompactionEvent(agent.CompactionEndEvent{
 		Reason:               "manual",
+		HasResult:            true,
 		Summary:              result.Summary,
 		FirstKeptEntryID:     result.FirstKeptEntryID,
 		TokensBefore:         result.TokensBefore,
@@ -3000,10 +3149,12 @@ func (s *Session) IsCompacting() bool {
 	return s.compacting.Load() || s.branchSumCancel != nil
 }
 
+// isManualCompacting reports a manual compaction or a branch summary in progress: a prompt submitted during either is rejected
+// (agent-session.ts: _compactionAbortController !== undefined || _branchSummaryAbortController !== undefined).
 func (s *Session) isManualCompacting() bool {
 	s.compactMu.Lock()
 	defer s.compactMu.Unlock()
-	return s.manualCompacting
+	return s.manualCompacting || s.branchSumCancel != nil
 }
 
 func (s *Session) beginCompaction() bool {
@@ -3081,7 +3232,8 @@ const treeNavigationInProgressError = "Wait for the current compaction or tree n
 // navigateTree is the internal implementation. NavigateTree (public SDK) and
 // NavigateTreeHandle (InteractiveSessionHandle bridge) both call this.
 func (s *Session) navigateTree(ctx context.Context, targetID string, opts NavigateTreeOptions) (NavigateTreeResult, error) {
-	if s.agent.IsStreaming() {
+	// A prompt that is still in its input hooks and auth checks owns the context (#9154).
+	if s.agent.IsStreaming() || s.runState.promptPreflight.Load() > 0 {
 		return NavigateTreeResult{}, errors.New("Wait for the current response to finish before navigating the session tree.")
 	}
 
@@ -3100,19 +3252,26 @@ func (s *Session) navigateTree(ctx context.Context, targetID string, opts Naviga
 	// callers may release their ordered initiation lane while this admitted
 	// operation continues asynchronously.
 	extension.CallInitiated(ctx)
-	defer func() {
-		cancel()
-		s.compactMu.Lock()
-		s.branchSumCancel = nil
-		s.branchSumDone = nil
-		close(done)
-		s.compactMu.Unlock()
-		s.notifyIdleWaiters()
-	}()
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			cancel()
+			s.compactMu.Lock()
+			s.branchSumCancel = nil
+			s.branchSumDone = nil
+			close(done)
+			s.compactMu.Unlock()
+			s.notifyIdleWaiters()
+		})
+	}
+	// A navigation that session_tree handlers start owns the Session operation by then, so the first one releases it before the event
+	// (the selected context is installed) and only once.
+	defer release()
 
 	// Snapshot current leaf under lock.
 	s.mu.Lock()
-	oldLeafID := s.inner.GetLeafID()
+	in := s.inner.Load()
+	oldLeafID := in.GetLeafID()
 	s.mu.Unlock()
 
 	// No-op if already at target.
@@ -3123,13 +3282,13 @@ func (s *Session) navigateTree(ctx context.Context, targetID string, opts Naviga
 	if opts.Summarize && s.Model() == nil {
 		return NavigateTreeResult{}, errors.New("No model available for summarization")
 	}
-	targetEntry, entryFound := s.inner.GetEntry(targetID)
+	targetEntry, entryFound := in.GetEntry(targetID)
 	if !entryFound {
 		return NavigateTreeResult{}, fmt.Errorf("Entry %s not found", targetID)
 	}
 
 	// Collect entries to summarize (from old leaf to common ancestor).
-	collected := compaction.CollectEntriesForBranchSummary(icodingagent.HandleReads{Session: s.inner}, derefLeafID(oldLeafID), targetID)
+	collected := compaction.CollectEntriesForBranchSummary(icodingagent.HandleReads{Session: in}, derefLeafID(oldLeafID), targetID)
 
 	// Extensions may override the instructions and label.
 	customInstructions := opts.CustomInstructions
@@ -3220,9 +3379,11 @@ func (s *Session) navigateTree(ctx context.Context, targetID string, opts Naviga
 		s.mu.Unlock()
 		return NavigateTreeResult{}, err
 	}
-	currentLeafID := s.inner.GetLeafID()
+	currentLeafID := s.inner.Load().GetLeafID()
 	s.mu.Unlock()
 
+	// The selected context is installed; session_tree handlers may now prompt or navigate again.
+	release()
 	s.emitSessionTree(ctx, currentLeafID, oldLeafID, summaryID, summary != nil && summary.FromExtension)
 	return NavigateTreeResult{EditorText: editorText, SummaryEntry: s.branchSummaryEntry(summaryID)}, nil
 }
@@ -3247,11 +3408,13 @@ func (s *Session) AbortBranchSummary() {
 // applies to compaction. Mirrors upstream _summarizationRetryCallbacks.
 func (s *Session) summarizationRetryOptions(source, reason string) (*ai.RetryPolicy, ai.RetryCallbacks) {
 	cfg := s.SettingsManager().GetRetrySettings()
+	// pig additive (D654): the installed decider also decides a summarization request's retries.
 	policy := &ai.RetryPolicy{
 		Enabled:         cfg.Enabled,
 		MaxRetries:      cfg.MaxRetries,
 		BaseDelayMs:     cfg.BaseDelayMs,
 		MaxAgentDelayMs: &cfg.MaxAgentDelayMs,
+		Decide:          icodingagent.DefaultRetryDecider(),
 	}
 	return policy, ai.RetryCallbacks{
 		OnRetryScheduled: func(attempt, maxAttempts, delayMs int, errMsg string) error {
@@ -3317,7 +3480,7 @@ func (s *Session) checkCompactionDecision(ctx context.Context, assistantMsg *age
 
 	branch := s.currentBranch()
 	// The decision reads the projection (entry ids, estimates) and keeps none of its messages.
-	projection := s.inner.BuildSessionProjectionView()
+	projection := s.inner.Load().BuildSessionProjectionView()
 	// A message from before the latest compaction carries stale usage.
 	latestCompTS, hasCompaction := projectionCompactionTimestamp(projection)
 	if hasCompaction && assistantMsg.Timestamp <= latestCompTS {
@@ -3376,6 +3539,10 @@ func (s *Session) checkCompactionDecision(ctx context.Context, assistantMsg *age
 		contextTokens = estimate.Tokens
 	default:
 		contextTokens = directContextTokens
+	}
+	// pig divergence (D660): a context window of 0 or below is unknown, so the threshold check is skipped; Pi's shouldCompact(tokens, 0, settings) is true after every reply that carries usage.
+	if contextWindow <= 0 {
+		return false, nil
 	}
 	if compaction.ShouldCompact(contextTokens, contextWindow, settings) {
 		return compact(ctx, "threshold", false)
@@ -3489,7 +3656,7 @@ func (s *Session) runAutoCompactionFor(ctx context.Context, reason string, willR
 		return false, nil
 	}
 
-	compactCtx, cancel := context.WithCancel(ctx)
+	compactCtx, cancel := context.WithCancel(s.withCompactionProgress(ctx))
 	s.compactMu.Lock()
 	s.compactCancel = cancel
 	abortRequested := s.compactAbortRequested
@@ -3501,6 +3668,7 @@ func (s *Session) runAutoCompactionFor(ctx context.Context, reason string, willR
 		cancel()
 		s.compactMu.Lock()
 		s.compactCancel = nil
+		s.compactionProgress.Store(nil)
 		s.compactMu.Unlock()
 	}()
 
@@ -3533,9 +3701,10 @@ func (s *Session) runAutoCompactionFor(ctx context.Context, reason string, willR
 	if err == nil && compactCtx.Err() != nil {
 		err = errCompactionCancelled
 	}
+	in := s.inner.Load()
 	var entryID string
 	if err == nil {
-		entryID, err = s.appendCompaction(s.inner, result.Summary, result.FirstKeptEntryID, result.TokensBefore, result.Details, fromExtension, result.Usage)
+		entryID, err = s.appendCompaction(in, icodingagent.CompactionEntry{Summary: result.Summary, FirstKeptEntryID: result.FirstKeptEntryID, TokensBefore: result.TokensBefore, Details: result.Details, Usage: result.Usage, UsageNull: result.UsageNull, UsageRaw: result.UsageRaw, FromHook: fromExtension})
 	}
 	if err != nil {
 		aborted := compactCtx.Err() != nil || cancelledByExtension
@@ -3561,11 +3730,12 @@ func (s *Session) runAutoCompactionFor(ctx context.Context, reason string, willR
 
 	s.refreshContext()
 	estimatedTokensAfter := estimateMessagesTokens(s.agent.Messages())
-	if entry, haveEntry := s.inner.GetEntry(entryID); haveEntry {
+	if entry, haveEntry := in.GetEntry(entryID); haveEntry {
 		s.emitSessionCompact(compactCtx, entry, fromExtension, reason, willRetry)
 	}
 	s.emitCompactionEvent(agent.CompactionEndEvent{
 		Reason:               reason,
+		HasResult:            true,
 		Summary:              result.Summary,
 		FirstKeptEntryID:     result.FirstKeptEntryID,
 		TokensBefore:         result.TokensBefore,

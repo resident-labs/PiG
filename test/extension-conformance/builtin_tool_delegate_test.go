@@ -2,16 +2,28 @@ package extensionconformance
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/internal/childwait"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
+)
+
+// shellExitedTicks is the writer's lines, and shellExitedAfter the seconds the shell reported, as the delegation cases below normalize them.
+var (
+	shellExitedTicks = regexp.MustCompile(`(?:tick\\n)+`)
+	shellExitedAfter = regexp.MustCompile(`(exited with code \d+) after (\d+(?:\.\d)?) seconds`)
 )
 
 // TestConformance_BuiltinToolDelegationAcrossSDKs: Pi's create<Tool>ToolDefinition(cwd, options) and create<Tool>Tool factories (core/tools/*.ts, exported from the
@@ -32,6 +44,15 @@ func TestConformance_BuiltinToolDelegationAcrossSDKs(t *testing.T) {
 	t.Parallel()
 
 	type tcase = map[string]any
+	// The pipes' grace after the shell exits (childwait.Grace, Pi's EXIT_STDIO_GRACE_MS) is a 100 ms wall-clock timer that the writer's CPU-bound gap between ticks can
+	// outrun on a loaded host, ending the command normally with exit 7 instead of at its deadline. The host's grace never elapses here (Pi's own #5303 test uses virtual
+	// time for the same reason) and the Node reference's armIdleTimer is held the same way, so the writer holds the pipes until the 2 second deadline in every SDK.
+	t.Cleanup(tools.SetStdioGraceTimerForTest(func() childwait.IdleTimer {
+		return childwait.IdleTimer{Expired: make(chan time.Time), Rearm: func() {}, Stop: func() {}}
+	}))
+	// The shell exits with code 7 after half a second, and the writer it leaves holds the pipes: a loop that writes a line and then spends a few milliseconds in the
+	// shell itself, so it never leaves the pipe quiet for the 100 ms the wait allows and does not fork (a fork per line is how a loaded runner outruns that grace).
+	const shellExitedWriterCommand = `(while :; do echo tick; for ((i = 0; i < 20000; i++)); do :; done; done) & sleep 0.5; exit 7`
 	// cases are built per harness, because they name the host's working directory.
 	cases := func(hostCwd, factoryCwd string) []tcase {
 		return []tcase{
@@ -102,6 +123,25 @@ func TestConformance_BuiltinToolDelegationAcrossSDKs(t *testing.T) {
 			{"kind": "prepare", "tool": "write", "factoryCwd": factoryCwd, "params": tcase{"path": "a.txt", "content": "c"}},
 			{"kind": "prepare", "tool": "read", "factoryCwd": factoryCwd, "params": tcase{"path": "a.txt"}},
 			{"kind": "prepare", "tool": "bash", "factoryCwd": factoryCwd, "params": tcase{"command": "true"}},
+			// find asks a custom glob for one result past its limit (Pi main 676af1d77, in the pin), whatever the SDK
+			{"kind": "delegate", "tool": "find", "factoryCwd": factoryCwd, "params": tcase{"pattern": "*.txt", "limit": 2}, "ops": "globlimit"},
+			// createReadStream (Pi's ReadOperations.createReadStream): the read tool reads a text file through the stream an extension opens, and never calls its readFile
+			{"kind": "delegate", "tool": "read", "factoryCwd": factoryCwd, "params": tcase{"path": "anything.txt"}, "ops": "stream"},
+			// grep never reads a matched file through an extension (Pi main 8da141c2a): isDirectory answers true and every SDK's extension also passes the deprecated readFile, which stays uncalled
+			{"kind": "delegate", "tool": "grep", "factoryCwd": factoryCwd, "params": tcase{"pattern": "needle-1", "path": "grepdir"}, "ops": "grepdir"},
+			// A command whose shell exits with code 7 half a second in while a background writer holds its output pipes until the 2 second timeout (Pi #11613). The bash tool runs
+			// on the local operations: Pi's createLocalBashOperations().exec throws its ShellTimeoutError with the shell's exit, which the tool reports when the operations rethrow it
+			// ("local", with and without an extension context) and does not when they throw a new error with its message ("localWrapped"): Pi matches the class.
+			{"kind": "delegate", "tool": "bash", "factoryCwd": factoryCwd, "params": tcase{"command": shellExitedWriterCommand, "timeout": 2}, "ops": "local"},
+			{"kind": "delegate", "tool": "bash", "factoryCwd": factoryCwd, "params": tcase{"command": shellExitedWriterCommand, "timeout": 2}, "ops": "local", "noContext": true},
+			{"kind": "delegate", "tool": "bash", "factoryCwd": factoryCwd, "params": tcase{"command": shellExitedWriterCommand, "timeout": 2}, "ops": "localWrapped"},
+			// The same command with the local operations run on another thread (a goroutine, a Python thread, a Lisp thread, a Rust std::thread; the Node reference runs them in
+			// another turn of its event loop): the shell's exit belongs to the error and not to the thread that made it, so it survives the hop in every SDK.
+			{"kind": "delegate", "tool": "bash", "factoryCwd": factoryCwd, "params": tcase{"command": shellExitedWriterCommand, "timeout": 2}, "ops": "localThread"},
+			// An image read while the session's model takes no images (the harness's model: provider "conformance", id "current", input []). Pi 4be4cb4f5e9c
+			// names that model in details.imageUnsupportedByModel and keeps the text free of it. The id is the host's: an SDK that dropped the details, or
+			// rebuilt them from a type without the member, could not report it.
+			{"kind": "delegate", "tool": "read", "factoryCwd": factoryCwd, "params": tcase{"path": "pixel.png"}},
 			// A truncated read's details, whose members Pi writes in an order a sorted map would lose
 			{"kind": "delegate", "tool": "read", "factoryCwd": factoryCwd, "params": tcase{"path": "big.txt"}},
 			// createCodingTools and createReadOnlyTools
@@ -116,11 +156,13 @@ func TestConformance_BuiltinToolDelegationAcrossSDKs(t *testing.T) {
 			fmt.Fprintf(&multi, "l%d\n", i)
 		}
 		for path, content := range map[string]string{
-			filepath.Join(hostCwd, "marker.txt"):    "from-H\nline2\n",
-			filepath.Join(hostCwd, "multi.txt"):     multi.String(),
-			filepath.Join(hostCwd, "big.txt"):       strings.Repeat("a line of the big file\n", 2500),
-			filepath.Join(factoryCwd, "marker.txt"): "from-X\n",
-			filepath.Join(factoryCwd, "multi.txt"):  "x1\nx2\n",
+			filepath.Join(hostCwd, "marker.txt"):       "from-H\nline2\n",
+			filepath.Join(hostCwd, "multi.txt"):        multi.String(),
+			filepath.Join(hostCwd, "grepdir", "g.txt"): "needle-1\nhay\n",
+			filepath.Join(hostCwd, "big.txt"):          strings.Repeat("a line of the big file\n", 2500),
+			filepath.Join(hostCwd, "pixel.png"):        string(onePixelPNGForDelegation()),
+			filepath.Join(factoryCwd, "marker.txt"):    "from-X\n",
+			filepath.Join(factoryCwd, "multi.txt"):     "x1\nx2\n",
 		} {
 			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 				t.Fatal(err)
@@ -183,6 +225,17 @@ func TestConformance_BuiltinToolDelegationAcrossSDKs(t *testing.T) {
 				}
 				text = strings.ReplaceAll(text, dir[0], dir[1])
 			}
+			// The writer's lines are as many as the run had time for, and the shell's run time is the half second it slept plus the load's share: the lines are reported
+			// as a count of ticks and the time as a time after the spawn and before the 2 second deadline, which the code 7 and the sentence distinguish from the fallback.
+			text = shellExitedTicks.ReplaceAllString(text, `<ticks>\n`)
+			text = shellExitedAfter.ReplaceAllStringFunc(text, func(found string) string {
+				match := shellExitedAfter.FindStringSubmatch(found)
+				seconds, _ := strconv.ParseFloat(match[2], 64)
+				if seconds > 0 && seconds < 2 {
+					return match[1] + " after <0-2> seconds"
+				}
+				return found
+			})
 			var normalized map[string]any
 			if err := json.Unmarshal([]byte(text), &normalized); err != nil {
 				t.Fatal(err)
@@ -234,6 +287,15 @@ func TestConformance_BuiltinToolDelegationAcrossSDKs(t *testing.T) {
 		}
 		return strings.Join(parts, "\n")
 	}
+	// calls lists what the tool called of the options' operations. Pi's grep calls isDirectory only: every extension also passes the deprecated readFile
+	// (Pi's GrepOperations.readFile, ignored), so an equal list across SDKs shows the host never asks an extension for it.
+	calls := func(report map[string]any) string {
+		var encoded strings.Builder
+		encoder := json.NewEncoder(&encoded)
+		encoder.SetEscapeHTML(false)
+		_ = encoder.Encode(report["calls"])
+		return strings.TrimSuffix(encoded.String(), "\n")
+	}
 	errorOf := func(report map[string]any) string { s, _ := report["error"].(string); return s }
 	definitionField := func(field string) func(map[string]any) string {
 		return func(report map[string]any) string {
@@ -254,6 +316,7 @@ func TestConformance_BuiltinToolDelegationAcrossSDKs(t *testing.T) {
 		{5, errorOf, "Offset 99 is beyond end of file (31 lines total)"},
 		{6, errorOf, "Operation aborted"},
 		{7, text, "OPS:<host>/anything.txt"},
+		{11, calls, `["isDirectory:<host>/gone"]`}, // grep never calls a readFile an extension passes
 		{16, text, "sentinel-42\n<host>\n"},
 		{17, text, "sentinel-42\n<factory>\n"},
 		{20, errorOf, "Command aborted"},
@@ -267,6 +330,17 @@ func TestConformance_BuiltinToolDelegationAcrossSDKs(t *testing.T) {
 		{43, text, "OPS:<factory>/anything.txt"}, // the functions of the options, for a tool without a context
 		{44, text, "custom:echo hi"},
 		{46, text, "hook-env|"},
+		{58, text, "a.txt\nb.txt\n\n[2 results limit reached]"},                              // find with a glob that honors the limit it is given
+		{59, text, "STREAM:<host>/anything.txt\n"},                                           // the text came through the stream of the extension's createReadStream
+		{59, calls, `["access:<host>/anything.txt","createReadStream:<host>/anything.txt"]`}, // and readFile was never asked for it
+		// The error text of Pi's bash tool (a throw, so the report's error), with the code and the seconds the shell reported: not the deadline's 2 seconds, nor a zero.
+		{61, errorOf, "<ticks>\n"},
+		{61, errorOf, "Command timed out after 2 seconds. The shell exited with code 7 after <0-2> seconds, but background processes it started kept writing output until the timeout."},
+		{62, errorOf, "Command timed out after 2 seconds. The shell exited with code 7 after <0-2> seconds, but background processes it started kept writing output until the timeout."},
+		{63, errorOf, "Command timed out after 2 seconds"},
+		{64, errorOf, "Command timed out after 2 seconds. The shell exited with code 7 after <0-2> seconds, but background processes it started kept writing output until the timeout."},
+		{60, text, "g.txt:1: needle-1"},
+		{60, calls, `["isDirectory:<host>/grepdir"]`}, // the match was printed from ripgrep's output, and the readFile the reference's extension passes was not called
 		{28, definitionField("description"), `"Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first).`},
 		{28, definitionField("promptSnippet"), `"Read file contents"`},
 		{30, definitionField("renderShell"), `"self"`},
@@ -307,9 +381,22 @@ func TestConformance_BuiltinToolDelegationAcrossSDKs(t *testing.T) {
 	if details, _ := bigResult["detailsJSON"].(string); !strings.HasPrefix(details, `{"truncation":{"content":`) {
 		t.Fatalf("Pi's own details = %q", details)
 	}
+	// Pi 4be4cb4f5e9c: the text of an image read under a model without image input says nothing of the model, and the details name it.
+	imageRead := reference[len(reference)-3]
+	imageResult, _ := imageRead["result"].(map[string]any)
+	if got, _ := json.Marshal(imageResult["content"]); string(got) != `[{"text":"Read image file [image/png]","type":"text"},{"mimeType":"image/png","type":"image"}]` {
+		t.Fatalf("Pi's own read of an image under a model without image input reported the content %s", got)
+	}
+	if details, _ := imageResult["detailsJSON"].(string); details != `{"imageUnsupportedByModel":"current"}` {
+		t.Fatalf("Pi's own read of an image under a model without image input reported the details %q", details)
+	}
 	// bash's structured content lists its members in insertion order
 	if keys, _ := reference[16]["result"].(map[string]any)["structuredKeys"].([]any); fmt.Sprint(keys) != "[output truncated exit_code wall_time_seconds]" {
 		t.Fatalf("Pi's own structuredContent keys = %v", keys)
+	}
+	// A new error with the backend's message is not the backend's error, so the tool reports the plain timeout (Pi matches ShellTimeoutError by class).
+	if got := errorOf(reference[63]); strings.Contains(got, "The shell exited") {
+		t.Fatalf("Pi's own code reported %q for case 63 (%v): an error thrown with the backend's message must not carry its shell exit", got, referenceCases[63])
 	}
 	for _, e := range expectations {
 		if got := e.check(reference[e.index]); !strings.Contains(got, e.want) {
@@ -334,9 +421,10 @@ func TestConformance_BuiltinToolDelegationAcrossSDKs(t *testing.T) {
 			})
 			got := observe(t, h)
 			for i, report := range got {
-				if !reflect.DeepEqual(report, reference[i]) {
+				want := reference[i]
+				if !reflect.DeepEqual(report, want) {
 					a, _ := json.Marshal(report)
-					b, _ := json.Marshal(reference[i])
+					b, _ := json.Marshal(want)
 					t.Errorf("case %d %v:\n got  %s\n want %s (Pi's own code)", i, referenceCases[i], a, b)
 				}
 			}
@@ -500,4 +588,13 @@ func TestConformance_BuiltinEditOverrideNormalisesLegacyArgumentsAcrossSDKs(t *t
 			}
 		})
 	}
+}
+
+// onePixelPNGForDelegation is the 1x1 PNG of Pi's tools.test.ts image cases.
+func onePixelPNGForDelegation() []byte {
+	data, err := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAX+XDSwAAAABJRU5ErkJggg==")
+	if err != nil {
+		panic(err)
+	}
+	return data
 }

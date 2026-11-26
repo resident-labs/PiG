@@ -79,6 +79,7 @@ func sessionOracleFixtures() (small, big, all []sessionOracleInfo) {
 // session-selector.ts handleInput against pinned Pi: delete confirmation swallows keys, tab/sort/named/path toggle, rename mode
 // owns its keys, up/down/page/confirm/cancel drive the list, and every other key edits the search whose query refilters.
 func TestSessionSelectorInputMatchesPi(t *testing.T) {
+	restoreStartupTheme(t)
 	restoreTUIKeybindings(t)
 	small, big, all := sessionOracleFixtures()
 	scripts := [][]string{
@@ -108,6 +109,9 @@ func TestSessionSelectorInputMatchesPi(t *testing.T) {
 		{"\x13", "\x1b[B", "\x1b[B", "\x0e", "\r"},
 		{"\t", "\x1b[6~", "\x1b[6~", "\x1b[6~", "\r"},
 		{"\x1b[B", "t", "\x1b[B", "\x7f", "\x1b[A"},
+		// Pi 37b74c546 (#12246) and 5bcf370a5 (#12334): a query after scrolling selects the top row, and a cursor key keeps the selection.
+		{"\x1b[B", "\x1b[B", "\x1b[B", "t", "o", "\r"},
+		{"t", "\x1b[B", "\x1b[B", "\x1b[D", "\x1b[H", "\x1b[F", "\r"},
 	}
 	bindings := []map[string][]string{
 		nil,
@@ -163,10 +167,9 @@ func TestSessionSelectorInputMatchesPi(t *testing.T) {
 	if err := json.Unmarshal(output, &expected); err != nil {
 		t.Fatal(err)
 	}
-	previousTheme, previousCaps, previousKeys := tui.ActiveTheme(), tui.GetCapabilities(), tui.GetTUIKeybindings()
+	restoreStartupTheme(t)
+	previousKeys := tui.GetTUIKeybindings()
 	t.Cleanup(func() {
-		tui.SetCapabilities(previousCaps)
-		tui.SetTheme(previousTheme.Name)
 		tui.SetTUIKeybindings(previousKeys)
 	})
 	toGo := func(infos []sessionOracleInfo) []SessionInfo {

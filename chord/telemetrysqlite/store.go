@@ -7,6 +7,7 @@ package telemetrysqlite
 
 import (
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"reflect"
@@ -16,6 +17,7 @@ import (
 
 	chordsqlite "github.com/MichaelKinsy/PiG/chord/sqlite"
 	"github.com/MichaelKinsy/PiG/internal/jsnumber"
+	"github.com/MichaelKinsy/PiG/internal/jsonopts"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/telemetry"
 )
@@ -53,6 +55,11 @@ func rowNumber(row chordsqlite.SqliteRow, column string) (float64, error) {
 	}
 }
 
+// spanOrder is spans in start order: by start time (to the microsecond), then as each recorder started them (an id is
+// its recorder's scope and a counter: by length, then text, so the counter compares as a number), so spans of one
+// microsecond keep their order (slice 9).
+const spanOrder = "started_us, length(id), id"
+
 type spanRow struct {
 	id, traceID, name, attributes, events, links, status string
 	parentID                                             *string
@@ -82,12 +89,15 @@ func readSpanRow(row chordsqlite.SqliteRow) (spanRow, error) {
 	if present {
 		result.parentID = &parent
 	}
-	if result.startedMs, err = rowNumber(row, "started_ms"); err != nil {
+	// Times are stored in whole microseconds (schema version 2) and read as milliseconds.
+	if result.startedMs, err = rowNumber(row, "started_us"); err != nil {
 		return spanRow{}, err
 	}
-	if result.endedMs, err = rowNumber(row, "ended_ms"); err != nil {
+	result.startedMs /= 1000
+	if result.endedMs, err = rowNumber(row, "ended_us"); err != nil {
 		return spanRow{}, err
 	}
+	result.endedMs /= 1000
 	return result, nil
 }
 
@@ -141,33 +151,34 @@ func unmarshalAll(items []json.RawMessage, decode func(int, json.RawMessage) err
 // decodeAttributes is JSON.parse of an attribute object: members in the order written, with array-index names listed
 // first as a JavaScript object lists them.
 func decodeAttributes(text string) (telemetry.SpanAttributes, error) {
-	decoder := json.NewDecoder(strings.NewReader(text))
-	opening, err := decoder.Token()
+	decoder := jsontext.NewDecoder(strings.NewReader(text), jsonopts.Parse)
+	opening, err := decoder.ReadToken()
 	if err != nil {
 		return nil, err
 	}
-	if delimiter, ok := opening.(json.Delim); !ok || delimiter != '{' {
+	if opening.Kind() != '{' {
 		return nil, errors.New("telemetry-sqlite: attributes are not an object")
 	}
 	attributes := telemetry.SpanAttributes{}
-	for decoder.More() {
-		name, err := decoder.Token()
+	for decoder.PeekKind() != '}' {
+		nameToken, err := decoder.ReadToken()
 		if err != nil {
 			return nil, err
 		}
-		var raw json.RawMessage
-		if err := decoder.Decode(&raw); err != nil {
+		name := nameToken.String() // a Token and the bytes ReadValue returns are void after the next call on the decoder
+		raw, err := decoder.ReadValue()
+		if err != nil {
 			return nil, err
 		}
-		value, err := decodeAttributeValue(raw)
+		value, err := decodeAttributeValue(json.RawMessage(raw)) // reads raw before the decoder moves; keeps none of it
 		if err != nil {
 			return nil, err
 		}
 		if value != nil {
-			attributes = attributes.Set(name.(string), value)
+			attributes = attributes.Set(name, value)
 		}
 	}
-	if _, err := decoder.Token(); err != nil {
+	if _, err := decoder.ReadToken(); err != nil {
 		return nil, err
 	}
 	return attributes, nil
@@ -299,7 +310,7 @@ func attributeNumber(value telemetry.AttributeValue) (float64, bool) {
 }
 
 func getTrace(db chordsqlite.SqliteDatabase, traceID string) (*telemetry.StoredTrace, error) {
-	rows, err := db.All("SELECT * FROM telemetry_spans WHERE trace_id = ? ORDER BY started_ms, id", traceID)
+	rows, err := db.All("SELECT * FROM telemetry_spans WHERE trace_id = ? ORDER BY "+spanOrder, traceID)
 	if err != nil {
 		return nil, err
 	}
@@ -350,16 +361,16 @@ func findTraces(db chordsqlite.SqliteDatabase, query telemetry.TraceQuery) (tele
 	var conditions []string
 	var params []chordsqlite.SqliteValue
 	if query.Name != nil {
-		conditions = append(conditions, "(SELECT name FROM telemetry_spans WHERE trace_id = heads.trace_id ORDER BY started_ms, id LIMIT 1) = ?")
+		conditions = append(conditions, "(SELECT name FROM telemetry_spans WHERE trace_id = heads.trace_id ORDER BY "+spanOrder+" LIMIT 1) = ?")
 		params = append(params, *query.Name)
 	}
 	if query.StartMin != nil {
-		conditions = append(conditions, "started_ms >= ?")
-		params = append(params, *query.StartMin)
+		conditions = append(conditions, "started_us >= ?")
+		params = append(params, *query.StartMin*1000)
 	}
 	if query.StartMax != nil {
-		conditions = append(conditions, "started_ms <= ?")
-		params = append(params, *query.StartMax)
+		conditions = append(conditions, "started_us <= ?")
+		params = append(params, *query.StartMax*1000)
 	}
 	if query.Errors {
 		conditions = append(conditions, "EXISTS (SELECT 1 FROM telemetry_spans WHERE trace_id = heads.trace_id AND json_extract(status, '$.status') = 'error')")
@@ -376,7 +387,7 @@ func findTraces(db chordsqlite.SqliteDatabase, query telemetry.TraceQuery) (tele
 		if err != nil {
 			return telemetry.FindTracesResult{}, err
 		}
-		conditions = append(conditions, "(started_ms < ? OR (started_ms = ? AND trace_id > ?))")
+		conditions = append(conditions, "(started_us < ? OR (started_us = ? AND trace_id > ?))")
 		params = append(params, cursor.startedMs, cursor.startedMs, cursor.traceID)
 	}
 	where := "1"
@@ -387,8 +398,8 @@ func findTraces(db chordsqlite.SqliteDatabase, query telemetry.TraceQuery) (tele
 	err := db.Transaction(func(tx chordsqlite.SqliteExecutor) error {
 		result = telemetry.FindTracesResult{}
 		heads, err := tx.All(`WITH heads AS (
-			SELECT trace_id, min(started_ms) started_ms FROM telemetry_spans GROUP BY trace_id
-		) SELECT * FROM heads WHERE `+where+" ORDER BY started_ms DESC, trace_id LIMIT ?", append(slices.Clone(params), int64(limit)+1)...)
+			SELECT trace_id, min(started_us) started_us FROM telemetry_spans GROUP BY trace_id
+		) SELECT * FROM heads WHERE `+where+" ORDER BY started_us DESC, trace_id LIMIT ?", append(slices.Clone(params), int64(limit)+1)...)
 		if err != nil {
 			return err
 		}
@@ -409,7 +420,7 @@ func findTraces(db chordsqlite.SqliteDatabase, query telemetry.TraceQuery) (tele
 		if err != nil {
 			return err
 		}
-		rows, err := tx.All("SELECT * FROM telemetry_spans WHERE trace_id IN (SELECT value FROM json_each(?)) ORDER BY started_ms, id", string(encoded))
+		rows, err := tx.All("SELECT * FROM telemetry_spans WHERE trace_id IN (SELECT value FROM json_each(?)) ORDER BY "+spanOrder, string(encoded))
 		if err != nil {
 			return err
 		}
@@ -430,7 +441,7 @@ func findTraces(db chordsqlite.SqliteDatabase, query telemetry.TraceQuery) (tele
 			result.Traces[i] = telemetry.StoredTrace{TraceID: traceID, Spans: grouped[traceID]}
 		}
 		if more {
-			startedMs, err := rowNumber(heads[len(heads)-1], "started_ms")
+			startedMs, err := rowNumber(heads[len(heads)-1], "started_us")
 			if err != nil {
 				return err
 			}

@@ -4,10 +4,12 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding"
@@ -48,55 +50,21 @@ func buildModelFromRef(ctx context.Context, providerID, modelID string, services
 	return coding.BuildModelFromEntry(providerID, modelID, entry, services)
 }
 
-// resolveStartupModelEntry resolves a model as upstream resolveCliModel does:
-// the exact catalog entry, else a models.json definition, else the provider's
-// default model under the requested id (buildFallbackModel), else the
-// registry entry.
+// resolveStartupModelEntry resolves a model by provider and id: the remote
+// catalog's record, else the bundled catalog's, else the registry entry (a
+// models.json or registered definition, or the provider's settings alone for
+// an id nothing defines). An id no catalog carries that `--model` named is
+// not resolved here: startup builds the resolver's copy of one of the
+// provider's models (coding.BuildFallbackModel).
 func resolveStartupModelEntry(providerID, modelID string, registry *codingagent.ModelRegistry) codingagent.ModelEntry {
-	spec := providerID + "/" + modelID
-	if generated, ok := ai.LookupModelExact(spec); ok {
+	if remote, ok := registry.ResolveRemoteCatalogModel(providerID, modelID); ok {
+		return remote
+	}
+	if generated, ok := ai.LookupModelExact(providerID + "/" + modelID); ok {
 		return registry.ResolveGeneratedModel(providerID, modelID, generated)
 	}
-	entry, entryOK := registry.Resolve(providerID, modelID)
-	if entryOK && registry.HasModelDefinition(providerID, modelID) {
-		return entry
-	}
-	if base, ok := providerFallbackModel(providerID); ok {
-		fallback := registry.ResolveGeneratedModel(providerID, modelID, base)
-		fallback.DisplayName = modelID
-		return fallback
-	}
+	entry, _ := registry.Resolve(providerID, modelID)
 	return entry
-}
-
-// printModelDiagnostic writes a model-resolution warning to stderr in the
-// same shape as upstream reportDiagnostics: a yellow "Warning: <msg>" line.
-// Color follows chalk's level, which supports-color takes from stdout.
-func printModelDiagnostic(msg string) {
-	text := "Warning: " + msg
-	if chalkStdoutColor() {
-		text = codingagent.ChalkApply("\x1b[33m", "\x1b[39m", text)
-	}
-	fmt.Fprintln(os.Stderr, text)
-}
-
-// providerFallbackModel returns the catalog model whose capabilities are
-// borrowed when a requested model is unknown under providerID: the
-// provider's default model when catalogued, else its first catalogued model.
-// Mirrors upstream buildFallbackModel's base selection. Returns false when
-// the provider has no catalogued models (then the model stays a bare custom
-// id with tool-use-only caps and no warning).
-func providerFallbackModel(providerID string) (*ai.GeneratedModel, bool) {
-	if defID, ok := codingagent.DefaultModelPerProvider()[providerID]; ok {
-		if m, ok := ai.LookupModelExact(providerID + "/" + defID); ok {
-			return m, true
-		}
-	}
-	models := ai.ListModels(providerID)
-	if len(models) > 0 {
-		return &models[0], true
-	}
-	return nil, false
 }
 
 // agentDirForModel returns the path passed to NewAuthStorage. We don't have
@@ -131,22 +99,41 @@ func formatTokenCount(count int) string {
 	return fmt.Sprintf("%d", count)
 }
 
-// printModelList prints the models the given registry (already populated with any
-// extension-contributed providers) reports as available. Mirrors upstream
-// listModels (cli/list-models.ts), which lists exactly modelRuntime.getAvailable():
-// a built-in model the runtime's own catalog no longer carries, such as one an
-// OpenRouter personalized catalog dropped, is not listed. The caller owns process
-// exit and extension-host teardown.
-func printModelList(registry *codingagent.ModelRegistry, search string) {
-	// Load error handling mirrors upstream.
-	if loadErr := registry.LoadError(); loadErr != "" {
+// listModelsTimeout is main.ts:951's AbortSignal.timeout(15_000).
+const listModelsTimeout = 15 * time.Second // upstream: coding-agent/src/main.ts:main
+
+// listModels is upstream listModels (cli/list-models.ts:29-115) under the bound of main.ts:951. It warns of the runtime's error (:34-37), awaits a
+// fresh availability pass (:39, model-runtime.ts:490-506) and prints the table of the registry, which reads the availability that pass published. A
+// pass that fails, or that the bound or ctx ends, returns its error and no table line is printed. The caller owns process exit and extension-host
+// teardown.
+func listModels(ctx context.Context, runtime *coding.ModelRuntime, registry *codingagent.ModelRegistry, search string) error {
+	if loadErr := runtime.GetError(); loadErr != "" {
 		fmt.Fprintln(os.Stderr, chalkYellow("Warning: errors loading models.json:\n"+loadErr))
 	}
+	ctx, cancel := context.WithTimeout(ctx, listModelsTimeout)
+	defer cancel()
+	if _, err := runtime.GetAvailable(ctx); err != nil {
+		return err
+	}
+	printModelTable(registry, search)
+	return nil
+}
 
-	// Auth-filtered models: mirrors upstream modelRegistry.getAvailable().
-	entries := registry.GetAvailable()
+// uncaughtListModelsError is the line Node heads its report with for the error of listModels, which Pi's main leaves uncaught: the bound that
+// fired is the DOMException of AbortSignal.timeout.
+func uncaughtListModelsError(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "DOMException [TimeoutError]: The operation was aborted due to timeout"
+	}
+	return err.Error()
+}
 
-	for _, line := range modelListLines(entries, search) {
+// printModelTable prints the models the given registry (already populated with any
+// extension-contributed providers) reports as available: exactly modelRuntime.getAvailable()
+// (cli/list-models.ts:39-114). A built-in model the runtime's own catalog no longer carries,
+// such as one an OpenRouter personalized catalog dropped, is not listed.
+func printModelTable(registry *codingagent.ModelRegistry, search string) {
+	for _, line := range modelListLines(registry.GetAvailable(), search) {
 		fmt.Println(line)
 	}
 }

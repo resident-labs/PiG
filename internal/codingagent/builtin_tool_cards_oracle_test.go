@@ -21,7 +21,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -52,15 +51,23 @@ type toolCardResult struct {
 }
 
 type toolCardProbe struct {
-	Tool     string          `json:"tool"`
-	Args     map[string]any  `json:"args"`
-	Result   *toolCardResult `json:"result"`
-	Partial  bool            `json:"partial"`
-	NoImages bool            `json:"noImages"`
-	Expanded bool            `json:"expanded"`
-	Width    int             `json:"width"`
-	Theme    string          `json:"theme"`
-	CWD      string          `json:"cwd"`
+	Tool    string          `json:"tool"`
+	Args    map[string]any  `json:"args"`
+	Result  *toolCardResult `json:"result"`
+	Partial bool            `json:"partial"`
+	// Streaming draws the call while its arguments still arrive: no execution start and no completed arguments on either side.
+	Streaming bool `json:"streaming,omitempty"`
+	NoImages  bool `json:"noImages"`
+	// Images is the terminal image protocol the card sees ("" shows image fallback text only).
+	Images   string `json:"images,omitempty"`
+	Expanded bool   `json:"expanded"`
+	Width    int    `json:"width"`
+	Theme    string `json:"theme"`
+	CWD      string `json:"cwd"`
+	// Hyperlinks is the terminal's OSC 8 support, which the path in a call header links through (renderToolPath).
+	Hyperlinks bool `json:"hyperlinks,omitempty"`
+	// DocsPage names a page of the documentation root (README.md, docs/x.md); the Pi oracle reads it from Pi's package and Args holds PiG's page.
+	DocsPage string `json:"docsPage,omitempty"`
 	// Settle waits for the edit call's diff preview before the card is drawn.
 	Settle bool `json:"settle,omitempty"`
 	// Bindings are user keybindings (the expand hint names the keys bound to app.tools.expand).
@@ -75,52 +82,9 @@ type toolCardProbe struct {
 
 func cardText(text string) []map[string]any { return []map[string]any{{"type": "text", "text": text}} }
 
-// tool-execution.ts with the built-in tool definitions' renderCall and renderResult (core/tools/{read,write,bash,grep,find,ls}.ts)
-// against pinned Pi: each card pending and with a result, collapsed and expanded, in both themes at two widths, as the interactive mode builds it from tool events.
-// Rows are compared byte for byte: colours, backgrounds and padding included.
-func TestBuiltinToolCardsMatchPi(t *testing.T) {
-	probes, names := builtinToolCardProbes(t)
-	compareToolCards(t, probes, names)
-}
-
-// Cards for files in a language highlight.js registers only in its full load (README.md is markdown) and in one it never registers (schema.graphql: the mdCodeBlock color for an unsupported language, which the card
-// draws on either side of the load). Interactive mode's init runs that load within moments of a session starting, and the rest of a test process inherits it once any test starts a mode. The load is a one-way latch
-// in Pi and PiG alike, so this test loads PiG's before the oracle runs, as a test ahead of it in the process would: it fails on any ordering where the Pi side drew without the languages the PiG side had.
-func TestBuiltinToolCardsMatchPiAfterTheHighlightLanguageLoad(t *testing.T) {
-	tui.LoadAllHighlightLanguages()
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := "# heading\n  indented\n\ttabbed\n\x1b[31mred\x1b[0m\n{ \"k\": [1, 2] }\n```go\npackage main\n```"
-	var probes []toolCardProbe
-	var names []string
-	for _, path := range []string{"README.md", "schema.graphql"} {
-		for _, tool := range []string{"read", "write"} {
-			args := map[string]any{"path": path}
-			result := &toolCardResult{Content: cardText(body)}
-			if tool == "write" {
-				args["content"] = body
-				result = &toolCardResult{Content: cardText("Successfully wrote 80 bytes to " + path)}
-			}
-			for _, theme := range []string{"dark", "light"} {
-				for _, expanded := range []bool{false, true} {
-					probes = append(probes, toolCardProbe{Tool: tool, Args: args, Result: result, Expanded: expanded, Width: 80, Theme: theme, CWD: cwd})
-					names = append(names, fmt.Sprintf("%s %s theme=%s expanded=%v", tool, path, theme, expanded))
-				}
-			}
-		}
-	}
-	compareToolCards(t, probes, names)
-}
-
-// compareToolCards renders each probe with Pi and with Pig and reports the first rows that differ.
-func compareToolCards(t *testing.T, probes []toolCardProbe, names []string) {
+// piToolCardRows renders each probe with pinned Pi (testdata/builtin_tool_cards.mjs) and returns its rows.
+func piToolCardRows(t *testing.T, probes []toolCardProbe) [][]string {
 	t.Helper()
-	// Both sides draw with every highlight.js language registered, as a session does once its startup load is done. The load is a one-way latch,
-	// so a test that ran earlier in the process (a mode's init, TestLoadRemainingHighlightLanguages...) may already have tripped it, and a load
-	// still running on a stopped mode's task finishes under this test. Waiting for it here makes the state the same on every run; the oracle loads Pi's.
-	tui.LoadAllHighlightLanguages()
 	input, err := json.Marshal(probes)
 	if err != nil {
 		t.Fatal(err)
@@ -137,6 +101,17 @@ func compareToolCards(t *testing.T, probes []toolCardProbe, names []string) {
 	if err := json.Unmarshal(output, &expected); err != nil {
 		t.Fatal(err)
 	}
+	return expected
+}
+
+// compareToolCards renders each probe with Pi and with Pig and reports the first rows that differ.
+func compareToolCards(t *testing.T, probes []toolCardProbe, names []string) {
+	t.Helper()
+	// Both sides draw with every highlight.js language registered, as a session does once its startup load is done. The load is a one-way latch,
+	// so a test that ran earlier in the process (a mode's init, TestLoadRemainingHighlightLanguages...) may already have tripped it, and a load
+	// still running on a stopped mode's task finishes under this test. Waiting for it here makes the state the same on every run; the oracle loads Pi's.
+	tui.LoadAllHighlightLanguages()
+	expected := piToolCardRows(t, probes)
 	failures := 0
 	for i, got := range renderBuiltinToolCards(t, probes) {
 		if strings.Join(got, "\n") != strings.Join(expected[i], "\n") {
@@ -413,10 +388,8 @@ func renderBuiltinToolCards(t *testing.T, probes []toolCardProbe) [][]string {
 	t.Helper()
 	// A preview that never lands is a hang, not a slow machine: the wait for its repaint ends at the test's hang bound.
 	waitCtx := testbudget.Context(t)
-	previousCaps := tui.GetCapabilities()
-	t.Cleanup(func() { tui.SetCapabilities(previousCaps) })
+	restoreStartupTheme(t)
 	tui.SetCapabilities(tui.TerminalCapabilities{TrueColor: true})
-	t.Cleanup(func() { tui.SetTheme("dark") })
 	t.Cleanup(func() { tui.SetAppKeyTextResolver(nil) })
 	// The card clock reads cardClock, which stands at the probe's start until its result lands, as the Pi probe moves Date.now().
 	var cardClock atomic.Int64
@@ -426,6 +399,7 @@ func renderBuiltinToolCards(t *testing.T, probes []toolCardProbe) [][]string {
 	out := make([][]string, len(probes))
 	for i, probe := range probes {
 		tui.SetTheme(probe.Theme)
+		tui.SetCapabilities(tui.TerminalCapabilities{TrueColor: true, Hyperlinks: probe.Hyperlinks})
 		installCardBindings(t, probe)
 		raw, _ := json.Marshal(probe.Args)
 		// A session registers bash, powershell, grep, find and ls as tool definitions; bindToolCard gives read, write and edit their built-in definitions.
@@ -441,7 +415,13 @@ func renderBuiltinToolCards(t *testing.T, probes []toolCardProbe) [][]string {
 			watcher = &renderRequestWatcher{TUI: f.mode.tuiInst, requests: make(chan struct{}, 1)}
 			f.mode.tuiInst = watcher
 		}
-		f.mode.handleAgentEvent(agent.ToolExecutionStartEvent{ToolCallID: f.id, ToolName: f.name, Args: raw})
+		if !probe.Streaming {
+			f.mode.handleAgentEvent(agent.ToolExecutionStartEvent{ToolCallID: f.id, ToolName: f.name, Args: raw})
+			if probe.Tool == "write" {
+				// The Pi probe completes the arguments of every call, and the write card draws a complete call unlike a streaming one for a path whose language lookup throws.
+				f.card.SetArgsComplete()
+			}
+		}
 		if probe.Settle {
 			f.card.SetArgsComplete()
 			// As the Pi probe does, wait for the preview before the result lands. A result drawn first would start the preview inside the event handler,
@@ -491,80 +471,6 @@ func renderBuiltinToolCards(t *testing.T, probes []toolCardProbe) [][]string {
 		}
 	}
 	return out
-}
-
-// TestBuiltinToolCardsRandomMatchPi drives random tool calls and results through the same cards: arguments of every type, result text with wide, combining, ANSI, tab, CRLF and very long lines, from none to 70 rows, error and truncation details, widths from 3 to 120 (Pi pads the children of a Box to a content width of at least one column, which only shows below the two padding columns), both themes, collapsed and expanded.
-func TestBuiltinToolCardsRandomMatchPi(t *testing.T) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	rng := rand.New(rand.NewSource(20261017))
-	// The card clock's span draws from its own source so the rest of the corpus stays the one rng gives.
-	clockRng := rand.New(rand.NewSource(20261013))
-	pieces := []string{"", "x", "alpha beta", "日本語のテキスト", "e\u0301", "😀", "\ttabbed", "  indented", "\x1b[31mred\x1b[0m", "line with CR\r", "src/a.go:12: needle", "a/very/long/path/that/keeps/going/and/going/and/going/until/it/wraps/around/the/card.txt", strings.Repeat("w", 150), "{ \"k\": [1, 2] }", "package main", "# heading", "\x00bin\x07"}
-	paths := []string{"notes.txt", "main.go", "README.md", "data.json", "日本語.txt", "a b/c.ts", "/abs/path/file.py", "~/home.txt", "", ".", "../up.sh", "dir/", "x.unknownext"}
-	text := func(rows int) string {
-		out := make([]string, rows)
-		for i := range out {
-			out[i] = pieces[rng.Intn(len(pieces))]
-		}
-		return strings.Join(out, "\n")
-	}
-	tools := []string{"read", "write", "edit", "bash", "powershell", "grep", "find", "ls"}
-	var probes []toolCardProbe
-	var names []string
-	for i := range 500 {
-		tool := tools[rng.Intn(len(tools))]
-		args := map[string]any{}
-		maybe := func(key string, value any) {
-			if rng.Intn(2) == 0 {
-				args[key] = value
-			}
-		}
-		maybe("path", paths[rng.Intn(len(paths))])
-		maybe("pattern", pieces[rng.Intn(len(pieces))])
-		maybe("command", pieces[rng.Intn(len(pieces))]+"\n"+pieces[rng.Intn(len(pieces))])
-		maybe("content", text(rng.Intn(30)))
-		maybe("glob", []string{"*.go", "**/*.ts", ""}[rng.Intn(3)])
-		maybe("offset", []any{1, 10, 0, -1, "x"}[rng.Intn(5)])
-		maybe("limit", []any{1, 100, 0, "y"}[rng.Intn(4)])
-		maybe("timeout", []any{1, 30, 0.5, "z"}[rng.Intn(4)])
-		maybe("edits", []any{map[string]any{"oldText": pieces[rng.Intn(len(pieces))], "newText": pieces[rng.Intn(len(pieces))]}})
-		var result *toolCardResult
-		if rng.Intn(5) != 0 {
-			result = &toolCardResult{Content: cardText(text(rng.Intn(70))), IsError: rng.Intn(6) == 0}
-			details := map[string]any{}
-			if rng.Intn(4) == 0 {
-				details["truncation"] = map[string]any{"truncated": true, "truncatedBy": []string{"lines", "bytes"}[rng.Intn(2)], "totalLines": 5000, "totalBytes": 90000, "outputLines": 2000, "outputBytes": 50000, "lastLinePartial": rng.Intn(2) == 0, "firstLineExceedsLimit": rng.Intn(4) == 0, "maxLines": 2000, "maxBytes": 51200}
-				if rng.Intn(2) == 0 {
-					details["fullOutputPath"] = "/tmp/full.log"
-				}
-			}
-			if tool == "edit" && rng.Intn(2) == 0 {
-				details["diff"] = "  1 context\n-  2 " + pieces[rng.Intn(len(pieces))] + "\n+  2 " + pieces[rng.Intn(len(pieces))] + "\n  3 tail"
-				details["firstChangedLine"] = 2
-			}
-			for _, key := range []string{"matchLimitReached", "resultLimitReached", "entryLimitReached"} {
-				if rng.Intn(8) == 0 {
-					details[key] = 100
-				}
-			}
-			if rng.Intn(8) == 0 {
-				details["linesTruncated"] = true
-			}
-			if len(details) > 0 {
-				result.Details = details
-			}
-		}
-		partial := result == nil && (tool == "bash" || tool == "powershell")
-		if partial {
-			result = &toolCardResult{Content: cardText("")[:0]}
-		}
-		probes = append(probes, toolCardProbe{Tool: tool, Args: args, Result: result, Partial: partial, Expanded: rng.Intn(2) == 0, Width: 3 + rng.Intn(118), Theme: []string{"dark", "light"}[rng.Intn(2)], CWD: cwd, ElapsedMs: clockRng.Int63n([]int64{60_000, 2 * 3_600_000}[clockRng.Intn(2)])})
-		names = append(names, fmt.Sprintf("random %d %s", i, tool))
-	}
-	compareToolCards(t, probes, names)
 }
 
 // rebindExpandCards copies each collapsed 80-column probe once per expand-key binding set: rebound, multi-key and unbound, which the hint names.

@@ -2,17 +2,20 @@ package documents
 
 import (
 	"context"
+	"maps"
 	"slices"
 
 	"github.com/MichaelKinsy/PiG/chord"
+	chordctx "github.com/MichaelKinsy/PiG/chord/context"
 	"github.com/MichaelKinsy/PiG/chord/delta"
 	"github.com/MichaelKinsy/PiG/chord/internal/parking"
+	"github.com/MichaelKinsy/PiG/chord/next/contracts"
 	"github.com/MichaelKinsy/PiG/chord/next/data"
 	"github.com/MichaelKinsy/PiG/chord/next/state"
 	"github.com/MichaelKinsy/PiG/chord/next/store"
 )
 
-// Ports packages/chord/src/next/documents/keyed-slot.ts
+// Ports packages/chord/src/documents/keyed-slot.ts
 //
 // Keyed slots (slice 6a §1.2, §4, §10, §11): the documents of one keyed name on one object, by key. In memory, every
 // present document stays; persisted, a document is loaded on demand (a cold read is a job on the object's line, one
@@ -28,6 +31,26 @@ import (
 type Access struct {
 	Token   *SealToken
 	Version int
+}
+
+// ChangedKind is how a keyed document stands after a host data change.
+type ChangedKind string
+
+// The kinds of ChangedDocument.
+const (
+	ChangedAbsent    ChangedKind = "absent"
+	ChangedUnchanged ChangedKind = "unchanged"
+	ChangedPresent   ChangedKind = "present"
+	ChangedFailed    ChangedKind = "failed"
+)
+
+// ChangedDocument is a keyed document as a host data change left it in the store (ReadChanged): absent, unchanged
+// (the same record and revision as in memory), present (Loaded, decoded by the slot's definition) or failed (Error:
+// the code cannot read it; adopting it fails the owner).
+type ChangedDocument struct {
+	Kind   ChangedKind
+	Loaded Loaded
+	Error  *data.ChordError
 }
 
 // keysPage is the keys `Keys` reads per page from the store.
@@ -57,6 +80,9 @@ type KeyedSlot struct {
 	loads map[string]*sharedLoad
 	// keyWhat names a refused key.
 	keyWhat string
+	// observers are the bridge's copies of this slot, by registration number.
+	observers    map[int]KeyObserver
+	nextObserver int
 }
 
 // NewKeyedSlot is the keyed slot of definition on owner, persisted when persistence is not nil.
@@ -96,37 +122,111 @@ func (slot *KeyedSlot) Get(raw string, access Access, ctx context.Context) (*Jso
 	return slot.get(key, access, ctx)
 }
 
+// getHandle resolves raw under the slot's section in Pi's order (keyOf, Key, AssertLive, AssertVersion, resident) so
+// handle reads take no extra section and never read definition.current outside Do.
+func (slot *KeyedSlot) getHandle(raw any, access Access, ctx context.Context) (*JsonObject, error) {
+	_, value, err := slot.getHandleWithKey(raw, access, ctx)
+	return value, err
+}
+
+// getHandleWithKey is getHandle returning the resolved stored key for Watch.
+func (slot *KeyedSlot) getHandleWithKey(raw any, access Access, ctx context.Context) (string, *JsonObject, error) {
+	if slot.owner.InSection() {
+		key, value, settled, err := slot.getHandleInSection(raw, access)
+		if err != nil || settled {
+			return key, value, err
+		}
+		value, err = slot.loadAndRead(key, access.Token, ctx)
+		return key, value, err
+	}
+	return slot.getHandleFromOutside(raw, access, ctx)
+}
+
+// getHandleFromOutside is getHandleWithKey for a caller outside the owner's section (closure allocated here only).
+func (slot *KeyedSlot) getHandleFromOutside(raw any, access Access, ctx context.Context) (string, *JsonObject, error) {
+	var state struct {
+		key     string
+		value   *JsonObject
+		err     error
+		settled bool
+	}
+	slot.owner.Do(func() {
+		state.key, state.value, state.settled, state.err = slot.getHandleInSection(raw, access)
+	})
+	if state.err != nil || state.settled {
+		return state.key, state.value, state.err
+	}
+	value, err := slot.loadAndRead(state.key, access.Token, ctx)
+	return state.key, value, err
+}
+
+// getHandleInSection resolves raw and reads an in-memory resident inside the owner's section in Pi's order
+// (keyOf, Key, AssertLive, AssertVersion, resident).
+func (slot *KeyedSlot) getHandleInSection(raw any, access Access) (key string, value *JsonObject, settled bool, err error) {
+	if key, err = slot.keyOfInSection(raw); err != nil {
+		return "", nil, false, err
+	}
+	if key, err = slot.Key(key); err != nil {
+		return "", nil, false, err
+	}
+	value, settled, err = slot.getInSection(key, access)
+	return key, value, settled, err
+}
+
 // get is Get of a key that went through Key already.
 func (slot *KeyedSlot) get(key string, access Access, ctx context.Context) (*JsonObject, error) {
-	var value *JsonObject
-	var failure error
-	var settled bool
-	slot.owner.Do(func() {
-		if failure = slot.owner.AssertLive(); failure != nil {
-			return
+	if slot.owner.InSection() {
+		value, settled, err := slot.getInSection(key, access)
+		if err != nil || settled {
+			return value, err
 		}
-		if failure = slot.definition.AssertVersion(access.Version); failure != nil {
-			return
-		}
-		resident, err := slot.resident(key)
-		if err != nil {
-			failure = err
-			return
-		}
-		if resident != nil {
-			slot.touch(resident)
-			value, settled = resident.Tracker.Value(), true
-			return
-		}
-		settled = slot.persistence == nil
-	})
-	if failure != nil || settled {
-		return value, failure
+		return slot.loadAndRead(key, access.Token, ctx)
 	}
-	loaded, err := slot.loadShared(key, access.Token, ctx)
+	return slot.getFromOutside(key, access, ctx)
+}
+
+// getFromOutside is get for a caller outside the owner's section (closure allocated here only).
+func (slot *KeyedSlot) getFromOutside(key string, access Access, ctx context.Context) (*JsonObject, error) {
+	var state struct {
+		value   *JsonObject
+		err     error
+		settled bool
+	}
+	slot.owner.Do(func() {
+		state.value, state.settled, state.err = slot.getInSection(key, access)
+	})
+	if state.err != nil || state.settled {
+		return state.value, state.err
+	}
+	return slot.loadAndRead(key, access.Token, ctx)
+}
+
+// getInSection runs the in-section read of Get for an already validated key.
+func (slot *KeyedSlot) getInSection(key string, access Access) (value *JsonObject, settled bool, err error) {
+	if err = slot.owner.AssertLive(); err != nil {
+		return nil, false, err
+	}
+	if err = slot.definition.AssertVersion(access.Version); err != nil {
+		return nil, false, err
+	}
+	resident, err := slot.resident(key)
+	if err != nil {
+		return nil, false, err
+	}
+	if resident != nil {
+		slot.touch(resident)
+		return resident.Tracker.Value(), true, nil
+	}
+	return nil, slot.persistence == nil, nil
+}
+
+// loadAndRead loads a cold key on the line and returns its resident or loaded value.
+func (slot *KeyedSlot) loadAndRead(key string, token *SealToken, ctx context.Context) (*JsonObject, error) {
+	loaded, err := slot.loadShared(key, token, ctx)
 	if err != nil {
 		return nil, err
 	}
+	var value *JsonObject
 	slot.owner.Do(func() {
 		if resident := slot.residents[key]; resident != nil {
 			value = resident.Tracker.Value()
@@ -216,6 +316,37 @@ func (it *KeyIterator) Close() {
 	it.buffer = nil
 }
 
+// HandleKeyIterator is Keys as a handle yields them (Pi's `AsyncIterable<Key>`): a host-keyed slot's stored keys decoded
+// into addresses of its kind (Address values), a string-keyed one's strings as they are.
+type HandleKeyIterator struct {
+	keys *KeyIterator
+	kind *contracts.HostKind
+}
+
+// HandleKeys is Keys as a handle yields them.
+func (slot *KeyedSlot) HandleKeys(access Access, ctx context.Context) *HandleKeyIterator {
+	return &HandleKeyIterator{keys: slot.Keys(access, ctx), kind: slot.hostKind()}
+}
+
+// Next is the next key; ok is false once every key was read. Decoded keys are not re-validated.
+func (it *HandleKeyIterator) Next(ctx context.Context) (key any, ok bool, err error) {
+	stored, ok, err := it.keys.Next(ctx)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	if it.kind == nil {
+		return stored, true, nil
+	}
+	address, err := contracts.AddressOfKey(it.kind, stored)
+	if err != nil {
+		return nil, false, err
+	}
+	return address, true, nil
+}
+
+// Close ends the iteration.
+func (it *HandleKeyIterator) Close() { it.keys.Close() }
+
 // Watch is a watch of the document at key, nil when absent (after a cold load); it follows the address (a retirement
 // is a frame with the `retired` flag) and pins the key until it ends.
 func (slot *KeyedSlot) Watch(raw string, access Access, ctx context.Context) (*chord.Watch[delta.JsonValue], error) {
@@ -227,6 +358,20 @@ func (slot *KeyedSlot) Watch(raw string, access Access, ctx context.Context) (*c
 	if err != nil || value == nil {
 		return nil, err
 	}
+	return slot.openKeyWatch(key, ctx)
+}
+
+// watchHandle is Watch for a handle: resolves raw inside getHandleWithKey's Do section in Pi's order.
+func (slot *KeyedSlot) watchHandle(raw any, access Access, ctx context.Context) (*chord.Watch[delta.JsonValue], error) {
+	key, value, err := slot.getHandleWithKey(raw, access, ctx)
+	if err != nil || value == nil {
+		return nil, err
+	}
+	return slot.openKeyWatch(key, ctx)
+}
+
+// openKeyWatch pins key and opens its watch once Get confirmed it is present.
+func (slot *KeyedSlot) openKeyWatch(key string, ctx context.Context) (*chord.Watch[delta.JsonValue], error) {
 	var watch *chord.Watch[delta.JsonValue]
 	var failure error
 	slot.owner.Do(func() {
@@ -247,10 +392,11 @@ func (slot *KeyedSlot) Watch(raw string, access Access, ctx context.Context) (*c
 			return
 		}
 		watch = opened
-		go func() {
-			<-opened.Closed()
+		// `void watch.closed.then(release)` (Pi): an owned task of the owner's loop that waits parked for the close.
+		slot.owner.Task(func() {
+			_, _ = chordctx.Receive(chordctx.Background(), opened.Closed())
 			slot.owner.Do(release)
-		}()
+		})
 	})
 	return watch, failure
 }
@@ -332,6 +478,47 @@ func (slot *KeyedSlot) KeySourceOf(raw string) *KeySource {
 // U+FFFD, NUL refused `invalid/args`. Plugin keys are a trust boundary; every entry point takes them through here, so
 // memory and the store agree on one key.
 func (slot *KeyedSlot) Key(key string) (string, error) { return store.StoredText(key, slot.keyWhat) }
+
+// KeyOf is the stored key of a key a handle was given (a trust boundary for Go callers): a string-keyed slot's string
+// as it is (Key applies the text rules), a host-keyed slot's address of its kind (an Address or *Address) as the
+// address's key; anything else is invalid/args.
+func (slot *KeyedSlot) KeyOf(key any) (string, error) {
+	return slot.keyOfWithKind(slot.hostKind(), key)
+}
+
+// hostKind reads the slot's key host kind under the owner's section (inline when already in one).
+func (slot *KeyedSlot) hostKind() *contracts.HostKind {
+	if slot.owner.InSection() {
+		return slot.definition.current.Host
+	}
+	return slot.hostKindFromOutside()
+}
+
+// hostKindFromOutside is hostKind for a caller outside the owner's section (the closure is made here only).
+func (slot *KeyedSlot) hostKindFromOutside() (kind *contracts.HostKind) {
+	slot.owner.Do(func() { kind = slot.definition.current.Host })
+	return kind
+}
+
+// keyOfInSection is KeyOf when the caller already holds the owner's section.
+func (slot *KeyedSlot) keyOfInSection(key any) (string, error) {
+	return slot.keyOfWithKind(slot.definition.current.Host, key)
+}
+
+func (slot *KeyedSlot) keyOfWithKind(kind *contracts.HostKind, key any) (string, error) {
+	if kind == nil {
+		text, isText := key.(string)
+		if !isText {
+			return "", data.Invalid(data.ReasonArgs, slot.keyWhat+": expected a string")
+		}
+		return text, nil
+	}
+	stored, fits := contracts.KeyOfAddress(kind, key)
+	if !fits {
+		return "", data.Invalid(data.ReasonArgs, slot.keyWhat+": expected an address of "+kind.Kind)
+	}
+	return stored, nil
+}
 
 // LoadDeclared loads every pinned key not loaded since it was pinned (activation, holding the line).
 func (slot *KeyedSlot) LoadDeclared(ctx context.Context) error {
@@ -518,7 +705,81 @@ func (slot *KeyedSlot) Adopt(key string, tracker *delta.Tracker, prepared *delta
 	} else {
 		source.Written(before, prepared)
 	}
+	slot.tell(key, tracker.Value(), false)
 	return nil
+}
+
+// Holds reports whether the slot holds key in memory: a resident document or a pinned key's source (a host data change
+// reads it). A section.
+func (slot *KeyedSlot) Holds(key string) bool {
+	_, resident := slot.residents[key]
+	_, pinned := slot.sources[key]
+	return resident || pinned
+}
+
+// ReadChanged is what the store holds at key after a host data change, read through step (it sees the change's writes,
+// before `COMMIT`): absent, unchanged (the same record and revision as in memory) or present, decoded by the slot's
+// definition; a document the code cannot read is failed. An error is the store's.
+func (slot *KeyedSlot) ReadChanged(key string, step *store.Step, ctx context.Context) (ChangedDocument, error) {
+	persistence := slot.persistence
+	record, err := store.FindDocument(step, persistence.At(key), store.CurrentPoint)
+	if err != nil {
+		return ChangedDocument{}, err
+	}
+	if record == nil {
+		return ChangedDocument{Kind: ChangedAbsent}, nil
+	}
+	var unchanged bool
+	var definition AnyDefinition
+	slot.owner.Do(func() {
+		definition = slot.definition.current
+		if resident := slot.residents[key]; resident != nil && resident.Stored != nil {
+			unchanged = resident.Stored.ID == record.ID && resident.Stored.Revision == record.Revision
+		}
+	})
+	if unchanged {
+		return ChangedDocument{Kind: ChangedUnchanged}, nil
+	}
+	document, err := store.LoadDocument(step, *record, store.CurrentPoint)
+	if err != nil {
+		return ChangedDocument{}, err
+	}
+	loaded, err := persistence.Decode(&document, definition, ctx)
+	if err != nil {
+		return ChangedDocument{Kind: ChangedFailed, Error: data.AsChordError(err, slot.owner.Label())}, nil
+	}
+	return ChangedDocument{Kind: ChangedPresent, Loaded: loaded}, nil
+}
+
+// AdoptChanged adopts a host data change's changed document at key (inside the change's batch): a new value replaces the
+// resident (its watchers get a root replacement), an absent one retires it (a `retired` frame). An unreadable one changes
+// nothing: the caller fails the owner after the batch, and its references keep the value they had until the failure
+// detaches them.
+func (slot *KeyedSlot) AdoptChanged(key string, changed ChangedDocument) error {
+	if changed.Kind == ChangedUnchanged || changed.Kind == ChangedFailed {
+		return nil
+	}
+	before := slot.residents[key]
+	if before != nil {
+		delete(slot.residents, key)
+		slot.owner.Residency().Forget(before)
+	}
+	source := slot.sources[key]
+	if changed.Kind == ChangedAbsent {
+		if before != nil && source != nil {
+			source.Retire()
+		}
+		return nil
+	}
+	stored := changed.Loaded.Stored
+	resident := NewResident(slot, key, delta.Track(changed.Loaded.Value), &stored, slot.definition.current.Version)
+	slot.residents[key] = resident
+	if source == nil {
+		slot.touch(resident)
+		return nil
+	}
+	source.ready = true
+	return source.Replaced()
 }
 
 // Retire retires the document at key (inside the batch): out of memory, its source reads `initial()` with the flag.
@@ -530,6 +791,7 @@ func (slot *KeyedSlot) Retire(key string) {
 	if source := slot.sources[key]; source != nil {
 		source.Retire()
 	}
+	slot.tell(key, nil, false)
 }
 
 // Evict is: the sweep found resident idle past the retention: it leaves memory.
@@ -549,6 +811,33 @@ func (slot *KeyedSlot) Drop() {
 		source.End()
 	}
 	clear(slot.sources)
+	slot.tell("", nil, true)
+}
+
+// KeyObserver is told, inside the commit, of each document its slot adopts (value) or retires (nil), and with dropped that
+// the slot ended (key and value are then empty). It must not block and must copy what it keeps of value.
+type KeyObserver func(key string, value *JsonObject, dropped bool)
+
+// Observe registers observer for the slot's later changes until the returned stop runs. It is how the plugins bridge keeps
+// a Node host's copy of a keyed member (not a Pi API: Pi's plugins share the one host).
+func (slot *KeyedSlot) Observe(observer KeyObserver) (stop func()) {
+	var id int
+	slot.owner.Do(func() {
+		slot.nextObserver++
+		id = slot.nextObserver
+		if slot.observers == nil {
+			slot.observers = map[int]KeyObserver{}
+		}
+		slot.observers[id] = observer
+	})
+	return func() { slot.owner.Do(func() { delete(slot.observers, id) }) }
+}
+
+// tell tells the observers, in registration order.
+func (slot *KeyedSlot) tell(key string, value *JsonObject, dropped bool) {
+	for _, id := range slices.Sorted(maps.Keys(slot.observers)) {
+		slot.observers[id](key, value, dropped)
+	}
 }
 
 // loadShared is a cold persisted key's load, one in flight per key, on the line under the owner's context (rule 11).
@@ -572,10 +861,8 @@ func (slot *KeyedSlot) loadShared(key string, token *SealToken, ctx context.Cont
 		return nil, failure
 	}
 	parking.Park(ctx)
-	select {
-	case <-load.done:
-	case <-ctx.Done():
-		return nil, context.Cause(ctx)
+	if _, err := parking.Recv(ctx, load.done); err != nil {
+		return nil, err
 	}
 	if load.err != nil {
 		return nil, load.err
@@ -592,7 +879,7 @@ func (slot *KeyedSlot) loadShared(key string, token *SealToken, ctx context.Cont
 func (slot *KeyedSlot) startLoad(key string) *sharedLoad {
 	load := &sharedLoad{done: make(chan struct{}), tokens: map[*SealToken]struct{}{}}
 	slot.loads[key] = load
-	go func() {
+	slot.owner.Task(func() {
 		err := slot.owner.OnLine(slot.owner.Context(), func() error {
 			var failure error
 			slot.owner.Do(func() {
@@ -625,7 +912,7 @@ func (slot *KeyedSlot) startLoad(key string) *sharedLoad {
 			delete(slot.loads, key)
 		})
 		close(load.done)
-	}()
+	})
 	return load
 }
 

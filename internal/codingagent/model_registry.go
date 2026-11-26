@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"fmt"
 	"maps"
 	"os"
@@ -21,8 +22,10 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/codingagent/configschema"
 	"github.com/MichaelKinsy/PiG/internal/configvalue"
 	"github.com/MichaelKinsy/PiG/internal/jsjson"
+	"github.com/MichaelKinsy/PiG/internal/jsonopts"
 	"github.com/MichaelKinsy/PiG/internal/jsonparse"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/orderedjson"
 	"github.com/MichaelKinsy/PiG/internal/pigstrip"
 	"github.com/MichaelKinsy/PiG/internal/text"
 )
@@ -56,18 +59,22 @@ type ModelEntry struct {
 	SamplingParams   map[string]any
 	// SamplingParamsByThinkingLevel overrides SamplingParams for the effective Pi thinking level.
 	SamplingParamsByThinkingLevel ai.SamplingParamsByThinkingLevel
-	InputLimits                   *ai.ModelInputLimits
-	Input                         []string // ["text"] or ["text","image"]
-	ContextWindow                 int      // default: 128000
-	MaxTokens                     int      // default: 16384
-	InputCost                     float64
-	OutputCost                    float64
-	CacheReadCost                 float64
-	CacheWriteCost                float64
-	CostTiers                     []ai.CostTier
-	PromptCache                   ai.ModelPromptCache
-	Env                           map[string]string // provider-scoped env overrides (auth.json env)
-	Insecure                      bool              // skip TLS verification (self-signed/internal-CA on-prem endpoints)
+	// SamplingParamsOrder and SamplingParamsByThinkingLevelOrder are ai.Model's: the member order of the sampling parameters in models.json or
+	// in the registering extension's definition, merged as Pi's spreads merge it. nil is the sorted order.
+	SamplingParamsOrder                []string
+	SamplingParamsByThinkingLevelOrder map[ai.ModelThinkingLevel][]string
+	InputLimits                        *ai.ModelInputLimits
+	Input                              []string // ["text"] or ["text","image"]
+	ContextWindow                      int      // default: 128000
+	MaxTokens                          int      // default: 16384
+	InputCost                          float64
+	OutputCost                         float64
+	CacheReadCost                      float64
+	CacheWriteCost                     float64
+	CostTiers                          []ai.CostTier
+	PromptCache                        ai.ModelPromptCache
+	Env                                map[string]string // provider-scoped env overrides (auth.json env)
+	Insecure                           bool              // skip TLS verification (self-signed/internal-CA on-prem endpoints)
 }
 
 // ─── models.json schema (upstream-compatible) ────────────────────────────────
@@ -104,9 +111,13 @@ type providerConfig struct {
 	oauthCallbacks *extension.ProviderOAuth
 	// Insecure skips TLS verification for this provider's endpoint. Opt-in,
 	// for self-signed/internal-CA on-prem gateways.
-	// pig additive (D36): additive optional field; no upstream equivalent.
-	Insecure bool `json:"insecure,omitempty"`
+	// pig additive (D36): additive optional field; no upstream equivalent. It has three states: nil (omitted), false and true. A re-registration's
+	// defined value replaces the earlier one and an omitted value keeps it, as Pi's registerProvider merges a re-registration (model-runtime.ts:970-977).
+	Insecure *bool `json:"insecure,omitempty"`
 }
+
+// optedIn is whether a layer's three-state insecure setting opts in: an omitted or false setting verifies certificates.
+func optedIn(setting *bool) bool { return setting != nil && *setting }
 
 // oauthProviderConfig contains serializable OAuth discovery/filtering metadata. Callback values are retained separately.
 type oauthProviderConfig struct {
@@ -155,6 +166,10 @@ type modelDefinition struct {
 	// models.json model. Pi's model object is that definition spread (provider-composer.ts extensionModelFromDefinition), not the
 	// member-by-member object modelFromJson builds, so the definition fixes its members and their order.
 	registration *registeredDefinition
+	// samplingOrder and samplingLevelOrder are the member order of SamplingParams and of each level of SamplingParamsByThinkingLevel in the
+	// JSON this was decoded from, where it is not the sorted one (decodeSamplingOrder).
+	samplingOrder      []string
+	samplingLevelOrder map[ai.ModelThinkingLevel][]string
 }
 
 type modelCostJSON struct {
@@ -189,6 +204,10 @@ type modelOverrideJSON struct {
 	Headers                       map[string]*string               `json:"headers,omitempty"`
 	headerEntries                 []orderedHeaderEntry
 	Compat                        *providerCompat `json:"compat,omitempty"`
+	// samplingOrder and samplingLevelOrder are the member order of SamplingParams and of each level of SamplingParamsByThinkingLevel in the
+	// JSON this was decoded from, where it is not the sorted one (decodeSamplingOrder).
+	samplingOrder      []string
+	samplingLevelOrder map[ai.ModelThinkingLevel][]string
 }
 
 type orderedHeaderEntry struct {
@@ -222,7 +241,7 @@ func (definition *modelDefinition) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	if err := json.Unmarshal(normalized, &decoded); err != nil {
+	if err := jsstring.UnmarshalKeepingSurrogates(normalized, &decoded); err != nil {
 		return err
 	}
 	*definition = modelDefinition(decoded)
@@ -231,6 +250,7 @@ func (definition *modelDefinition) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	definition.headerEntries = entries
+	definition.samplingOrder, definition.samplingLevelOrder = decodeSamplingOrder(data)
 	return nil
 }
 
@@ -249,26 +269,26 @@ func (override *modelOverrideJSON) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	override.headerEntries = entries
+	override.samplingOrder, override.samplingLevelOrder = decodeSamplingOrder(data)
 	return nil
 }
 
 func decodeOrderedHeaderEntries(data []byte) ([]orderedHeaderEntry, error) {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	token, err := decoder.Token()
+	decoder := jsontext.NewDecoder(bytes.NewReader(data), jsonopts.Parse)
+	token, err := decoder.ReadToken()
 	if err != nil {
 		return nil, err
 	}
-	if token != json.Delim('{') {
+	if token.Kind() != '{' {
 		return nil, fmt.Errorf("model configuration must be an object")
 	}
-	for decoder.More() {
-		key, err := decoder.Token()
+	for decoder.PeekKind() != '}' {
+		key, err := decoder.ReadToken()
 		if err != nil {
 			return nil, err
 		}
-		if key != "headers" {
-			var discard json.RawMessage
-			if err := decoder.Decode(&discard); err != nil {
+		if key.String() != "headers" {
+			if err := decoder.SkipValue(); err != nil {
 				return nil, err
 			}
 			continue
@@ -278,27 +298,37 @@ func decodeOrderedHeaderEntries(data []byte) ([]orderedHeaderEntry, error) {
 	return nil, nil
 }
 
-func decodeOrderedHeaderObject(decoder *json.Decoder) ([]orderedHeaderEntry, error) {
-	token, err := decoder.Token()
+func decodeOrderedHeaderObject(decoder *jsontext.Decoder) ([]orderedHeaderEntry, error) {
+	token, err := decoder.ReadToken()
 	if err != nil {
 		return nil, err
 	}
-	if token != json.Delim('{') {
+	if token.Kind() != '{' {
 		return nil, fmt.Errorf("headers must be an object")
 	}
 	var entries []orderedHeaderEntry
-	for decoder.More() {
-		name, err := decoder.Token()
+	for decoder.PeekKind() != '}' {
+		nameToken, err := decoder.ReadToken()
+		if err != nil {
+			return nil, err
+		}
+		name := nameToken.String() // a Token is void after the next call on the decoder
+		valueToken, err := decoder.ReadToken()
 		if err != nil {
 			return nil, err
 		}
 		var value *string
-		if err := decoder.Decode(&value); err != nil {
-			return nil, err
+		switch valueToken.Kind() {
+		case '"':
+			text := valueToken.String()
+			value = &text
+		case 'n': // a null header value stays nil
+		default:
+			return nil, fmt.Errorf("header %q must be a string or null", name)
 		}
-		entries = append(entries, orderedHeaderEntry{Name: name.(string), Value: value})
+		entries = append(entries, orderedHeaderEntry{Name: name, Value: value})
 	}
-	_, err = decoder.Token()
+	_, err = decoder.ReadToken()
 	return entries, err
 }
 
@@ -372,8 +402,9 @@ type ModelRegistry struct {
 	nativeInputs         map[string]*ProviderConfigInput
 	nativeAvailable      map[string]bool
 	credentialOperations map[string][]chan struct{}
-	// apiStream returns a provider's API stream function: the implementation a composed registration runs for a model whose api neither its streamSimple nor its base serves. Guarded by nativeMu.
-	apiStream func(id string) ai.ModelsStreamFunction
+	// apiStream and apiSimpleStream return a provider's API stream/streamSimple functions: the implementations a composed registration runs for a model whose api neither its streamSimple nor its base serves. Guarded by nativeMu.
+	apiStream       func(id string) ai.ModelsStreamFunction
+	apiSimpleStream func(id string) ai.ModelsStreamFunction
 }
 
 // SetAPIStream installs the API stream functions of composed registrations, Pi's getApiProvider(model.api) (provider-composer.ts:597-602).
@@ -383,10 +414,28 @@ func (r *ModelRegistry) SetAPIStream(fn func(id string) ai.ModelsStreamFunction)
 	r.apiStream = fn
 }
 
+// SetAPISimpleStream installs the API simple-stream functions of composed registrations.
+func (r *ModelRegistry) SetAPISimpleStream(fn func(id string) ai.ModelsStreamFunction) {
+	r.nativeMu.Lock()
+	defer r.nativeMu.Unlock()
+	r.apiSimpleStream = fn
+}
+
 // apiStreamFor returns id's API stream function, or nil when none is installed.
 func (r *ModelRegistry) apiStreamFor(id string) ai.ModelsStreamFunction {
 	r.nativeMu.Lock()
 	fn := r.apiStream
+	r.nativeMu.Unlock()
+	if fn == nil {
+		return nil
+	}
+	return fn(id)
+}
+
+// apiSimpleStreamFor returns id's API simple-stream function, or nil when none is installed.
+func (r *ModelRegistry) apiSimpleStreamFor(id string) ai.ModelsStreamFunction {
+	r.nativeMu.Lock()
+	fn := r.apiSimpleStream
 	r.nativeMu.Unlock()
 	if fn == nil {
 		return nil
@@ -505,8 +554,10 @@ func (r *ModelRegistry) readConfig() (*modelsConfig, string) {
 		return nil, "Invalid models.json schema:\n" + strings.Join(errs, "\n") + "\n\nFile: " + path
 	}
 	var cfg modelsConfig
-	// JSON.parse reads 128000.0 or 1.28e5 as the number 128000, which ModelDefinitionSchema's Type.Number() accepts.
-	if err := json.Unmarshal(jsjson.NormalizeIntegers(content), &cfg); err != nil {
+	// JSON.parse reads 128000.0 or 1.28e5 as the number 128000, which ModelDefinitionSchema's Type.Number() accepts, and keeps a lone UTF-16
+	// surrogate of a string or a member name (a provider's name, a model's id and name, a compat value): the decode of a model
+	// definition keeps it too.
+	if err := jsstring.UnmarshalKeepingSurrogates(jsjson.NormalizeIntegers(content), &cfg); err != nil {
 		return nil, "Failed to parse models.json: " + err.Error() + "\n\nFile: " + path
 	}
 	// ModelDefinitionSchema has no `type`, and modelFromJson (provider-composer.ts:210-249) builds every models.json model as a chat
@@ -562,6 +613,18 @@ func (r *ModelRegistry) Resolve(providerID, modelID string) (ModelEntry, bool) {
 	if entry, found, owned := r.resolveRadiusModel(providerID, modelID); owned {
 		return entry, found
 	}
+	entry, ok, needsDefaults := r.resolveLocked(providerID, modelID)
+	if needsDefaults {
+		// provider-composer.ts:218,224,338 (modelFromJson / findModelDefaults): a models.json custom model under a built-in provider inherits omitted api and baseUrl from the provider's composed model list.
+		if composed := r.GetProviderModelDataByID(providerID, modelID); composed != nil {
+			entry.API = firstModelValue(entry.API, string(composed.ProviderMeta.API))
+			entry.BaseURL = firstModelValue(entry.BaseURL, composed.ProviderMeta.BaseURL)
+		}
+	}
+	return entry, ok
+}
+
+func (r *ModelRegistry) resolveLocked(providerID, modelID string) (ModelEntry, bool, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	var configured *providerConfig
@@ -576,7 +639,7 @@ func (r *ModelRegistry) Resolve(providerID, modelID string) (ModelEntry, bool) {
 			if !found {
 				entry := r.resolveProviderDefaults(providerID, dynamic)
 				entry.ModelID = modelID
-				return entry, true
+				return entry, true, false
 			}
 			entry := r.resolveModelDef(providerID, dynamic, definition)
 			if override, exists := dynamic.ModelOverrides[modelID]; exists {
@@ -588,21 +651,26 @@ func (r *ModelRegistry) Resolve(providerID, modelID string) (ModelEntry, bool) {
 				}
 			}
 			entry.Headers = r.composeRequestHeadersLocked(nil, providerID, modelID, configured, &dynamic)
-			return entry, true
+			return entry, true, entry.API == "" || entry.BaseURL == ""
 		}
 		entry := r.resolveProviderDefaults(providerID, dynamic)
 		entry.ModelID = modelID
+		needsDefaults := false
 		if configured != nil {
 			entry = r.mergeProviderDefaultsLocked(entry, *configured)
 			if definition, found := findModelDefinition(configured.Models, modelID); found {
 				entry = r.resolveModelDef(providerID, *configured, definition)
+				if dynamic.BaseURL != "" {
+					entry.BaseURL = dynamic.BaseURL
+				}
+				needsDefaults = entry.API == "" || entry.BaseURL == ""
 			}
 			if override, exists := configured.ModelOverrides[modelID]; exists {
 				r.applyOverride(&entry, override)
 			}
 		}
 		entry.Headers = r.composeRequestHeadersLocked(nil, providerID, modelID, configured, &dynamic)
-		return entry, true
+		return entry, true, needsDefaults
 	}
 	if configured != nil {
 		if definition, found := findModelDefinition(configured.Models, modelID); found {
@@ -611,27 +679,27 @@ func (r *ModelRegistry) Resolve(providerID, modelID string) (ModelEntry, bool) {
 				r.applyOverride(&entry, override)
 			}
 			entry.Headers = r.composeRequestHeadersLocked(nil, providerID, modelID, configured, nil)
-			return entry, true
+			return entry, true, entry.API == "" || entry.BaseURL == ""
 		}
 		if override, exists := configured.ModelOverrides[modelID]; exists {
 			if _, generated := ai.LookupModelExact(providerID + "/" + modelID); generated {
 				entry := r.resolveProviderDefaults(providerID, *configured)
 				entry.ModelID = modelID
 				r.applyOverride(&entry, override)
-				return entry, true
+				return entry, true, false
 			}
 		}
 		if providerHasDefaults(*configured) {
 			entry := r.resolveProviderDefaults(providerID, *configured)
 			entry.ModelID = modelID
 			entry.Headers = r.composeRequestHeadersLocked(nil, providerID, modelID, configured, nil)
-			return entry, true
+			return entry, true, false
 		}
 	}
 	if hasEnvAuth(providerID) {
-		return ModelEntry{ProviderID: providerID, ModelID: modelID, APIKey: resolveAPIKeyFromEnv(providerID)}, true
+		return ModelEntry{ProviderID: providerID, ModelID: modelID, APIKey: resolveAPIKeyFromEnv(providerID)}, true, false
 	}
-	return ModelEntry{}, false
+	return ModelEntry{}, false, false
 }
 
 func findModelDefinition(models []modelDefinition, modelID string) (modelDefinition, bool) {
@@ -652,7 +720,67 @@ func (r *ModelRegistry) ResolveGeneratedModel(providerID, modelID string, genera
 	if entry, found, _ := r.resolveRadiusModel(providerID, modelID); found {
 		return entry
 	}
-	entry := generatedModelEntry(providerID, modelID, generated)
+	return r.layerCatalogEntry(providerID, modelID, generatedModelEntry(providerID, modelID, generated))
+}
+
+// ResolveFallbackModel returns the entry of model, a copy of one of its provider's models under an id no catalog carries: what the CLI
+// resolver makes of an unknown `--model` id (model-resolver.ts buildFallbackModel: `{ ...baseModel, id: modelId, name: modelId }`).
+// Every model member (window, output limit, prices, input kinds, compat, thinking levels) is model's own. The provider's connection
+// (key, request headers, auth header, environment, TLS) is resolved for the id, as for any id the provider's lists do not define: the
+// copied model's own request headers and overrides belong to its id and are not carried over, as Pi sends the provider's headers only.
+func (r *ModelRegistry) ResolveFallbackModel(model *ai.Model) ModelEntry {
+	providerID, modelID := model.ProviderMeta.ProviderID, model.ID
+	if entry, found, _ := r.resolveRadiusModel(providerID, modelID); found {
+		return entry
+	}
+	entry := NativeModelEntry(model)
+	r.mu.RLock()
+	registration, registered := r.dynamic[providerID]
+	r.mu.RUnlock()
+	if !registered || registration.Models == nil {
+		return r.layerCatalogEntry(providerID, modelID, entry)
+	}
+	// A registration that brings its own model list defines the provider's connection for every id under it (Resolve).
+	connection, _ := r.Resolve(providerID, modelID)
+	entry.APIKey, entry.Headers, entry.AuthHeader, entry.Env, entry.Insecure = connection.APIKey, connection.Headers, connection.AuthHeader, connection.Env, connection.Insecure
+	return entry
+}
+
+// ResolveRemoteCatalogModel is ResolveGeneratedModel for a model the remote catalog overlay carries: a model the bundled catalog lacks, or one whose bundled record the overlay replaces.
+// The entry holds the overlay's window, limits and prices, so a model built from it matches the one ModelRuntime.getModel returns. It reports false for a model the overlay does not carry
+// and for one an explicit models list defines. An OpenRouter routing variant (D199) of a model the overlay carries is carried too, with the base record's window, limits and prices.
+// upstream: model-runtime.ts getModel reads the catalog with the remote overlay applied; sdk.ts:224-229 and agent-session.ts:647 build every session model from it.
+func (r *ModelRegistry) ResolveRemoteCatalogModel(providerID, modelID string) (ModelEntry, bool) {
+	if r.GetProvider(providerID) != nil || r.HasModelDefinition(providerID, modelID) {
+		return ModelEntry{}, false
+	}
+	carriedID := func(id string) bool {
+		return slices.ContainsFunc(r.remoteOverlayModels(providerID), func(model ai.AnyModel) bool {
+			chat, ok := model.(*ai.Model)
+			return ok && chat.ID == id
+		})
+	}
+	carried := carriedID(modelID)
+	if !carried {
+		// pig divergence (D199): an OpenRouter routing variant reads every property from its base model, so the overlay's record of the base is the variant's record; GetProviderModelDataByID derives it.
+		if base, _, variant := ai.OpenRouterRoutingVariant(providerID, modelID); variant {
+			carried = carriedID(base)
+		}
+	}
+	if !carried {
+		return ModelEntry{}, false
+	}
+	model := r.GetProviderModelDataByID(providerID, modelID)
+	if model == nil {
+		return ModelEntry{}, false
+	}
+	entry := NativeModelEntry(model)
+	entry.ProviderID, entry.ModelID = providerID, modelID
+	return r.layerCatalogEntry(providerID, modelID, entry), true
+}
+
+// layerCatalogEntry layers provider configuration, registered-provider settings and a matching model override onto the catalog entry of one model.
+func (r *ModelRegistry) layerCatalogEntry(providerID, modelID string, entry ModelEntry) ModelEntry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	var configured *providerConfig
@@ -678,7 +806,7 @@ func (r *ModelRegistry) ResolveGeneratedModel(providerID, modelID string, genera
 			if dynamic.APIKey != "" {
 				entry.APIKey = configvalue.Resolve(dynamic.APIKey, r.providerEnv(providerID))
 			}
-			entry.Insecure = dynamic.Insecure
+			entry.Insecure = r.providerTLSOptInLocked(providerID, nil)
 		}
 	}
 	if configured != nil {
@@ -755,7 +883,7 @@ func (r *ModelRegistry) resolveGeneratedModelLocked(entry ModelEntry, provider p
 	entry.BaseURL = firstModelValue(provider.BaseURL, entry.BaseURL)
 	entry.Headers = mergeHeadersOrdered(entry.Headers, provider.Headers, provider.headerEntries, r.providerEnv(entry.ProviderID))
 	entry.Compat = mergeCompat((*providerCompat)(entry.Compat), provider.Compat)
-	entry.Insecure = provider.Insecure
+	entry.Insecure = r.providerTLSOptInLocked(entry.ProviderID, nil)
 	entry.AuthHeader = provider.AuthHeader != nil && *provider.AuthHeader
 	entry.APIKey = configvalue.Resolve(provider.APIKey, r.providerEnv(entry.ProviderID))
 	if entry.APIKey == "" {
@@ -793,7 +921,7 @@ func (r *ModelRegistry) mergeProviderDefaultsLocked(entry ModelEntry, provider p
 	if provider.AuthHeader != nil {
 		entry.AuthHeader = *provider.AuthHeader
 	}
-	entry.Insecure = entry.Insecure || provider.Insecure
+	entry.Insecure = r.providerTLSOptInLocked(entry.ProviderID, nil)
 	return entry
 }
 
@@ -949,6 +1077,7 @@ func providerConfigFromRegistration(configMap extension.ProviderConfig) (provide
 		}
 		if definition != nil {
 			provider.Models[i].registration = &registeredDefinition{raw: definition}
+			provider.Models[i].readDefinitionOrder(definition)
 		}
 	}
 	if configMap.Headers != nil && provider.Headers == nil {
@@ -1017,6 +1146,9 @@ func (r *ModelRegistry) upsertRegisteredProviderLocked(name string, incoming pro
 	if incoming.StreamSimple != nil {
 		existing.StreamSimple = incoming.StreamSimple
 	}
+	if incoming.RefreshModels != nil {
+		existing.RefreshModels = incoming.RefreshModels
+	}
 	if incoming.Images != nil {
 		existing.Images = incoming.Images
 	}
@@ -1033,8 +1165,10 @@ func (r *ModelRegistry) upsertRegisteredProviderLocked(name string, incoming pro
 	if incoming.AuthHeader != nil {
 		existing.AuthHeader = incoming.AuthHeader
 	}
-	// pig additive (D36): Pi merges a re-registration's defined values and keeps the undefined ones (model-runtime.ts:921-933); an opt-in sets it, an omitted (false) one keeps the earlier value.
-	existing.Insecure = existing.Insecure || incoming.Insecure
+	// pig additive (D36): Pi merges a re-registration's defined values over the previous registration and keeps the undefined ones (model-runtime.ts:970-977), so an explicit false turns an earlier opt-in off and an omitted value keeps it.
+	if incoming.Insecure != nil {
+		existing.Insecure = incoming.Insecure
+	}
 	if incoming.Models != nil {
 		existing.Models = incoming.Models
 	}
@@ -1128,6 +1262,12 @@ func (r *ModelRegistry) runtimeCredentialsLocked() *ai.RuntimeCredentials {
 	return credentials
 }
 
+// SettleCredentialWrites waits until the credential modifications already in progress finish, such as an OAuth refresh a background catalog refresh started. Call it before the process exits so a rotated token is not lost. It fails only with ctx's cancellation cause.
+// upstream: packages/coding-agent/src/core/model-runtime.ts:settleCredentialWrites (b2cb62923)
+func (r *ModelRegistry) SettleCredentialWrites(ctx context.Context) error {
+	return registryCredentials{r}.current().Settled(ctx)
+}
+
 // SetRuntimeAPIKey installs a non-persistent API key for providerID. It acts
 // as a stored api_key credential that is never written to auth.json. Mirrors
 // upstream ModelRuntime.setRuntimeApiKey over RuntimeCredentials.
@@ -1163,10 +1303,15 @@ func (r *ModelRegistry) RuntimeAPIKey(providerID string) (string, bool) {
 // process environment when resolving config-value `$VAR` references for the
 // provider's API key and headers.
 func (r *ModelRegistry) providerEnv(providerID string) map[string]string {
+	return r.providerEnvIn(context.Background(), providerID)
+}
+
+// providerEnvIn is providerEnv with its credential read made in ctx's operation.
+func (r *ModelRegistry) providerEnvIn(ctx context.Context, providerID string) map[string]string {
 	if r.credentialStore == nil {
 		return nil
 	}
-	env, err := ai.CredentialStoreProviderEnv(context.Background(), r.credentialStore, providerID)
+	env, err := ai.CredentialStoreProviderEnv(ctx, r.credentialStore, providerID)
 	if err != nil {
 		return nil
 	}
@@ -1258,7 +1403,7 @@ func (r *ModelRegistry) refreshContext(ctx context.Context, providers []string) 
 
 // GetAll returns explicit models and configured overlays for exact generated identities; dynamic providers take precedence over models.json. It omits the models of a stripped API, as the composed catalog does (ai.OfferedModels).
 func (r *ModelRegistry) GetAll() []ModelEntry {
-	out := append(r.getAllConfigured(), r.radiusEntries(false)...)
+	out := append(r.getAllConfigured(), r.radiusEntries(nil)...)
 	out = slices.DeleteFunc(out, func(entry ModelEntry) bool {
 		return r.GetProvider(entry.ProviderID) != nil || pigstrip.Has(pigstrip.ListAPIs, entry.API)
 	})
@@ -1348,12 +1493,14 @@ func (r *ModelRegistry) GetAvailable() []ModelEntry {
 }
 
 // GetAvailableModelData returns the available catalog without request authentication or backend construction.
-// It reads every provider's catalog as GetAllModelData does, in the same order, but builds a model of a plain bundled catalog (plainGeneratedModels) only when the model is available: a catalog built for a provider without auth is discarded unseen.
+// It reads every provider's catalog as GetAllModelData does, in the same order, but builds a model of a plain bundled catalog (plainGeneratedModels) only when the model is available, and a Radius provider's models only when the provider has auth: a catalog built for a provider without auth is discarded unseen.
 func (r *ModelRegistry) GetAvailableModelData() []*ai.Model {
 	type providerData struct {
 		id      string
 		models  []*ai.Model
 		isPlain bool
+		// isRadius marks a provider whose models come only from its Radius catalog, bound to the provider's own ID (ai.newRadiusParts), so models read from it are available exactly when the provider is.
+		isRadius bool
 	}
 	ids := r.modelProviderIDs()
 	data := make([]providerData, len(ids))
@@ -1362,18 +1509,23 @@ func (r *ModelRegistry) GetAvailableModelData() []*ai.Model {
 			data[i] = providerData{id: id, isPlain: true}
 			continue
 		}
+		if r.isRadiusCatalog(id) {
+			data[i] = providerData{id: id, isRadius: true}
+			continue
+		}
 		data[i].models = r.GetProviderModelData(id)
 	}
 	var out []*ai.Model
+	ctx := availabilityPassContext()
 	configured := make(map[string]bool)
 	filters := make(map[string]func(string) bool)
 	accept := func(providerID, modelID string) bool {
-		return r.providerAvailable(configured, filters, providerID) && filters[providerID](modelID)
+		return r.providerAvailable(ctx, configured, filters, providerID) && filters[providerID](modelID)
 	}
 	for _, provider := range data {
 		if provider.isPlain {
 			// A provider that has no catalog or no auth lists no model, so its list (OpenRouter's routing variants, D199, are derived with it) is not read.
-			if len(builtinChatCatalog(provider.id)) == 0 || !r.providerAvailable(configured, filters, provider.id) {
+			if len(builtinChatCatalog(provider.id)) == 0 || !r.providerAvailable(ctx, configured, filters, provider.id) {
 				continue
 			}
 			plain := builtinChatCatalogListed(provider.id)
@@ -1385,6 +1537,12 @@ func (r *ModelRegistry) GetAvailableModelData() []*ai.Model {
 			}
 			continue
 		}
+		if provider.isRadius {
+			if !r.providerAvailable(ctx, configured, filters, provider.id) {
+				continue
+			}
+			provider.models = r.GetProviderModelData(provider.id)
+		}
 		for _, model := range provider.models {
 			if accept(model.ProviderMeta.ProviderID, model.ID) {
 				out = append(out, model)
@@ -1394,19 +1552,29 @@ func (r *ModelRegistry) GetAvailableModelData() []*ai.Model {
 	return out
 }
 
+// isRadiusCatalog reports whether GetProviderModelData(id) lists only the models of the Radius provider id: no provider code and no extension registration take the catalog (GetProviderModelData's radius branch).
+func (r *ModelRegistry) isRadiusCatalog(id string) bool {
+	if r.GetProvider(id) != nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.radiusProviderLocked(id) != nil
+}
+
 // providerAvailable reports whether providerID has configured auth, reading it and its account filter once into configured and filters.
-func (r *ModelRegistry) providerAvailable(configured map[string]bool, filters map[string]func(string) bool, providerID string) bool {
+func (r *ModelRegistry) providerAvailable(ctx context.Context, configured map[string]bool, filters map[string]func(string) bool, providerID string) bool {
 	available, checked := configured[providerID]
 	if !checked {
-		available = r.HasConfiguredAuth(providerID)
+		available = r.hasConfiguredAuth(ctx, providerID)
 		configured[providerID] = available
-		filters[providerID] = r.accountModelFilter(providerID)
+		filters[providerID] = r.accountModelFilter(ctx, providerID)
 	}
 	return available
 }
 
 // accountModelFilter retains native availability snapshots and Copilot's optional OAuth picker allowlist.
-func (r *ModelRegistry) accountModelFilter(providerID string) func(string) bool {
+func (r *ModelRegistry) accountModelFilter(ctx context.Context, providerID string) func(string) bool {
 	r.mu.RLock()
 	native, registered := r.native[providerID]
 	available := slices.Clone(native.available)
@@ -1430,7 +1598,7 @@ func (r *ModelRegistry) accountModelFilter(providerID string) func(string) bool 
 	if store == nil {
 		return all
 	}
-	credential, found, err := ai.ReadRawCredential(context.Background(), store, providerID)
+	credential, found, err := ai.ReadRawCredential(ctx, store, providerID)
 	if err != nil || !found || credential.Type != ai.CredentialOAuth || len(credential.AvailableModelIDs) == 0 {
 		return all
 	}
@@ -1450,6 +1618,11 @@ func (r *ModelRegistry) accountModelFilter(providerID string) func(string) bool 
 // credentials. Mirrors upstream ModelRegistry.hasConfiguredAuth()
 // (model-registry.ts:605-612).
 func (r *ModelRegistry) HasConfiguredAuth(providerID string) bool {
+	return r.hasConfiguredAuth(context.Background(), providerID)
+}
+
+// hasConfiguredAuth is HasConfiguredAuth with its credential reads made in ctx's operation.
+func (r *ModelRegistry) hasConfiguredAuth(ctx context.Context, providerID string) bool {
 	if r.GetProvider(providerID) != nil {
 		if r.availabilityAuth != nil {
 			return r.availabilityAuth(providerID)
@@ -1459,7 +1632,7 @@ func (r *ModelRegistry) HasConfiguredAuth(providerID string) bool {
 		return r.nativeAvailable[providerID]
 	}
 	if _, owned := r.RadiusOAuth(providerID); owned {
-		return r.radiusHasAuth(providerID)
+		return r.radiusHasAuth(ctx, providerID)
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -1470,9 +1643,9 @@ func (r *ModelRegistry) HasConfiguredAuth(providerID string) bool {
 		return true
 	}
 	if prov, configured := r.effectiveProviderConfigLocked(providerID); configured {
-		return r.hasConfiguredAuthLocked(providerID, &prov)
+		return r.hasConfiguredAuthLocked(ctx, providerID, &prov)
 	}
-	return r.checkProviderAuth(providerID)
+	return r.checkProviderAuth(ctx, providerID)
 }
 
 func (r *ModelRegistry) GetProviderAuthStatus(providerID string) ai.AuthStatus {
@@ -1549,8 +1722,8 @@ func (r *ModelRegistry) GetProviderDisplayName(providerID string) string {
 	return ai.ProviderDisplayName(providerID)
 }
 
-func (r *ModelRegistry) hasConfiguredAuthLocked(providerID string, prov *providerConfig) bool {
-	if r.storedOAuthWithoutMethod(providerID, prov) {
+func (r *ModelRegistry) hasConfiguredAuthLocked(ctx context.Context, providerID string, prov *providerConfig) bool {
+	if r.storedOAuthWithoutMethod(ctx, providerID, prov) {
 		return false
 	}
 	// Explicit authHeader:false declares an endpoint that does not require an
@@ -1559,22 +1732,22 @@ func (r *ModelRegistry) hasConfiguredAuthLocked(providerID string, prov *provide
 		return true
 	}
 	// Dynamic provider with explicit API key.
-	if prov.APIKey != "" && configvalue.IsConfigValueConfigured(prov.APIKey, r.providerEnv(providerID)) {
+	if prov.APIKey != "" && configvalue.IsConfigValueConfigured(prov.APIKey, r.providerEnvIn(ctx, providerID)) {
 		return true
 	}
 	// OAuth registration present → check stored credentials.
 	if prov.OAuth != nil && prov.OAuth.HasLogin {
-		return r.hasStoredOAuth(providerID)
+		return r.hasStoredOAuth(ctx, providerID)
 	}
 	// Fall back to a stored credential or env-based auth.
-	return r.checkProviderAuth(providerID)
+	return r.checkProviderAuth(ctx, providerID)
 }
 
-func (r *ModelRegistry) hasStoredOAuth(providerID string) bool {
+func (r *ModelRegistry) hasStoredOAuth(ctx context.Context, providerID string) bool {
 	if r.credentialStore == nil {
 		return false
 	}
-	cred, err := r.credentialStore.Read(context.Background(), providerID)
+	cred, err := r.credentialStore.Read(ctx, providerID)
 	return err == nil && cred != nil && cred.Type == "oauth"
 }
 
@@ -1593,8 +1766,8 @@ func (r *ModelRegistry) hasStoredCredential(providerID string) bool {
 // envApiKeyAuth uses the stored key only when it resolves non-empty and otherwise reads the env vars (auth/helpers.ts:18-28),
 // and the Bedrock and Cloudflare resolvers also need their env targets. A provider without built-in auth counts an env key or
 // a non-empty stored key.
-func (r *ModelRegistry) checkProviderAuth(providerID string) bool {
-	credential := r.storedCredentialLocked(providerID)
+func (r *ModelRegistry) checkProviderAuth(ctx context.Context, providerID string) bool {
+	credential := r.storedCredentialLocked(ctx, providerID)
 	if credential != nil && credential.Type == ai.CredentialOAuth {
 		return hasOAuthMethod(providerID, nil)
 	}
@@ -1606,14 +1779,14 @@ func (r *ModelRegistry) checkProviderAuth(providerID string) bool {
 	if store == nil {
 		store = noStoredCredentials
 	}
-	check, err := ai.CheckProviderAuth(context.Background(), providerID, auth, store, ai.DefaultProviderAuthContext())
+	check, err := ai.CheckProviderAuth(ctx, providerID, auth, store, ai.DefaultProviderAuthContext())
 	return err == nil && check != nil
 }
 
 // storedOAuthWithoutMethod reports a stored OAuth credential for a provider that has no OAuth method. Pi's checkProviderAuth
 // then reports no auth, whatever API key models.json or the environment holds.
-func (r *ModelRegistry) storedOAuthWithoutMethod(providerID string, prov *providerConfig) bool {
-	credential := r.storedCredentialLocked(providerID)
+func (r *ModelRegistry) storedOAuthWithoutMethod(ctx context.Context, providerID string, prov *providerConfig) bool {
+	credential := r.storedCredentialLocked(ctx, providerID)
 	return credential != nil && credential.Type == ai.CredentialOAuth && !hasOAuthMethod(providerID, prov)
 }
 
@@ -1628,11 +1801,11 @@ func hasOAuthMethod(providerID string, prov *providerConfig) bool {
 }
 
 // storedCredentialLocked reads providerID's stored credential; the caller holds r.mu or owns the registry.
-func (r *ModelRegistry) storedCredentialLocked(providerID string) *ai.Credential {
+func (r *ModelRegistry) storedCredentialLocked(ctx context.Context, providerID string) *ai.Credential {
 	if r.credentialStore == nil {
 		return nil
 	}
-	credential, err := r.credentialStore.Read(context.Background(), providerID)
+	credential, err := r.credentialStore.Read(ctx, providerID)
 	if err != nil {
 		return nil
 	}
@@ -1647,14 +1820,15 @@ var noStoredCredentials = ai.NewInMemoryCredentialStore()
 // /sprite create uses it to require a configured provider.
 func (r *ModelRegistry) AvailableProviderCount() int {
 	providers := make(map[string]struct{})
-	for _, entry := range r.radiusEntries(true) {
+	ctx := availabilityPassContext()
+	for _, entry := range r.radiusEntries(func(providerID string) bool { return r.radiusHasAuth(ctx, providerID) }) {
 		providers[entry.ProviderID] = struct{}{}
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	// Check dynamic providers.
 	for providerID, prov := range r.dynamic {
-		if r.hasConfiguredAuthLocked(providerID, &prov) {
+		if r.hasConfiguredAuthLocked(ctx, providerID, &prov) {
 			providers[providerID] = struct{}{}
 		}
 	}
@@ -1664,7 +1838,7 @@ func (r *ModelRegistry) AvailableProviderCount() int {
 			if _, already := providers[providerID]; already {
 				continue
 			}
-			if prov := r.config.Providers[providerID]; r.hasConfiguredAuthLocked(providerID, &prov) {
+			if prov := r.config.Providers[providerID]; r.hasConfiguredAuthLocked(ctx, providerID, &prov) {
 				providers[providerID] = struct{}{}
 			}
 		}
@@ -1674,7 +1848,7 @@ func (r *ModelRegistry) AvailableProviderCount() int {
 		if _, already := providers[pid]; already {
 			continue
 		}
-		if r.checkProviderAuth(pid) {
+		if r.checkProviderAuth(ctx, pid) {
 			providers[pid] = struct{}{}
 		}
 	}
@@ -1691,6 +1865,7 @@ func (r *ModelRegistry) resolveModelDef(providerID string, prov providerConfig, 
 	providerHeaders := mergeHeadersOrdered(nil, prov.Headers, prov.headerEntries, env)
 	entry.Headers = mergeHeadersOrdered(providerHeaders, md.Headers, md.headerEntries, env)
 	entry.Env = env
+	entry.Insecure = r.providerTLSOptInLocked(providerID, nil)
 	return entry
 }
 
@@ -1714,7 +1889,7 @@ func (r *ModelRegistry) resolveProviderDefaults(providerID string, prov provider
 		Env:        env,
 		AuthHeader: authHeader,
 		Compat:     mergeCompat(prov.Compat, nil),
-		Insecure:   prov.Insecure,
+		Insecure:   r.providerTLSOptInLocked(providerID, nil),
 	}
 }
 
@@ -1754,27 +1929,124 @@ func cloneSamplingParamsByThinkingLevel(in ai.SamplingParamsByThinkingLevel) ai.
 
 // mergeSamplingParamsByThinkingLevel merges a model override's per-level sampling parameters over the base model's, per key within each Pi thinking level.
 // Mirrors upstream provider-composer.ts mergeSamplingParamsByThinkingLevel.
-func mergeSamplingParamsByThinkingLevel(base, override ai.SamplingParamsByThinkingLevel) ai.SamplingParamsByThinkingLevel {
+func mergeSamplingParamsByThinkingLevel(base ai.SamplingParamsByThinkingLevel, baseOrder map[ai.ModelThinkingLevel][]string, override ai.SamplingParamsByThinkingLevel, overrideOrder map[ai.ModelThinkingLevel][]string) (ai.SamplingParamsByThinkingLevel, map[ai.ModelThinkingLevel][]string) {
 	if override == nil {
-		return base
+		return base, baseOrder
 	}
 	merged := cloneSamplingParamsByThinkingLevel(base)
 	if merged == nil {
 		merged = ai.SamplingParamsByThinkingLevel{}
 	}
+	order := maps.Clone(baseOrder)
 	for _, level := range []ai.ModelThinkingLevel{ai.ThinkingOff, ai.ThinkingMinimal, ai.ThinkingLow, ai.ThinkingMedium, ai.ThinkingHigh, ai.ThinkingXHigh, ai.ThinkingMax} {
 		params := override[level]
 		if params == nil {
 			continue
 		}
-		next := maps.Clone(base[level])
-		if next == nil {
-			next = make(ai.SamplingParams, len(params))
-		}
-		maps.Copy(next, params)
+		next, keys := mergeSamplingParams(base[level], baseOrder[level], params, overrideOrder[level])
 		merged[level] = next
+		if keys == nil {
+			delete(order, level)
+			continue
+		}
+		if order == nil {
+			order = make(map[ai.ModelThinkingLevel][]string)
+		}
+		order[level] = keys
 	}
-	return merged
+	if len(order) == 0 {
+		order = nil
+	}
+	return merged, order
+}
+
+// mergeSamplingParams is `{ ...base, ...override }` (provider-composer.ts:201-203, :164-172): the merged parameters and their member order,
+// base's members in base's order with an overridden one in its place, then override's new members in override's order; a nil order is the
+// sorted one.
+func mergeSamplingParams(base ai.SamplingParams, baseOrder []string, override ai.SamplingParams, overrideOrder []string) (ai.SamplingParams, []string) {
+	keys := samplingKeys(base, baseOrder)
+	for _, key := range samplingKeys(override, overrideOrder) {
+		if _, inBase := base[key]; !inBase {
+			keys = append(keys, key)
+		}
+	}
+	merged := maps.Clone(base)
+	if merged == nil {
+		merged = make(ai.SamplingParams, len(override))
+	}
+	maps.Copy(merged, override)
+	return merged, unsortedKeys(keys)
+}
+
+// samplingKeys is the keys of params in member order: those order records, then the others sorted.
+func samplingKeys(params ai.SamplingParams, order []string) []string {
+	keys := make([]string, 0, len(params))
+	for _, key := range order {
+		if _, ok := params[key]; ok && !slices.Contains(keys, key) {
+			keys = append(keys, key)
+		}
+	}
+	recorded := len(keys)
+	for key := range params {
+		if !slices.Contains(keys[:recorded], key) {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys[recorded:])
+	return keys
+}
+
+// unsortedKeys is keys, or nil when they are in the sorted order a map without a recorded order is written in.
+func unsortedKeys(keys []string) []string {
+	if slices.IsSorted(keys) {
+		return nil
+	}
+	return keys
+}
+
+// decodeSamplingOrder is the member order of samplingParams and of each level of samplingParamsByThinkingLevel in data, a model's JSON
+// object, where it is not the sorted one. Pi hands those objects on as JSON.parse built them (model-config.ts:185, provider-composer.ts:246-247,
+// :299), and a Go map has no order.
+func decodeSamplingOrder(data []byte) ([]string, map[ai.ModelThinkingLevel][]string) {
+	if !bytes.Contains(data, []byte(`"samplingParams`)) {
+		return nil, nil
+	}
+	var members struct {
+		SamplingParams                *orderedjson.Object                           `json:"samplingParams"`
+		SamplingParamsByThinkingLevel map[ai.ModelThinkingLevel]*orderedjson.Object `json:"samplingParamsByThinkingLevel"`
+	}
+	if json.Unmarshal(data, &members) != nil {
+		return nil, nil
+	}
+	var order []string
+	if members.SamplingParams != nil {
+		order = unsortedKeys(members.SamplingParams.Keys())
+	}
+	var levels map[ai.ModelThinkingLevel][]string
+	for level, params := range members.SamplingParamsByThinkingLevel {
+		if params == nil {
+			continue
+		}
+		if keys := unsortedKeys(params.Keys()); keys != nil {
+			if levels == nil {
+				levels = make(map[ai.ModelThinkingLevel][]string)
+			}
+			levels[level] = keys
+		}
+	}
+	return order, levels
+}
+
+// readDefinitionOrder takes the member order of the sampling parameters and of the compat objects from raw, the definition as the
+// registering extension wrote it: the model itself was decoded from the host's encoding of the definition, which writes every map sorted.
+func (definition *modelDefinition) readDefinitionOrder(raw json.RawMessage) {
+	definition.samplingOrder, definition.samplingLevelOrder = decodeSamplingOrder(raw)
+	var members struct {
+		Compat *providerCompat `json:"compat"`
+	}
+	if definition.Compat != nil && json.Unmarshal(raw, &members) == nil && members.Compat != nil {
+		definition.Compat = members.Compat
+	}
 }
 
 func mergeThinkingLevelMaps(base, override ai.ThinkingLevelMap) ai.ThinkingLevelMap {
@@ -1833,185 +2105,10 @@ func mergeHeadersOrdered(base map[string]string, overrides map[string]*string, o
 	return out
 }
 
-// mergeCompat merges two compat structs; b fields override a fields (per-field).
-// Mirrors upstream mergeCompat (model-registry.ts).
+// mergeCompat merges two compat structs; b fields override a fields (per-field): ai.MergeOpenAICompat, which keeps the member order of
+// the compat objects with their values.
 func mergeCompat(a, b *providerCompat) *ai.OpenAICompat {
-	if a == nil && b == nil {
-		return nil
-	}
-	if a == nil {
-		cp := ai.OpenAICompat(*b)
-		return &cp
-	}
-	if b == nil {
-		cp := ai.OpenAICompat(*a)
-		return &cp
-	}
-	// b overrides a per-field.
-	base := ai.OpenAICompat(*a)
-	ovr := ai.OpenAICompat(*b)
-	merged := base
-	if ovr.SupportsDeveloperRole != nil {
-		merged.SupportsDeveloperRole = ovr.SupportsDeveloperRole
-	}
-	if ovr.SupportsReasoningEffort != nil {
-		merged.SupportsReasoningEffort = ovr.SupportsReasoningEffort
-	}
-	if ovr.SupportsStore != nil {
-		merged.SupportsStore = ovr.SupportsStore
-	}
-	if ovr.SupportsUsageInStreaming != nil {
-		merged.SupportsUsageInStreaming = ovr.SupportsUsageInStreaming
-	}
-	if ovr.SupportsFinishReason != nil {
-		merged.SupportsFinishReason = ovr.SupportsFinishReason
-	}
-	if ovr.MaxTokensField != "" {
-		merged.MaxTokensField = ovr.MaxTokensField
-	}
-	if ovr.RequiresToolResultName != nil {
-		merged.RequiresToolResultName = ovr.RequiresToolResultName
-	}
-	if ovr.RequiresAssistantAfterToolResult != nil {
-		merged.RequiresAssistantAfterToolResult = ovr.RequiresAssistantAfterToolResult
-	}
-	if ovr.RequiresThinkingAsText != nil {
-		merged.RequiresThinkingAsText = ovr.RequiresThinkingAsText
-	}
-	if ovr.RequiresReasoningContentOnAssistantMessages != nil {
-		merged.RequiresReasoningContentOnAssistantMessages = ovr.RequiresReasoningContentOnAssistantMessages
-	}
-	if ovr.SupportsOpenAIGrammarTools != nil {
-		merged.SupportsOpenAIGrammarTools = ovr.SupportsOpenAIGrammarTools
-	}
-	if ovr.SupportsExplicitPromptCacheMode != nil {
-		merged.SupportsExplicitPromptCacheMode = ovr.SupportsExplicitPromptCacheMode
-	}
-	if ovr.SupportsStrictTools != nil {
-		merged.SupportsStrictTools = ovr.SupportsStrictTools
-	}
-	if ovr.ThinkingFormat != "" {
-		merged.ThinkingFormat = ovr.ThinkingFormat
-	}
-	if ovr.CacheControlFormat != "" {
-		merged.CacheControlFormat = ovr.CacheControlFormat
-	}
-	if ovr.SendSessionAffinityHeaders != nil {
-		merged.SendSessionAffinityHeaders = ovr.SendSessionAffinityHeaders
-	}
-	if ovr.SupportsStrictMode != nil {
-		merged.SupportsStrictMode = ovr.SupportsStrictMode
-	}
-	merged.OpenRouterRouting = mergeCompatMap(base.OpenRouterRouting, ovr.OpenRouterRouting)
-	merged.ChatTemplateKwargs = mergeCompatMap(base.ChatTemplateKwargs, ovr.ChatTemplateKwargs)
-	if ovr.VLLMPriority != nil {
-		merged.VLLMPriority = ovr.VLLMPriority
-	}
-	merged.VercelGatewayRouting = mergeVercelGatewayRouting(base.VercelGatewayRouting, ovr.VercelGatewayRouting)
-	if ovr.SupportsLongCacheRetention != nil {
-		merged.SupportsLongCacheRetention = ovr.SupportsLongCacheRetention
-	}
-	if ovr.SendSessionIdHeader != nil {
-		merged.SendSessionIdHeader = ovr.SendSessionIdHeader
-	}
-	if ovr.SupportsEagerToolInputStreaming != nil {
-		merged.SupportsEagerToolInputStreaming = ovr.SupportsEagerToolInputStreaming
-	}
-	if ovr.SupportsCacheControlOnTools != nil {
-		merged.SupportsCacheControlOnTools = ovr.SupportsCacheControlOnTools
-	}
-	if ovr.ForceAdaptiveThinking != nil {
-		merged.ForceAdaptiveThinking = ovr.ForceAdaptiveThinking
-	}
-	if ovr.AllowEmptySignature != nil {
-		merged.AllowEmptySignature = ovr.AllowEmptySignature
-	}
-	if ovr.SupportsTemperature != nil {
-		merged.SupportsTemperature = ovr.SupportsTemperature
-	}
-	if ovr.ZaiToolStream != nil {
-		merged.ZaiToolStream = ovr.ZaiToolStream
-	}
-	if ovr.DeferredToolsMode != "" {
-		merged.DeferredToolsMode = ovr.DeferredToolsMode
-	}
-	if ovr.SessionAffinityFormat != "" {
-		merged.SessionAffinityFormat = ovr.SessionAffinityFormat
-	}
-	if ovr.SupportsToolSearch != nil {
-		merged.SupportsToolSearch = ovr.SupportsToolSearch
-	}
-	if ovr.SupportsMaxOutputTokens != nil {
-		merged.SupportsMaxOutputTokens = ovr.SupportsMaxOutputTokens
-	}
-	merged.ChatTemplateArgs = mergeCompatMap(base.ChatTemplateArgs, ovr.ChatTemplateArgs)
-	if ovr.SupportsThinkingTokenBudget != nil {
-		merged.SupportsThinkingTokenBudget = ovr.SupportsThinkingTokenBudget
-	}
-	if ovr.ThinkingTokenBudgetField != "" {
-		merged.ThinkingTokenBudgetField = ovr.ThinkingTokenBudgetField
-	}
-	if ovr.SupportsAdditionalTools != nil {
-		merged.SupportsAdditionalTools = ovr.SupportsAdditionalTools
-	}
-	if ovr.SupportsMidConvoEffort != nil {
-		merged.SupportsMidConvoEffort = ovr.SupportsMidConvoEffort
-	}
-	if ovr.SupportsMidConvoSystemMessages != nil {
-		merged.SupportsMidConvoSystemMessages = ovr.SupportsMidConvoSystemMessages
-	}
-	if ovr.SupportsMidConvoToolAdditions != nil {
-		merged.SupportsMidConvoToolAdditions = ovr.SupportsMidConvoToolAdditions
-	}
-	if ovr.SupportsMidConvoToolChanges != nil {
-		merged.SupportsMidConvoToolChanges = ovr.SupportsMidConvoToolChanges
-	}
-	if base.Extra != nil || ovr.Extra != nil {
-		merged.Extra = maps.Clone(base.Extra)
-		if merged.Extra == nil {
-			merged.Extra = make(map[string]json.RawMessage, len(ovr.Extra))
-		}
-		maps.Copy(merged.Extra, ovr.Extra)
-	}
-	if ovr.AllowedFallbackModels != nil {
-		merged.AllowedFallbackModels = slices.Clone(ovr.AllowedFallbackModels)
-		for i := range merged.AllowedFallbackModels {
-			merged.AllowedFallbackModels[i].Cost.Tiers = slices.Clone(merged.AllowedFallbackModels[i].Cost.Tiers)
-		}
-	}
-	return &merged
-}
-
-// mergeVercelGatewayRouting merges key by key, as mergeCompatMap does: a list the override sets replaces the base list, and an absent list keeps it.
-func mergeVercelGatewayRouting(base, override *ai.VercelGatewayRouting) *ai.VercelGatewayRouting {
-	if base == nil && override == nil {
-		return nil
-	}
-	merged := ai.VercelGatewayRouting{}
-	if base != nil {
-		merged = ai.VercelGatewayRouting{Only: slices.Clone(base.Only), Order: slices.Clone(base.Order)}
-	}
-	if override != nil {
-		if override.Only != nil {
-			merged.Only = slices.Clone(override.Only)
-		}
-		if override.Order != nil {
-			merged.Order = slices.Clone(override.Order)
-		}
-	}
-	return &merged
-}
-
-func mergeCompatMap(base, override map[string]any) map[string]any {
-	if base == nil && override == nil {
-		return nil
-	}
-	merged := maps.Clone(base)
-	if merged == nil {
-		merged = make(map[string]any, len(override))
-	}
-	maps.Copy(merged, override)
-	return merged
+	return ai.MergeOpenAICompat((*ai.OpenAICompat)(a), (*ai.OpenAICompat)(b))
 }
 
 // HasAnyKey reports whether the registry has at least one entry for

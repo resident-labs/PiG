@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync/atomic"
 
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 
@@ -23,6 +24,7 @@ import (
 // is encoded into one buffer sized for its text and its escapes instead, where the room reserved beyond the record is a small part of it: a
 // buffer the encoder outgrows is replaced by one of twice its size, which the session would keep.
 func marshalSessionLine(value any) ([]byte, error) {
+	sessionLinesEncoded.Add(1)
 	if entry, ok := value.(MessageEntry); ok {
 		text := entry.Message.TextBytes()
 		if size := text + sessionLineOverhead; size > sessionLinePooledMax {
@@ -31,6 +33,10 @@ func marshalSessionLine(value any) ([]byte, error) {
 	}
 	return jsstring.MarshalJSON(value)
 }
+
+// sessionLinesEncoded counts the records marshalSessionLine has encoded, which a session without a file must not need for a message it holds
+// as appended (the test of Session.holdsWithoutRecord reads it).
+var sessionLinesEncoded atomic.Uint64
 
 // sessionLineOverhead is the room a message entry's record takes beyond its message's text: the entry's members and the message's metadata.
 const sessionLineOverhead = 1 << 10
@@ -43,6 +49,10 @@ const sessionLineEscapeShare = 8
 // 64 KiB, extensions/sdk/json maxPooledEncodeBuffer). Beyond it a sized buffer reserves at most an eighth of the record beyond it.
 const sessionLinePooledMax = 64 << 10
 
+// ErrContextEditReplacement is Pi's error for a context edit whose replacement is neither null nor content (session-manager.ts appendContextEdit). A
+// replacement that is undefined, as a draft without the member has it, is one of them.
+var ErrContextEditReplacement = errors.New("Context edit replacement must be null or contain string/array content")
+
 // AppendContextEdit appends a branch-local edit to an earlier model-visible
 // entry and returns the new entry ID (session-manager.ts appendContextEdit).
 // A nil replacement omits the target. The target must be on the active branch
@@ -51,7 +61,7 @@ const sessionLinePooledMax = 64 << 10
 // as one text block because those roles require content arrays.
 func (s *Session) AppendContextEdit(targetID string, replacement *ContextEditReplacement) (string, error) {
 	if replacement != nil && !isContextEditableContent(replacement.Content) {
-		return "", errors.New("Context edit replacement must be null or contain string/array content")
+		return "", ErrContextEditReplacement
 	}
 	s.mu.RLock()
 	targetIdx, found := s.slotOf(targetID)
@@ -61,7 +71,7 @@ func (s *Session) AppendContextEdit(targetID string, replacement *ContextEditRep
 		target = s.entryAtLocked(targetIdx)
 		if s.leafID != nil {
 			for _, idx := range s.pathIndexesLocked(*s.leafID) {
-				if s.slots[idx].id == targetID {
+				if s.idAt(int(idx)) == targetID {
 					onBranch = true
 					break
 				}
@@ -93,12 +103,10 @@ func (s *Session) AppendContextEdit(targetID string, replacement *ContextEditRep
 		return "", err
 	}
 	entry := ContextEditEntry{
-		SessionEntryBase: SessionEntryBase{
-			Type:      "context_edit",
-			ID:        id,
-			ParentID:  s.GetLeafID(),
-			Timestamp: RFC3339NowNano(),
-		},
+		Type:        "context_edit",
+		ID:          id,
+		ParentID:    s.GetLeafID(),
+		Timestamp:   RFC3339NowNano(),
 		TargetID:    targetID,
 		Replacement: replacement,
 	}
@@ -164,9 +172,9 @@ func BuildSessionProjection(entries []SessionEntry, leafID *string, byID map[str
 	return buildSessionProjection(buildSessionPath(entries, leafID, byID), asMessage, true)
 }
 
-// ProjectSessionPath projects a root-to-leaf entry path as it stands, without walking parent links again. Compaction preparation uses it on SessionManager.getBranch() output (compaction.ts prepareCompaction passes that path to buildSessionProjection, which returns the same projection for a chained path).
+// ProjectSessionPath projects a root-to-leaf entry path as it stands, without walking parent links again. Compaction preparation uses it on SessionManager.getBranch() output (compaction.ts prepareCompaction passes that path to buildSessionProjection, which returns the same projection for a chained path). The messages are the entries' own, to be read and never modified: a caller that hands one on clones it first, as PrepareCompaction does for each message it returns.
 func ProjectSessionPath(path []SessionEntry) SessionProjection {
-	return buildSessionProjection(path, asMessage, true)
+	return buildSessionProjection(path, asMessage, false)
 }
 
 // SessionEntryToContextMessages projects one entry into context messages
@@ -356,8 +364,9 @@ func sessionEntryToContextMessagesInto(entry SessionEntry, decode messageDecoder
 		if json.Unmarshal(entry.Raw(), &custom) != nil {
 			return nil
 		}
+		// upstream: session-manager.ts:455 (`entry.content ?? []`): a content member that is null or absent is an empty list.
 		content := custom.Content
-		if content == nil {
+		if content == nil || orderedjson.IsNull(content) {
 			content = []any{}
 		}
 		message := map[string]any{
@@ -523,23 +532,32 @@ func SystemMessageFromAgentMessage(message agent.AgentMessage) (ai.SystemMessage
 	return *message.System, true
 }
 
-// CurrentSystemMessage replays every projected system message into the
-// current prompt and tool state (pi-ai getCurrentSystemMessage).
-func CurrentSystemMessage(messages []agent.AgentMessage) *ai.SystemMessage {
-	var systems []ai.Message
+// CurrentSystemMessageView replays every projected system message into the current prompt and tool state (pi-ai
+// getCurrentSystemMessage) for a caller that only reads it. The tool declarations in the result are the ones the projected
+// messages hold, not copies, so the caller must neither modify them nor keep them past the projection's life: the message
+// reads what compaction estimates and records, and a copy of every tool's parameters per read is what it saves. A declaration
+// is only ever replaced (declareToolChanges adds a new one and removes the old), never changed in place.
+func CurrentSystemMessageView(messages []agent.AgentMessage) *ai.SystemMessage {
+	var systems, instructions []ai.Message
 	for _, message := range messages {
 		if system, ok := SystemMessageFromAgentMessage(message); ok {
 			systems = append(systems, system)
+			system.ToolsAdded, system.ToolsRemoved = nil, nil
+			instructions = append(instructions, system)
 		}
 	}
-	return ai.GetCurrentSystemMessage(systems)
+	current := ai.GetCurrentSystemMessage(instructions)
+	if current != nil {
+		current.ToolsAdded = ai.BorrowedCurrentTools(systems)
+	}
+	return current
 }
 
 // compactionSystemMessage returns the JSON of the current projected system
 // state stamped with the compaction time, or nil when there is none. Sections,
 // when not nil, take the place of the current ones (dyna patch P7).
 func compactionSystemMessage(messages []agent.AgentMessage, timestampMs int64, sections ai.OrderedSections, tools []ai.ToolSchema) (json.RawMessage, error) {
-	current := CurrentSystemMessage(messages)
+	current := CurrentSystemMessageView(messages)
 	if current == nil {
 		if sections == nil {
 			return nil, nil

@@ -45,7 +45,7 @@ RUN apk update \
 FROM toolchain-base AS pi-oracle
 # PI_VERSION must equal the pin's package version and PI_COMMIT the pin's commit when the pin is a commit
 # (empty for a release tag); `make pin-sync` writes both and make compliance checks them.
-ARG PI_VERSION=1.5.0
+ARG PI_VERSION=1.6.0
 ARG PI_COMMIT=
 COPY automation/images/ci-parity/package.json automation/images/ci-parity/package-lock.json /opt/pig/pi/
 RUN test -z "${PI_COMMIT}" || { echo "this image installs the published Pi ${PI_VERSION}; it cannot be the build of Pi commit ${PI_COMMIT} yet (a commit pin needs the oracle built from source, automation/pin/oracle.py)" >&2; exit 1; } \
@@ -74,7 +74,7 @@ RUN npm ci --prefix /opt/pig/npm --omit=dev --ignore-scripts --no-audit --no-fun
     /opt/pig/npm/node_modules/npm/node_modules/postcss-selector-parser \
     /opt/pig/npm/node_modules/npm/node_modules/tar \
     /opt/pig/npm/node_modules/npm/node_modules/undici \
-  && test "$(node /opt/pig/npm/node_modules/npm/bin/npm-cli.js --version)" = "12.1.0"
+  && test "$(node /opt/pig/npm/node_modules/npm/bin/npm-cli.js --version)" = "12.2.1"
 
 FROM toolchain-base
 ARG GO_VERSION

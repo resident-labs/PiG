@@ -3,10 +3,12 @@ package ai
 import (
 	"cmp"
 	"context"
-	"slices"
+	"errors"
 	"strconv"
 	"sync/atomic"
 	"time"
+
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 )
 
 type assistantStreamBuilder struct {
@@ -38,6 +40,10 @@ type assistantStreamBuilder struct {
 	requestServiceTier string
 	// errorMessage rewrites the message of a failed stream, or is nil.
 	errorMessage func(string) string
+	// causeDetail appends the deepest cause of a failure to its message (anthropic-messages.ts withCauseDetail).
+	causeDetail bool
+	// transportCauseDetail does the same for a failure that crossed the Node fetch boundary only (formatProviderError(normalizeProviderError(error)) of the OpenAI APIs); an error with a status keeps its own message.
+	transportCauseDetail bool
 	// providerEvent is the bound OnProviderStreamEvent observer, or nil.
 	providerEvent func(data any) error
 	// providerEventOption and providerEventModel are the request's OnProviderStreamEvent option and the model it receives, for an adapter that
@@ -142,7 +148,7 @@ func (builder *assistantStreamBuilder) textBlockDelta(contentIndex int, delta st
 	block := builder.partial.Content[contentIndex].(TextContent)
 	block.Text = builder.appendContent(contentIndex, block.Text, delta)
 	builder.partial.Content[contentIndex] = block
-	builder.push(TextDeltaEvent{ContentIndex: contentIndex, Delta: delta, Partial: builder.partial})
+	builder.pushView(TextDeltaEvent{ContentIndex: contentIndex, Delta: delta, Partial: builder.publishedView()})
 }
 
 func (builder *assistantStreamBuilder) textBlockEnd(contentIndex int, content, signature string) {
@@ -170,7 +176,7 @@ func (builder *assistantStreamBuilder) thinkingBlockDelta(contentIndex int, delt
 	block := builder.partial.Content[contentIndex].(ThinkingContent)
 	block.Thinking = builder.appendContent(contentIndex, block.Thinking, delta)
 	builder.partial.Content[contentIndex] = block
-	builder.push(ThinkingDeltaEvent{ContentIndex: contentIndex, Delta: delta, Partial: builder.partial})
+	builder.pushView(ThinkingDeltaEvent{ContentIndex: contentIndex, Delta: delta, Partial: builder.publishedView()})
 }
 
 func (builder *assistantStreamBuilder) thinkingBlockSignature(contentIndex int, signature string) {
@@ -208,7 +214,7 @@ func (builder *assistantStreamBuilder) textDelta(delta string) {
 	block := builder.partial.Content[builder.activeText].(TextContent)
 	block.Text = builder.appendContent(builder.activeText, block.Text, delta)
 	builder.partial.Content[builder.activeText] = block
-	builder.push(TextDeltaEvent{ContentIndex: builder.activeText, Delta: delta, Partial: builder.partial})
+	builder.pushView(TextDeltaEvent{ContentIndex: builder.activeText, Delta: delta, Partial: builder.publishedView()})
 }
 
 func (builder *assistantStreamBuilder) textSignature(signature string) {
@@ -253,7 +259,7 @@ func (builder *assistantStreamBuilder) thinkingDelta(delta string, redacted bool
 	block.Thinking = builder.appendContent(builder.activeThinking, block.Thinking, delta)
 	block.Redacted = block.Redacted || redacted
 	builder.partial.Content[builder.activeThinking] = block
-	builder.push(ThinkingDeltaEvent{ContentIndex: builder.activeThinking, Delta: delta, Partial: builder.partial})
+	builder.pushView(ThinkingDeltaEvent{ContentIndex: builder.activeThinking, Delta: delta, Partial: builder.publishedView()})
 }
 
 func (builder *assistantStreamBuilder) thinkingSignature(signature string) {
@@ -323,7 +329,7 @@ func (builder *assistantStreamBuilder) toolCallDelta(delta streamToolCallDelta) 
 		builder.showStreamedArguments(state.contentIndex, &block, state.args, arguments, order)
 	}
 	builder.partial.Content[state.contentIndex] = block
-	builder.push(ToolCallDeltaEvent{ContentIndex: state.contentIndex, Delta: delta.argumentsDelta, Partial: builder.partial})
+	builder.pushView(ToolCallDeltaEvent{ContentIndex: state.contentIndex, Delta: delta.argumentsDelta, Partial: builder.publishedView()})
 }
 
 // convertToCustomToolCall makes the open call at index a custom (grammar) tool call with the empty input of custom, when it is
@@ -372,7 +378,7 @@ func (builder *assistantStreamBuilder) showStreamedArguments(contentIndex int, c
 // pushToolCallDelta pushes a toolcall_delta event for the call at index, whose arguments the caller already updated.
 func (builder *assistantStreamBuilder) pushToolCallDelta(index int, delta string) {
 	if state := builder.toolCalls[index]; state != nil {
-		builder.push(ToolCallDeltaEvent{ContentIndex: state.contentIndex, Delta: delta, Partial: builder.partial})
+		builder.pushView(ToolCallDeltaEvent{ContentIndex: state.contentIndex, Delta: delta, Partial: builder.publishedView()})
 	}
 }
 
@@ -491,17 +497,50 @@ func (builder *assistantStreamBuilder) recordTransportFailure(err error) {
 	if err == nil {
 		return
 	}
+	builder.recordFailureResponse(err)
 	if diagnostic, ok := transportFailureDiagnostic(err, builder.started); ok {
 		AppendAssistantMessageDiagnostic(builder.partial, diagnostic)
 	}
 }
 
+// recordFailureResponse stores the HTTP status, response headers and stream-start state of a failed request for a custom retry policy. It records
+// nothing unless the request's context came from WithFailureResponse.
+func (builder *assistantStreamBuilder) recordFailureResponse(err error) {
+	recorder := failureResponseRecorderOf(builder.ctx)
+	if recorder == nil {
+		return
+	}
+	info := &FailureResponse{StreamStarted: builder.started}
+	if own, ok := errors.AsType[*providerError](err); ok && own != nil {
+		if own.status != nil {
+			info.Status = *own.status
+		}
+	} else if reported, ok := errors.AsType[ProviderRequestError](err); ok {
+		if st := reported.ProviderStatus(); st != nil {
+			info.Status = *st
+		}
+		if hdr := reported.ProviderHeaders(); len(hdr) > 0 {
+			info.Headers = headersToRecord(hdr)
+		}
+	}
+	if info.Headers == nil {
+		info.Headers = recorder.headersOf(info.Status)
+	}
+	builder.partial.FailureResponse = info
+}
+
 // failureMessage is the ErrorMessage recorded for err.
 func (builder *assistantStreamBuilder) failureMessage(err error) string {
-	if builder.errorMessage != nil {
-		return builder.errorMessage(err.Error())
+	message := err.Error()
+	if builder.causeDetail {
+		message = WithCauseDetail(err)
+	} else if _, transport := errors.AsType[*nodeTransportError](err); transport && builder.transportCauseDetail {
+		message = WithCauseDetail(err)
 	}
-	return err.Error()
+	if builder.errorMessage != nil {
+		return builder.errorMessage(message)
+	}
+	return message
 }
 
 func (builder *assistantStreamBuilder) finishBlocks() {
@@ -639,17 +678,28 @@ func (builder *assistantStreamBuilder) publish() *AssistantMessage {
 	return builder.cell.view()
 }
 
-func (builder *assistantStreamBuilder) push(event AssistantMessageEvent) {
+// publishedView publishes the partial and returns the message an event of this push carries as its partial.
+func (builder *assistantStreamBuilder) publishedView() *AssistantMessage {
 	view := builder.publish()
 	if builder.partialCopy != nil {
 		view = builder.partialCopy(view)
 	}
+	return view
+}
+
+func (builder *assistantStreamBuilder) push(event AssistantMessageEvent) {
+	view := builder.publishedView()
 	event = mapAssistantEventPartial(event, func(message *AssistantMessage) *AssistantMessage {
 		if message == builder.partial {
 			return view
 		}
 		return message
 	})
+	builder.pushView(event)
+}
+
+// pushView pushes an event whose partial is already the published view, so the event is boxed once. A delta pushes this way: it takes publishedView first and builds its event around the result.
+func (builder *assistantStreamBuilder) pushView(event AssistantMessageEvent) {
 	if err := builder.stream.Push(event); err != nil {
 		builder.failInvariant(err)
 	}
@@ -690,7 +740,7 @@ type endingBlock struct {
 
 // sortEndingBlocks orders blocks by content index, the order their end events follow. Content indices are distinct, so the unstable sort is deterministic; the typed comparison avoids sort.Slice's reflective swapper, which allocates on every stream end.
 func sortEndingBlocks(blocks []endingBlock) {
-	slices.SortFunc(blocks, func(a, b endingBlock) int { return cmp.Compare(a.contentIndex, b.contentIndex) })
+	sortx.Func(blocks, func(a, b endingBlock) int { return cmp.Compare(a.contentIndex, b.contentIndex) })
 }
 
 // closeGrammarToolInputJSONState closes the input of a custom tool call that ends without a complete input of its own.

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
 	"github.com/MichaelKinsy/PiG/coding/source"
 	"github.com/MichaelKinsy/PiG/tui"
 )
@@ -99,6 +101,38 @@ func TestExtensionChangelogUpdatesUpstream(t *testing.T) {
 		}
 		if got := display(sm, info, false); len(got) != 0 {
 			t.Fatalf("second display = %+v, want none", got)
+		}
+	})
+
+	// pi: interactive-mode-extension-changelog.test.ts "does not repeat entries for a prerelease version" (Pi 9a1953961, #11703).
+	t.Run("does not repeat entries for a prerelease version", func(t *testing.T) {
+		sm := NewInMemorySettingsManager(Settings{})
+		info := newSourceInfo()
+		writePackage("1.0.0")
+		display(sm, info, false)
+		writePackage("1.2.0-20261020.7")
+		if got := display(sm, info, false); len(got) != 1 {
+			t.Fatalf("first display = %+v, want one update", got)
+		}
+		if got := display(sm, info, false); len(got) != 0 {
+			t.Fatalf("second display = %+v, want none", got)
+		}
+	})
+
+	t.Run("shows nothing for an unreadable last seen version and records the current one", func(t *testing.T) {
+		sm := NewInMemorySettingsManager(Settings{})
+		info := newSourceInfo()
+		_ = sm.SetExtensionChangelogVersion(source.GetSourcePackageKey(info.Source, info.Scope), "latest")
+		writePackage("1.0.0")
+		if got := display(sm, info, false); len(got) != 0 {
+			t.Fatalf("updates = %+v, want none", got)
+		}
+		if version, _ := recorded(sm, info); version != "1.0.0" {
+			t.Fatalf("recorded version = %q, want 1.0.0", version)
+		}
+		writePackage("1.2.0")
+		if got := display(sm, info, false); len(got) != 1 {
+			t.Fatalf("later update = %+v, want one", got)
 		}
 	})
 
@@ -193,7 +227,7 @@ func TestStartupExtensionChangelogBlock(t *testing.T) {
 		{Name: "demo", Version: "1.2.0", Markdown: "## demo [1.2.0]\n\nAdded B"},
 		{Name: "other", Version: "2.0.0", Markdown: "## other [2.0.0]\n\nAdded C"},
 	}
-	own := GetNewEntries(ParseChangelog("## [0.3.0]\nNewest\n\n## [0.2.0]\nMiddle"), "0.2.0")
+	own, _ := GetNewEntries(ParseChangelog("## [0.3.0]\nNewest\n\n## [0.2.0]\nMiddle"), "0.2.0")
 	render := func(collapse bool, entries []ChangelogEntry, updates []extensionChangelogUpdate) []string {
 		mode := &InteractiveMode{
 			chatContainer: tui.NewContainer(),
@@ -221,5 +255,38 @@ func TestStartupExtensionChangelogBlock(t *testing.T) {
 	want = []string{border, " What's New", "", " [0.3.0]", "", " Newest", "", "", " Extension Updates", "", " demo [1.2.0]", "", " Added B", "", border}
 	if got := render(false, own, updates[:1]); !slices.Equal(got, want) {
 		t.Fatalf("expanded own and extension blocks\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
+// Pi eebd5d90 interactive-mode-extension-changelog.test.ts "InteractiveMode startup notices": the What's New and Extension Updates blocks run the transformers
+// registered for the changelog type, and skip those that did not list it.
+func TestStartupChangelogRunsTheChangelogMarkdownTransformers(t *testing.T) {
+	tui.SetCapabilityOverrides(tui.CapabilityOverrides{Hyperlinks: new(false)})
+	t.Cleanup(func() { tui.SetCapabilityOverrides(tui.CapabilityOverrides{}); tui.ResetCapabilitiesCache() })
+	replaceWarning := func(markdown string, _ extension.MarkdownTransformContext) string {
+		return strings.ReplaceAll(markdown, ":warning:", "WARN")
+	}
+	for _, tc := range []struct {
+		name       string
+		extensions []extension.Extension
+		want       string
+	}{
+		{"changelog opt-in", []extension.Extension{{MarkdownTransformer: extension.NewMarkdownTransformerRegistration(replaceWarning, []extension.MarkdownMessageType{extension.MarkdownMessageChangelog})}}, "WARN"},
+		{"default types", []extension.Extension{{MarkdownTransformer: extension.NewMarkdownTransformerRegistration(replaceWarning, nil)}}, ":warning:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mode := &InteractiveMode{
+				chatContainer: tui.NewContainer(),
+				tuiInst:       tui.NewWithOutput(io.Discard, 80, 24),
+				opts:          InteractiveModeOptions{SettingsManager: &SettingsManager{merged: Settings{}}, AppVersion: "9.9.9"},
+			}
+			mode.newRunner = inproc.NewRunner(tc.extensions, t.TempDir())
+			own, _ := GetNewEntries(ParseChangelog("## [0.3.0]\n- :warning: Pi change\n\n## [0.2.0]\nMiddle"), "0.2.0")
+			mode.showStartupChangelog(own, []extensionChangelogUpdate{{Name: "demo", Version: "1.2.0", Markdown: "## demo [1.2.0]\n\n- :warning: Demo change"}})
+			rendered := stripANSI(strings.Join(mode.chatContainer.Render(80), "\n"))
+			if got := strings.Count(rendered, tc.want); got != 2 {
+				t.Fatalf("%q appears %d times, want 2 (What's New and Extension Updates):\n%s", tc.want, got, rendered)
+			}
+		})
 	}
 }

@@ -1,6 +1,6 @@
 package plugins
 
-// pi: packages/chord/src/next-node/plugins/stack.ts
+// pi: packages/chord/src/node/plugins/stack.ts
 
 import (
 	"regexp"
@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// Ports packages/chord/test/next-node/plugins/stack.test.ts: `mapStack` names plugin files and lines through each evaluated
+// Ports packages/chord/test/node/plugins/stack.test.ts: `mapStack` names plugin files and lines through each evaluated
 // script's source map; nothing global; a script's map goes with its facet. The plugins are built by the real BuildFacet and
 // evaluated by Pi's evaluateFacet and mapped by Pi's mapStack in the Node subprocess, read through the probe (the ops of
 // plugins_evaluate_test.go's prelude; the GC cases run in a subprocess started with --expose-gc). The import-time throw and
@@ -39,6 +39,23 @@ const stackOps = evaluateOpsPrelude + `
 		for (let round = 0; round < 10 && stack.mapStack(held.error).includes("notes/helper.ts"); round++) await ops.settle();
 		return { before, collected, after: stack.mapStack(held.error) };
 	},
+	lazy: async (a) => {
+		// A map that does not parse ("not json"), under a filename of its own: evaluation never reads it.
+		const built = {
+			...a.script.built,
+			digest: "broken-map",
+			source: a.script.built.source.replace(/base64,[A-Za-z0-9+/=]+/, "base64,bm90IGpzb24="),
+		};
+		const facet = evaluate.evaluateFacet(built, { hostPackages: await ops.packages(a), plugin: a.script.plugin });
+		const elsewhere = stack.mapStack(new Error("elsewhere"));
+		let threw = "nothing";
+		try {
+			stack.mapStack(ops.thrownBy(facet));
+		} catch (error) {
+			threw = error instanceof SyntaxError ? "SyntaxError" : String(error);
+		}
+		return { elsewhere, threw };
+	},
 	failed: async (a) => {
 		const hostPackages = await ops.packages(a);
 		let failure;
@@ -68,7 +85,7 @@ func stackFailing(t *testing.T) PluginScript {
 		"worker.ts": "import { helper } from \"./helper.ts\";\nexport default { setup: () => {}, fail: () => helper() };",
 		"helper.ts": "// A helper.\nexport function helper(): never {\n\tthrow new Error(\"helper failed at \" + Date.now());\n}",
 	}, nil)
-	return evaluateBuilt(t, root, "@test/notes", "worker", []string{"@earendil-works/chord/next"})
+	return evaluateBuilt(t, root, "@test/notes", "worker", []string{"@earendil-works/chord"})
 }
 
 // stackSingle writes a plugin dir (name "@test/<dir>") whose worker.ts is text and builds it with no host packages.
@@ -104,6 +121,20 @@ func TestStackMapsAPluginScriptsPositionsToThePluginsFilesAndLines(t *testing.T)
 	}
 	if got["plain"] != "not an error" {
 		t.Errorf("mapStack(\"not an error\") = %v", got["plain"])
+	}
+}
+
+// stack.test.ts › mapStack › parses a script's map at the first position looked up in it, not when the script is evaluated
+// (read through the probe: the map that does not parse is a SyntaxError of the first lookup, never of the evaluation).
+func TestStackParsesAScriptsMapAtTheFirstPositionLookedUpInIt(t *testing.T) {
+	script := stackFailing(t)
+	p := evaluateProbe(t, stackOps)
+	got := asMap(t, p.must("lazy", evaluateArgs(t, script, "chord")))
+	if elsewhere, _ := got["elsewhere"].(string); !regexp.MustCompile(`^Error: elsewhere\n`).MatchString(elsewhere) {
+		t.Errorf("mapStack(elsewhere) = %q", elsewhere)
+	}
+	if got["threw"] != "SyntaxError" {
+		t.Errorf("mapStack of the broken script's error threw %v, want SyntaxError", got["threw"])
 	}
 }
 

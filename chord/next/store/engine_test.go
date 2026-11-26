@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -11,7 +12,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/sqlite/node"
 )
 
-// Ports packages/chord/test/next/store/engine.test.ts: the engine (slice 6a §10, §11, slice 6b §1.5): documents as
+// Ports packages/chord/test/store/engine.test.ts: the engine (slice 6a §10, §11, slice 6b §1.5): documents as
 // bases and deltas, their keys in code point order, the history rules at a new base and at retirement (R1), reads at a
 // point, records inserted as they are.
 
@@ -39,7 +40,7 @@ func (kit *engineKit) commit(writes ...StagedWrite) ([]int64, error) {
 	var created []int64
 	fence := CommitFence{
 		Admit: func() bool { return true },
-		Adopt: func(_ int64, ids []int64) error { created = ids; return nil },
+		Adopt: func(_ int64, ids []int64, _ int) error { created = ids; return nil },
 	}
 	_, err := kit.store.Commit(writes, fence, background)
 	return created, err
@@ -224,6 +225,39 @@ func TestEngineDocuments(t *testing.T) {
 			t.Fatalf("Read after refusal = %v, %v", one, err)
 		}
 	})
+}
+
+// LoadContent is LoadDocument's content without its record: the value at a point, the base's version, and how many deltas followed the base.
+func TestLoadContentReadsADocumentsValueVersionAndDeltaCountAtAPointWithoutItsRecord(t *testing.T) {
+	kit := newEngine(t)
+	id := kit.mustCommit(kit.create("a", delta.JsonObjectOf("n", float64(0))))[0]
+	kit.mustCommit(kit.delta(id, 1, `[["s",["n"],1]]`))
+	kit.mustCommit(kit.delta(id, 2, `[["s",["n"],2]]`))
+	load := func(documentID int64, at DocumentPoint) (DocumentContentAt, error) {
+		return Read(kit.store, func(executor sqlite.SqliteExecutor) (DocumentContentAt, error) {
+			return LoadContent(executor, documentID, at)
+		}, background)
+	}
+	current, err := load(id, CurrentPoint)
+	noError(t, err)
+	if engineJSON(t, current.Value) != `{"n":2}` || current.Version != 1 || current.DeltasSinceBase != 2 {
+		t.Fatalf("LoadContent now = %s, version %d, deltas %d; want {\"n\":2}, 1, 2", engineJSON(t, current.Value), current.Version, current.DeltasSinceBase)
+	}
+	past, err := load(id, AtSeq(2))
+	noError(t, err)
+	if engineJSON(t, past.Value) != `{"n":1}` || past.DeltasSinceBase != 1 {
+		t.Fatalf("LoadContent at seq 2 = %s, deltas %d; want {\"n\":1}, 1", engineJSON(t, past.Value), past.DeltasSinceBase)
+	}
+	whole := engineFind(t, kit.store, kit.at("a"), CurrentPoint)
+	stored, err := engineLoad(t, kit.store, whole, CurrentPoint)
+	noError(t, err)
+	if engineJSON(t, stored.Value) != engineJSON(t, current.Value) || stored.Version != current.Version || stored.DeltasSinceBase != current.DeltasSinceBase {
+		t.Fatalf("LoadDocument and LoadContent disagree: %+v and %+v", stored, current)
+	}
+	// A failed read ends the store, so the document without revisions comes last.
+	if _, err := load(id+100, CurrentPoint); err == nil {
+		t.Fatal("LoadContent of a document without revisions did not fail")
+	}
 }
 
 // lifetime creates adapter record 10 at "a" (its base `{ n: 0 }`), then changes and retires it in later commits.
@@ -413,6 +447,178 @@ func TestEngineCounters(t *testing.T) {
 		_, err := kit.commit(kit.delta(found.ID, engineLimit, `[["s",["n"],2]]`))
 		if err == nil || !strings.Contains(err.Error(), "safe range") {
 			t.Fatalf("change past the range = %v", err)
+		}
+	})
+}
+
+// entriesKit has records 10 ("a", meta m-a) and 11 ("b", no meta) of kind "notes" created at seq 1, record 12 ("c", meta m-c) of
+// kind "other" at seq 2, and record 10 retired at seq 3: the lifetimes the entry reads (an adapter that keeps its fields in
+// `meta`) are asked about.
+func entriesKit(t *testing.T) *engineKit {
+	t.Helper()
+	kit := newEngine(t)
+	text := "{}"
+	insert := func(id int64, key, kind string, meta *string) StagedWrite {
+		return stagedApply(func(step *Step) ([]StoreWrite, error) {
+			record := adapterRecord(id, key, "rewindable", step.Seq)
+			record.Kind = kind
+			record.Meta = meta
+			return nil, InsertDocument(step, record, &text)
+		})
+	}
+	metaA, metaC := "m-a", "m-c"
+	kit.mustCommit(insert(10, "a", "notes", &metaA), insert(11, "b", "notes", nil))
+	kit.mustCommit(insert(12, "c", "other", &metaC))
+	kit.mustCommit(stagedApply(func(step *Step) ([]StoreWrite, error) {
+		record, err := ReadDocument(step, 10)
+		if err != nil {
+			return nil, err
+		}
+		return nil, RetireRecord(step, *record)
+	}))
+	return kit
+}
+
+func entryMeta(entry DocumentEntry) string {
+	if entry.Meta == nil {
+		return "<none>"
+	}
+	return *entry.Meta
+}
+
+func TestEngineEntries(t *testing.T) {
+	scope := DocumentScope{Owner: engineOwner.Owner, Namespace: engineOwner.Namespace}
+	list := func(t *testing.T, kit *engineKit, scope DocumentScope, at DocumentPoint, after, limit int64) []DocumentEntry {
+		t.Helper()
+		entries, err := Read(kit.store, func(executor sqlite.SqliteExecutor) ([]DocumentEntry, error) {
+			return ListDocumentEntries(executor, scope, at, after, limit)
+		}, background)
+		noError(t, err)
+		return entries
+	}
+	t.Run("find an entry reading only its meta, and its retirement where a read can find retired records", func(t *testing.T) {
+		kit := entriesKit(t)
+		find := func(key string, at DocumentPoint) *DocumentEntry {
+			entry, err := Read(kit.store, func(executor sqlite.SqliteExecutor) (*DocumentEntry, error) {
+				return FindDocumentEntry(executor, kit.at(key), at)
+			}, background)
+			noError(t, err)
+			return entry
+		}
+		if entry := find("b", CurrentPoint); entry == nil || entry.Meta != nil || entry.RetiredAt != nil {
+			t.Fatalf("current b = %+v, want a record without meta", entry)
+		}
+		if entry := find("a", CurrentPoint); entry != nil {
+			t.Fatalf("current a = %+v, want none: it is retired", entry)
+		}
+		entry := find("a", AtSeq(2))
+		if entry == nil || entryMeta(*entry) != "m-a" || entry.RetiredAt == nil || *entry.RetiredAt != 3 {
+			t.Fatalf("a at 2 = %+v, want m-a retired at 3", entry)
+		}
+		if entry := find("a", AtSeq(3)); entry != nil {
+			t.Fatalf("a at 3 = %+v, want none: the lifetime is half-open", entry)
+		}
+		if entry := find("c", CurrentPoint); entry != nil {
+			t.Fatalf("c of another kind = %+v, want none at this address", entry)
+		}
+	})
+
+	t.Run("list entries of a scope by id, live now or at a point, from a cursor, by kind, up to a limit", func(t *testing.T) {
+		kit := entriesKit(t)
+		current := list(t, kit, scope, CurrentPoint, 0, 10)
+		if len(current) != 2 || current[0].Meta != nil || entryMeta(current[1]) != "m-c" || current[0].RetiredAt != nil || current[1].RetiredAt != nil {
+			t.Fatalf("current = %+v, want b (no meta) and c (m-c), neither retired", current)
+		}
+		atTwo := list(t, kit, scope, AtSeq(2), 0, 10)
+		if len(atTwo) != 3 || entryMeta(atTwo[0]) != "m-a" || atTwo[0].RetiredAt == nil || *atTwo[0].RetiredAt != 3 || atTwo[1].RetiredAt != nil {
+			t.Fatalf("at 2 = %+v, want a (m-a, retired at 3), b and c", atTwo)
+		}
+		if atOne := list(t, kit, scope, AtSeq(1), 0, 10); len(atOne) != 2 {
+			t.Fatalf("at 1 = %+v, want a and b: c was created at 2", atOne)
+		}
+		other := "other"
+		if byKind := list(t, kit, DocumentScope{Owner: scope.Owner, Namespace: scope.Namespace, Kind: &other}, CurrentPoint, 0, 10); len(byKind) != 1 || entryMeta(byKind[0]) != "m-c" {
+			t.Fatalf("kind other = %+v", byKind)
+		}
+		if page := list(t, kit, scope, AtSeq(2), 10, 1); len(page) != 1 || page[0].Meta != nil {
+			t.Fatalf("after 10, limit 1 = %+v, want b alone", page)
+		}
+		if foreign := list(t, kit, DocumentScope{Owner: "app.other", Namespace: scope.Namespace}, CurrentPoint, 0, 10); len(foreign) != 0 {
+			t.Fatalf("another owner = %+v, want none", foreign)
+		}
+	})
+
+	t.Run("read an entry by id, live or retired, with its owner, namespace and history", func(t *testing.T) {
+		kit := entriesKit(t)
+		read := func(id int64) *OwnedDocumentEntry {
+			entry, err := Read(kit.store, func(executor sqlite.SqliteExecutor) (*OwnedDocumentEntry, error) {
+				return ReadDocumentEntry(executor, id)
+			}, background)
+			noError(t, err)
+			return entry
+		}
+		retired := read(10)
+		if retired == nil || entryMeta(retired.DocumentEntry) != "m-a" || retired.RetiredAt == nil || *retired.RetiredAt != 3 ||
+			retired.Owner != engineOwner.Owner || retired.Namespace != engineOwner.Namespace || retired.History != "rewindable" {
+			t.Fatalf("entry 10 = %+v", retired)
+		}
+		if live := read(11); live == nil || live.Meta != nil || live.RetiredAt != nil {
+			t.Fatalf("entry 11 = %+v, want a live record without meta", live)
+		}
+		if absent := read(99); absent != nil {
+			t.Fatalf("entry 99 = %+v, want none", absent)
+		}
+	})
+}
+
+func TestEngineHostRecords(t *testing.T) {
+	t.Run("keep their host, are listed by it (live only, by id), and round-trip through an archive", func(t *testing.T) {
+		kit := newEngine(t)
+		hosted := func(key, host string) StagedWrite {
+			address := kit.at(key)
+			address.Host = &host
+			return CreateDocument(address, engineBase(delta.JsonObjectOf("n", float64(1)), 1), `{"n":1}`, nil)
+		}
+		a := kit.mustCommit(hosted("session|S1", "session|S1"))[0]
+		kit.mustCommit(hosted("session|S2", "session|S2"), CreateDocument(kit.at("session|S1x"), engineBase(delta.JsonObjectOf("n", float64(2)), 1), `{"n":2}`, nil))
+		other := DocumentAddress{Owner: engineOwner.Owner, Namespace: engineOwner.Namespace, Kind: "other"}
+		key, host := "session|S1", "session|S1"
+		other.Key, other.Host = &key, &host
+		b := kit.mustCommit(CreateDocument(other, engineBase(emptyObject(), 1), "{}", nil))[0]
+		list := func(after int64) [][2]any {
+			records, err := Read(kit.store, func(executor sqlite.SqliteExecutor) ([]DocumentRecord, error) {
+				return ListHostRecords(executor, "session|S1", after, 10)
+			}, background)
+			noError(t, err)
+			ids := [][2]any{}
+			for _, record := range records {
+				ids = append(ids, [2]any{record.ID, *record.Host})
+			}
+			return ids
+		}
+		qEqual(t, list(0), [][2]any{{a, "session|S1"}, {b, "session|S1"}})
+		qEqual(t, list(a), [][2]any{{b, "session|S1"}})
+		if plain := engineFind(t, kit.store, kit.at("session|S1x"), CurrentPoint); plain == nil || plain.Host != nil {
+			t.Fatalf("a record created without a host = %+v", plain)
+		}
+		kit.mustCommit(RetireDocument(a, 1))
+		qEqual(t, list(0), [][2]any{{b, "session|S1"}})
+		copyOf := reimported(t, kit.store, func(parts []ArchivePart) []ArchivePart { return parts })
+		qEqual(t, nexttest.JSONText(t, exported(t, copyOf, background)), nexttest.JSONText(t, exported(t, kit.store, background)))
+	})
+
+	t.Run("have an indexed host column", func(t *testing.T) {
+		kit := newEngine(t)
+		var names []string
+		for _, row := range engineRows(t, kit.store, `SELECT name FROM pragma_table_info('`+TableDocuments+`')`) {
+			names = append(names, row["name"].(string))
+		}
+		if !slices.Contains(names, "host") {
+			t.Fatalf("columns = %v, want host", names)
+		}
+		rows := engineRows(t, kit.store, `SELECT sql FROM sqlite_master WHERE name = 'chord_documents_host'`)
+		if len(rows) != 1 || !strings.Contains(rows[0]["sql"].(string), "WHERE host IS NOT NULL") {
+			t.Fatalf("index = %v", rows)
 		}
 	})
 }

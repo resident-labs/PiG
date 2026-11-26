@@ -5,10 +5,11 @@ import (
 	"context"
 	"maps"
 	"runtime"
-	"slices"
 	"sync"
 
+	"github.com/MichaelKinsy/PiG/coding/extension/host/runtimecell"
 	"github.com/MichaelKinsy/PiG/internal/procpolicy"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 )
 
 type startTurnKey struct{}
@@ -83,6 +84,8 @@ func (h *Host) stageCellsInOrder(ctx context.Context, cells []CellSpec, commit f
 	ctx = context.WithValue(stageCtx, runtimeParentKey{}, parent)
 	ctx, closeBuildLine := h.withBuildLine(ctx, cells)
 	defer closeBuildLine()
+	// The cells staged here are one load: they read each SDK tree once between them when they look for their built images.
+	ctx = runtimecell.WithLoadTreeHashes(ctx)
 	type unit struct {
 		order     int
 		admission *memberAdmission
@@ -118,7 +121,7 @@ func (h *Host) stageCellsInOrder(ctx context.Context, cells []CellSpec, commit f
 			}
 		}
 	}
-	slices.SortStableFunc(units, func(a, b unit) int { return cmp.Compare(a.order, b.order) })
+	sortx.Stable(units, func(a, b unit) int { return cmp.Compare(a.order, b.order) })
 	if len(units) == 0 {
 		return
 	}
@@ -182,24 +185,28 @@ func (me *managedExt) activateNode() error {
 	}
 	ready := me.pendingReady
 	me.pendingReady = nil
+	conn := me.connection()
+	var stateEpoch uint64
 	if me.host != nil && me.host.uiBridge != nil {
 		bridge := me.host.uiBridge
+		stateEpoch = me.host.readyStateEpoch(conn)
 		// Notifications may have arrived during later factories. Activation must not overwrite that state with the earlier registration snapshot.
-		if me.wantsModelRegistry {
+		registered := me.registration()
+		if registered.wantsModelRegistry {
 			ready.Ready.Models = bridge.ModelCatalog()
 		}
 		me.entryCursorMu.Lock()
-		ready.Ready.State = bridge.Snapshot(me.flagNames, 0, me.host.subscribedToSessionLog(me.config.Name))
+		me.entryPairCursor = 0
+		ready.Ready.State = bridge.Snapshot(registered.flagNames, 0, me.host.subscribedToSessionLog(me.config.Name))
 		if ready.Ready.State.Session != nil {
 			me.entryCursor = ready.Ready.State.Session.EntryCount
 		}
 		me.entryCursorMu.Unlock()
 	}
 	// The geometry is read when the deferred payload is sent: a resize while later factories loaded may have changed it.
-	conn := me.connection()
 	var err error
 	if me.host != nil {
-		err = me.host.sendReady(me, conn, ready)
+		err = me.host.sendReady(me, conn, ready, stateEpoch)
 	} else {
 		err = conn.Send(ready)
 	}

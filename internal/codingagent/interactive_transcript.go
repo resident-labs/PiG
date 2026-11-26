@@ -21,10 +21,15 @@ func (m *InteractiveMode) rebuildChatFromSession() {
 
 // rebuildChat clears and repaints the transcript; populateHistory is renderSessionEntries' option of the same name.
 func (m *InteractiveMode) rebuildChat(populateHistory bool) {
+	m.rebuildChatFrom(m.sessionEntriesToRender(), populateHistory)
+}
+
+// rebuildChatFrom is rebuildChat over entries read beforehand, as sessionEntriesToRender reads them.
+func (m *InteractiveMode) rebuildChatFrom(entries []SessionEntry, populateHistory bool) {
 	m.disposeArminComponents()
 	m.chatContainer.Clear()
-	m.tuiInst.ForceFullRender()
-	m.renderSessionEntriesWithHistory(populateHistory)
+	m.transcriptEmptied()
+	m.renderSessionEntriesFrom(entries, populateHistory)
 }
 
 // renderSessionEntries renders session messages/entries into the chat
@@ -126,7 +131,12 @@ func (m *InteractiveMode) showSessionCompactedStatus() {
 // `chatContainer.clear(); renderInitialMessages()` does after a Session replacement and a tree navigation (interactive-mode.ts:2004-2005,
 // 2201-2209, 5634-5635). rebuildChatFromSession alone is upstream's rebuildChatFromMessages, which paints no warning.
 func (m *InteractiveMode) repaintInitialMessages() {
-	m.rebuildChat(true)
+	m.repaintInitialMessagesFrom(m.sessionEntriesToRender())
+}
+
+// repaintInitialMessagesFrom is repaintInitialMessages over entries read beforehand, so the owner loop decodes no record of the Session.
+func (m *InteractiveMode) repaintInitialMessagesFrom(entries []SessionEntry) {
+	m.rebuildChatFrom(entries, true)
 	m.renderProjectTrustWarningIfNeeded()
 	m.showSessionCompactedStatus()
 	m.releaseSwitchHeap()
@@ -140,16 +150,31 @@ func (m *InteractiveMode) renderSessionEntries() {
 // renderSessionEntriesWithHistory is renderSessionEntries with upstream's populateHistory option: each rendered user message's text also goes to the
 // editor history.
 func (m *InteractiveMode) renderSessionEntriesWithHistory(populateHistory bool) {
-	var entries []SessionEntry
+	m.renderSessionEntriesFrom(m.sessionEntriesToRender(), populateHistory)
+}
+
+// sessionEntriesToRender reads the entries the transcript paints from the current Session.
+func (m *InteractiveMode) sessionEntriesToRender() []SessionEntry {
+	return transcriptEntries(m.currentSession(), m.showCacheMissNotices())
+}
+
+// transcriptEntries reads the entries the transcript paints from session: the kept range and everything after it render the same from the
+// context branch, and the entries before it hydrate the same state; cache-miss notices scan the whole branch, and a compaction whose kept
+// entry is not on the branch renders the whole branch. It decodes the records a cold read finds, so it runs off the owner loop when it can.
+func transcriptEntries(session *Session, showCacheMisses bool) []SessionEntry {
+	if session == nil {
+		return nil
+	}
+	if showCacheMisses || !session.KeptRangeOnBranch() {
+		return session.GetBranch()
+	}
+	return session.GetContextBranch()
+}
+
+// renderSessionEntriesFrom paints entries, which sessionEntriesToRender read, and refreshes the footer name.
+func (m *InteractiveMode) renderSessionEntriesFrom(entries []SessionEntry, populateHistory bool) {
 	name := ""
 	if session := m.currentSession(); session != nil {
-		// The kept range and everything after it render the same from the context branch, and the entries before it hydrate the same state;
-		// cache-miss notices scan the whole branch, and a compaction whose kept entry is not on the branch renders the whole branch.
-		if m.showCacheMissNotices() || !session.KeptRangeOnBranch() {
-			entries = session.GetBranch()
-		} else {
-			entries = session.GetContextBranch()
-		}
 		name = session.GetSessionName()
 	}
 	if m.statusLine != nil {
@@ -172,10 +197,11 @@ func (m *InteractiveMode) addUserMessageToChat(msg agent.AgentMessage, text stri
 		m.chatContainer.Add(block)
 		return
 	}
-	comp := tui.NewSkillInvocationMessageComponent(tui.ParsedSkillBlock{
+	comp := tui.NewSkillInvocationMessageComponentWithSurface(tui.ParsedSkillBlock{
 		Name:    parsed.Name,
 		Content: parsed.Content,
-	}, m.markdownThemeWithSettings(), m.outputPad)
+	}, m.markdownThemeWithSettings(), m.outputPad, m.surfaceMarkdownTransform(extension.MarkdownMessageCustom, meta))
+	m.markdownBlocks = append(m.markdownBlocks, comp)
 	if m.toolsExpanded {
 		comp.SetExpanded(true)
 	}
@@ -193,11 +219,18 @@ func (m *InteractiveMode) renderSessionEntryList(entries []SessionEntry, trim bo
 }
 
 func (m *InteractiveMode) renderSessionEntryListWithHistory(entries []SessionEntry, trim, populateHistory bool) {
+	m.renderSessionEntryListWithLive(entries, trim, populateHistory, "")
+}
+
+// renderSessionEntryListWithLive renders entries as renderSessionEntryListWithHistory does, except the compaction or branch summary entry whose id
+// is liveID, which a live event just appended: Pi draws it with addMessageToChat and no messageId or timestamp, where a restored
+// entry's summary gets them (renderSessionEntries).
+func (m *InteractiveMode) renderSessionEntryListWithLive(entries []SessionEntry, trim, populateHistory bool, liveID string) {
 	// Selection coordinates point into the transcript being replaced (upstream interactive-mode.ts renderSessionEntries, #9311).
 	if m.altScreen != nil {
 		m.altScreen.ResetTextSelection()
 	}
-	m.previousThinkingDroppedCount = 0
+	m.previousDroppedReasoning = droppedReasoningState{}
 	m.disposeMarkdownBlocks()
 	defer m.refreshFooterContextUsage()
 	// Reset all component tracking: all are stale after a branch navigation.
@@ -238,7 +271,7 @@ func (m *InteractiveMode) renderSessionEntryListWithHistory(entries []SessionEnt
 			}
 			if me, ok := decode(e); ok {
 				if me.Message.Assistant != nil {
-					m.previousThinkingDroppedCount = countDroppedThinkingBlocks(me.Message.Assistant)
+					m.previousDroppedReasoning, _ = countDroppedReasoning(me.Message.Assistant)
 					if m.statusLine != nil && me.Message.Assistant.Usage != nil {
 						m.statusLine.SetTurnContextUsage(me.Message.Assistant.Usage)
 					}
@@ -370,7 +403,12 @@ func (m *InteractiveMode) renderSessionEntryListWithHistory(entries []SessionEnt
 				if !ok {
 					continue
 				}
-				args, _ := jsonNoEscape(call.Arguments)
+				// The card reads the arguments in the member order the session file holds, as a live call's card does: the call
+				// fallback lists them in that order (render-utils.ts formatToolCallWithArgs walks Object.entries).
+				args, err := call.ArgumentsJSON()
+				if err != nil {
+					args = []byte("{}")
+				}
 				comp := m.newToolCard(call.Name, call.ID, json.RawMessage(args))
 				comp.BodyRenderer = toolBodyRendererForCall(call, agent.AgentToolResult{}, nil)
 				m.applyToolPresentation(comp, call.ID, call.Name, json.RawMessage(args))
@@ -432,17 +470,17 @@ func (m *InteractiveMode) renderSessionEntryListWithHistory(entries []SessionEnt
 		case msg.Role() == agent.RoleCustom:
 			// upstream addMessageToChat case "custom" (interactive-mode.ts:3901-3913): only a displayed message is drawn.
 			if entry, display := customMessageEntryOf(msg.Custom); display {
-				m.appendCustomMessage(entry)
+				m.appendCustomMessage(entry, meta)
 			}
 		case msg.Role() == agent.RoleCompactionSummary:
 			// upstream case "compactionSummary" (interactive-mode.ts:3915-3924): a message carries no usage, so no cost notice follows.
 			summary, _ := msg.Custom["summary"].(string)
 			tokensBefore, _ := msg.Custom["tokensBefore"].(float64)
-			m.addCompactionSummary(summary, int(tokensBefore), nil)
+			m.addCompactionSummary(summary, int(tokensBefore), nil, messageMeta{})
 		case msg.Role() == agent.RoleBranchSummary:
 			// upstream case "branchSummary" (interactive-mode.ts:3926-3935).
 			summary, _ := msg.Custom["summary"].(string)
-			m.addBranchSummary(summary, nil)
+			m.addBranchSummary(summary, nil, messageMeta{})
 		case msg.ToolResult != nil:
 			r := msg.ToolResult
 			call, pending := pendingCalls[r.ToolCallID]
@@ -480,17 +518,21 @@ func (m *InteractiveMode) renderSessionEntryListWithHistory(entries []SessionEnt
 		case "compaction":
 			var ce CompactionEntry
 			if err := json.Unmarshal(pe.entry.Raw(), &ce); err == nil {
-				m.addCompactionSummary(ce.Summary, ce.TokensBefore, ce.Usage)
+				meta := entryMeta(ce.SessionEntryBase)
+				if liveID != "" && ce.ID == liveID {
+					meta = messageMeta{}
+				}
+				m.addCompactionSummary(ce.Summary, ce.TokensBefore, ce.Usage, meta)
 			}
 		case "branch_summary":
 			var be BranchSummaryEntry
 			if err := json.Unmarshal(pe.entry.Raw(), &be); err == nil && be.Summary != "" {
-				m.addBranchSummary(be.Summary, be.Usage)
+				m.addBranchSummary(be.Summary, be.Usage, entryMeta(be.SessionEntryBase))
 			}
 		case "custom_message":
 			var cm CustomMessageEntry
 			if err := json.Unmarshal(pe.entry.Raw(), &cm); err == nil && cm.Display {
-				m.appendCustomMessage(cm)
+				m.appendCustomMessage(cm, entryMeta(cm.SessionEntryBase))
 			}
 		case "custom":
 			var ce CustomEntry
@@ -526,7 +568,14 @@ func (m *InteractiveMode) addCustomEntryToChat(entry CustomEntry) {
 	if renderer == nil {
 		return
 	}
-	component := NewCustomEntryComponent(entry, renderer, m.outputPad)
+	m.extensionRenderersMounted()
+	// Pi renders the same session-manager entry object on every rebuild, so the renderer's per-entry state survives compaction, /tree and the
+	// resume paint; the session's identity for the entry id is that object.
+	var identity *extension.RenderIdentity
+	if session := m.currentSession(); session != nil && entry.ID != "" {
+		identity = session.EntryRenderIdentity(entry.ID)
+	}
+	component := NewCustomEntryComponent(entry, renderer, identity, m.outputPad)
 	component.SetExpanded(m.toolsExpanded)
 	if !component.HasContent() {
 		return
@@ -540,11 +589,13 @@ func (m *InteractiveMode) addCustomEntryToChat(entry CustomEntry) {
 }
 
 // appendCustomMessage mounts a CustomMessageComponent for a displayed custom message, as upstream interactive-mode.ts:3861-3872
-// does: the registered renderer (if any) is handed to the component, which rebuilds it when expansion or padding changes.
-func (m *InteractiveMode) appendCustomMessage(message CustomMessageEntry) {
+// does: the registered renderer (if any) is handed to the component, which rebuilds it when expansion or padding changes. meta is the
+// persisted entry of a restored transcript; a live message passes the zero value, as Pi's addMessageToChat gets no options for it.
+func (m *InteractiveMode) appendCustomMessage(message CustomMessageEntry, meta messageMeta) {
 	var renderer tui.MessageRenderer
 	if m.newRunner != nil {
 		if registered := m.newRunner.MessageRenderer(message.CustomType); registered != nil {
+			m.extensionRenderersMounted()
 			customMessage := extension.CustomMessage{
 				CustomType: message.CustomType,
 				Content:    message.Content,
@@ -552,12 +603,16 @@ func (m *InteractiveMode) appendCustomMessage(message CustomMessageEntry) {
 				Details:    message.Details,
 				Timestamp:  entryTimestampMs(message.Timestamp),
 			}
+			// Pi's renderer receives the same message object on every rebuild; the identity is that object for a renderer that keeps per-message
+			// state (a card that a click expands).
+			identity := extension.NewRenderIdentity()
 			renderer = func(_ *tui.CustomMessage, options tui.MessageRenderOptions) tui.Component {
-				return registered(customMessage, extension.MessageRenderOptions{Expanded: options.Expanded, OutputPad: options.OutputPad}, nil)
+				return registered(customMessage, extension.MessageRenderOptions{Expanded: options.Expanded, OutputPad: options.OutputPad, Identity: identity}, nil)
 			}
 		}
 	}
-	component := tui.NewCustomMessageComponent(&tui.CustomMessage{CustomType: message.CustomType, Content: message.Content}, renderer, m.markdownThemeWithSettings(), m.outputPad)
+	component := tui.NewCustomMessageComponentWithSurface(&tui.CustomMessage{CustomType: message.CustomType, Content: message.Content}, renderer, m.markdownThemeWithSettings(), m.outputPad, m.surfaceMarkdownTransform(extension.MarkdownMessageCustom, meta))
+	m.markdownBlocks = append(m.markdownBlocks, component)
 	component.SetExpanded(m.toolsExpanded)
 	m.customMessageOrder = append(m.customMessageOrder, component)
 	m.chatContainer.Add(component)
@@ -577,15 +632,16 @@ func customMessageEntryOf(custom map[string]any) (entry CustomMessageEntry, disp
 		timestamp = int64(value)
 	}
 	return CustomMessageEntry{
-		SessionEntryBase: SessionEntryBase{Type: "custom_message", Timestamp: time.UnixMilli(timestamp).UTC().Format(time.RFC3339Nano)},
-		CustomType:       customType, Content: custom["content"], Display: display, Details: custom["details"],
+		Type: "custom_message", Timestamp: time.UnixMilli(timestamp).UTC().Format(time.RFC3339Nano),
+		CustomType: customType, Content: custom["content"], Display: display, Details: custom["details"],
 	}, display
 }
 
 // addBranchSummary draws a branch summary as upstream addMessageToChat case "branchSummary" (interactive-mode.ts:3926-3935)
 // does: a spacer, then the component at the current expansion. A branch_summary entry's usage adds its cost notice.
-func (m *InteractiveMode) addBranchSummary(summary string, usage *ai.Usage) {
-	component := tui.NewBranchSummaryMessageComponent(tui.BranchSummaryMessage{Summary: summary}, m.markdownThemeWithSettings(), m.outputPad)
+func (m *InteractiveMode) addBranchSummary(summary string, usage *ai.Usage, meta messageMeta) {
+	component := tui.NewBranchSummaryMessageComponentWithSurface(tui.BranchSummaryMessage{Summary: summary}, m.markdownThemeWithSettings(), m.outputPad, m.surfaceMarkdownTransform(extension.MarkdownMessageSummary, meta))
+	m.markdownBlocks = append(m.markdownBlocks, component)
 	component.SetExpanded(m.toolsExpanded)
 	m.branchSummaryOrder = append(m.branchSummaryOrder, component)
 	m.chatContainer.Add(tui.NewSpacer(1))
@@ -593,58 +649,68 @@ func (m *InteractiveMode) addBranchSummary(summary string, usage *ai.Usage) {
 	m.addCompactionCostNotice("branch_summary", usage)
 }
 
-// flushCompactionQueue sends all messages that were queued while a compaction
-// was in progress. Called at the end of successful CompactionEndEvent handling.
+// flushCompactionQueue sends the messages queued while a compaction ran (interactive-mode.ts flushCompactionQueue). The queue empties first and the
+// pending display is refreshed. A message that fails to send, or a prompt the run rejects, puts the whole queue back, clears the Session's queues and
+// shows "Failed to send queued message(s): <error>"; the messages after a failed one are not sent.
 //
-// Upstream: flushCompactionQueue in interactive-mode.ts:3561.
-// Now uses the agent's steering queue so compaction-queued messages are
-// injected between tool batches rather than spawning new turns.
-// flushCompactionQueue replays messages queued while compaction was running.
+// With willRetry the retry turn is imminent: an extension command runs and every other message is queued through the input handlers and prompt
+// expansion as a steering message or follow-up, whether or not a run is active.
 //
-// startTurn distinguishes the two call sites:
-//   - false (drain at handleSubmit top): a new prompt or an active overflow
-//     retry will start a turn, so the queued messages only need to be steered
-//     into it.
-//   - true (CompactionEndEvent): the agent is idle, so a bare Steer would be
-//     dropped (the steering queue is only drained by a running loop). The first
-//     non-slash message starts a turn; slash commands dispatch; the remaining
-//     messages steer into the started turn. Mirrors upstream flushCompactionQueue
-//     (interactive-mode.ts:3825), which uses the first non-extension-command
-//     message as session.prompt() and steers the rest.
-func (m *InteractiveMode) flushCompactionQueue(ctx context.Context, startTurn bool) {
+// Otherwise a run still settling (the compaction ran inside it) receives each message through its queued mode. An idle agent runs the extension commands
+// before the first message that is not one, starts a turn from that message, and queues the rest into the started turn. turnActive marks the interval in
+// which a run goroutine exists to drain the queues; isIdle is reset through a queued runOnMain and reads stale-false right after a turn ends, which is
+// what auto-compaction at the end of a turn leaves behind.
+//
+// Each message is awaited like Pi's `await this.session.prompt(...)`: the messages behind an extension command are handled once its handler returned
+// (runFlushSteps).
+func (m *InteractiveMode) flushCompactionQueue(ctx context.Context, willRetry bool) {
 	if len(m.compactionQueue) == 0 {
 		return
 	}
 	queued := m.compactionQueue
 	m.compactionQueue = nil
-	// The queue moved to the agent (steered) or a new turn; clear its
-	// entries from the pending display so it reflects the live queue.
-	defer m.updatePendingMessagesDisplay()
+	m.updatePendingMessagesDisplay()
 
-	// Steer only when a run goroutine actually exists to drain the steering
-	// queue. turnActive marks exactly that interval; isIdle is reset through a
-	// queued runOnMain and so reads stale-false right after a turn ends, which
-	// is precisely the state auto-compaction leaves behind when it runs at the
-	// end of a turn. Gating on isIdle therefore steered into a queue nothing
-	// would drain: the message vanished from the UI, never reached the session,
-	// and was lost on restart.
-	//
-	// When startTurn is false (the handleSubmit drain) the caller has its own
-	// turn to steer into. Starting a second concurrent turn while one is running
-	// would race the agent loop, so turnActive still suppresses that.
-	if !startTurn {
-		for _, msg := range queued {
-			m.queueCompactionMessageForActiveTurn(msg)
+	failed := false
+	// upstream: interactive-mode.ts flushCompactionQueue restoreQueue, run when a message or the first prompt is rejected.
+	ctx = withPromptRejection(ctx, func(err error) {
+		failed = true
+		m.agent.ClearAllQueues()
+		m.compactionQueue = queued
+		m.updatePendingMessagesDisplay()
+		plural := ""
+		if len(queued) > 1 {
+			plural = "s"
 		}
+		m.showError(fmt.Sprintf("Failed to send queued message%s: %s", plural, err.Error()))
+	})
+
+	// Pi awaits each message of the flush: an extension command runs through prompt(), whose handler is awaited, before the next message is handled.
+	// step handles one queued message and returns the channel that closes when the extension command it started returns, nil when it started none.
+	step := func(msg compactionQueuedMessage, handle func(compactionQueuedMessage) <-chan struct{}) func() <-chan struct{} {
+		return func() <-chan struct{} {
+			if failed {
+				return nil
+			}
+			return handle(msg)
+		}
+	}
+	var steps []func() <-chan struct{}
+	if willRetry {
+		for _, msg := range queued {
+			steps = append(steps, step(msg, func(msg compactionQueuedMessage) <-chan struct{} { return m.queueCompactionMessage(ctx, msg) }))
+		}
+		m.runFlushSteps(steps)
 		return
 	}
-	// A run still settling (the compaction ran inside it) receives each
-	// message through upstream's steer()/followUp(), input handlers and
-	// expansion included; extension commands run immediately.
+	// A run still settling receives each message through upstream's steer()/followUp(), input handlers and expansion included; extension commands run
+	// immediately.
+	deliver := func(msg compactionQueuedMessage) <-chan struct{} { return m.deliverCompactionQueued(ctx, msg) }
 	if m.runStreaming() {
 		for _, msg := range queued {
-			m.deliverCompactionQueued(ctx, msg)
+			steps = append(steps, step(msg, deliver))
 		}
+		m.runFlushSteps(steps)
 		return
 	}
 
@@ -656,47 +722,70 @@ func (m *InteractiveMode) flushCompactionQueue(ctx context.Context, startTurn bo
 	}
 	m.abortCtx, m.abortFn = context.WithCancel(m.runCtx)
 
-	firstIdx := -1
-	for i, msg := range queued {
-		if !m.isExtensionCommand(msg.text) {
-			firstIdx = i
-			break
-		}
-	}
+	firstIdx := slices.IndexFunc(queued, func(msg compactionQueuedMessage) bool { return !m.isExtensionCommand(msg.text) })
+	command := func(msg compactionQueuedMessage) <-chan struct{} { return m.dispatchExtensionCommand(ctx, msg.text) }
 	if firstIdx == -1 {
-		// All extension commands (interactive-mode.ts:4818-4825): run each; none starts a turn.
+		// All extension commands: run each; none starts a turn.
 		for _, msg := range queued {
-			m.handleSubmitWithImages(ctx, msg.text, msg.images)
+			steps = append(steps, step(msg, command))
 		}
+		m.runFlushSteps(steps)
 		return
 	}
 	// Run the extension commands before the first prompt.
 	for _, msg := range queued[:firstIdx] {
-		m.handleSubmitWithImages(ctx, msg.text, msg.images)
+		steps = append(steps, step(msg, command))
 	}
-	// Preserve the queued message's delivery mode. Upstream passes
-	// streamingBehavior on the first prompt so a still-settling agent run queues
-	// it instead of starting a concurrent turn. turnActive is the same boundary
-	// in PiG; the idle path starts a new prompt, while a live run receives the
-	// message through its requested queue.
-	m.handleSubmitWithImages(ctx, queued[firstIdx].text, queued[firstIdx].images)
-	// Remaining messages preserve their queued mode; later extension commands
-	// still dispatch immediately (deliverCompactionQueued). A message that finds the run already
+	// The first prompt keeps its delivery mode: a live run, such as one a command started, receives it through its requested queue, and the idle agent
+	// starts a turn.
+	first := queued[firstIdx]
+	steps = append(steps, step(first, func(first compactionQueuedMessage) <-chan struct{} {
+		m.promptUserInput(ctx, first.text, first.images, first.mode == compactionQueueFollowUp, extension.InputSourceUser, true)
+		return nil
+	}))
+	// The remaining messages keep their queued mode; a later extension command still runs immediately. A message that finds the run already
 	// settled starts the next turn instead of waiting in a drained queue.
 	for _, msg := range queued[firstIdx+1:] {
-		m.deliverCompactionQueued(ctx, msg)
+		steps = append(steps, step(msg, deliver))
 	}
+	m.runFlushSteps(steps)
+}
+
+// runFlushSteps runs the steps in order on the owner loop. The steps behind one that started an extension command run on the owner loop once the command
+// returned, as flushCompactionQueue awaits each session.prompt().
+func (m *InteractiveMode) runFlushSteps(steps []func() <-chan struct{}) {
+	for i, step := range steps {
+		returned := step()
+		if returned == nil {
+			continue
+		}
+		if rest := steps[i+1:]; len(rest) > 0 {
+			m.afterExtensionCommand(returned, func() { m.runFlushSteps(rest) })
+		}
+		return
+	}
+}
+
+// queueCompactionMessage hands one message queued during compaction to the retry turn: an extension command runs, any other message is queued with its
+// mode through the input handlers and prompt expansion (upstream prompt(), steer() and followUp()). It returns the channel of the command it started.
+func (m *InteractiveMode) queueCompactionMessage(ctx context.Context, msg compactionQueuedMessage) <-chan struct{} {
+	if m.isExtensionCommand(msg.text) {
+		return m.dispatchExtensionCommand(ctx, msg.text)
+	}
+	m.queueUserInput(ctx, msg.text, msg.images, msg.mode == compactionQueueFollowUp, extension.InputSourceUser)
+	return nil
 }
 
 // deliverCompactionQueued hands one message queued during compaction to the
 // active run with its queued mode, as upstream's flushCompactionQueue does
 // through prompt() for extension commands and steer()/followUp() otherwise.
-func (m *InteractiveMode) deliverCompactionQueued(ctx context.Context, msg compactionQueuedMessage) {
+// It returns the channel of the command it started.
+func (m *InteractiveMode) deliverCompactionQueued(ctx context.Context, msg compactionQueuedMessage) <-chan struct{} {
 	if m.isExtensionCommand(msg.text) {
-		m.dispatchSlash(ctx, msg.text)
-		return
+		return m.dispatchExtensionCommand(ctx, msg.text)
 	}
 	m.promptUserInput(ctx, msg.text, msg.images, msg.mode == compactionQueueFollowUp, extension.InputSourceUser, true)
+	return nil
 }
 
 // enqueueIfTurnActive runs enqueue and reports true when a run is active (a
@@ -714,25 +803,21 @@ func (m *InteractiveMode) enqueueIfTurnActive(enqueue func()) bool {
 	return true
 }
 
-func (m *InteractiveMode) queueCompactionMessageForActiveTurn(msg compactionQueuedMessage) {
-	if msg.mode == compactionQueueFollowUp {
-		m.followUpMessageWithImages(msg.text, msg.images)
-		return
+// queuedUserMessage is the user message the mode queues on the Agent. A Session builds it so its images are marked for normalization
+// when the message is delivered.
+func (m *InteractiveMode) queuedUserMessage(text string, images []ai.ImageContent) agent.AgentMessage {
+	if m.opts.SessionHandle != nil {
+		return m.opts.SessionHandle.QueuedUserMessage(text, images)
 	}
-	m.steerMessageWithImages(msg.text, msg.images)
+	// No Session: a mode that drives the raw Agent has no delivery-time normalization to mark the message for.
+	return agent.AgentMessage{User: &agent.UserMessage{Role: agent.RoleUser, Content: promptContent(text, images), Timestamp: time.Now().UnixMilli()}}
 }
 
 // steerMessageWithImages queues a steering message, delivered after the
 // current tool batch and before the next model call (upstream _queueSteer). Like Pi's onSubmit (interactive-mode.ts:3378-3383) it shows the
 // message in the pending area only, with no status line.
 func (m *InteractiveMode) steerMessageWithImages(text string, images []ai.ImageContent) {
-	msg := agent.AgentMessage{
-		User: &agent.UserMessage{
-			Role:      agent.RoleUser,
-			Content:   promptContent(text, images),
-			Timestamp: time.Now().UnixMilli(),
-		},
-	}
+	msg := m.queuedUserMessage(text, images)
 	m.agent.Steer(msg)
 	m.updatePendingMessagesDisplay()
 }
@@ -741,13 +826,7 @@ func (m *InteractiveMode) steerMessageWithImages(text string, images []ai.ImageC
 // run has no more tool calls or steering messages (upstream _queueFollowUp). Like Pi's handleFollowUp (interactive-mode.ts:4493-4498) it
 // shows the message in the pending area only, with no status line.
 func (m *InteractiveMode) followUpMessageWithImages(text string, images []ai.ImageContent) {
-	msg := agent.AgentMessage{
-		User: &agent.UserMessage{
-			Role:      agent.RoleUser,
-			Content:   promptContent(text, images),
-			Timestamp: time.Now().UnixMilli(),
-		},
-	}
+	msg := m.queuedUserMessage(text, images)
 	m.agent.FollowUp(msg)
 	m.updatePendingMessagesDisplay()
 }
@@ -756,10 +835,24 @@ func (m *InteractiveMode) followUpMessageWithImages(text string, images []ai.Ima
 // container with one line per queued steering/follow-up message and a
 // dequeue hint. Mirrors upstream interactive-mode.ts:3730-3746.
 func (m *InteractiveMode) updatePendingMessagesDisplay() {
+	if m.rebuildPendingMessages() {
+		m.tuiInst.Render()
+	}
+}
+
+// rebuildPendingMessages refreshes the pending-message rows without painting and reports whether it did. A caller that
+// paints right after (the end of a turn) uses it so the frame is drawn once.
+func (m *InteractiveMode) rebuildPendingMessages() bool {
 	if m.pendingMessagesContainer == nil || m.agent == nil {
-		return
+		return false
 	}
 	m.pendingMessagesContainer.Clear()
+	// User bash output shown while the agent works in this area until the run settles.
+	m.pendingBashBlocksMu.Lock()
+	for _, block := range m.pendingBashBlocks {
+		m.pendingMessagesContainer.Add(block)
+	}
+	m.pendingBashBlocksMu.Unlock()
 	steering, followUps := m.agent.PendingMessages()
 
 	// Merge messages typed during an in-flight /compact so the display and
@@ -769,8 +862,7 @@ func (m *InteractiveMode) updatePendingMessagesDisplay() {
 	if len(steeringTexts) == 0 && len(followUpTexts) == 0 {
 		// pig divergence (D228): the copy tip describes a queued message, so it goes with the queue.
 		m.clearQueueCopyTip()
-		m.tuiInst.Render()
-		return
+		return true
 	}
 	theme := tui.ActiveTheme()
 	m.pendingMessagesContainer.Add(tui.NewSpacer(1))
@@ -785,7 +877,7 @@ func (m *InteractiveMode) updatePendingMessagesDisplay() {
 	// upstream: interactive-mode.ts:4736 getAppKeyDisplay is keyDisplayText: every key bound to the action, capitalized and joined by "/".
 	// pig divergence (D228): in Terminal.app with an empty editor the row names Up, the key that dequeues there.
 	m.pendingMessagesContainer.Add(queueHintLine{m})
-	m.tuiInst.Render()
+	return true
 }
 
 // extractAgentMessageText is getUserMessageText (interactive-mode.ts): the text blocks of a user message joined with "".

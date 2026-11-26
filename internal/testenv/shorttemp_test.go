@@ -1,6 +1,13 @@
 package testenv
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -49,5 +56,135 @@ func TestShortTempBaseAtTheEdgeOfTheBound(t *testing.T) {
 		if got := shortTempBase("windows", temp, localAppData, "pe"); strings.ReplaceAll(got, "/", `\`) != want {
 			t.Errorf("a ShortTempDir of %d bytes: shortTempBase = %q, want %q", test.dirBytes, got, want)
 		}
+	}
+}
+
+// A package whose TestMain makes its root with MkdirShortTemp has a fixture depth that does not follow TMPDIR: the root is directly in /tmp.
+func TestMkdirShortTempIgnoresTMPDIR(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows keeps the host temp directory")
+	}
+	t.Setenv("PIG_TEST_TEMP_ROOT", "")
+	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "a", "b", "c", "d"))
+	root, err := MkdirShortTemp("pig-depth-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	if filepath.Dir(root) != "/tmp" || !strings.HasPrefix(filepath.Base(root), "pig-depth-") {
+		t.Errorf("MkdirShortTemp = %q, want a directory named pig-depth-* directly in /tmp", root)
+	}
+}
+
+// Setting PIG_TEST_TEMP_ROOT moves MkdirShortTemp (and ShortTempDir) under that directory without resolving symbolic links in it, so a gate job on Linux can exercise the macOS /tmp -> /private/tmp path shape. Unset keeps /tmp.
+func TestMkdirShortTempRespectsTempRootSwitch(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PIG_TEST_TEMP_ROOT overrides the non-Windows /tmp base")
+	}
+	realDir := filepath.Join(t.TempDir(), "real")
+	if err := os.Mkdir(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(t.TempDir(), "link")
+	RequireSymlink(t, realDir, linkDir)
+
+	t.Setenv("PIG_TEST_TEMP_ROOT", linkDir)
+	got, err := MkdirShortTemp("pig-link-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(got) })
+	if filepath.Dir(got) != linkDir || !strings.HasPrefix(filepath.Base(got), "pig-link-") {
+		t.Errorf("MkdirShortTemp with PIG_TEST_TEMP_ROOT=%q = %q, want a directory named pig-link-* directly in %q (unresolved)", linkDir, got, linkDir)
+	}
+	short := ShortTempDir(t, "pig-short-")
+	if filepath.Dir(short) != linkDir || !strings.HasPrefix(filepath.Base(short), "pig-short-") {
+		t.Errorf("ShortTempDir with PIG_TEST_TEMP_ROOT=%q = %q, want a directory named pig-short-* directly in %q (unresolved)", linkDir, short, linkDir)
+	}
+
+	t.Setenv("PIG_TEST_TEMP_ROOT", "")
+	unset, err := MkdirShortTemp("pig-unset-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(unset) })
+	if filepath.Dir(unset) != "/tmp" || !strings.HasPrefix(filepath.Base(unset), "pig-unset-") {
+		t.Errorf("MkdirShortTemp with unset PIG_TEST_TEMP_ROOT = %q, want a directory named pig-unset-* directly in /tmp", unset)
+	}
+}
+
+// Every Windows-built caller of ShortTempDir or MkdirShortTemp must use a prefix short enough that the fallback directory on GitHub's Windows runner
+// (C:\Users\runneradmin\AppData\Local\pig\s\<prefix><10 digits>) stays within maxShortTempDirBytes (70). Checking literal prefixes on Linux catches
+// overlong prefixes before they reach a Windows runner.
+func TestWindowsShortTempPrefixesFitRunnerBudget(t *testing.T) {
+	const runnerFallbackDir = `C:\Users\runneradmin\AppData\Local\pig\s`
+	const uint32Digits = 10
+	maxPrefix := maxShortTempDirBytes - len(runnerFallbackDir) - 1 - uint32Digits
+	root, files := windowsTestFiles(t)
+	fset := token.NewFileSet()
+	checked := 0
+	for _, path := range files {
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		rel, _ := filepath.Rel(root, path)
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			var fn string
+			switch fun := call.Fun.(type) {
+			case *ast.SelectorExpr:
+				fn = fun.Sel.Name
+			case *ast.Ident:
+				fn = fun.Name
+			}
+			var argIdx int
+			switch fn {
+			case "ShortTempDir":
+				argIdx = 1
+			case "MkdirShortTemp":
+				argIdx = 0
+			default:
+				return true
+			}
+			if len(call.Args) <= argIdx {
+				return true
+			}
+			lit, ok := call.Args[argIdx].(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			prefix, err := strconv.Unquote(lit.Value)
+			if err != nil {
+				return true
+			}
+			checked++
+			if len(prefix) > maxPrefix {
+				pos := fset.Position(call.Pos())
+				dirLen := len(runnerFallbackDir) + 1 + len(prefix) + uint32Digits
+				t.Errorf("%s:%d: %s prefix %q (%d bytes) makes a %d-byte directory under %s, over maxShortTempDirBytes (%d; max prefix %d bytes)",
+					filepath.ToSlash(rel), pos.Line, fn, prefix, len(prefix), dirLen, runnerFallbackDir, maxShortTempDirBytes, maxPrefix)
+			}
+			return true
+		})
+	}
+	if checked < 10 {
+		t.Fatalf("checked only %d ShortTempDir/MkdirShortTemp callers; expected at least 10", checked)
+	}
+}
+
+func TestEvalSymlinksResolvesDirectoryLink(t *testing.T) {
+	base := EvalSymlinks(t, t.TempDir())
+	target := filepath.Join(base, "real")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	RequireDirectoryLink(t, target, link)
+	if got := EvalSymlinks(t, link); got != target {
+		t.Fatalf("EvalSymlinks(%q) = %q, want %q", link, got, target)
 	}
 }

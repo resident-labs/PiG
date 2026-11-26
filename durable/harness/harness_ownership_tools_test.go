@@ -24,8 +24,8 @@ import (
 // ownTool builds an executable tool with an object schema.
 func ownTool(name, description string, parameters map[string]any, execute func(ctx context.Context, args any, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error), edit ...func(*durable.ToolRegistration)) *durable.ToolRegistration {
 	tool := DefineTool(durable.ToolRegistration{
-		ToolSchema: ai.ToolSchema{Name: name, Description: description, Parameters: parameters},
-		Execute:    execute,
+		Name: name, Description: description, Parameters: parameters,
+		Execute: execute,
 	})
 	for _, apply := range edit {
 		apply(tool)
@@ -403,6 +403,7 @@ func TestOwnedConversationsFromTools(t *testing.T) {
 	t.Run("aborts a subagent run with its parent's conversation, rejecting the waiting tool", func(t *testing.T) {
 		setup := chatSetup(t)
 		child := &syncValue[durable.ConversationId]{}
+		childSubmission := &syncValue[durable.SubmissionId]{}
 		toolWait := make(chan string, 1)
 		addTool(t, setup.Registry, ownTool("delegate", "Delegates", emptyObjectSchema(), func(ctx context.Context, _ any, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			created, err := ownCreateChild(ctx, api)
@@ -418,6 +419,7 @@ func TestOwnedConversationsFromTools(t *testing.T) {
 			if err != nil {
 				return durable.ToolExecutionResult{}, err
 			}
+			childSubmission.put(submitted.Id())
 			settled, err := submitted.Wait(ctx)
 			if err != nil {
 				toolWait <- err.Error()
@@ -432,6 +434,15 @@ func TestOwnedConversationsFromTools(t *testing.T) {
 		if err := childRun.reached.wait(testContext); err != nil {
 			t.Fatal(err)
 		}
+		// The abort rejects the tool's wait. The tool goes on to wait on its own goroutine, where upstream's continues before the
+		// child's run makes progress, so abort once the wait is registered.
+		waitFor(t, func() bool {
+			id, ok := childSubmission.get()
+			waiters := &harness.(*harnessImpl).submissions.waiters
+			waiters.mu.Lock()
+			defer waiters.mu.Unlock()
+			return ok && len(waiters.sets[id]) > 0
+		})
 		if err := root.Abort(testContext, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -656,8 +667,8 @@ func TestOwnedConversationsFromTools(t *testing.T) {
 			Child *durable.ConversationId `json:"child,omitempty"`
 		}
 		children := durable.DefineDoc(durable.DocDefinition[childrenState]{
-			CommonDocDefinition: durable.CommonDocDefinition[childrenState]{Kind: "test.children", Version: 1, Initial: func() childrenState { return childrenState{} }, CheckpointWhen: func(childrenState, []durable.Op, durable.CheckpointInfo) bool { return false }},
-			DocumentSemantics:   durable.DocumentSemantics{Scope: durable.ScopeConversation, History: durable.HistoryLatest, Fork: durable.ForkInitial},
+			Kind: "test.children", Version: 1, Initial: func() childrenState { return childrenState{} }, CheckpointWhen: func(childrenState, []durable.Op, durable.CheckpointInfo) bool { return false },
+			Scope: durable.ScopeConversation, History: durable.HistoryLatest, Fork: durable.ForkInitial,
 		})
 		type supervisorInput struct {
 			Parent durable.ConversationId `json:"parent"`

@@ -21,7 +21,7 @@ pig [options] [prompt]
 | `pig --models <patterns>` | Scope Ctrl+P model cycling to comma-separated model patterns. It is not an allow list. Without `--model`, a new session starts on the saved default model when the scope includes it, and otherwise on the first matching model. |
 | `pig --session-id <id>` | Use an exact session ID; may be combined with `--no-session` for provider cache affinity without disk persistence. |
 | `pig --mode rpc` | Start the JSONL RPC command loop on stdin/stdout. |
-| `pig --version` | Print the composite version `<PiG version>+<pinned Pi version>`. Pi prints only its own version (D63). |
+| `pig --version` | Print the pinned Pi version, exactly as `pi --version` does. `pig version` prints the PiG release and the Pi version in separate fields. |
 | `pig version` | Detailed pig/pi/Go/platform/build banner. |
 | `pig diagnose` | Print resolved config + binary identity. |
 
@@ -88,6 +88,8 @@ These options apply to `pig [options] [prompt]`. Run `pig --help` for the full l
 | `--fork <path\|id>` | Fork a session file or partial UUID into a new session. |
 | `--session-dir <dir>` | Directory for session storage and lookup. |
 | `--no-session` | Do not save the session. |
+| `--listen <path>` | Serve one RPC session per connection on the Unix socket at path; requires `--mode rpc` (D232). Every session has its own extension processes, so no extension process, and none of its module-level state, is shared between sessions (extensions compiled into the host program run in the server process; see the RPC page). |
+| `--listen-share-extensions` | With `--listen`, let the sessions share extension processes (D232). Warning: module-level state (Node module variables, `process.env`, `globalThis`; Go, Rust, Python and Lisp package variables) is then shared between sessions. |
 | `--name`, `-n <name>` | Set the session display name. |
 | `--no-mcp` | Turn off the built-in MCP support for this run: no servers connect, and there are no MCP tools or `/mcp`. It does not affect an extension that replaces the built-in MCP support. |
 | `--no-stdin` | Ignore piped stdin. Use it when the process that starts PiG leaves the stdin pipe open and never closes it. Without it, PiG waits for end of input, as Pi does. |
@@ -136,6 +138,8 @@ Without these options, PiG enables `read`, `bash`, `edit`, and `write`, unless t
 | `grep` | Search file contents | no |
 | `find` | Find paths by glob pattern | no |
 | `ls` | List directory contents | no |
+
+A command that the `bash` tool runs writes to a pipe. Pi gives the command a socket pair. On Linux a command that opens `/dev/stdout` or `/dev/stderr` again, such as `echo x > /dev/stdout` or `tee /dev/stderr`, works under PiG and fails under Pi with `No such device or address` (D631).
 
 <a id="mcp-tools"></a>
 

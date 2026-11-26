@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"math"
@@ -11,10 +12,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
-	sdkjson "github.com/MichaelKinsy/PiG/extensions/sdk/json"
+	"github.com/MichaelKinsy/PiG/internal/jsonopts"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 )
 
 // schemaObjectOrder retains object-key enumeration across Go map normalization. JSON Schema's required array is emitted in properties enumeration order by Pi.
@@ -25,18 +26,17 @@ func schemaPath(path, key string) string {
 }
 
 func readSchemaObjectOrder(data []byte) (schemaObjectOrder, error) {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
+	decoder := jsontext.NewDecoder(bytes.NewReader(data), jsonopts.Parse)
 	order := make(schemaObjectOrder)
 	// read decodes the value at segment below parent (the root has no segment). Only a container needs its path, so a scalar allocates none.
 	var read func(parent, segment string, nested bool) error
 	read = func(parent, segment string, nested bool) error {
-		token, err := decoder.Token()
+		token, err := decoder.ReadToken()
 		if err != nil {
 			return err
 		}
-		delimiter, ok := token.(json.Delim)
-		if !ok {
+		delimiter := token.Kind()
+		if delimiter != '{' && delimiter != '[' && delimiter != '}' && delimiter != ']' {
 			return nil
 		}
 		path := parent
@@ -47,25 +47,13 @@ func readSchemaObjectOrder(data []byte) (schemaObjectOrder, error) {
 		case '{':
 			var keys []string
 			var seen map[string]bool // built only for an object with many keys; a few keys are searched in keys
-			for decoder.More() {
-				before := decoder.InputOffset()
-				name, err := decoder.Token()
-				if err != nil {
-					return err
-				}
-				key, ok := name.(string)
-				if !ok {
+			for decoder.PeekKind() != '}' {
+				if decoder.PeekKind() != '"' {
 					return fmt.Errorf("schema object key is not a string")
 				}
-				if strings.ContainsRune(key, utf8.RuneError) {
-					// encoding/json turns an escaped lone surrogate into U+FFFD, but the decoded object keeps it as JSON.parse does, so the order must name the same key.
-					literal := data[before:decoder.InputOffset()]
-					if quote := bytes.IndexByte(literal, '"'); quote >= 0 {
-						var faithful string
-						if sdkjson.Unmarshal(literal[quote:], &faithful) == nil {
-							key = faithful
-						}
-					}
+				key, err := jsonopts.ReadName(decoder) // the JavaScript key, as the decoded object keeps it: "\ud800" and "\ud801" stay two keys
+				if err != nil {
+					return err
 				}
 				repeated := false
 				if seen != nil {
@@ -97,15 +85,15 @@ func readSchemaObjectOrder(data []byte) (schemaObjectOrder, error) {
 				delete(order, path)
 			}
 		case '[':
-			for i := 0; decoder.More(); i++ {
+			for i := 0; decoder.PeekKind() != ']'; i++ {
 				if err = read(path, strconv.Itoa(i), true); err != nil {
 					return err
 				}
 			}
 		default:
-			return fmt.Errorf("unexpected schema delimiter %q", delimiter)
+			return fmt.Errorf("unexpected schema delimiter %q", rune(delimiter))
 		}
-		_, err = decoder.Token()
+		_, err = decoder.ReadToken()
 		return err
 	}
 	if err := read("", "", false); err != nil {
@@ -210,7 +198,7 @@ func javascriptObjectKeyOrder(keys []string) []string {
 		}
 		names = append(names, key)
 	}
-	slices.SortFunc(indices, func(a, b indexKey) int { return cmp.Compare(a.index, b.index) })
+	sortx.Func(indices, func(a, b indexKey) int { return cmp.Compare(a.index, b.index) })
 	result := make([]string, 0, len(keys))
 	for _, key := range indices {
 		result = append(result, key.key)
@@ -366,7 +354,9 @@ func isSchemaContainer(value any) bool {
 	return false
 }
 
-// UnmarshalJSON keeps schema key order as well as its validated data values.
+// UnmarshalJSON keeps schema key order as well as its validated data values. JSON.parse keeps a lone UTF-16 surrogate in a name, a description
+// and a schema's keys and text, and Pi sends a tool as it was parsed (anthropic-messages.ts:1925-1936 convertTools sanitizes nothing);
+// encoding/json reads one as U+FFFD, so a declaration that holds the escape of a surrogate is read by the decoder that keeps the unit.
 func (tool *ToolSchema) UnmarshalJSON(data []byte) error {
 	type wire ToolSchema
 	var decoded wire
@@ -375,7 +365,7 @@ func (tool *ToolSchema) UnmarshalJSON(data []byte) error {
 		ConstrainedSampling json.RawMessage `json:"constrainedSampling"`
 	}
 	envelope.wire = &decoded
-	if err := json.Unmarshal(data, &envelope); err != nil {
+	if err := jsstring.UnmarshalKeepingSurrogates(data, &envelope); err != nil {
 		return err
 	}
 	if value := envelope.ConstrainedSampling; len(value) > 0 {
@@ -401,11 +391,13 @@ func (tool *ToolSchema) UnmarshalJSON(data []byte) error {
 }
 
 // MarshalJSON preserves imported parameter ordering when tool definitions cross a session or SDK boundary.
+// A lone UTF-16 surrogate in the name or the description is written as its escape, as JSON.stringify writes the tool into a session line and
+// an RPC line (session-manager.ts:1188, rpc/jsonl.ts:11); encoding/json alone writes U+FFFD for each of its bytes.
 func (tool ToolSchema) MarshalJSON() ([]byte, error) {
 	var sampling json.RawMessage
 	switch {
 	case tool.ConstrainedSampling != nil:
-		encoded, err := json.Marshal(tool.ConstrainedSampling)
+		encoded, err := jsstring.MarshalKeepingSurrogates(tool.ConstrainedSampling)
 		if err != nil {
 			return nil, err
 		}
@@ -414,7 +406,7 @@ func (tool ToolSchema) MarshalJSON() ([]byte, error) {
 		sampling = json.RawMessage("false")
 	}
 	if tool.parameterOrder == nil {
-		return json.Marshal(struct {
+		return jsstring.MarshalKeepingSurrogates(struct {
 			Name                string          `json:"name"`
 			Description         string          `json:"description"`
 			Parameters          map[string]any  `json:"parameters"`
@@ -426,7 +418,7 @@ func (tool ToolSchema) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(struct {
+	return jsstring.MarshalKeepingSurrogates(struct {
 		Name                string          `json:"name"`
 		Description         string          `json:"description"`
 		Parameters          json.RawMessage `json:"parameters"`
@@ -445,7 +437,7 @@ func (tool ToolSchema) ParametersJSON() ([]byte, error) {
 func marshalToolParameters(parameters map[string]any, order schemaObjectOrder) ([]byte, error) {
 	if order == nil {
 		//portlint:allow mapkeyorder no recorded order: a Go-authored map has no insertion order for JSON.stringify to keep, so its members are sorted (doc above)
-		return json.Marshal(parameters)
+		return jsstring.MarshalKeepingSurrogates(parameters)
 	}
 	var pathStorage [16]schemaContainer
 	encoded, err := appendSchemaWithOrder(nil, parameters, order, "", &schemaWalk{path: pathStorage[:0]})

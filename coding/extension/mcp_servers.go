@@ -3,6 +3,7 @@ package extension
 import (
 	"encoding/json"
 	"fmt"
+	"iter"
 	"regexp"
 	"slices"
 	"strings"
@@ -10,11 +11,11 @@ import (
 
 	"github.com/MichaelKinsy/PiG/internal/changeobservers"
 	"github.com/MichaelKinsy/PiG/internal/configvalue"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
+	"github.com/MichaelKinsy/PiG/internal/mcpshared"
 	"github.com/MichaelKinsy/PiG/internal/nodeurl"
-
 	"github.com/MichaelKinsy/PiG/internal/orderedjson"
-	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
 
 // Ports packages/coding-agent/src/core/mcp-servers.ts.
@@ -76,7 +77,7 @@ type McpOAuthConfig struct {
 	// for servers that only accept known clients. Default: the app name.
 	ClientName string `json:"clientName,omitempty"`
 	// ClientRegistration is how pi identifies itself without ClientID. `auto`
-	// (default): pi's Client ID Metadata Document on pi.dev when the
+	// (default): pi's Client ID Metadata Document on pi-in-go.dev when the
 	// authorization server supports it for public clients, otherwise dynamic
 	// client registration; with ClientName or a CallbackURL other than
 	// `/callback` on localhost or 127.0.0.1, always dynamic client
@@ -194,6 +195,18 @@ func (s *OrderedStrings) Get(key string) (string, bool) {
 	return v, true
 }
 
+// All yields the entries in key order, as `Object.entries` of the JavaScript object lists them.
+func (s *OrderedStrings) All() iter.Seq2[string, string] {
+	return func(yield func(string, string) bool) {
+		for _, key := range s.Keys() {
+			value, _ := s.Get(key)
+			if !yield(key, value) {
+				return
+			}
+		}
+	}
+}
+
 // MarshalJSON writes the keys in order.
 func (s OrderedStrings) MarshalJSON() ([]byte, error) { return s.o.MarshalJSON() }
 
@@ -265,23 +278,6 @@ func (e *OrderedExposures) UnmarshalJSON(data []byte) error {
 
 var loopbackHosts = []string{"localhost", "127.0.0.1", "[::1]"}
 
-// IsLoopbackRedirectURI reports whether a redirect URI can be served by the
-// loopback callback server: an `http` URI on `localhost`, `127.0.0.1`, or
-// `[::1]` without query or fragment. The URI is parsed as `new URL(value)` does.
-func IsLoopbackRedirectURI(value string) bool {
-	u, err := nodeurl.ParseHTTPURL(value)
-	return err == nil && u.Protocol == "http:" && slices.Contains(loopbackHosts, u.Hostname) && u.Search == "" && u.Hash == ""
-}
-
-// McpNamespace is the namespace of a server's tools: `mcp__<server>` with `-` replaced by `_`, like the tool names.
-//
-// Ports packages/coding-agent/src/core/mcp-servers.ts (mcpNamespace).
-func McpNamespace(server string) string {
-	return "mcp__" + strings.ReplaceAll(server, "-", "_")
-}
-
-var mcpServerName = lazyregexp.New(`^[A-Za-z0-9_-]+$`)
-
 // resolveExposureAliases returns the entry with the exposure aliases of `exposure` and `toolExposure` replaced by their current names, every member in its original place (resolveExposureAliases: `{ ...value }` and an in-place assignment keep the member order).
 //
 // upstream: mcp-servers.ts:151-166 (resolveExposureAliases)
@@ -344,16 +340,25 @@ func isExposure(value string) bool {
 // toolPatternRegExp is upstream's `new RegExp("^" + parts.join(".*") + "$")`.
 // A JavaScript `.` matches anything but a line terminator.
 func toolPatternRegExp(pattern string) *regexp.Regexp {
+	return toolPatternRegExps.Get(pattern, compileToolPatternRegExp)
+}
+
+// toolPatternRegExps holds the expression of each wildcard pattern of a configuration: GetMcpToolExposure asks for every pattern of a server for
+// every tool it resolves. The patterns come from configuration, so the cache is bounded.
+var toolPatternRegExps = lazyregexp.NewCache[string](256)
+
+func compileToolPatternRegExp(pattern string) *regexp.Regexp {
 	parts := strings.Split(pattern, "*")
 	for i, part := range parts {
 		parts[i] = regexp.QuoteMeta(part)
 	}
-	return regexp.MustCompile("^" + strings.Join(parts, `[^\n\r\x{2028}\x{2029}]*`) + "$")
+	return regexp.MustCompile("^" + strings.Join(parts, `[^\n\r\x{2028}\x{2029}]*`) + "$") //perf:ok compiled once per pattern: toolPatternRegExps caches it
 }
 
 // GetMcpToolExposure is the exposure of one tool of a server: its
 // `toolExposure` entry, else the server's `exposure`.
 func GetMcpToolExposure(config McpServerConfig, toolName string) McpExposure {
+	// pig divergence (D645): the overrides hold own entries only, so a tool named like an Object.prototype member (constructor, toString, __proto__) gets the server's exposure; Pi's `overrides[toolName]` on a plain object returns the inherited function or object as the exposure.
 	if exact, ok := config.ToolExposure.Get(toolName); ok {
 		return exact
 	}
@@ -369,86 +374,6 @@ func GetMcpToolExposure(config McpServerConfig, toolName string) McpExposure {
 	return McpExposureCodemode
 }
 
-func validateOAuth(fields map[string]json.RawMessage, name string) string {
-	raw, ok := fields["oauth"]
-	if !ok {
-		return ""
-	}
-	oauth, isObject := objectMap(raw)
-	if !isObject {
-		return "oauth must be an object"
-	}
-	if v, ok := oauth["clientId"]; ok && !isString(v) {
-		return "oauth.clientId must be a string"
-	}
-	if v, ok := oauth["clientSecret"]; ok && !isString(v) {
-		return "oauth.clientSecret must be a string"
-	}
-	port, hasPort := 0, false
-	if v, ok := oauth["callbackPort"]; ok {
-		var n float64
-		if err := json.Unmarshal(v, &n); err != nil || len(v) == 0 || v[0] == '"' || n != float64(int(n)) || n < 1 || n > 65535 {
-			return "oauth.callbackPort must be a port number"
-		}
-		port, hasPort = int(n), true
-	}
-	if v, ok := oauth["callbackUrl"]; ok {
-		var s string
-		if !isString(v) || json.Unmarshal(v, &s) != nil || !IsLoopbackRedirectURI(s) {
-			return "oauth.callbackUrl must be an http URI on localhost, 127.0.0.1, or [::1] without query or fragment"
-		}
-		u, _ := nodeurl.ParseHTTPURL(s)
-		if urlPort := u.Port; urlPort != "" && hasPort {
-			var p int
-			_, _ = fmt.Sscanf(urlPort, "%d", &p)
-			if p != port {
-				return "oauth.callbackUrl and oauth.callbackPort name different ports"
-			}
-		}
-	}
-	if v, ok := oauth["scope"]; ok && !isString(v) {
-		return "oauth.scope must be a string"
-	}
-	if v, ok := oauth["clientName"]; ok {
-		var s string
-		// upstream: mcp-servers.ts validateOAuth (`!value.clientName.trim()`, String.prototype.trim's whitespace set).
-		if !isString(v) || json.Unmarshal(v, &s) != nil || widthx.JSTrim(s) == "" {
-			return "oauth.clientName must be a non-empty string"
-		}
-	}
-	// upstream: mcp-servers.ts validateOAuth (clientRegistration, 1.0.1 #10302).
-	if v, ok := oauth["clientRegistration"]; ok && string(v) != `"auto"` && string(v) != `"dcr"` {
-		if string(v) != `"cimd"` {
-			return `oauth.clientRegistration must be "auto", "dcr", or "cimd"`
-		}
-		_, hasClientID := oauth["clientId"]
-		_, hasClientName := oauth["clientName"]
-		if hasClientID || hasClientName {
-			return `oauth.clientRegistration "cimd" cannot be combined with oauth.clientId or oauth.clientName`
-		}
-		var callback string
-		if raw, ok := oauth["callbackUrl"]; ok {
-			var s string
-			if isString(raw) && json.Unmarshal(raw, &s) == nil {
-				callback = s
-			}
-		}
-		if !IsClientMetadataDocumentCallback(callback) {
-			return `oauth.clientRegistration "cimd" requires oauth.callbackUrl on localhost or 127.0.0.1 with path /callback`
-		}
-	}
-	if v, ok := oauth["authServerMetadataUrl"]; ok {
-		var s string
-		valid := isString(v) && json.Unmarshal(v, &s) == nil
-		u, err := nodeurl.ParseHTTPURL(s)
-		secure := u.Protocol == "https:" || (u.Protocol == "http:" && slices.Contains(loopbackHosts, u.Hostname))
-		if !valid || err != nil || !secure {
-			return "oauth.authServerMetadataUrl must be an https URL, or http on localhost, 127.0.0.1, or [::1]"
-		}
-	}
-	return ""
-}
-
 func objectMap(raw json.RawMessage) (map[string]json.RawMessage, bool) {
 	if len(raw) == 0 || raw[0] != '{' {
 		return nil, false
@@ -462,19 +387,6 @@ func objectMap(raw json.RawMessage) (map[string]json.RawMessage, bool) {
 
 func isString(raw json.RawMessage) bool { return len(raw) > 0 && raw[0] == '"' }
 
-func isStringRecord(raw json.RawMessage) bool {
-	m, ok := objectMap(raw)
-	if !ok {
-		return false
-	}
-	for _, v := range m {
-		if !isString(v) {
-			return false
-		}
-	}
-	return true
-}
-
 func stringField(fields map[string]json.RawMessage, key string) (string, bool) {
 	raw, ok := fields[key]
 	if !ok || !isString(raw) {
@@ -485,110 +397,88 @@ func stringField(fields map[string]json.RawMessage, key string) (string, bool) {
 	return s, true
 }
 
-// ValidateMcpServerConfig validates one entry of the `mcpServers` shape. It
-// returns the config, or the message upstream's validation returns as a string.
-func ValidateMcpServerConfig(name string, value json.RawMessage) (McpServerConfig, string) {
-	if !mcpServerName.MatchString(name) {
-		return McpServerConfig{}, fmt.Sprintf(`invalid server name "%s" (use letters, digits, "_" and "-")`, name)
-	}
-	fields, ok := objectMap(value)
-	if !ok {
-		return McpServerConfig{}, fmt.Sprintf(`server "%s" must be an object`, name)
-	}
-	value, fields = resolveExposureAliases(value, fields)
+// checkExposures checks `exposure` and `toolExposure`, after aliases were resolved. It returns an error message, or "".
+//
+// Ports packages/coding-agent/src/core/mcp-servers.ts checkExposures.
+func checkExposures(fields map[string]json.RawMessage) string {
 	quoted := make([]string, len(mcpExposures))
 	for i, e := range mcpExposures {
 		quoted[i] = `"` + string(e) + `"`
 	}
 	exposures := strings.Join(quoted, ", ")
-	if raw, ok := fields["exposure"]; ok {
+	if _, ok := fields["exposure"]; ok {
 		if s, isStr := stringField(fields, "exposure"); !isStr || !isExposure(s) {
-			_ = raw
-			return McpServerConfig{}, fmt.Sprintf(`server "%s": exposure must be one of %s`, name, exposures)
+			return fmt.Sprintf(`exposure must be one of %s`, exposures)
 		}
 	}
 	if raw, ok := fields["toolExposure"]; ok {
 		overrides, isObject := objectMap(raw)
 		if !isObject {
-			return McpServerConfig{}, fmt.Sprintf(`server "%s": toolExposure must map tool names to exposures`, name)
+			return "toolExposure must map tool names to exposures"
 		}
 		parsed, _ := orderedjson.Parse(raw)
 		for _, tool := range parsed.Keys() {
 			v := overrides[tool]
 			var s string
 			if !isString(v) || json.Unmarshal(v, &s) != nil || !isExposure(s) {
-				return McpServerConfig{}, fmt.Sprintf(`server "%s": toolExposure "%s" must be one of %s`, name, tool, exposures)
+				return `toolExposure "` + tool + `" must be one of ` + exposures
 			}
 		}
 	}
-	if raw, ok := fields["enabled"]; ok && string(raw) != "true" && string(raw) != "false" {
-		return McpServerConfig{}, fmt.Sprintf(`server "%s": enabled must be a boolean`, name)
-	}
-	if raw, ok := fields["description"]; ok && !isString(raw) {
-		return McpServerConfig{}, fmt.Sprintf(`server "%s": description must be a string`, name)
-	}
-	if raw, ok := fields["timeout"]; ok {
-		var n float64
-		if len(raw) == 0 || raw[0] == '"' || json.Unmarshal(raw, &n) != nil || !(n > 0) {
-			return McpServerConfig{}, fmt.Sprintf(`server "%s": timeout must be a positive number of seconds`, name)
-		}
-	}
-	// upstream: mcp-servers.ts validateMcpServerConfig (`type === undefined || type === "http"`): a `type` that is present but not a string names no transport.
-	typ, typeIsString := stringField(fields, "type")
-	_, typePresent := fields["type"]
-	typeIs := func(names ...string) bool {
-		return !typePresent || (typeIsString && slices.Contains(names, typ))
-	}
-	if typ == "sse" {
-		return McpServerConfig{}, fmt.Sprintf(`server "%s": legacy SSE transport is not supported; use the streamable HTTP URL`, name)
-	}
+	return ""
+}
 
-	rawURL, hasURL := stringField(fields, "url")
-	if hasURL && typeIs("http", "streamable-http") {
-		// upstream: mcp-servers.ts validateMcpServerConfig (`URL.canParse(value.url) && /^https?:$/.test(new URL(value.url).protocol)`).
+// checkAuth checks `auth` of an HTTP server, which sends a provider's credential to `url`. It returns an error message, or "".
+//
+// Ports packages/coding-agent/src/core/mcp-servers.ts checkAuth.
+func checkAuth(fields map[string]json.RawMessage, url nodeurl.HTTPURL) string {
+	raw, ok := fields["auth"]
+	if !ok {
+		return ""
+	}
+	auth, isObject := objectMap(raw)
+	provider, hasProvider := stringField(auth, "provider")
+	if !isObject || !hasProvider || provider == "" {
+		return "auth.provider must be a provider name"
+	}
+	if url.Protocol != "https:" && !slices.Contains(loopbackHosts, url.Hostname) {
+		return "auth requires an https URL, or http on localhost, 127.0.0.1, or [::1]"
+	}
+	return ""
+}
+
+// ValidateMcpServerConfig validates one entry of the `mcpServers` shape: pi-mcp's shared fields and pi's own. It returns the config with exposure
+// aliases resolved, or the message upstream's validation returns as a string.
+func ValidateMcpServerConfig(name string, value json.RawMessage) (McpServerConfig, string) {
+	if _, ok := objectMap(value); ok {
+		value, _ = resolveExposureAliases(value, mustObjectMap(value))
+	}
+	result := mcpshared.ValidateMcpServerConfig(name, value, mcpshared.McpServerConfigOptions{
+		CheckMetadataDocumentCallback: func(callbackURL *string) string {
+			if callbackURL == nil || IsClientMetadataDocumentCallback(*callbackURL) {
+				return ""
+			}
+			return `oauth.clientRegistration "cimd" requires oauth.callbackUrl on localhost or 127.0.0.1 with path /callback`
+		},
 		// pig divergence (D156): the URL is checked after environment expansion, as headers and env values are resolved (Pi #10654).
-		parsedURL, err := nodeurl.ParseHTTPURL(ExpandMcpURL(rawURL))
-		if err != nil {
-			return McpServerConfig{}, fmt.Sprintf(`server "%s": url must be an http or https URL`, name)
-		}
-		if raw, ok := fields["headers"]; ok && !isStringRecord(raw) {
-			return McpServerConfig{}, fmt.Sprintf(`server "%s": headers must map names to strings`, name)
-		}
-		if message := validateOAuth(fields, name); message != "" {
-			return McpServerConfig{}, fmt.Sprintf(`server "%s": %s`, name, message)
-		}
-		if raw, ok := fields["auth"]; ok {
-			auth, isObject := objectMap(raw)
-			provider, hasProvider := stringField(auth, "provider")
-			if !isObject || !hasProvider || provider == "" {
-				return McpServerConfig{}, fmt.Sprintf(`server "%s": auth.provider must be a provider name`, name)
-			}
-			if parsedURL.Protocol != "https:" && !slices.Contains(loopbackHosts, parsedURL.Hostname) {
-				return McpServerConfig{}, fmt.Sprintf(`server "%s": auth requires an https URL, or http on localhost, 127.0.0.1, or [::1]`, name)
-			}
-		}
-		return decodeMcpServerConfig(value), ""
+		ExpandURL: ExpandMcpURL,
+	})
+	if result.Kind == mcpshared.McpServerConfigInvalid {
+		return McpServerConfig{}, result.Error
 	}
-	if _, hasCommand := stringField(fields, "command"); hasCommand && typeIs("stdio") {
-		if raw, ok := fields["args"]; ok {
-			var args []json.RawMessage
-			valid := len(raw) > 0 && raw[0] == '[' && json.Unmarshal(raw, &args) == nil
-			for _, a := range args {
-				valid = valid && isString(a)
-			}
-			if !valid {
-				return McpServerConfig{}, fmt.Sprintf(`server "%s": args must be an array of strings`, name)
-			}
-		}
-		if raw, ok := fields["env"]; ok && !isStringRecord(raw) {
-			return McpServerConfig{}, fmt.Sprintf(`server "%s": env must map names to strings`, name)
-		}
-		if raw, ok := fields["cwd"]; ok && !isString(raw) {
-			return McpServerConfig{}, fmt.Sprintf(`server "%s": cwd must be a string`, name)
-		}
-		return decodeMcpServerConfig(value), ""
+	message := checkExposures(result.Fields)
+	if message == "" && result.Kind == mcpshared.McpServerConfigHTTP {
+		message = checkAuth(result.Fields, result.URL)
 	}
-	return McpServerConfig{}, fmt.Sprintf(`server "%s" needs either "command" (stdio) or "url" (streamable HTTP)`, name)
+	if message != "" {
+		return McpServerConfig{}, fmt.Sprintf(`server "%s": %s`, name, message)
+	}
+	return decodeMcpServerConfig(result.Config), ""
+}
+
+func mustObjectMap(raw json.RawMessage) map[string]json.RawMessage {
+	fields, _ := objectMap(raw)
+	return fields
 }
 
 // ExpandMcpURL expands the environment references of a server URL the way header and env values are resolved
@@ -632,7 +522,7 @@ func (s RegisteredMcpServer) MarshalJSON() ([]byte, error) {
 	if len(s.Declared) > 0 {
 		config = s.Declared
 	}
-	return json.Marshal(struct {
+	return jsstring.MarshalKeepingSurrogates(struct {
 		Name          string `json:"name"`
 		Config        any    `json:"config"`
 		ExtensionPath string `json:"extensionPath"`

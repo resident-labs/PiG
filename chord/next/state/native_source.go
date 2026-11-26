@@ -4,11 +4,12 @@ import (
 	"context"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/MichaelKinsy/PiG/chord"
 )
 
-// Ports packages/chord/src/next/state/native-source.ts (NativeObserver, NativeObservation, NativeStart, NativeSource,
+// Ports packages/chord/src/state/native-source.ts (NativeObserver, NativeObservation, NativeStart, NativeSource,
 // FollowedSource). Native sources (W4, slice 8 §2): in-process values that change, compared by identity (a writable, a
 // registry's composed value, ref.state). Derives and registry tables depend on them and the batch marks them; the
 // followed ones (writables, registry values) give their watches and observers one call per batch that changed them.
@@ -69,13 +70,14 @@ type NativeSource[T any] struct {
 	hooks NativeHooks[T]
 	// dependents is the derives and registry tables reading this source; each removes itself when it stops.
 	dependents DependentSet
-	// batch is the host's batch; dropped when the source ended, so an ended source keeps no host.
-	batch *Batch
+	// batch is the host's batch; dropped when the source ended, so an ended source keeps no host. A client's goroutine opens a watch while the host ends the
+	// source (a TUI closing as its scope follows), so it is read and dropped atomically.
+	batch atomic.Pointer[Batch]
 }
 
 // Init makes the source of batch, with hooks its embedder; batch nil makes it ended (a released reference's state).
 func (n *NativeSource[T]) Init(batch *Batch, hooks NativeHooks[T]) {
-	n.batch = batch
+	n.batch.Store(batch)
 	n.hooks = hooks
 }
 
@@ -110,7 +112,7 @@ func (n *NativeSource[T]) DeriveValue() (any, error) {
 }
 
 // Batch is the host's batch, nil once the source ended.
-func (n *NativeSource[T]) Batch() *Batch { return n.batch }
+func (n *NativeSource[T]) Batch() *Batch { return n.batch.Load() }
 
 // Changed records a change inside the current batch: every dependent marked. Pi's protected `changed`.
 func (n *NativeSource[T]) Changed() {
@@ -121,7 +123,7 @@ func (n *NativeSource[T]) Changed() {
 
 // End ends the source for good: its dependents dropped, the batch let go. Pi's protected `end`.
 func (n *NativeSource[T]) End() {
-	n.batch = nil
+	n.batch.Store(nil)
 	n.dependents.Clear()
 }
 
@@ -188,12 +190,18 @@ type FollowedSource[T any] struct {
 	shown    shown[T]
 	// listed is set while listed for a frame in the current batch.
 	listed bool
+	// ended is set by End under mu: a follower registering after it (a watch opened on another goroutine as the source ends) would never be ended, so it ends
+	// at once instead.
+	ended bool
 }
 
 // Init makes the source of batch, with impl its embedder; batch nil makes it ended.
 func (f *FollowedSource[T]) Init(batch *Batch, impl FollowedHooks[T]) {
 	f.NativeSource.Init(batch, impl)
 	f.impl = impl
+	f.mu.Lock()
+	f.ended = batch == nil
+	f.mu.Unlock()
 }
 
 // Watched reports whether a watch or an observer follows it.
@@ -213,10 +221,10 @@ func (f *FollowedSource[T]) Watch(ctx context.Context) (chord.NativeWatchHandle[
 	return watch, nil
 }
 
-// OpenWatch is Watch without the Promise. On a failed source it opens at the last good value and its first call is the
+// openWatch is OpenWatch inside a section of the host. On a failed source it opens at the last good value and its first call is the
 // failure; with no value to start at it returns the failure. An ended source gives a watch that has ended.
-func (f *FollowedSource[T]) OpenWatch(ctx context.Context) (*chord.NativeWatch[T], error) {
-	batch := f.batch
+func (f *FollowedSource[T]) openWatch(ctx context.Context) (*chord.NativeWatch[T], error) {
+	batch := f.batch.Load()
 	if batch == nil {
 		value, err := startValue(f.impl.Start())
 		if err != nil {
@@ -236,11 +244,18 @@ func (f *FollowedSource[T]) OpenWatch(ctx context.Context) (*chord.NativeWatch[T
 	}
 	f.follow(start.Kind, start.Value)
 	var watch *chord.NativeWatch[T]
-	watch = chord.NewNativeWatch(value, func() { f.unfollow(watch) }, batch.ReportListener, nil)
+	// A watch ends from the goroutine of its context's listener too: its unfollow runs as a section of the host, with the
+	// other code that touches the source (Pi runs both on one event loop).
+	watch = chord.NewNativeWatch(value, func() { batch.Section(func() { f.unfollow(watch) }) }, batch.ReportListener, nil)
 	if scheduler := batch.deliveries(); scheduler != nil {
 		watch.On(scheduler)
 	}
 	f.mu.Lock()
+	if f.ended {
+		f.mu.Unlock()
+		watch.EndWith(chord.WatchEnd{Kind: chord.WatchEnded})
+		return watch, nil
+	}
 	f.watches = append(f.watches, watch)
 	f.mu.Unlock()
 	if ctx.Done() != nil {
@@ -252,12 +267,12 @@ func (f *FollowedSource[T]) OpenWatch(ctx context.Context) (*chord.NativeWatch[T
 	return watch, nil
 }
 
-// Observe attaches a synchronous observer at the current value (Durable's observeXXX); it counts as following, so a lazy
+// observe is Observe inside a section of the host: the observer is attached at the current value; it counts as following, so a lazy
 // value is computed in the batch that changed it. It returns the failure when there is no value to start at; aborting ctx
 // detaches it (aborted); the source's end detaches it too (ended), its abort listener removed.
-func (f *FollowedSource[T]) Observe(observer NativeObserver[T], ctx context.Context) (NativeObservation[T], error) {
-	if f.batch != nil {
-		if err := f.batch.AssertOutside("observe"); err != nil {
+func (f *FollowedSource[T]) observe(observer NativeObserver[T], ctx context.Context) (NativeObservation[T], error) {
+	if batch := f.batch.Load(); batch != nil {
+		if err := batch.AssertOutside("observe"); err != nil {
 			return NativeObservation[T]{}, err
 		}
 	}
@@ -266,7 +281,7 @@ func (f *FollowedSource[T]) Observe(observer NativeObserver[T], ctx context.Cont
 	if err != nil {
 		return NativeObservation[T]{}, err
 	}
-	if f.batch == nil {
+	if f.batch.Load() == nil {
 		observer.End(chord.WatchEnd{Kind: chord.WatchEnded})
 		return NativeObservation[T]{Value: value, Detach: func() {}}, nil
 	}
@@ -277,6 +292,11 @@ func (f *FollowedSource[T]) Observe(observer NativeObserver[T], ctx context.Cont
 	f.follow(start.Kind, start.Value)
 	entry := &observerEntry[T]{observer: observer}
 	f.mu.Lock()
+	if f.ended {
+		f.mu.Unlock()
+		observer.End(chord.WatchEnd{Kind: chord.WatchEnded})
+		return NativeObservation[T]{Value: value, Detach: func() {}}, nil
+	}
 	f.observers = append(f.observers, entry)
 	f.mu.Unlock()
 	if ctx.Done() != nil {
@@ -298,15 +318,18 @@ func (f *FollowedSource[T]) Observe(observer NativeObserver[T], ctx context.Cont
 	return NativeObservation[T]{Value: value, Detach: func() { f.Unsubscribe(observer) }}, nil
 }
 
-// Subscribe feeds observer every call from now on, inside each batch, also while the source has no value (Chord's own
+// subscribe is Subscribe inside a section of the host: every call from now on, inside each batch, also while the source has no value (Chord's own
 // followers: retryOn). Nothing is delivered for the current value.
-func (f *FollowedSource[T]) Subscribe(observer NativeObserver[T]) {
-	if f.batch == nil {
+func (f *FollowedSource[T]) subscribe(observer NativeObserver[T]) {
+	if f.batch.Load() == nil {
 		return
 	}
 	f.followOrNone()
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.ended {
+		return
+	}
 	for _, entry := range f.observers {
 		if entry.observer == observer {
 			entry.cleanup = nil
@@ -378,7 +401,8 @@ func (f *FollowedSource[T]) Changed() {
 // List lists the source for a frame in the current batch when someone follows it (or Watched says so), its dependents left
 // as they are (marked already). Pi's protected `list`.
 func (f *FollowedSource[T]) List() {
-	if f.batch == nil {
+	batch := f.batch.Load()
+	if batch == nil {
 		return
 	}
 	f.mu.Lock()
@@ -395,7 +419,7 @@ func (f *FollowedSource[T]) List() {
 		f.hasShown, f.shown = true, shown[T]{kind: shownNone}
 	}
 	f.mu.Unlock()
-	f.batch.Changed(f)
+	batch.Changed(f)
 }
 
 // Unfollowed is nothing follows it any more (no watch, no observer): an embedder drops what it kept for followers.
@@ -405,6 +429,7 @@ func (f *FollowedSource[T]) Unfollowed() {}
 func (f *FollowedSource[T]) End() {
 	f.NativeSource.End()
 	f.mu.Lock()
+	f.ended = true
 	f.hasShown, f.shown = false, shown[T]{}
 	watches := f.watches
 	observers := f.observers
@@ -533,4 +558,46 @@ func (f *FollowedSource[T]) settleFollowers() {
 	f.hasShown, f.shown = false, shown[T]{}
 	f.mu.Unlock()
 	f.impl.Unfollowed()
+}
+
+// OpenWatch is Watch without the Promise. On a failed source it opens at the last good value and its first call is the
+// failure; with no value to start at it returns the failure. An ended source gives a watch that has ended.
+//
+// Forced Go difference. Pi reads the source, records what its followers have and registers the watch in one synchronous
+// turn of the one event loop (native-source.ts openWatch). A Go caller outside the host's loop (a native's open, the
+// goroutine of a request) took the read as a section of its own and registered after it: a commit between the two changed
+// a source nobody followed yet, which lists no frame, and the watch stayed at the older value for good. The read and the
+// registration are one section of the host: inline for a caller in one, and on a batch without sections.
+func (f *FollowedSource[T]) OpenWatch(ctx context.Context) (watch *chord.NativeWatch[T], err error) {
+	batch := f.batch.Load()
+	if batch == nil || batch.InSection() {
+		return f.openWatch(ctx)
+	}
+	batch.Section(func() { watch, err = f.openWatch(ctx) })
+	return watch, err
+}
+
+// Observe attaches a synchronous observer at the current value (Durable's observeXXX); it counts as following, so a lazy
+// value is computed in the batch that changed it. It returns the failure when there is no value to start at; aborting ctx
+// detaches it (aborted); the source's end detaches it too (ended), its abort listener removed. As OpenWatch, its read and
+// its registration are one section of the host.
+func (f *FollowedSource[T]) Observe(observer NativeObserver[T], ctx context.Context) (observation NativeObservation[T], err error) {
+	batch := f.batch.Load()
+	if batch == nil || batch.InSection() {
+		return f.observe(observer, ctx)
+	}
+	batch.Section(func() { observation, err = f.observe(observer, ctx) })
+	return observation, err
+}
+
+// Subscribe feeds observer every call from now on, inside each batch, also while the source has no value (Chord's own
+// followers: retryOn). Nothing is delivered for the current value. As OpenWatch, its read and its registration are one
+// section of the host.
+func (f *FollowedSource[T]) Subscribe(observer NativeObserver[T]) {
+	batch := f.batch.Load()
+	if batch == nil || batch.InSection() {
+		f.subscribe(observer)
+		return
+	}
+	batch.Section(func() { f.subscribe(observer) })
 }

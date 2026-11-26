@@ -6,7 +6,7 @@ The outputs below come from PiG run against a scripted test model, with each key
 
 Settings are merged from two files, and a key in the project file wins: `~/.pig/agent/settings.json` (yours) and `<project>/.pig/settings.json` (the project's, read only after you trust the project). Some keys are read from the global file only and are ignored in a project file: `defaultProjectTrust`, `httpProxy`, `cacheWarming`, `extensionsAutoUpgrade`, `extensionsTypescriptRuntime` and `deviceId`.
 
-If the file is not valid JSON, PiG warns at startup (`Invalid settings file …`) and uses defaults for what it cannot read. A value of the wrong JSON type, such as `"skills": 5`, is ignored with one warning that names it, and the other keys apply. Pi 1.5.0 exits with a `TypeError` instead (D158). After an edit, start PiG again (or `/reload`) and look at the first lines of the screen.
+If the file is not valid JSON, PiG warns at startup (`Invalid settings file …`) and uses defaults for what it cannot read. A value of the wrong JSON type, such as `"skills": 5`, is ignored with one warning that names it, and the other keys apply. Pi 1.6.0 exits with a `TypeError` instead (D158). After an edit, start PiG again (or `/reload`) and look at the first lines of the screen.
 
 ## Choose the model, and how hard it thinks
 
@@ -124,7 +124,7 @@ Cache warming sends small extra requests that you pay for ([Settings](/docs/late
  Status: Inactive (cache warming disabled)
 ```
 
-The default shows `Mode: streaming`. The key is global-only.
+The default shows `Mode: idle`. The key is global-only.
 
 ## Trust a project
 
@@ -222,7 +222,7 @@ PiG-only (D80). When you enter an API key in `/login`, PiG shows dots, a charact
 
 ## Every other key
 
-Each row gives a value to try, what it does and the line in Pi 1.5.0's `packages/coding-agent/src/core/settings-schema.ts` that defines it. These were not run on this page. Most are visible in the first screen after you restart, in `/settings`, or in the behaviour named.
+Each row gives a value to try, what it does and the line in Pi 1.6.0's `packages/coding-agent/src/core/settings-schema.ts` that defines it. These were not run on this page. Most are visible in the first screen after you restart, in `/settings`, or in the behaviour named.
 
 | Key | Example | What you see | Pi |
 |---|---|---|---|
@@ -248,6 +248,7 @@ Each row gives a value to try, what it does and the line in Pi 1.5.0's `packages
 | `terminal.imageWidthCells` | `40` | Images are 40 cells wide. | `:81` |
 | `terminal.clearOnShrink` | `true` | The screen is cleared when the content gets shorter. | `:87` |
 | `terminal.showTerminalProgress` | `true` | A progress bar appears in the terminal tab while the agent works. | `:93` |
+| `terminal.framePacing` | `"adaptive"` | PiG-only (D625). In fullscreen mode the frames of a streaming reply begin 10 to 16 ms apart on the terminals listed in [Terminal setup](/docs/latest/terminal-setup#display-problems). Without it, and with `"pi"`, they begin 16 ms apart, as Pi's do, on every terminal. It takes effect only with `terminal.screenWriter` `"writer"`; without that, interactive mode shows a warning at start. Global file only; takes effect at the next start. | none |
 | `terminal.hyperlinks`, `terminal.images`, `terminal.trueColor` | `false`, `"kitty"`, `true` | Overrides detection of links, inline images and 24-bit colour. A setting beats `PI_HYPERLINKS`, `PI_IMAGE_PROTOCOL`, `PI_TRUE_COLOR`. | `:99-103` |
 | `images.autoResize` | `false` | Large images go to the model at full size. | `:107` |
 | `images.blockImages` | `true` | The model receives `Image reading is disabled.` in place of each image (Pi `sdk.ts:312`). Checked for this page: `pig -p "what is this" @a.png` sent the text and no image. | `:113` |
@@ -260,7 +261,7 @@ Each row gives a value to try, what it does and the line in Pi 1.5.0's `packages
 | `codemode` | `{"mode": "only", "inlineBudget": 2000}` | See [Codemode](/docs/latest/codemode). | `:381` |
 | `warnings` | `{"anthropicExtraUsage": false}` | Hides the paid-extra-usage warning. | `:380` |
 | `showCacheMissNotices` | `true` | A notice appears for each prompt-cache miss and refresh. | `:239` |
-| `enableInstallTelemetry` | `false` | No install or update ping is sent (D64). `PI_TELEMETRY=0` does the same. | `:280` |
+| `enableInstallTelemetry` | `false` | No install or update ping is sent (D64). `PIG_TELEMETRY=0` does the same, and so does Pi's `PI_TELEMETRY=0`; `PIG_TELEMETRY` decides when both are set. | `:280` |
 | `enableAnalytics`, `trackingId` | written by the first-time setup | `false` after you choose `Don't share` (see [Your first ten minutes](/docs/latest/first-run)). | `:286,292` |
 | `extensionsAutoUpgrade`, `extensionsTypescriptRuntime` | `true`, `"bun"` | PiG-only (D109, D19). See [TypeScript extension runtimes](/docs/latest/typescript-runtimes). | none |
 

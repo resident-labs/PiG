@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/MichaelKinsy/PiG/internal/jsjson"
+	"github.com/MichaelKinsy/PiG/internal/orderedjson"
 
 	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
@@ -140,16 +141,29 @@ type mistralToolFn struct {
 
 // MarshalJSON writes the parameters with the tool schema's own member order: the SDK copies the parameters record entry by entry.
 func (f mistralToolFn) MarshalJSON() ([]byte, error) {
-	parameters, err := marshalToolParameters(f.Parameters, f.parameterOrder)
+	wire, err := f.wire()
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(struct {
-		Name        string          `json:"name"`
-		Description string          `json:"description"`
-		Parameters  json.RawMessage `json:"parameters"`
-		Strict      bool            `json:"strict"`
-	}{f.Name, f.Description, parameters, f.Strict})
+	// The name and the description are written as JSON.stringify writes them: a lone UTF-16 surrogate as its escape (mistral-conversations.ts
+	// toFunctionTools passes a tool through, and the SDK posts JSON.stringify of the request).
+	return jsstring.MarshalKeepingSurrogates(wire)
+}
+
+// mistralToolFnWire is a function tool as it is written: the parameters are already encoded, in the schema's own member order.
+type mistralToolFnWire struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
+	Strict      bool            `json:"strict"`
+}
+
+func (f mistralToolFn) wire() (mistralToolFnWire, error) {
+	parameters, err := marshalToolParameters(f.Parameters, f.parameterOrder)
+	if err != nil {
+		return mistralToolFnWire{}, err
+	}
+	return mistralToolFnWire{Name: f.Name, Description: f.Description, Parameters: parameters, Strict: f.Strict}, nil
 }
 
 // ─── Response wire types ─────────────────────────────────────────────────────
@@ -299,12 +313,24 @@ func mistralToolChoice(choice any) any {
 		}
 		return name
 	}
-	object, ok := choice.(map[string]any)
+	// An extension's object arrives as the JSON text it sent.
+	object, ok := orderedjson.Map(choice)
 	if !ok {
 		return choice
 	}
 	function, _ := object["function"].(map[string]any)
-	return map[string]any{"type": "function", "function": map[string]any{"name": function["name"]}}
+	return mistralFunctionChoice{Type: "function", Function: mistralFunctionName{Name: function["name"]}}
+}
+
+// mistralFunctionChoice is the tool choice mapToolChoice builds for a named function: type, then function (mistral-conversations.ts:902-905).
+type mistralFunctionChoice struct {
+	Type     string              `json:"type"`
+	Function mistralFunctionName `json:"function"`
+}
+
+// mistralFunctionName is the function member of mistralFunctionChoice: the caller's name and nothing else of the caller's object.
+type mistralFunctionName struct {
+	Name any `json:"name"`
 }
 
 func (p *mistralProvider) resolveModel() *Model {
@@ -353,9 +379,12 @@ func (p *mistralProvider) Stream(ctx context.Context, transcript TranscriptConte
 	}
 	tools := borrowedCurrentTools(messages)
 	if len(tools) > 0 {
-		convertedTools, err := p.convertTools(tools)
+		// Strict tools are opt-in: Mistral Large 4 can go silent for minutes before a strict tool call (Pi 2c2a77f9f3ab, #12148).
+		supportsStrictMode := model.ProviderMeta.Compat != nil && model.ProviderMeta.Compat.SupportsStrictMode != nil && *model.ProviderMeta.Compat.SupportsStrictMode
+		convertedTools, err := p.convertTools(tools, supportsStrictMode)
 		if err != nil {
-			return nil, fmt.Errorf("mistral: convert tools: %w", err)
+			// Pi's buildChatPayload throws the resolver's message and the stream reports it as is: a "require" tool the model's compat cannot send strict fails before any request.
+			return nil, err
 		}
 		req.Tools = convertedTools
 	}
@@ -540,6 +569,7 @@ func (p *mistralProvider) Stream(ctx context.Context, transcript TranscriptConte
 	builder.setProviderEventObserver(opts, model)
 	_, builder.managed = resp.Body.(*observedResponseBody)
 	streamOwnsRequest = true
+	//portlint:allow asyncorder Pi's stream() starts a detached async IIFE and returns the stream (mistral-conversations.ts:134, :178); the stream owns this goroutine, which runs the body after the response headers as a turn of the stream's continuation executor (responseTurn below), the ordering point with the consumer; TestMistralDirectMatchesPiTickOrder holds each delivered event and the state the consumer sees there to Pi's
 	go func() {
 		defer finishRequest()
 		_ = builder.responseTurn(func() error {
@@ -665,50 +695,20 @@ func toMistralWirePayload(payload any) (json.RawMessage, error) {
 // mistralWireRequest is a mistralRequest after toMistralWirePayload: the members buildChatPayload creates in place, then each renamed member in the order
 // toMistralWirePayload remaps it (mistral-conversations.ts:374-389).
 type mistralWireRequest struct {
-	Model           string               `json:"model"`
-	Stream          bool                 `json:"stream"`
-	Messages        []mistralWireMessage `json:"messages"`
-	Tools           []mistralTool        `json:"tools,omitempty"` //portlint:allow emptydrop Pi sets tools only when currentTools is non-empty (mistral-conversations.ts:540); req.Tools likewise (mistral.go:355)
-	Temperature     *float64             `json:"temperature,omitempty"`
-	MaxTokens       *int                 `json:"max_tokens,omitempty"`
-	ToolChoice      any                  `json:"tool_choice,omitempty"`
-	ReasoningEffort string               `json:"reasoning_effort,omitempty"`
-	PromptMode      string               `json:"prompt_mode,omitempty"`
-	PromptCacheKey  string               `json:"prompt_cache_key,omitempty"`
-}
-
-// mistralWireMessage is a mistralMessage after toMistralWireMessage, which appends tool_calls and tool_call_id after the members it keeps.
-type mistralWireMessage struct {
-	Role       string `json:"role"`
-	Prefix     *bool  `json:"prefix,omitempty"`
-	Name       string `json:"name,omitempty"`
-	Content    any    `json:"content,omitempty"`
-	ToolCalls  any    `json:"tool_calls,omitempty"`
-	ToolCallID string `json:"tool_call_id,omitempty"`
-}
-
-// mistralWireChunk is a mistralContentChunk after toMistralWireContentChunk; a chunk has one of text, thinking and image_url.
-type mistralWireChunk struct {
-	Type     string  `json:"type"`
-	Text     *string `json:"text,omitempty"`
-	Thinking any     `json:"thinking,omitempty"`
-	ImageURL string  `json:"image_url,omitempty"`
+	Model           string              `json:"model"`
+	Stream          bool                `json:"stream"`
+	Messages        mistralWireMessages `json:"messages"`
+	Tools           []mistralTool       `json:"tools,omitempty"` //portlint:allow emptydrop Pi sets tools only when currentTools is non-empty (mistral-conversations.ts:540); req.Tools likewise (mistral.go:355)
+	Temperature     *float64            `json:"temperature,omitempty"`
+	MaxTokens       *int                `json:"max_tokens,omitempty"`
+	ToolChoice      any                 `json:"tool_choice,omitempty"`
+	ReasoningEffort string              `json:"reasoning_effort,omitempty"`
+	PromptMode      string              `json:"prompt_mode,omitempty"`
+	PromptCacheKey  string              `json:"prompt_cache_key,omitempty"`
 }
 
 func (r mistralRequest) wire() mistralWireRequest {
-	messages := make([]mistralWireMessage, len(r.Messages))
-	for i, message := range r.Messages {
-		content := message.Content
-		if chunks, ok := content.([]mistralContentChunk); ok {
-			wire := make([]mistralWireChunk, len(chunks))
-			for j, chunk := range chunks {
-				wire[j] = mistralWireChunk{Type: chunk.Type, Text: chunk.Text, Thinking: chunk.Thinking, ImageURL: chunk.ImageURL}
-			}
-			content = wire
-		}
-		messages[i] = mistralWireMessage{Role: message.Role, Prefix: message.Prefix, Name: message.Name, Content: content, ToolCalls: message.ToolCalls, ToolCallID: message.ToolCallID}
-	}
-	return mistralWireRequest{Model: r.Model, Stream: r.Stream, Messages: messages, Tools: r.Tools, Temperature: r.Temperature, MaxTokens: r.MaxTokens,
+	return mistralWireRequest{Model: r.Model, Stream: r.Stream, Messages: mistralWireMessages(r.Messages), Tools: r.Tools, Temperature: r.Temperature, MaxTokens: r.MaxTokens,
 		ToolChoice: r.ToolChoice, ReasoningEffort: r.ReasoningEffort, PromptMode: r.PromptMode, PromptCacheKey: r.PromptCacheKey}
 }
 
@@ -959,7 +959,7 @@ func (consumer *mistralChunkConsumer) content(raw json.RawMessage) error {
 	}
 	for _, rawItem := range items {
 		var text string
-		if json.Unmarshal(rawItem, &text) == nil && bytes.HasPrefix(bytes.TrimSpace(rawItem), []byte(`"`)) {
+		if jsstring.UnmarshalKeepingSurrogates(rawItem, &text) == nil && bytes.HasPrefix(bytes.TrimSpace(rawItem), []byte(`"`)) {
 			// GLM models on Mistral send empty content deltas around thinking and tool calls; opening a block for them splits thinking (mistral-conversations.ts:633-635).
 			if delta := sanitizeSurrogates(text); delta != "" {
 				builder.textDelta(delta)
@@ -970,7 +970,7 @@ func (consumer *mistralChunkConsumer) content(raw json.RawMessage) error {
 			return errors.New("Cannot read properties of null (reading 'type')")
 		}
 		var item mistralContentItem
-		if err := json.Unmarshal(rawItem, &item); err != nil {
+		if err := jsstring.UnmarshalKeepingSurrogates(rawItem, &item); err != nil {
 			if _, ok := errors.AsType[*json.UnmarshalTypeError](err); !ok {
 				return err
 			}
@@ -1046,7 +1046,7 @@ func (consumer *mistralChunkConsumer) toolCalls(calls []mistralSSEToolCall) erro
 			return fmt.Errorf("Cannot read properties of %s (reading '%s')", holder, property)
 		}
 		var function mistralSSEToolFunction
-		if err := json.Unmarshal(call.Function, &function); err != nil {
+		if err := jsstring.UnmarshalKeepingSurrogates(call.Function, &function); err != nil {
 			return err
 		}
 		start := streamToolCallDelta{index: blockIndex}
@@ -1065,7 +1065,7 @@ func mistralArgumentsDelta(raw json.RawMessage) string {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) > 0 && trimmed[0] == '"' {
 		var text string
-		if json.Unmarshal(trimmed, &text) == nil {
+		if jsstring.UnmarshalKeepingSurrogates(trimmed, &text) == nil {
 			return text
 		}
 	}
@@ -1228,10 +1228,10 @@ func buildMistralToolResultText(text string, hasImages, supportsImages, isError 
 	return prefix + "(no tool output)"
 }
 
-func (p *mistralProvider) convertTools(tools []ToolSchema) ([]mistralTool, error) {
+func (p *mistralProvider) convertTools(tools []ToolSchema, supportsStrictMode bool) ([]mistralTool, error) {
 	result := make([]mistralTool, len(tools))
 	for i, tool := range tools {
-		strict, err := resolveJSONSchemaStrictSampling(tool, true, nil)
+		strict, err := resolveJSONSchemaStrictSampling(tool, supportsStrictMode, nil)
 		if err != nil {
 			return nil, err
 		}

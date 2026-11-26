@@ -108,29 +108,37 @@ func systemMessageWithoutTools(message ai.SystemMessage) ai.SystemMessage {
 	return message
 }
 
-// effectiveSystemSections reads the run's live loadout without changing the base prompt. A structured prompt is built from the run's before_agent_start options, as agent-session.ts:1669-1683 builds it for every mode, also when the caller's structured prompt is the rendering of the base options; any other caller-owned structured prompt takes only the tools and rules sections from them. The caller holds toolRegistryMu.
+// effectiveSystemSections reads the run's live loadout without changing the base prompt. A structured prompt that the Session built, or whose resources the caller supplied with it (SessionOptions.SystemPromptResources, as interactive mode does), is built whole from the run's before_agent_start options, as agent-session.ts:1828-1840 builds it for every mode; a caller-owned structured prompt without resources takes only the tools and rules sections from them. The caller holds toolRegistryMu.
 func (s *Session) effectiveSystemSections() (ai.OrderedSections, error) {
-	sections, err := s.runSystemSections()
-	if host := s.hostSections.Load(); err == nil && host != nil {
+	return s.effectiveSystemSectionsFor(s.runPrompt.Load())
+}
+
+// effectiveSystemSectionsFor builds the prompt for the supplied run, then appends any host sections.
+func (s *Session) effectiveSystemSectionsFor(run *codingagent.BeforeAgentStartRun) (ai.OrderedSections, error) {
+	return s.effectiveSystemSectionsWithHost(run, s.hostSections.Load())
+}
+
+func (s *Session) effectiveSystemSectionsWithHost(run *codingagent.BeforeAgentStartRun, host *ai.OrderedSections) (ai.OrderedSections, error) {
+	sections, err := s.runSystemSections(run)
+	if err == nil && host != nil {
 		// dyna patch P5 (PATCHES.md): the host's sections follow the built ones.
 		return prompts.ApplyCustomSystemPromptSections(sections, *host)
 	}
 	return sections, err
 }
 
-// runSystemSections are the sections before the host's: the base prompt with the run's before_agent_start sections. The caller holds toolRegistryMu.
-func (s *Session) runSystemSections() (ai.OrderedSections, error) {
+// runSystemSections builds the prompt before host sections. The caller holds toolRegistryMu.
+func (s *Session) runSystemSections(run *codingagent.BeforeAgentStartRun) (ai.OrderedSections, error) {
 	desired := s.baseSystemSections
-	run := s.runPrompt.Load()
 	if run == nil {
 		return desired, nil
 	}
 	if !s.structuredSystemPrompt {
 		return prompts.ApplyCustomSystemPromptSections(desired, run.Sections)
 	}
-	active, hidden := s.promptToolOrder(s.ActiveToolNames()), s.hiddenDeclarations()
-	built := run.BaseSections(active, hidden)
-	if s.defaultSystemPrompt || s.baseSectionsRenderBaseOptions(active, hidden) {
+	built := run.BaseSections(s.promptToolOrder(s.ActiveToolNames()), s.hiddenDeclarations())
+	// The caller's sections are not compared with a rendering of the base options: the skills section follows the loadout too (system-prompt.ts:177), so they stop being that rendering when the read tool leaves it.
+	if s.buildsRunPromptWhole() {
 		return prompts.ApplyCustomSystemPromptSections(built, run.Sections)
 	}
 	desired = cloneSystemSections(desired)
@@ -148,16 +156,9 @@ func (s *Session) runSystemSections() (ai.OrderedSections, error) {
 	return prompts.ApplyCustomSystemPromptSections(desired, run.Sections)
 }
 
-// baseSectionsRenderBaseOptions reports that the caller's structured prompt is exactly the rendering of the Session's base options, as the print, JSON and RPC modes build it. Pi builds every mode's run prompt from the handlers' options (agent-session.ts:1669-1683, 2032), so such a prompt is rebuilt from them whole; any other caller-owned prompt keeps its own sections. The caller holds toolRegistryMu.
-func (s *Session) baseSectionsRenderBaseOptions(active []string, hidden map[string]struct{}) bool {
-	base := s.baseSystemPromptOptions.Load()
-	if base == nil {
-		return false
-	}
-	rendered := codingagent.BeforeAgentStartRun{Options: *base}.BaseSections(active, hidden)
-	return slices.EqualFunc(rendered, s.baseSystemSections, func(a, b ai.PromptSection) bool {
-		return a.Name == b.Name && (a.Value == nil) == (b.Value == nil) && (a.Value == nil || *a.Value == *b.Value)
-	})
+// buildsRunPromptWhole reports that a structured prompt is the Session's to build: it is the default prompt, or the caller supplied the resources behind its sections. The caller holds toolRegistryMu.
+func (s *Session) buildsRunPromptWhole() bool {
+	return s.defaultSystemPrompt || s.systemPromptResources.Load() != nil
 }
 
 // hiddenDeclarations returns the tools whose declarations the active loadout hides (agent-session.ts:1674-1677).
@@ -199,12 +200,12 @@ func (s *Session) systemPrompt() string {
 	if prompt, present := s.agent.SystemPromptOverride(); present {
 		return prompt
 	}
-	if s.runPrompt.Load() != nil {
+	if run := s.runPrompt.Load(); run != nil {
 		s.toolRegistryMu.RLock()
-		sections, err := s.effectiveSystemSections()
+		prompt, err := s.runSystemPromptLocked(run)
 		s.toolRegistryMu.RUnlock()
 		if err == nil {
-			return ai.GetCurrentSystemPrompt([]ai.Message{ai.SystemMessage{Sections: sections}})
+			return prompt
 		}
 	}
 	if baseline := s.baseSystemPrompt.Load(); baseline != nil {
@@ -243,6 +244,12 @@ func (s *Session) initSystemPrompt(opts SessionOptions) {
 	}
 	s.baseSystemPrompt.Store(new(ai.GetCurrentSystemPrompt([]ai.Message{ai.SystemMessage{Sections: s.baseSystemSections}})))
 	s.rebuildSystemPrompt(s.ActiveToolNames())
+	// The CLI renders the same prompt for its own use before it starts the Session; sharing its string, when the text is equal, keeps one copy of a prompt that holds the project's context files (about 65 KB with this repository's AGENTS.md) in the first frame's live heap, not two.
+	if known := opts.SystemPrompt; known != "" {
+		if current := s.baseSystemPrompt.Load(); current != nil && *current == known {
+			s.baseSystemPrompt.Store(&known)
+		}
+	}
 }
 
 // contextFromProjection is the canonical Session projection as the agent's loop context, keeping the current instruction baseline.
@@ -257,7 +264,7 @@ func (s *Session) prepareRequest(ctx context.Context, request agent.PrepareReque
 	failed := s.failedResponse.Swap(nil)
 	// prepare projects the Session and passes the projection through the hook the supplied Agent had before the Session installed its own.
 	prepare := func() (previous *agent.AgentRequestUpdate, requestContext *agent.AgentContext, projection codingagent.SessionProjection, err error) {
-		projection = s.inner.BuildSessionProjectionView()
+		projection = s.inner.Load().BuildSessionProjectionView()
 		requestContext = s.executableContext(s.contextFromProjection(projection))
 		if s.previousPrepareRequest == nil {
 			return nil, requestContext, projection, nil
@@ -336,7 +343,7 @@ func (s *Session) exceedsCompactionThreshold(model *ai.Model, projection codinga
 // Send, which holds s.mu.
 func (s *Session) prepareNextTurn(ctx context.Context, turn agent.PrepareNextTurnContext) (*agent.AgentLoopTurnUpdate, error) {
 	// The projection is the session's own messages, as Pi's buildSessionContext returns the entries' objects: the loop reads them and the request that follows projects the session again, so a deep copy of every message before each request only grows with the history.
-	projection := s.inner.BuildSessionProjectionView()
+	projection := s.inner.Load().BuildSessionProjectionView()
 	// A virtual selection is checked in prepareRequest, against the model the request is routed to.
 	if model := s.Model(); model != nil && !IsVirtualModel(model) {
 		exceeds, err := s.exceedsCompactionThreshold(model, projection)
@@ -347,7 +354,7 @@ func (s *Session) prepareNextTurn(ctx context.Context, turn agent.PrepareNextTur
 			if _, err := s.runAutoCompaction(ctx, "threshold", false); err != nil {
 				return nil, err
 			}
-			projection = s.inner.BuildSessionProjectionView()
+			projection = s.inner.Load().BuildSessionProjectionView()
 		}
 	}
 	projected := s.contextFromProjection(projection)

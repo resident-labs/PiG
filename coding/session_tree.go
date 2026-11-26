@@ -63,9 +63,13 @@ func customMessageEditorText(raw json.RawMessage) string {
 
 // treeBranchSummary is the summary navigateTree attaches at the new leaf.
 type treeBranchSummary struct {
-	Summary       string
-	Details       any
-	Usage         *ai.Usage
+	Summary string
+	Details any
+	Usage   *ai.Usage
+	// UsageNull marks a nil Usage an extension wrote as null (agent-session.ts navigateTree: `summaryUsage = extensionSummary.usage`).
+	UsageNull bool
+	// UsageRaw is the usage object as an extension wrote it, which the entry holds as Pi's does.
+	UsageRaw      json.RawMessage
 	FromExtension bool
 }
 
@@ -76,22 +80,22 @@ type treeBranchSummary struct {
 // The caller holds s.mu.
 func (s *Session) moveTreeLeaf(targetID string, newLeafID *string, summary *treeBranchSummary, label string) (string, error) {
 	if summary != nil && summary.Summary != "" {
-		summaryID, err := s.inner.BranchWithSummary(newLeafID, summary.Summary, summary.Details, summary.FromExtension, summary.Usage)
+		summaryID, err := s.inner.Load().BranchWithSummaryEntry(newLeafID, icodingagent.BranchSummaryEntry{Summary: summary.Summary, Details: summary.Details, Usage: summary.Usage, UsageNull: summary.UsageNull, UsageRaw: summary.UsageRaw, FromHook: summary.FromExtension})
 		if err != nil {
 			return "", err
 		}
 		if label != "" {
-			if _, err := s.inner.AppendLabelChange(summaryID, &label); err != nil {
+			if _, err := s.inner.Load().AppendLabelChange(summaryID, &label); err != nil {
 				return summaryID, err
 			}
 		}
 		return summaryID, nil
 	}
-	if err := s.inner.SetLeafID(newLeafID); err != nil {
+	if err := s.inner.Load().SetLeafID(newLeafID); err != nil {
 		return "", err
 	}
 	if label != "" {
-		_, err := s.inner.AppendLabelChange(targetID, &label)
+		_, err := s.inner.Load().AppendLabelChange(targetID, &label)
 		return "", err
 	}
 	return "", nil
@@ -110,7 +114,7 @@ func (s *Session) branchSummaryEntry(id string) *BranchSummaryEntry {
 	if id == "" {
 		return nil
 	}
-	entry, ok := s.inner.GetEntry(id)
+	entry, ok := s.inner.Load().GetEntry(id)
 	if !ok || entry.Base().Type != "branch_summary" {
 		return nil
 	}
@@ -138,7 +142,8 @@ func (s *Session) emitSessionBeforeTree(ctx context.Context, preparation TreePre
 		return nil, err
 	}
 	preparation.EntriesToSummarize = sessionEntryValues(entries)
-	result, err := runner.Emit(ctx, extension.SessionBeforeTreeEvent{
+	// runner.ts emit awaits every handler with event.signal aborted and keeps their results, and navigateTree checks no abort after the emit (agent-session.ts): a late cancel or summary is honoured.
+	result, err := runner.Emit(context.WithoutCancel(ctx), extension.SessionBeforeTreeEvent{
 		Type:        icodingagent.EventSessionBeforeTree,
 		Preparation: preparation,
 		Signal:      ctx,
@@ -159,7 +164,7 @@ func (s *Session) emitSessionBeforeTree(ctx context.Context, preparation TreePre
 
 // extensionTreeSummary converts an extension-provided summary. Its details keep the member order the extension wrote ([extension.SessionBeforeTreeResultSummary] decodes them through orderedjson).
 func extensionTreeSummary(result *extension.SessionBeforeTreeResultSummary) *treeBranchSummary {
-	return &treeBranchSummary{Summary: result.Summary, Details: result.Details, Usage: result.Usage, FromExtension: true}
+	return &treeBranchSummary{Summary: result.Summary, Details: result.Details, Usage: result.Usage, UsageNull: result.UsageNull, UsageRaw: result.UsageRaw, FromExtension: true}
 }
 
 // emitSessionTree runs session_tree handlers after a navigation. summaryID
@@ -175,7 +180,7 @@ func (s *Session) emitSessionTree(ctx context.Context, newLeafID, oldLeafID *str
 		NewLeafID: newLeafID,
 		OldLeafID: oldLeafID,
 	}
-	if entry, ok := s.inner.GetEntry(summaryID); ok {
+	if entry, ok := s.inner.Load().GetEntry(summaryID); ok {
 		if entry.Base().Type == "branch_summary" {
 			// As upstream casts the entry without validating it, one whose JSON does not decode reaches the handlers with its base members only.
 			summary, decoded := entry.(icodingagent.BranchSummaryEntry)
@@ -186,7 +191,8 @@ func (s *Session) emitSessionTree(ctx context.Context, newLeafID, oldLeafID *str
 			event.FromExtension = fromExtension
 		}
 	}
-	_, _ = runner.Emit(ctx, event)
+	// Upstream awaits the emit with no signal (agent-session.ts:4221-4230), so a navigation context that ended while it ran does not end the dispatch.
+	_, _ = runner.Emit(context.WithoutCancel(ctx), event)
 }
 
 // sessionEntryValues is the entries as the extension API's SessionEntry values; an empty list is a non-nil empty list, not null.

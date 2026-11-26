@@ -83,6 +83,11 @@ type MessageRenderOptions struct {
 	Expanded bool `json:"expanded"`
 	// OutputPad is the horizontal padding configured by the outputPad setting.
 	OutputPad int `json:"outputPad"`
+	// State is the message's renderer state, the Go form of the WeakMap keyed by the message object that a Pi renderer keeps per message: it starts
+	// empty, is the same map on every call for one displayed message (the renderer's and its [Extension.MessageViewEvent] handler's), and is dropped
+	// when the host stops showing the message. Calls for one message run one at a time. It is a fresh empty map for a call that is not for a
+	// displayed message (HTML export). It never crosses the wire.
+	State map[string]any `json:"-"`
 }
 
 // RendererFunc renders a custom message into terminal lines for the host.
@@ -91,14 +96,16 @@ type RendererFunc func(ctx Context, message map[string]any, options MessageRende
 // EntryRenderOptions is the entry-renderer request options.
 type EntryRenderOptions struct {
 	Expanded bool `json:"expanded"`
+	// State is the entry's renderer state, as [MessageRenderOptions.State] is the message's.
+	State map[string]any `json:"-"`
 }
 
 // EntryRendererFunc renders a custom session entry into terminal lines for the host.
 type EntryRendererFunc func(ctx Context, entry map[string]any, options EntryRenderOptions, width int) ([]string, error)
 
 // MarkdownTransformContext mirrors Pi's MarkdownTransformContext: the
-// transcript message being rendered ("user", "assistant" or
-// "assistant-thinking"), whether it is still streaming, and the width it is
+// message being rendered ("user", "assistant", "assistant-thinking",
+// "custom", "summary" or "changelog"), whether it is still streaming, and the width it is
 // rendered at.
 type MarkdownTransformContext struct {
 	MessageType    string `json:"messageType"`
@@ -113,6 +120,16 @@ type MarkdownTransformContext struct {
 // MarkdownTransformerFunc rewrites Markdown for display only, as Pi's
 // MarkdownTransformer does. A transformer that panics keeps its input.
 type MarkdownTransformerFunc func(markdown string, context MarkdownTransformContext) string
+
+// MarkdownTransformerOptions mirrors Pi's MarkdownTransformerOptions.
+type MarkdownTransformerOptions struct {
+	// MessageTypes lists the surfaces the transformer runs on, by the MarkdownTransformContext.MessageType they carry:
+	// "user", "assistant", "assistant-thinking" (the transcript messages, the default), "custom" (custom messages without a
+	// message renderer, and the content of expanded skill blocks), "summary" (expanded branch and compaction summaries)
+	// and "changelog" (What's New, /changelog, Extension Updates and the Update Available note). Nil selects the default
+	// types; a non-nil empty list runs the transformer nowhere.
+	MessageTypes []string
+}
 
 // Factory constructs an extension instance for generated standalone or packed
 // runners. Factory-style packages should expose a function such as:
@@ -154,14 +171,17 @@ type Extension struct {
 	providerOperations map[string]providerOperations
 	toolMu             sync.RWMutex
 	toolConn           *conn
-	// footer is the host's footer data (guarded by mu) and footerSubs the onBranchChange callbacks.
+	// toolPublishMu orders the registerTool calls to the host with the table changes they publish (lock order: toolPublishMu, then toolMu). toolMu is released before the host call: the host asks the tool's hooks (tool_prepare_loadout, tool_reaches_tools) while it answers the call, and those read the tables under toolMu.
+	toolPublishMu sync.Mutex
+	// footer is the host's footer data (guarded by mu).
 	footer           footerSnapshot
-	footerSubs       footerSubscribers
 	toolFuncs        map[string]ToolFunc
 	toolPrepareFuncs map[string]ToolPrepareArgumentsFunc
 	toolBatches      toolBatchOrders
 	// requestStarts keeps the handlers of the requests that run extension code (startsInArrivalOrder) starting in the order the requests arrive: the tool_call requests of a parallel batch (agent-loop.ts:619-647, 820-837) and the event and command requests of concurrent emits (runner.ts:1096-1125).
 	requestStarts jsloop.Lane
+	// startObserver is set by tests of this package before the extension serves, never while it runs. It is called with the method and id of each request that takes a place, after the earlier places were released and before this one is.
+	startObserver func(method, id string)
 	// children are the child agent sessions this extension created and has not disposed (child_session.go).
 	children           childSessions
 	commandFuncs       map[string]CommandFunc
@@ -191,6 +211,7 @@ type Extension struct {
 	renderers               []rendererDef
 	entryRenderers          []rendererDef
 	markdownTransform       MarkdownTransformerFunc
+	markdownMessageTypes    []string
 	ownsThinkingRuns        bool // guarded by toolMu
 
 	// toolRenderMu guards toolRenderers and toolRenderCards: render requests
@@ -198,6 +219,12 @@ type Extension struct {
 	toolRenderMu    sync.Mutex
 	toolRenderers   map[string]ToolRenderers
 	toolRenderCards map[string]*toolRenderCard
+	// renderMu guards renderCards, the renderer state of the displayed messages and entries by the host's key. messageViewEventFuncs and
+	// entryViewEventFuncs, the event handlers of their view renderers, are guarded by toolMu with the renderers.
+	renderMu              sync.Mutex
+	renderCards           map[string]*renderCard
+	messageViewEventFuncs map[string]MessageViewEventFunc
+	entryViewEventFuncs   map[string]EntryViewEventFunc
 	// toolRendererResolvers are the pi.registerToolRenderer resolvers in registration order; resolvedToolRenderers
 	// holds the renderers they returned, by the id the host draws them with. Both are guarded by toolRenderMu.
 	toolRendererResolvers []ToolRendererResolver
@@ -240,6 +267,9 @@ type Extension struct {
 	// instead of fetching the entire log over IPC.
 	session sessionMirror
 
+	// views is the D614 mount state: what the attached client draws and the intent handler. It carries its own lock, so it
+	// stands before mu and the replicated fields mu guards; applyAbilities takes every state snapshot.
+	views viewState
 	// session info from host (set after ready message).
 	mu          sync.RWMutex
 	sessionName string
@@ -253,7 +283,9 @@ type Extension struct {
 	height        int
 	model         string
 	modelProvider string
-	sessionFile   string
+	// identity is the replicated model object and session id behind GetModelInfo and GetSessionID (state_replica.go).
+	identity    replicatedIdentity
+	sessionFile string
 	// uiTheme is the host's theme palette from the state snapshot and
 	// theme_change notifies (upstream ctx.ui.theme).
 	uiTheme UITheme
@@ -273,12 +305,15 @@ type Extension struct {
 	// loadedDone closes when the OnLoaded handlers returned; requests wait for it.
 	loadedDone <-chan struct{}
 
-	// themeFeed and expandedFeed deliver a change of the replicated theme and tool-expansion state to the handlers of OnThemeChange and OnToolsExpandedChange.
+	// themeFeed, expandedFeed and branchFeed deliver a change of the replicated theme, tool-expansion state and Git branch to the handlers of OnThemeChange, OnToolsExpandedChange and FooterData.OnBranchChange.
 	themeFeed    stateFeed[UITheme]
 	expandedFeed stateFeed[bool]
+	branchFeed   stateFeed[struct{}]
+	// viewAbilitiesFeed delivers a change of the replicated client abilities (D614) to the OnViewAbilities handlers.
+	viewAbilitiesFeed stateFeed[*ViewAbilities]
 
 	requestsMu sync.Mutex
-	requests   map[string]context.CancelCauseFunc
+	requests   map[string]requestCancel
 	requestWG  sync.WaitGroup
 	runCtx     context.Context
 	runCancel  context.CancelFunc
@@ -328,7 +363,7 @@ type Extension struct {
 	// The host's replicated state of the upstream 0.99.1 API, as raw JSON so each read decodes a copy the caller owns. It is guarded by mu.
 	settingsRaw   json.RawMessage
 	mcpServersRaw json.RawMessage
-	// mcpServersAt is the position of mcpServersRaw in the host's frame order: 2k for the state of the k-th notify frame, 2n+1 for the reply of a registration call routed after n notify frames. A list from an earlier position never replaces it.
+	// mcpServersAt is the position of mcpServersRaw in the host's frame order: 2k for the state of the k-th notify frame, 2n+1 for the ready snapshot or the reply of a registration call read after n notify frames. A list from an earlier position never replaces it.
 	mcpServersAt uint64
 
 	// executeUpdates holds the OnUpdate callbacks of the executeTool calls in flight, by execute id.
@@ -399,6 +434,18 @@ type overlayMessage struct {
 	opened *overlayHandleState
 	// focus is the host's ui.custom.focus: the component lost (false) or regained (true) TUI focus.
 	focus *bool
+	// invalidate is the host's ui.custom.invalidate: how many times its TUI was invalidated since the last one it sent.
+	invalidate int
+}
+
+// RemoteComponentInvalidateHandler is the optional Invalidate method of a [Context.Custom] component: Pi's Component.invalidate().
+// The host's TUI invalidates every mounted component after a theme change, a cell-size report or a change of image support (Pi's
+// TUI.invalidate, tui.ts:951-954); the component drops what it kept from the state before, and is rendered again. A theme
+// change is applied before Invalidate runs, so [Context.UITheme] already answers with the new theme. Invalidate runs on the
+// component's own worker, in order with its input, never while Render or HandleInput runs. A component without the method is
+// rendered again all the same.
+type RemoteComponentInvalidateHandler interface {
+	Invalidate()
 }
 
 func newRemoteOverlay(component overlayComponent) *remoteOverlay {
@@ -557,6 +604,8 @@ func (o *remoteOverlay) handleMessage(conn *conn, key string, message overlayMes
 		what = "view event"
 	case message.mouse != nil:
 		what = "mouse"
+	case message.invalidate > 0:
+		what = "invalidate"
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil && !o.closed {
@@ -576,6 +625,15 @@ func (o *remoteOverlay) handleMessage(conn *conn, key string, message overlayMes
 	}
 	if message.focus != nil {
 		o.applyFocus(*message.focus)
+		_ = o.renderLocked(conn, key, width)
+		return
+	}
+	if message.invalidate > 0 {
+		if handler, ok := o.component.(RemoteComponentInvalidateHandler); ok {
+			for range message.invalidate {
+				handler.Invalidate()
+			}
+		}
 		_ = o.renderLocked(conn, key, width)
 		return
 	}
@@ -707,6 +765,8 @@ func New(name string) *Extension {
 		name:                     name,
 		themeFeed:                stateFeed[UITheme]{what: "theme"},
 		expandedFeed:             stateFeed[bool]{what: "tools expanded"},
+		branchFeed:               stateFeed[struct{}]{what: "footer branch"},
+		viewAbilitiesFeed:        stateFeed[*ViewAbilities]{what: "view abilities"},
 		toolFuncs:                make(map[string]ToolFunc),
 		toolPrepareFuncs:         make(map[string]ToolPrepareArgumentsFunc),
 		commandFuncs:             make(map[string]CommandFunc),
@@ -718,7 +778,7 @@ func New(name string) *Extension {
 		messageViewRendererFuncs: make(map[string]MessageViewRendererFunc),
 		entryViewRendererFuncs:   make(map[string]EntryViewRendererFunc),
 		flagDefaults:             make(map[string]any),
-		requests:                 make(map[string]context.CancelCauseFunc),
+		requests:                 make(map[string]requestCancel),
 		modelStreams:             make(map[string]*ModelEventStream),
 		modelStreamCallbacks:     make(map[string]*modelStreamCallbacks),
 		overlays:                 make(map[string]*remoteOverlay),
@@ -747,14 +807,16 @@ func (e *Extension) validateToolSchema(name string, schema Schema) {
 
 // ToolPromptSnippet sets the registered tool's optional system-prompt summary and refreshes a running Session.
 func (e *Extension) ToolPromptSnippet(name, snippet string) {
-	e.toolMu.Lock()
-	defer e.toolMu.Unlock()
-	for i := range e.tools {
-		if e.tools[i].Name == name {
-			e.tools[i].PromptSnippet = snippet
-			e.publishTool(e.tools[i])
+	e.changeTools(func() []toolDef {
+		var updated []toolDef
+		for i := range e.tools {
+			if e.tools[i].Name == name {
+				e.tools[i].PromptSnippet = snippet
+				updated = append(updated, e.tools[i])
+			}
 		}
-	}
+		return updated
+	})
 }
 
 // ToolWithPrepareArguments registers a tool with a local pre-validation argument transform. A nil schema panics before registration.
@@ -880,7 +942,7 @@ func (e *Extension) takeProviderDef(name string, config ProviderConfig) (provide
 	}
 	// A re-registration replaces only the kinds it defines, as registerProvider merges defined values (model-runtime.ts registerProvider) and the host keeps the APIs it wired.
 	ops, imageAPIs, classifierAPIs := takeProviderOperations(config)
-	if len(imageAPIs)+len(classifierAPIs) > 0 {
+	if len(imageAPIs)+len(classifierAPIs) > 0 || ops.refresh != nil {
 		if e.providerOperations == nil {
 			e.providerOperations = make(map[string]providerOperations)
 		}
@@ -890,6 +952,9 @@ func (e *Extension) takeProviderDef(name string, config ProviderConfig) (provide
 		}
 		if len(classifierAPIs) > 0 {
 			kept.classifiers = ops.classifiers
+		}
+		if ops.refresh != nil {
+			kept.refresh = ops.refresh
 		}
 		e.providerOperations[name] = kept
 	}
@@ -903,7 +968,7 @@ func (e *Extension) takeProviderDef(name string, config ProviderConfig) (provide
 		}
 	}
 	data, err := json.MarshalJS(config)
-	return providerDef{Name: name, Config: data, StreamSimple: streaming, ImageAPIs: imageAPIs, ClassifierAPIs: classifierAPIs}, err
+	return providerDef{Name: name, Config: data, StreamSimple: streaming, ImageAPIs: imageAPIs, ClassifierAPIs: classifierAPIs, RefreshModels: ops.refresh != nil}, err
 }
 
 // heldCallbacks are the callbacks an extension holds for one provider name.
@@ -1013,10 +1078,27 @@ func (e *Extension) declare(late registerMsg, apply func()) {
 
 // MarkdownTransformer registers the extension's display-only Markdown
 // transform (Pi's pi.registerMarkdownTransformer). The host applies it to
-// user and assistant Markdown in the interactive transcript, after its own
-// transformers; a later registration replaces an earlier one.
-func (e *Extension) MarkdownTransformer(transformer MarkdownTransformerFunc) {
+// user, assistant and thinking Markdown in the interactive transcript, after
+// its own transformers, or to the surfaces options.MessageTypes lists; a
+// later registration replaces an earlier one.
+func (e *Extension) MarkdownTransformer(transformer MarkdownTransformerFunc, options ...MarkdownTransformerOptions) {
 	e.markdownTransform = transformer
+	e.markdownMessageTypes = nil
+	if len(options) > 0 && options[0].MessageTypes != nil {
+		e.markdownMessageTypes = slices.Clone(options[0].MessageTypes)
+	}
+}
+
+// markdownMessageTypeList is the surface list the register frame carries: the types of the registration, or Pi's defaults. Nil without a transformer.
+func (e *Extension) markdownMessageTypeList() *[]string {
+	if e.markdownTransform == nil {
+		return nil
+	}
+	types := e.markdownMessageTypes
+	if types == nil {
+		types = []string{"user", "assistant", "assistant-thinking"}
+	}
+	return &types
 }
 
 // OwnThinkingRuns declares that this extension owns the thinking runs of
@@ -1031,7 +1113,7 @@ func (e *Extension) OwnThinkingRuns(enabled bool) {
 	conn := e.toolConn
 	e.toolMu.Unlock()
 	if conn != nil {
-		result, err := hostCallFor(nil, conn, "ownThinkingRuns", map[string]bool{"enabled": enabled})
+		result, err := e.hostCallFor(nil, conn, "ownThinkingRuns", map[string]bool{"enabled": enabled})
 		if err = callResultError(result, err); err != nil {
 			panic(fmt.Errorf("ownThinkingRuns: %w", err))
 		}
@@ -1189,6 +1271,7 @@ func (e *Extension) runWithConn(nc net.Conn, started *conn, sockPath string) err
 			Renderers:               e.renderers,
 			EntryRenderers:          e.entryRenderers,
 			MarkdownTransformer:     e.markdownTransform != nil,
+			MarkdownMessageTypes:    e.markdownMessageTypeList(),
 			OwnsThinkingRuns:        e.ownsThinkingRuns,
 			ToolRenderers:           e.toolRendererCount(),
 			McpServers:              e.mcpServerDecls,
@@ -1221,10 +1304,9 @@ func (e *Extension) runWithConn(nc net.Conn, started *conn, sockPath string) err
 			})
 			continue
 		}
-		// A listener that a load-time dispatch unsubscribed is released as soon as its dispatch ends, which can precede ready.
-		if env.Type == msgNotify && env.Notify != nil && env.Notify.Method == notifyEventsRelease {
-			e.releaseEventListener(env.Notify.Args)
-			e.markNotifyHandled()
+		// A notify the Host sent before ready is applied and counted as one the loop reads is: the release of a listener a load-time dispatch unsubscribed, which follows its dispatch, or a state pushed to a connection that had not registered.
+		if env.Type == msgNotify {
+			e.applyQueuedNotify(env)
 			continue
 		}
 		break
@@ -1255,12 +1337,16 @@ func (e *Extension) runWithConn(nc net.Conn, started *conn, sockPath string) err
 		wrapped := []byte(`{"state":`)
 		wrapped = append(wrapped, env.Ready.State...)
 		wrapped = append(wrapped, '}')
-		e.handleNotify(envelope{
+		// The snapshot is newer than every frame read before it, so it takes the position after the last of them.
+		e.notifyMu.Lock()
+		at := 2*e.notifyHandled + 1
+		e.notifyMu.Unlock()
+		e.handleNotifyAt(envelope{
 			Notify: &notifyMsg{
 				Method: "state_update",
 				Args:   wrapped,
 			},
-		})
+		}, at)
 	}
 
 	e.toolConn = conn
@@ -1281,6 +1367,10 @@ func (e *Extension) loop() error {
 				e.applyEventStream(env.Request)
 			}
 			ctx, scope := e.armRequestScope(env.ID)
+			if env.Request != nil && env.Request.SignalAborted {
+				// The event's signal is aborted before its handler starts, as a signal-only cancel queued ahead of the request would leave it: the handler's first line sees the abort (runner.ts emit awaits a handler dispatched after the signal aborted), and its host calls run.
+				scope.signal.fire(cancelReason(context.Canceled.Error()))
+			}
 			if env.Request != nil && env.Request.Method == "tool_call" {
 				ctx.start = e.toolBatches.reserve(env.Request.Batch)
 			}
@@ -1300,11 +1390,7 @@ func (e *Extension) loop() error {
 		case msgCancel:
 			e.cancelRequest(env)
 		case msgNotify:
-			e.notifyMu.Lock()
-			seq := e.notifyHandled + 1
-			e.notifyMu.Unlock()
-			e.handleNotifyAt(env, seq)
-			e.markNotifyHandled()
+			e.applyQueuedNotify(env)
 		case msgShutdown:
 			return e.stopRequests()
 		}
@@ -1324,10 +1410,22 @@ func startsInArrivalOrder(req *requestMsg) bool {
 	return false
 }
 
+// passStart waits until the handler of every earlier request was invoked or its request ended without one, then lets startObserver see that this request's handler is next and hands the place on. The order it keeps is the order of invocation: what a handler runs first is up to the scheduler.
+// pig divergence (D658): the place is handed on before the handler's first statement runs, so a descheduled thread can be overtaken; Pi runs a handler to its first await in invocation order.
+func (e *Extension) passStart(id, method string, place *jsloop.Place) {
+	place.Wait()
+	if e.startObserver != nil {
+		e.startObserver(method, id)
+	}
+	place.Release()
+}
+
 func (e *Extension) stopRequests() error {
 	e.stopWidthDeliveries()
 	e.themeFeed.stop()
 	e.expandedFeed.stop()
+	e.branchFeed.stop()
+	e.viewAbilitiesFeed.stop()
 	// The sessions end with the connection, as the host disposes them: no listener runs after it.
 	e.children.closeAll()
 	if e.runCancel != nil {
@@ -1360,7 +1458,15 @@ type requestScope struct {
 	e      *Extension
 	id     string
 	cancel context.CancelCauseFunc
+	// signal is the request's signal (Context.Done and Err), which a signal-only cancel aborts without ending the request the host calls wait on. It is held here, and its context made when the handler first uses it, so a request that never asks for it costs no allocation for it.
+	signal requestSignal
 	place  jsloop.Place
+}
+
+// requestCancel is what a cancel frame of an active request reaches: the request, and the signal its handler holds.
+type requestCancel struct {
+	request context.CancelCauseFunc
+	signal  *requestSignal
 }
 
 func (s *requestScope) end() {
@@ -1375,17 +1481,27 @@ func (e *Extension) armRequest(id string) (Context, func()) {
 	return ctx, scope.end
 }
 
+// armRequestScope arms a request with two contexts: the request's, which the host calls of its handler wait on, and the signal's, a child of it, which is Context.Done and Err. An ordinary cancel ends the request and with it the signal; a signal-only cancel (a tool_call, and session_before_compact and session_before_tree, whose AbortSignal aborts while the handler goes on, as Pi's in-process host calls never fail with it) ends the signal alone. The signal's context is made when something first asks for it (requestSignal), so a tool_call round trip does not pay five allocations for one it never reads.
 func (e *Extension) armRequestScope(id string) (Context, *requestScope) {
 	requestRoot := e.runCtx
 	if requestRoot == nil {
 		requestRoot = context.Background()
 	}
 	reqCtx, cancel := context.WithCancelCause(requestRoot)
-	parent := e.conn.armParent(id, requestRoot, reqCtx)
+	scope := &requestScope{e: e, id: id, cancel: cancel}
+	scope.signal.parent = reqCtx
+	parent, queued := e.conn.armParentWithSignal(id, requestRoot, reqCtx, &scope.signal)
+	// The cancel frames the read loop read before this arming (queuedCancel) are applied here, as if the loop had taken them first: the handler starts with its signal aborted and, after an ordinary cancel, its request ended.
+	if queued.signal {
+		scope.signal.fire(queued.signalCause)
+	}
+	if queued.request {
+		cancel(queued.requestCause)
+	}
 	e.requestsMu.Lock()
-	e.requests[id] = cancel
+	e.requests[id] = requestCancel{request: cancel, signal: &scope.signal}
 	e.requestsMu.Unlock()
-	return Context{ext: e, requestID: id, parent: parent, ctx: reqCtx}, &requestScope{e: e, id: id, cancel: cancel}
+	return Context{ext: e, requestID: id, parent: parent, ctx: &scope.signal}, scope
 }
 
 func (e *Extension) handleRequest(id string, req *requestMsg) {
@@ -1400,6 +1516,9 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 		_ = e.conn.respond(id, nil, fmt.Errorf("nil request"))
 		return
 	}
+	if ctx.parent != nil && (req.Method == "command" || req.Method == requestWithSession) {
+		ctx.parent.markCommand()
+	}
 
 	// A handler runs on its own goroutine (see loop: `go handleRequest`). Without
 	// this guard a single panicking handler would crash the whole extension
@@ -1408,30 +1527,51 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 	// mirrors upstream's per-request error isolation (a thrown handler error in
 	// the TS runtime rejects one call, it does not tear down the runtime).
 	var boundaryData map[string]any
+	// boundaryEdits are the messages a turn_end handler edited in place, each at its position (event_edits_reply.go); nil for the other boundary.
+	var boundaryEdits func() []any
+	// order is the member order of the objects of an event as the host sent them; the objects a handler hands back are written in it.
+	var order *json.ObjectOrder
 	var promptOptions map[string]any
 	var toolCall *toolCallInput
+	// editReply is the reply of a before_provider_request, before_provider_headers or message_end handler for the result it returned: the host cannot share the objects the handler edits in place, so the reply carries what the handler left of them (provider_hook.go, message_end_reply.go).
+	var editReply func(result any) any
+	// contextSnapshot is the list a context handler was handed, whose messages it may have edited before it failed: Pi keeps an edit of a message after a throw and loses a change to the list (runner.ts emitContext), so a failed handler's reply carries the snapshot as the handler left it.
+	var contextSnapshot []any
 	defer func() {
 		if r := recover(); r != nil {
 			name := req.Tool
 			if name == "" {
 				name = req.Event
 			}
-			fmt.Fprintf(os.Stderr, "extension: recovered from panic in %s %q: %v\n%s\n", req.Method, name, r, debug.Stack())
+			diagnosticf("extension: recovered from panic in %s %q: %v\n%s\n", req.Method, name, r, debug.Stack())
 			var result any
 			if boundaryData != nil {
-				result = map[string]any{"_pigBoundaryEntries": boundaryData["entries"], "_pigBoundaryResult": nil}
+				var edits []any
+				if boundaryEdits != nil {
+					edits = boundaryEdits()
+				}
+				result = boundaryReply(boundaryData, nil, edits)
 			}
 			if toolCall != nil {
 				reply := map[string]any{"_pigToolCallResult": nil}
 				if edited, ok := toolCall.edit(); ok {
 					reply["_pigToolCallInput"] = edited
 				}
+				if assigned, ok := toolCall.assigned(); ok {
+					reply["_pigToolCallEventInput"] = assigned
+				}
 				result = reply
 			}
 			if promptOptions != nil {
 				result = map[string]any{"_pigPromptSections": promptOptions["sections"], "_pigPromptSelectedTools": promptOptions["selectedTools"], "_pigPromptOptions": promptOptions, "_pigPromptResult": nil}
 			}
-			_ = e.conn.respond(id, result, fmt.Errorf("handler panicked: %v", r))
+			if editReply != nil {
+				result = editReply(nil)
+			}
+			if contextSnapshot != nil {
+				result = map[string]any{"messages": contextSnapshot, "_pigContextUnchanged": true}
+			}
+			_ = e.conn.respond(id, handedBack(req.Event, result, order), fmt.Errorf("handler panicked: %v", r))
 		}
 	}()
 
@@ -1453,7 +1593,7 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 	case "provider_object_callback", "provider_object_callback_sync":
 		result, err := e.dispatchProviderObjectCallback(req)
 		_ = e.conn.respond(id, result, err)
-	case methodOAuthLogin, methodOAuthRefresh, methodOAuthGetAPIKey,
+	case methodOAuthLogin, methodOAuthRefresh, methodOAuthGetAPIKey, methodOAuthModifyModels,
 		methodOAuthCredentialStatus, methodOAuthStoreCredentials, methodOAuthDeleteCredentials:
 		e.dispatchOAuth(id, req)
 
@@ -1500,13 +1640,13 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 		ctx.toolInput = &req.Args
 		var params map[string]any
 		if len(req.Args) > 0 {
-			if err := json.Unmarshal(req.Args, &params); err != nil {
+			if err := unmarshalFrameMember(req.Args, &params); err != nil {
 				_ = e.conn.respond(id, nil, fmt.Errorf("decode tool arguments: %w", err))
 				return
 			}
 		}
 		// agent-loop.ts:619-647: the handlers of a batch start in source order.
-		ctx.place.Pass()
+		e.passStart(id, "tool_call", ctx.place)
 		ctx.start.begin()
 		result, err := handler(ctx, params)
 		// A handler whose dialog was answered before another's responds after it, as Pi's continuations run in the order of the answers.
@@ -1521,7 +1661,7 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 		}
 		var params map[string]any
 		if len(req.Args) > 0 {
-			if err := json.Unmarshal(req.Args, &params); err != nil {
+			if err := unmarshalFrameMember(req.Args, &params); err != nil {
 				_ = e.conn.respond(id, nil, fmt.Errorf("decode tool arguments: %w", err))
 				return
 			}
@@ -1549,10 +1689,10 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 		}
 		var args string
 		if len(req.Args) > 0 {
-			_ = json.Unmarshal(req.Args, &args)
+			_ = unmarshalFrameMember(req.Args, &args)
 		}
 		// runner.ts:1096-1125: the handlers of concurrent requests start in arrival order.
-		ctx.place.Pass()
+		e.passStart(id, "command", ctx.place)
 		err := handler(ctx, args)
 		_ = e.conn.respond(id, nil, err)
 
@@ -1572,15 +1712,17 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 			}
 			data = req.streamData
 		} else if len(req.Args) > 0 {
+			// pig divergence (D657): a handler gets its own copy of the event payload: the fused decode below clones a master for each handler, the other decode reads the request's own frame. Pi hands every handler of an emit the one event object.
 			if e.conn.fused {
 				// Fused extensions share one decode of a payload; each handler gets its own copy.
 				var release func()
-				data, master, release = fusedEventArgs.decodeWithMaster(req.Args)
+				data, master, order, release = fusedEventArgs.decodeWithMaster(req.Args)
 				defer release()
 			} else {
-				_ = json.Unmarshal(req.Args, &data)
+				data, order, _ = unmarshalFrameObject(req.Args)
 			}
 		}
+		ctx.req, req.keyOrder = req, order
 		if req.Event == "agent_before_settle" || req.Event == "turn_end" {
 			boundaryData = data
 		}
@@ -1588,8 +1730,53 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 			var source struct {
 				Input json.RawMessage `json:"input"`
 			}
-			_ = json.Unmarshal(req.Args, &source)
-			toolCall = newToolCallInput(data["input"], source.Input)
+			_ = unmarshalFrameMember(req.Args, &source)
+			toolCall = newToolCallInput(data, source.Input)
+		}
+		// sentMember is the member of the event as the host sent it, decoded again: the handler may have edited its copy.
+		sentMember := func(member string) any {
+			if master == nil {
+				if unmarshalFrameMember(req.Args, &master) != nil {
+					return nil
+				}
+			}
+			return master[member]
+		}
+		if req.Event == "turn_end" {
+			objects, _ := captureEventObjects(req.Event, data)
+			boundaryEdits = func() []any { return objects.edits(req.Event, req.Args) }
+		}
+		if req.Event == "before_provider_request" || req.Event == "before_provider_headers" {
+			member := "payload"
+			if req.Event == "before_provider_headers" {
+				member = "headers"
+			}
+			object := data[member]
+			editReply = func(result any) any {
+				return providerHookReply(req.Event, object, result, func() any { return sentMember(member) })
+			}
+		}
+		// The members of the event as the handler receives them, to find the ones it assigns, reassigns or deletes (event_members_reply.go).
+		var members memberSnapshot
+		var memberEdits []any
+		trackMembers := memberEvent(req.Event)
+		if trackMembers {
+			members = snapshotMembers(data)
+		}
+		if req.Event == "message_start" || req.Event == "message_end" || req.Event == "agent_end" {
+			objects, _ := captureEventObjects(req.Event, data)
+			editReply = func(result any) any {
+				return eventEditsReply(result, append(objects.edits(req.Event, req.Args), memberEdits...))
+			}
+		}
+		if req.Event == "tool_result" {
+			received := map[string]any{}
+			for _, name := range toolResultMembers {
+				if value, ok := data[name]; ok {
+					received[name] = value
+				}
+			}
+			editReply = func(result any) any { return toolResultReply(data, received, result, sentMember) }
 		}
 		if req.Event == "before_agent_start" {
 			var err error
@@ -1604,9 +1791,18 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 			data["systemPrompt"] = ctx.systemPrompt
 		}
 		snapshot := snapshotContextMessages(req.Event, data)
+		if req.Event == "context" {
+			contextSnapshot = snapshot
+		}
+		// The member order of the objects of the event came with the decode, so no object has to be captured before the handler runs.
 		// runner.ts:1096-1125: the handlers of concurrent emits start in arrival order.
-		ctx.place.Pass()
+		e.passStart(id, "event", ctx.place)
 		result, err := handler(ctx, data)
+		if trackMembers {
+			if memberEdits = members.edits(data); memberEdits != nil && editReply == nil {
+				editReply = func(result any) any { return eventEditsReply(result, memberEdits) }
+			}
+		}
 		if req.Event == "user_bash" && err == nil {
 			result, err = e.userBashEventResult(result)
 		}
@@ -1614,13 +1810,19 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 			result = contextEventResult(data, snapshot, result, func() []any {
 				if master == nil {
 					// The handler may have edited its copy: decode the payload again.
-					if json.Unmarshal(req.Args, &master) != nil {
+					if unmarshalFrameMember(req.Args, &master) != nil {
 						return nil
 					}
 				}
 				messages, _ := master["messages"].([]any)
 				return messages
 			})
+		}
+		if contextSnapshot != nil && err != nil {
+			result = map[string]any{"messages": contextSnapshot, "_pigContextUnchanged": true}
+		}
+		if editReply != nil {
+			result = editReply(result)
 		}
 		if req.Event == "before_agent_start" {
 			result = map[string]any{"_pigPromptSections": promptOptions["sections"], "_pigPromptSelectedTools": promptOptions["selectedTools"], "_pigPromptOptions": promptOptions, "_pigPromptResult": result}
@@ -1631,6 +1833,9 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 			if edited, ok := toolCall.edit(); ok {
 				reply["_pigToolCallInput"] = edited
 			}
+			if assigned, ok := toolCall.assigned(); ok {
+				reply["_pigToolCallEventInput"] = assigned
+			}
 			result = reply
 		}
 		// pig additive (D19): return boundary mutations separately from the handler result and error.
@@ -1638,8 +1843,20 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 			if err != nil {
 				result = nil
 			}
-			result = map[string]any{"_pigBoundaryEntries": data["entries"], "_pigBoundaryResult": result}
+			var edits []any
+			if boundaryEdits != nil {
+				edits = boundaryEdits()
+			}
+			result = boundaryReply(data, result, edits)
 		}
+		_ = e.conn.respond(id, handedBack(req.Event, result, order), err)
+		// A Context a handler kept must not hold the event's payload: ObjectKeys reads byte order from here on.
+		req.keyMu.Lock()
+		req.keyOrder, req.Args = nil, nil
+		req.keyMu.Unlock()
+
+	case "ui.view.intent":
+		result, err := e.handleViewIntent(ctx, req.Args)
 		_ = e.conn.respond(id, result, err)
 
 	case "shortcut":
@@ -1662,21 +1879,23 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 			_ = e.conn.respond(id, nil, fmt.Errorf("unknown renderer: %s", req.Tool))
 			return
 		}
-		var payload struct {
-			Message map[string]any       `json:"message"`
-			Options MessageRenderOptions `json:"options"`
-			Width   int                  `json:"width"`
-		}
-		if len(req.Args) > 0 {
-			_ = json.Unmarshal(req.Args, &payload)
-		}
-		if viewOK {
-			view, err := viewHandler(ctx, payload.Message, payload.Options, payload.Width)
-			e.respondView(id, view, err)
-			return
-		}
-		lines, err := handler(ctx, payload.Message, payload.Options, payload.Width)
-		_ = e.conn.respond(id, map[string]any{"lines": lines}, err)
+		e.renderTranscript(id, req, "message", func(c *renderCard, subject map[string]any, options renderOptions, width int) (renderOutput, error) {
+			messageOptions := MessageRenderOptions{Expanded: options.Expanded, OutputPad: options.OutputPad, State: c.state}
+			if viewOK {
+				view, err := viewHandler(ctx, subject, messageOptions, width)
+				return renderOutput{view: &view}, err
+			}
+			lines, err := handler(ctx, subject, messageOptions, width)
+			return renderOutput{lines: lines}, err
+		}, func(c *renderCard, subject map[string]any, options renderOptions, event kit.Event) error {
+			e.toolMu.RLock()
+			handle := e.messageViewEventFuncs[req.Tool]
+			e.toolMu.RUnlock()
+			if handle == nil {
+				return nil
+			}
+			return handle(ctx, subject, MessageRenderOptions{Expanded: options.Expanded, OutputPad: options.OutputPad, State: c.state}, event)
+		})
 
 	case "render_entry":
 		e.toolMu.RLock()
@@ -1687,21 +1906,23 @@ func (e *Extension) handleArmedRequest(id string, req *requestMsg, ctx Context) 
 			_ = e.conn.respond(id, nil, fmt.Errorf("unknown entry renderer: %s", req.Tool))
 			return
 		}
-		var payload struct {
-			Entry   map[string]any     `json:"entry"`
-			Options EntryRenderOptions `json:"options"`
-			Width   int                `json:"width"`
-		}
-		if len(req.Args) > 0 {
-			_ = json.Unmarshal(req.Args, &payload)
-		}
-		if viewOK {
-			view, err := viewHandler(ctx, payload.Entry, payload.Options, payload.Width)
-			e.respondView(id, view, err)
-			return
-		}
-		lines, err := handler(ctx, payload.Entry, payload.Options, payload.Width)
-		_ = e.conn.respond(id, map[string]any{"lines": lines}, err)
+		e.renderTranscript(id, req, "entry", func(c *renderCard, subject map[string]any, options renderOptions, width int) (renderOutput, error) {
+			entryOptions := EntryRenderOptions{Expanded: options.Expanded, State: c.state}
+			if viewOK {
+				view, err := viewHandler(ctx, subject, entryOptions, width)
+				return renderOutput{view: &view}, err
+			}
+			lines, err := handler(ctx, subject, entryOptions, width)
+			return renderOutput{lines: lines}, err
+		}, func(c *renderCard, subject map[string]any, options renderOptions, event kit.Event) error {
+			e.toolMu.RLock()
+			handle := e.entryViewEventFuncs[req.Tool]
+			e.toolMu.RUnlock()
+			if handle == nil {
+				return nil
+			}
+			return handle(ctx, subject, EntryRenderOptions{Expanded: options.Expanded, State: c.state}, event)
+		})
 
 	case "markdown_transform":
 		_ = e.conn.respond(id, e.transformMarkdown(req.Args), nil)
@@ -1755,18 +1976,18 @@ func (e *Extension) transformMarkdown(args json.RawMessage) (result any) {
 }
 
 // reportRecoveredPanic writes a panic that an isolation boundary recovered to
-// stderr, which the host captures in the extension's log.
+// the extension's log (diagnostic.go).
 func reportRecoveredPanic(where string, recovered any) {
-	fmt.Fprintf(os.Stderr, "extension: recovered from panic in %s: %v\n%s\n", where, recovered, debug.Stack())
+	diagnosticf("extension: recovered from panic in %s: %v\n%s\n", where, recovered, debug.Stack())
 }
 
 // reportHostCallFailure writes a failed host call the caller cannot return to
-// stderr, which the host captures in the extension's log.
+// the extension's log (diagnostic.go).
 func reportHostCallFailure(method string, err error, result *callResultMsg) {
 	if err == nil && result != nil && result.Error != nil {
 		err = errors.New(result.Error.Message)
 	}
-	fmt.Fprintf(os.Stderr, "pig: host call %s failed: %v\n", method, err)
+	diagnosticf("pig: host call %s failed: %v\n", method, err)
 }
 
 // markNotifyHandled records that the main loop applied one queued notify frame.
@@ -1804,13 +2025,22 @@ func (e *Extension) waitNotifications(target uint64, stop <-chan struct{}) {
 	}
 }
 
+// applyQueuedNotify applies one notify frame the read loop queued and counts it as handled. Every reader of the queue calls it for each notify it takes: the main loop, the wait for ready and the factory's pump. A host call's wait counts on both halves (waitNotifications): a frame that is taken and not counted is waited for for ever, and one that is counted and not applied lets the call return on a replica older than its result.
+func (e *Extension) applyQueuedNotify(env envelope) {
+	e.notifyMu.Lock()
+	seq := e.notifyHandled + 1
+	e.notifyMu.Unlock()
+	e.handleNotifyAt(env, 2*seq)
+	e.markNotifyHandled()
+}
+
 // handleNotify processes broadcast notifications from the host.
 // Currently handles "state_update" to keep cached fields (model, thinking,
 // etc.) in sync with the host.
 func (e *Extension) handleNotify(env envelope) { e.handleNotifyAt(env, 0) }
 
-// handleNotifyAt is handleNotify for the seq-th notify frame the read loop queued; 0 is a state that precedes every frame, such as the ready snapshot.
-func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
+// handleNotifyAt is handleNotify for a frame at position at of the host's frame order (mcpServersAt); 0 precedes every frame.
+func (e *Extension) handleNotifyAt(env envelope, at uint64) {
 	if env.Notify == nil {
 		return
 	}
@@ -1823,18 +2053,20 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 		var payload struct {
 			Message string `json:"message"`
 		}
-		if json.Unmarshal(env.Notify.Args, &payload) == nil && payload.Message != "" {
+		if unmarshalFrameMember(env.Notify.Args, &payload) == nil && payload.Message != "" {
 			e.stale.CompareAndSwap(nil, &payload.Message)
 		}
 	case notifyEventsRelease:
 		e.releaseEventListener(env.Notify.Args)
 	case "tool_render_release":
 		e.releaseToolRenderCard(env.Notify.Args)
+	case notifyRenderRelease:
+		e.releaseRenderCard(env.Notify.Args)
 	case notifyBashOperationsRelease:
 		var release struct {
 			Handle string `json:"handle"`
 		}
-		if json.Unmarshal(env.Notify.Args, &release) == nil {
+		if unmarshalFrameMember(env.Notify.Args, &release) == nil {
 			e.bashOperationsMu.Lock()
 			delete(e.bashOperations, release.Handle)
 			e.bashOperationsMu.Unlock()
@@ -1845,7 +2077,7 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 		var release struct {
 			Key string `json:"key"`
 		}
-		if json.Unmarshal(env.Notify.Args, &release) == nil {
+		if unmarshalFrameMember(env.Notify.Args, &release) == nil {
 			e.providerMu.Lock()
 			delete(e.nativeProviders, release.Key)
 			e.providerMu.Unlock()
@@ -1854,7 +2086,7 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 		var released struct {
 			ID string `json:"id"`
 		}
-		if json.Unmarshal(env.Notify.Args, &released) == nil {
+		if unmarshalFrameMember(env.Notify.Args, &released) == nil {
 			e.autocomplete.mu.Lock()
 			delete(e.autocomplete.providers, released.ID)
 			e.autocomplete.mu.Unlock()
@@ -1865,7 +2097,7 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 			Event    map[string]any `json:"event"`
 			Started  bool           `json:"started"`
 		}
-		if err := json.Unmarshal(env.Notify.Args, &payload); err != nil {
+		if err := unmarshalFrameMember(env.Notify.Args, &payload); err != nil {
 			return
 		}
 		e.modelStreamsMu.RLock()
@@ -1897,14 +2129,17 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 				Settings      json.RawMessage `json:"settings"`
 				McpServers    json.RawMessage `json:"mcpServers"`
 				FooterData    *footerDataWire `json:"footerData"`
+				// UIAbilities (D614) is absent while no client is attached; every state is a full snapshot, so absent clears it.
+				UIAbilities json.RawMessage `json:"uiAbilities"`
 			} `json:"state"`
 		}
-		if err := json.Unmarshal(env.Notify.Args, &payload); err != nil {
+		if err := unmarshalFrameMember(env.Notify.Args, &payload); err != nil {
 			return
 		}
 		// Session replication: apply incremental entries before any handler
 		// runs, so GetBranch()/GetEntries() are current and local.
 		var sessionState struct {
+			SessionID   string `json:"sessionId"`
 			SessionName string `json:"sessionName"`
 			SessionFile string `json:"sessionFile"`
 		}
@@ -1918,12 +2153,17 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 			e.hasUI = *payload.State.HasUI
 		}
 		e.frontend = payload.State.Frontend
+		if changed, abilities := e.views.applyAbilities(payload.State.UIAbilities); changed {
+			e.viewAbilitiesFeed.publish(e, abilities)
+		}
 		if sessionState.SessionFile != "" {
 			e.sessionFile = sessionState.SessionFile
 		}
 		// Every session snapshot carries the name; the empty string is the host's carrier for a session with no name, so it clears the replica.
 		if len(payload.State.Session) > 0 {
 			e.sessionName = sessionState.SessionName
+			// The host omits the id only when it is empty, so a snapshot's Session always replaces the replicated id.
+			e.identity = e.identity.withSession(sessionState.SessionID, sessionState.SessionName, sessionState.SessionFile)
 		}
 		if theme, ok := decodeUITheme(payload.State.Theme); ok {
 			e.setUITheme(theme)
@@ -1933,7 +2173,7 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 			e.setToolsExpanded(*payload.State.ToolsExpanded)
 		}
 		applyHostTuiState(payload.State.Keybindings, payload.State.TerminalCapabilities)
-		e.applyReplicatedState(payload.State.Settings, payload.State.McpServers, 2*seq)
+		e.applyReplicatedState(payload.State.Settings, payload.State.McpServers, at)
 		footerChanged, branchChanged := e.applyFooterData(payload.State.FooterData)
 		defer func() {
 			e.mu.Unlock()
@@ -1943,9 +2183,12 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 		}()
 		// An absent model key leaves the replica, an explicit null clears it (the Session has no model), and an object replaces it.
 		if len(payload.State.Model) > 0 {
-			var model map[string]any
-			if json.Unmarshal(payload.State.Model, &model) == nil {
-				e.model, e.modelProvider = modelIdentity(model)
+			var changed bool
+			if e.identity, changed = e.identity.withModel(payload.State.Model); changed {
+				var model map[string]any
+				if json.Unmarshal(payload.State.Model, &model) == nil {
+					e.model, e.modelProvider = modelIdentity(model)
+				}
 			}
 		}
 	case "theme_change":
@@ -1968,7 +2211,7 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 		var payload struct {
 			Width int `json:"width"`
 		}
-		if err := json.Unmarshal(env.Notify.Args, &payload); err != nil {
+		if err := unmarshalFrameMember(env.Notify.Args, &payload); err != nil {
 			return
 		}
 		if payload.Width > 0 {
@@ -1990,7 +2233,7 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 		var payload struct {
 			Height int `json:"height"`
 		}
-		if err := json.Unmarshal(env.Notify.Args, &payload); err != nil {
+		if err := unmarshalFrameMember(env.Notify.Args, &payload); err != nil {
 			return
 		}
 		if payload.Height > 0 {
@@ -2005,7 +2248,7 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 			Key string `json:"key"`
 			overlayHandleState
 		}
-		if err := json.Unmarshal(env.Notify.Args, &payload); err != nil || payload.Key == "" {
+		if err := unmarshalFrameMember(env.Notify.Args, &payload); err != nil || payload.Key == "" {
 			return
 		}
 		e.overlaysMu.RLock()
@@ -2019,7 +2262,7 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 			Key     string `json:"key"`
 			Focused bool   `json:"focused"`
 		}
-		if err := json.Unmarshal(env.Notify.Args, &payload); err != nil || payload.Key == "" {
+		if err := unmarshalFrameMember(env.Notify.Args, &payload); err != nil || payload.Key == "" {
 			return
 		}
 		e.overlaysMu.RLock()
@@ -2028,13 +2271,28 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 		if overlay != nil {
 			overlay.enqueue(e.conn, payload.Key, overlayMessage{focus: &payload.Focused})
 		}
+	case "ui.custom.invalidate":
+		// The theme_change that precedes it on the connection is applied by now; the component's worker runs Invalidate and renders.
+		var payload struct {
+			Key   string `json:"key"`
+			Count int    `json:"count"`
+		}
+		if err := unmarshalFrameMember(env.Notify.Args, &payload); err != nil || payload.Key == "" || payload.Count < 1 {
+			return
+		}
+		e.overlaysMu.RLock()
+		overlay := e.overlays[payload.Key]
+		e.overlaysMu.RUnlock()
+		if overlay != nil {
+			overlay.enqueue(e.conn, payload.Key, overlayMessage{invalidate: payload.Count})
+		}
 	case "ui.custom.input":
 		var payload struct {
 			Key   string              `json:"key"`
 			Data  string              `json:"data"`
 			State *overlayHandleState `json:"state"`
 		}
-		if err := json.Unmarshal(env.Notify.Args, &payload); err != nil || payload.Key == "" {
+		if err := unmarshalFrameMember(env.Notify.Args, &payload); err != nil || payload.Key == "" {
 			return
 		}
 		e.overlaysMu.RLock()
@@ -2051,7 +2309,7 @@ func (e *Extension) handleNotifyAt(env envelope, seq uint64) {
 			Key   string     `json:"key"`
 			Event MouseEvent `json:"event"`
 		}
-		if err := json.Unmarshal(env.Notify.Args, &payload); err != nil || payload.Key == "" {
+		if err := unmarshalFrameMember(env.Notify.Args, &payload); err != nil || payload.Key == "" {
 			return
 		}
 		e.overlaysMu.RLock()
@@ -2076,17 +2334,24 @@ func (e *Extension) cancelRequest(env envelope) {
 		return
 	}
 	e.requestsMu.Lock()
-	cancel := e.requests[id]
+	cancel, armed := e.requests[id]
 	e.requestsMu.Unlock()
+	var cause error
+	if env.Cancel != nil && env.Cancel.Reason != "" {
+		cause = cancelReason(env.Cancel.Reason)
+	}
+	if env.Cancel != nil && env.Cancel.SignalOnly {
+		// Only the request's signal ended: no host call is cancelled and the request is not marked cancelled, so the handler's calls, pending and later, are answered and its reply is delivered.
+		if armed {
+			cancel.signal.fire(cause)
+		}
+		return
+	}
 	if e.conn != nil {
 		e.conn.cancelParentCalls(id)
 	}
-	if cancel != nil {
-		var cause error
-		if env.Cancel != nil && env.Cancel.Reason != "" {
-			cause = cancelReason(env.Cancel.Reason)
-		}
-		cancel(cause)
+	if armed {
+		cancel.request(cause)
 	}
 }
 
@@ -2094,9 +2359,9 @@ func (e *Extension) cancelAllRequests() {
 	e.requestsMu.Lock()
 	cancels := make([]context.CancelCauseFunc, 0, len(e.requests))
 	for _, cancel := range e.requests {
-		cancels = append(cancels, cancel)
+		cancels = append(cancels, cancel.request)
 	}
-	e.requests = make(map[string]context.CancelCauseFunc)
+	e.requests = make(map[string]requestCancel)
 	e.requestsMu.Unlock()
 	for _, cancel := range cancels {
 		cancel(nil)
@@ -2236,7 +2501,7 @@ func (e *Extension) dispatchTerminalInput(id string, req *requestMsg) {
 		Data string `json:"data"`
 	}
 	if len(req.Args) > 0 {
-		_ = json.Unmarshal(req.Args, &args)
+		_ = unmarshalFrameMember(req.Args, &args)
 	}
 
 	e.terminalInputMu.RLock()
@@ -2473,7 +2738,7 @@ func (e *Extension) runWidthDeliveries() {
 func (e *Extension) callWidthHandler(ctx Context, handler WidthChangeHandler, width int) {
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Fprintf(os.Stderr, "extension: recovered from panic in a width change handler: %v\n%s\n", r, debug.Stack())
+			diagnosticf("extension: recovered from panic in a width change handler: %v\n%s\n", r, debug.Stack())
 		}
 	}()
 	handler(ctx, width)
@@ -2487,16 +2752,29 @@ func (e *Extension) stopWidthDeliveries() {
 	e.widthMu.Unlock()
 }
 
-// toolCallInput is the input a tool_call handler received. The tool runs with that object (agent-loop.ts prepareToolCall passes the same args to beforeToolCall and execute), so an edit counts only when the handler changed its members; assigning another value to event["input"] changes nothing the tool receives. source is the input as the host wrote it, which gives the member order an edit keeps.
+// toolCallInput is the input a tool_call handler received. The tool runs with that object (agent-loop.ts prepareToolCall passes the same args to beforeToolCall and execute), so an edit counts only when the handler changed its members; assigning another value to event["input"] changes nothing the tool receives, and is the input the next handlers read (runner.ts emitToolCall hands them the one event). source is the input as the host wrote it, which gives the member order an edit keeps.
 type toolCallInput struct {
+	event  map[string]any
 	input  any
 	source json.RawMessage
 	before []byte
 }
 
-func newToolCallInput(input any, source json.RawMessage) *toolCallInput {
+func newToolCallInput(event map[string]any, source json.RawMessage) *toolCallInput {
+	input := event["input"]
 	before, _ := json.MarshalJS(input)
-	return &toolCallInput{input: input, source: source, before: before}
+	return &toolCallInput{event: event, input: input, source: source, before: before}
+}
+
+// assigned returns the value the handler assigned to event["input"], when it is another object than the one the event carried.
+func (t *toolCallInput) assigned() (any, bool) {
+	now := t.event["input"]
+	nowMap, nowOK := now.(map[string]any)
+	wasMap, wasOK := t.input.(map[string]any)
+	if nowOK && wasOK {
+		return now, reflect.ValueOf(nowMap).Pointer() != reflect.ValueOf(wasMap).Pointer()
+	}
+	return now, now != nil || t.input != nil
 }
 
 // edit returns the input as JSON when the handler left its members different from the ones it received. A retained member keeps the place it had, as an assignment to a JavaScript object leaves it.

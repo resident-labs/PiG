@@ -10,7 +10,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/store"
 )
 
-// Ports packages/chord/src/next/documents/transaction.ts
+// Ports packages/chord/src/documents/transaction.ts
 //
 // Transactions (§9, R12, R13): drafts of an object's documents, prepared and adopted in one batch, with Chord's own
 // staged changes (job runs, §15), fenced by the token they run under; they run on the object's line (line.go).
@@ -21,36 +21,37 @@ import (
 // A Transaction is used by its callback's goroutine and, through Cut and Discard, by the host.
 //
 // Go forced differences: the table type parameters and the `draft`/`retire` overloads are designed out (see the
-// package documentation); the table handle is the store's *TableHandle; `rows` is a TxRows iterator.
+// package documentation); the table is the store's Table interface (its handle is a *TableHandle); `rows` is a TxRows iterator.
 
 // Tx is what `self.tx` gives its callback. Inside it: only `tx.*`, no other `self.tx`, no calls to other objects.
 type Tx interface {
 	// Draft is the document's draft: the same one for the same document within one transaction. handle is a
-	// SingletonHandle (no key) or a KeyedHandle with its key.
-	Draft(handle any, key ...string) (*delta.Object, error)
+	// SingletonHandle (no key) or a KeyedHandle with its key: a string, or for a host-keyed one an address of its kind
+	// (anything else, and an omitted key, is invalid/args).
+	Draft(handle any, key ...any) (*delta.Object, error)
 	// Retire retires the document when the transaction commits (its address reads `initial()` again); a no-op when it
 	// is absent.
-	Retire(handle any, key ...string) error
+	Retire(handle any, key ...any) error
 	// Start starts a run of job, one of this object's jobs, with this transaction's other writes (§15): both commit or
 	// neither. It returns its Run at once; a discarded transaction's Run fails `released` from Outcome. A key of an
 	// unsettled run (one started earlier in this transaction too) returns that run.
 	Start(job JobHandle, args any, options ...StartOptions) (Run, error)
 	// Get is the row with key as this transaction leaves it (its own put, update, delete overlaid; W10).
-	Get(table *store.TableHandle, key any) (store.Row, error)
+	Get(table store.Table, key any) (store.Row, error)
 	// Page is a page of committed rows, stable for the transaction (without its own writes).
-	Page(table *store.TableHandle, q *store.Query, limit int64, options ...store.PageOptions) (store.Page, error)
+	Page(table store.Table, q *store.Query, limit int64, options ...store.PageOptions) (store.Page, error)
 	// Rows is every committed row of q, as Page.
-	Rows(table *store.TableHandle, q *store.Query) *TxRows
+	Rows(table store.Table, q *store.Query) *TxRows
 	// Put writes row when the transaction commits (an upsert: the whole row replaced).
-	Put(table *store.TableHandle, row any) error
+	Put(table store.Table, row any) error
 	// Update changes the row with key when the transaction commits; an absent key changes nothing.
-	Update(table *store.TableHandle, key, set any) error
+	Update(table store.Table, key, set any) error
 	// Delete deletes the row with key when the transaction commits.
-	Delete(table *store.TableHandle, key any) error
+	Delete(table store.Table, key any) error
 	// UpdateWhere changes every row matching where when the transaction commits (one statement, its count recorded).
-	UpdateWhere(table *store.TableHandle, where, set any) error
+	UpdateWhere(table store.Table, where, set any) error
 	// DeleteWhere deletes every row matching where when the transaction commits.
-	DeleteWhere(table *store.TableHandle, where any) error
+	DeleteWhere(table store.Table, where any) error
 }
 
 // Staged is Chord's own changes staged in a transaction (a job's run records): adopted in its commit step with the
@@ -123,13 +124,19 @@ type Transaction struct {
 	// writes are the store writes, in staging order, and the store they commit to; made by the first (the flag that
 	// sends the commit through the store's step, W12).
 	writes *txWrites
-	// tables are the tables written, each with its writes and overlay.
-	tables map[*store.TableHandle]*store.TableChanges
+	// tables are the tables written, each with its writes and overlay; tableList is the same tables in the order they were
+	// first written (Pi's Map order).
+	tables    map[*store.TableHandle]*store.TableChanges
+	tableList []*store.TableHandle
 	// pending counts the `tx.*` reads underway: a callback settling with one is refused (rule 3).
 	pending int
 	// persistence is when its commit reaches the store (a run state's deferred change, D8).
 	persistence CommitPersistence
 	state       txState
+	// adoptions are what its commit adopts (set at its preparation, counted when Committed asks); rows the table rows its
+	// commit's step changed.
+	adoptions []*adoption
+	rows      int64
 	// queued rejects the commit while it waits in the store's queue (cut): its caller is told at once (rule 3).
 	queued chan error
 }
@@ -160,9 +167,11 @@ func (tx *Transaction) StageStore(chordStore *store.ChordStore) *[]store.StagedW
 	return &tx.writes.staged
 }
 
-// keyed is what a slot of either kind says of a key.
+// keyer is what a slot of either kind says of a key: Key is the stored key of a string (the text rules), KeyOf the
+// string a handle's key stands for (an address's key for a host-keyed slot).
 type keyer interface {
 	Key(key string) (string, error)
+	KeyOf(key any) (string, error)
 }
 
 func (tx *Transaction) slotOf(handle any) (slot DocumentSlot, err error) {
@@ -182,27 +191,36 @@ func (tx *Transaction) slotOf(handle any) (slot DocumentSlot, err error) {
 	return nil, fmt.Errorf("%s: a transaction drafts only documents of handles self.state made", tx.documents.Label())
 }
 
-func keyOf(keys []string) string {
+// keyOf is the key a transaction call was given: "" when omitted.
+func keyOf(keys []any) any {
 	if len(keys) > 0 {
 		return keys[0]
 	}
 	return ""
 }
 
+// storedKey is the stored key of key for slot: `slot.key(slot.keyOf(key))`.
+func storedKey(slot DocumentSlot, key any) (string, error) {
+	each := slot.(keyer)
+	handleKey, err := each.KeyOf(key)
+	if err != nil {
+		return "", err
+	}
+	return each.Key(handleKey)
+}
+
 // Draft is the draft of the document of handle (at key, for a keyed one).
-func (tx *Transaction) Draft(handle any, keys ...string) (*delta.Object, error) {
+func (tx *Transaction) Draft(handle any, keys ...any) (*delta.Object, error) {
 	var slot DocumentSlot
 	var at string
 	var err error
-	// Keyed keys follow the text rules (KeyedSlot.Key); a singleton's key is always "".
+	// Keyed keys are the handle's (KeyOf: an address's key for a host-keyed one, an empty string refused there) and
+	// follow the text rules (KeyedSlot.Key); a singleton's key is always "".
 	tx.documents.Do(func() {
 		if slot, err = tx.slotOf(handle); err != nil {
 			return
 		}
-		at = keyOf(keys)
-		if at != "" {
-			at, err = slot.(keyer).Key(at)
-		}
+		at, err = storedKey(slot, keyOf(keys))
 	})
 	if err != nil {
 		return nil, err
@@ -249,7 +267,7 @@ func (tx *Transaction) DraftSlot(slot DocumentSlot, key string) (*delta.Object, 
 }
 
 // Retire retires the document of handle (at key, for a keyed one) when the transaction commits.
-func (tx *Transaction) Retire(handle any, keys ...string) error {
+func (tx *Transaction) Retire(handle any, keys ...any) error {
 	var slot DocumentSlot
 	var at string
 	var e *Entry
@@ -258,11 +276,8 @@ func (tx *Transaction) Retire(handle any, keys ...string) error {
 		if slot, err = tx.slotOf(handle); err != nil {
 			return
 		}
-		at = keyOf(keys)
-		if at != "" {
-			if at, err = slot.(keyer).Key(at); err != nil {
-				return
-			}
+		if at, err = storedKey(slot, keyOf(keys)); err != nil {
+			return
 		}
 		e, err = tx.RetireSlot(slot, at)
 	})
@@ -327,7 +342,7 @@ func (tx *Transaction) Start(job JobHandle, args any, options ...StartOptions) (
 }
 
 // Get is the row with key as this transaction leaves it.
-func (tx *Transaction) Get(table *store.TableHandle, key any) (store.Row, error) {
+func (tx *Transaction) Get(table store.Table, key any) (store.Row, error) {
 	var handle *store.TableHandle
 	var changes *store.TableChanges
 	var err error
@@ -348,7 +363,7 @@ func (tx *Transaction) Get(table *store.TableHandle, key any) (store.Row, error)
 }
 
 // Page is a page of committed rows, stable for the transaction (without its own writes).
-func (tx *Transaction) Page(table *store.TableHandle, q *store.Query, limit int64, options ...store.PageOptions) (store.Page, error) {
+func (tx *Transaction) Page(table store.Table, q *store.Query, limit int64, options ...store.PageOptions) (store.Page, error) {
 	var option store.PageOptions
 	if len(options) > 0 {
 		option = options[0]
@@ -367,7 +382,7 @@ func (tx *Transaction) Page(table *store.TableHandle, q *store.Query, limit int6
 // TxRows is every committed row of a query, read a page of store.RowsPage at a time (Pi's `rows` AsyncIterable).
 type TxRows struct {
 	tx       *Transaction
-	table    *store.TableHandle
+	table    store.Table
 	q        *store.Query
 	buffer   []store.Row
 	after    *string
@@ -375,7 +390,7 @@ type TxRows struct {
 }
 
 // Rows is every committed row of q, as Page.
-func (tx *Transaction) Rows(table *store.TableHandle, q *store.Query) *TxRows {
+func (tx *Transaction) Rows(table store.Table, q *store.Query) *TxRows {
 	return &TxRows{tx: tx, table: table, q: q}
 }
 
@@ -408,7 +423,7 @@ func (rows *TxRows) Close() {
 	rows.buffer = nil
 }
 
-func (tx *Transaction) withChanges(table *store.TableHandle, write func(changes *store.TableChanges) error) error {
+func (tx *Transaction) withChanges(table store.Table, write func(changes *store.TableChanges) error) error {
 	var err error
 	tx.documents.Do(func() {
 		var changes *store.TableChanges
@@ -420,27 +435,27 @@ func (tx *Transaction) withChanges(table *store.TableHandle, write func(changes 
 }
 
 // Put writes row when the transaction commits (an upsert: the whole row replaced).
-func (tx *Transaction) Put(table *store.TableHandle, row any) error {
+func (tx *Transaction) Put(table store.Table, row any) error {
 	return tx.withChanges(table, func(changes *store.TableChanges) error { return changes.Put(row) })
 }
 
 // Update changes the row with key when the transaction commits; an absent key changes nothing.
-func (tx *Transaction) Update(table *store.TableHandle, key, set any) error {
+func (tx *Transaction) Update(table store.Table, key, set any) error {
 	return tx.withChanges(table, func(changes *store.TableChanges) error { return changes.Update(key, set) })
 }
 
 // Delete deletes the row with key when the transaction commits.
-func (tx *Transaction) Delete(table *store.TableHandle, key any) error {
+func (tx *Transaction) Delete(table store.Table, key any) error {
 	return tx.withChanges(table, func(changes *store.TableChanges) error { return changes.Delete(key) })
 }
 
 // UpdateWhere changes every row matching where when the transaction commits.
-func (tx *Transaction) UpdateWhere(table *store.TableHandle, where, set any) error {
+func (tx *Transaction) UpdateWhere(table store.Table, where, set any) error {
 	return tx.withChanges(table, func(changes *store.TableChanges) error { return changes.UpdateWhere(where, set) })
 }
 
 // DeleteWhere deletes every row matching where when the transaction commits.
-func (tx *Transaction) DeleteWhere(table *store.TableHandle, where any) error {
+func (tx *Transaction) DeleteWhere(table store.Table, where any) error {
 	return tx.withChanges(table, func(changes *store.TableChanges) error { return changes.DeleteWhere(where) })
 }
 
@@ -475,7 +490,9 @@ func (tx *Transaction) Commit() error {
 		return err
 	}
 	var writes *txWrites
-	tx.documents.Do(func() { writes = tx.writes })
+	tx.documents.Do(func() {
+		writes = tx.writes
+	})
 	if writes == nil {
 		tx.documents.Do(func() {
 			if err = tx.adopt(adoptions); err == nil {
@@ -493,6 +510,11 @@ func (tx *Transaction) prepareCommit() ([]*adoption, error) {
 	}
 	if tx.pending > 0 {
 		return nil, fmt.Errorf("%s: the callback settled before its pending tx operations", tx.documents.Label())
+	}
+	if tx.tables != nil {
+		if err := tx.refreshQueries(); err != nil {
+			return nil, err
+		}
 	}
 	tx.state = txCommitting
 	if err := tx.ctx.Err(); err != nil {
@@ -534,6 +556,7 @@ func (tx *Transaction) prepareCommit() ([]*adoption, error) {
 		}
 		adoptions = append(adoptions, &adoption{entry: e, prepared: prepared, retires: retires, stored: stored})
 	}
+	tx.adoptions = adoptions
 	return adoptions, nil
 }
 
@@ -553,9 +576,12 @@ func (tx *Transaction) step(chordStore *store.ChordStore, staged []store.StagedW
 			})
 			return admitted
 		},
-		Adopt: func(int64, []int64) error {
+		Adopt: func(_ int64, _ []int64, rows int) error {
 			var err error
-			tx.documents.Do(func() { err = tx.adopt(adoptions) })
+			tx.documents.Do(func() {
+				tx.rows = int64(rows)
+				err = tx.adopt(adoptions)
+			})
 			return err
 		},
 	}
@@ -627,6 +653,20 @@ func (tx *Transaction) adopt(adoptions []*adoption) error {
 		}
 		return nil
 	}, tx.ctx)
+}
+
+// Committed is what its commit adopted: its documents, their ops, its store writes and the table rows they changed (all 0
+// before it committed). A section.
+func (tx *Transaction) Committed() (documents, ops, writes, rows int64) {
+	for _, a := range tx.adoptions {
+		if a.prepared != nil {
+			ops += int64(len(a.prepared.Ops()))
+		}
+	}
+	if tx.writes != nil {
+		writes = int64(len(tx.writes.staged))
+	}
+	return int64(len(tx.adoptions)), ops, writes, tx.rows
 }
 
 // Discard aborts every draft and prepared change. A section.
@@ -717,12 +757,44 @@ func (tx *Transaction) cutError() error {
 	}, nil)
 }
 
+// refreshQueries stages the refresh of the store's reads over the tables this transaction wrote (slice 14 §3.2; Pi
+// transaction.ts `#refreshQueries`, 549-560): the reads are chosen and tested in the commit step, after every table write
+// staged so far (the callback's), and published in the commit's batch. Staged whether or not a read exists now: one opened
+// while this commit waits is refreshed too (the index is read in the step, Pi reads.ts `ReadRefresh.#refresh`, 241-248).
+//
+// The ordering contract: the refresh is the last staged write of the commit (`OrderWrite`, after the table writes, so a run
+// sees them); it runs in the commit's backend transaction, so what it reads is what the commit leaves; its runs are adopted
+// by the commit's fence, inside the commit's batch, only once the step committed. A refused or rolled back step adopts
+// nothing, and a group that rolled back applies it again alone (only the last application's runs count). What a failed
+// refresh does: a run that fails (a row the code cannot read, a statement that threw) is a failed run handed to its read,
+// not a failure of the transaction (Pi `Read.run` catches into a failed run, read.ts 83-88: the member fails, the commit stands); an
+// error of the step itself (a skip test's probe the backend refused, Pi `skips` awaiting the step) refuses the commit as any
+// staged write's error does.
+func (tx *Transaction) refreshQueries() error {
+	written := make([]string, len(tx.tableList))
+	for index, handle := range tx.tableList {
+		written[index] = handle.Sql.Table
+	}
+	changes := func() []store.Change {
+		var all []store.Change
+		for _, handle := range tx.tableList {
+			all = append(all, tx.tables[handle].Changes()...)
+		}
+		return all
+	}
+	refresh := store.NewReadRefresh(tx.writes.store.Reads, written, changes, tx.ctx)
+	tx.writes.staged = append(tx.writes.staged, refresh.Write)
+	_, err := tx.Stage(refresh, func() Staged { return refresh })
+	return err
+}
+
 // handle is the handle behind table, one of this object's tables (another object's is refused).
-func (tx *Transaction) handle(table *store.TableHandle) (*store.TableHandle, error) {
+func (tx *Transaction) handle(given store.Table) (*store.TableHandle, error) {
 	if err := tx.assertOpen(); err != nil {
 		return nil, err
 	}
 	// Plugin code may pass any table: only this object's handles are taken.
+	table, _ := given.(*store.TableHandle)
 	if table == nil || table.Owner.Scope() != any(tx.documents) {
 		return nil, fmt.Errorf("%s: a transaction writes only its own object's tables", tx.documents.Label())
 	}
@@ -733,7 +805,7 @@ func (tx *Transaction) handle(table *store.TableHandle) (*store.TableHandle, err
 }
 
 // changes are the writes to table in this transaction, made by the first.
-func (tx *Transaction) changes(table *store.TableHandle) (*store.TableChanges, error) {
+func (tx *Transaction) changes(table store.Table) (*store.TableChanges, error) {
 	handle, err := tx.handle(table)
 	if err != nil {
 		return nil, err
@@ -748,6 +820,7 @@ func (tx *Transaction) changes(table *store.TableHandle) (*store.TableChanges, e
 		}
 		changes = store.NewTableChanges(handle, &tx.writes.staged)
 		tx.tables[handle] = changes
+		tx.tableList = append(tx.tableList, handle)
 	}
 	return changes, nil
 }
@@ -778,7 +851,12 @@ func (tx *Transaction) begin(e *Entry) (*delta.Object, error) {
 
 // checkFound fails, failing slot's owner `broken`, when its definition cannot read the cold document found (R15).
 func (tx *Transaction) checkFound(found *FoundDocument, persisted PersistedSlot, slot DocumentSlot) error {
-	if err := CheckReadable(found.Stored.Version, found.Fingerprint, persisted.Definition().Current()); err != nil {
+	definition := persisted.Definition().Current()
+	err := persisted.Persistence().CheckHost(found.Host, definition)
+	if err == nil {
+		err = CheckReadable(found.Stored.Version, found.Fingerprint, definition)
+	}
+	if err != nil {
 		failure := data.AsChordError(err, slot.Owner().Label())
 		slot.Owner().Fail(failure)
 		return failure

@@ -40,6 +40,7 @@ func TestAcquireRetriesEEXISTUntilHolderReleases(t *testing.T) {
 	for _, a := range acquirers {
 		t.Run(a.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "auth.json")
+			createLockTarget(t, path)
 			held, err := AcquireSync(path)
 			if err != nil {
 				t.Fatal(err)
@@ -74,6 +75,7 @@ func TestAcquireRetriesOnlyWindowsEPERMAmongNonEEXISTMkdirErrors(t *testing.T) {
 		for _, a := range acquirers {
 			t.Run(name+"/"+a.name, func(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "auth.json")
+				createLockTarget(t, path)
 				held, err := AcquireSync(path)
 				if err != nil {
 					t.Fatal(err)
@@ -115,7 +117,7 @@ func TestAcquireRetriesOnlyWindowsEPERMAmongNonEEXISTMkdirErrors(t *testing.T) {
 					t.Fatalf("err = %v, want the unwrapped %s and not ErrLocked", err, name)
 				}
 				// Pi surfaces the fs error's Node message (lib/node_errors.js uvException).
-				if want := nonEEXISTMkdirMessages[name] + ", mkdir '" + path + ".lock'"; err.Error() != want {
+				if want := nonEEXISTMkdirMessages[name] + ", mkdir '" + resolvedLockTarget(t, path) + ".lock'"; err.Error() != want {
 					t.Fatalf("message = %q, want %q", err.Error(), want)
 				}
 				if got := calls.Load(); got != 2 {
@@ -135,6 +137,7 @@ func TestAcquireRetriesEveryEEXISTMkdirError(t *testing.T) {
 		for _, a := range acquirers {
 			t.Run(name+"/"+a.name, func(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "auth.json")
+				createLockTarget(t, path)
 				held, err := AcquireSync(path)
 				if err != nil {
 					t.Fatal(err)

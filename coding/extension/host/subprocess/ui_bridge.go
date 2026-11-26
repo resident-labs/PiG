@@ -1,7 +1,9 @@
 package subprocess
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"maps"
@@ -14,10 +16,12 @@ import (
 
 	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
 	"github.com/MichaelKinsy/PiG/internal/orderedjson"
+	"github.com/MichaelKinsy/PiG/internal/sessionentry"
 	"github.com/MichaelKinsy/PiG/internal/streamattachhook"
 
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/coding/uiview"
 )
 
 // UIBridge translates extension→host call messages into real UI/action method
@@ -34,13 +38,21 @@ type UIBridge struct {
 	// waitForIdleBlocks reports whether a waitForIdle call waits now (extension.CommandActions.WaitForIdleBlocks); guarded by mu.
 	waitForIdleBlocks   func() bool
 	modelCatalogEncoder func() (json.RawMessage, error)
-	// modelCatalogBatches counts open BatchModelCatalogPublication calls; modelCatalogPending records a publication one of them deferred.
-	modelCatalogBatches int
-	modelCatalogPending bool
+	// modelCatalogBatches counts open BatchModelCatalogPublication calls; modelCatalogPending records a publication one of them deferred, and
+	// modelCatalogPendingAll that a deferred one was a PublishModelCatalog, which reaches every replica.
+	modelCatalogBatches    int
+	modelCatalogPending    bool
+	modelCatalogPendingAll bool
 	// commandsCache memoizes the encoded command catalog between matching GetCommandsVersion readings; version 0 is empty.
 	commandsCache struct {
 		version uint64
 		encoded json.RawMessage
+	}
+	// optionsCache memoizes the encoded system prompt options for the key GetSystemPromptOptionsKey last reported.
+	optionsCache struct {
+		key     any
+		encoded json.RawMessage
+		valid   bool
 	}
 	// modelCache memoizes the active model's encoded metadata for the model identity GetModelKey last reported.
 	modelCache struct {
@@ -48,13 +60,16 @@ type UIBridge struct {
 		encoded json.RawMessage
 		valid   bool
 	}
+	// afterRun returns, for a send of the extension on owner, the function that makes a failure report when the sending code's run ends (Host.syncReports); nil when the Host has none.
+	afterRun func(owner *Conn, request, token string) func(report func())
+
 	// mcpServers reads the servers extensions registered; the Host installs its runtime's registry.
 	mcpServers    func() []extension.RegisteredMcpServer
 	mu            sync.RWMutex
 	headerMu      sync.Mutex
-	footerMu      sync.Mutex            // footer admission, pending state and application are one step, as for headerMu; lock headerMu first
-	widgets       map[string]*PushProxy // widget key → proxy; one namespace for every extension, as Pi's setExtensionWidget keys its maps
-	widgetOwners  map[string]string     // widget key → the extension that set it, for ClearExtension
+	footerMu      sync.Mutex             // footer admission, pending state and application are one step, as for headerMu; lock headerMu first
+	widgets       map[string]*PushProxy  // widget key → proxy; one namespace for every extension, as Pi's setExtensionWidget keys its maps
+	widgetOwners  map[string]widgetOwner // widget key → the extension that set it and its connection, for ClearExtension
 	widgetOrder   uint64
 	surfaceOwners map[string]surfaceOwner
 
@@ -130,6 +145,8 @@ type UIBridge struct {
 	actions *HostCallbacks
 	// resolveFlag enforces registration scope and supplies host-owned defaults after CLI overrides.
 	resolveFlag func(extName, name string, override any) any
+	// extensionPath names a loaded extension by the path it was selected from, as its ExtensionError does. Set by the Host.
+	extensionPath func(extName string) string
 
 	// withSession builds the WithSession option of a replacement call that names a callback handle. Set by the Host.
 	withSession func(ctx context.Context, extName string, owner *Conn, handle string) func(*extension.ReplacedSessionContext) error
@@ -174,6 +191,9 @@ type UIBridge struct {
 
 	// OnHostStateChanged is called when host state that runtimes replicate changed with no extension call or event to announce it. Set by the Host, which pushes the new state to every connected runtime off the caller's goroutine (see [UIBridge.HostStateChanged]).
 	OnHostStateChanged func()
+	// OnHostStateChanging and OnHostStateSettled bracket a change of the identity state (the model, the session id, name and file) that the Session makes: the first runs before the change is visible, the second after the change was reported through OnHostStateChanged. Set by the Host (see [UIBridge.HostStateChanging]).
+	OnHostStateChanging func()
+	OnHostStateSettled  func()
 
 	// invalidateTUI triggers a TUI render cycle.
 	invalidateTUI func()
@@ -182,17 +202,24 @@ type UIBridge struct {
 	// mode (D107). Every state snapshot carries it as StatePayload.frontend.
 	frontend bool
 	// frontendPush is the owned worker that pushes the state_update for a
-	// SetFrontend change off the caller's goroutine. pending coalesces changes
-	// made while a push runs, since each push reads the current flag;
+	// SetFrontend change, or a change of the view abilities, off the caller's
+	// goroutine. pending coalesces changes made while a push runs, since each
+	// push reads the current state. The worker ends when nothing is pending and
+	// the next change starts it again, so an idle bridge holds no goroutine;
 	// StopFrontendPushes stops the worker and waits for it.
 	frontendPush struct {
 		mu      sync.Mutex
-		cond    *sync.Cond
 		pending bool
 		started bool
 		stopped bool
 		wg      sync.WaitGroup
 	}
+	// views is the D614 plugin UI mount registry.
+	views *uiview.Registry
+	// viewAnswers maps each unanswered ui.view.intent request (viewAnswer) to its intent's ticket.
+	viewAnswers sync.Map
+	// viewSuperseded holds the connections of the extension instances a reload is replacing (SupersedeViews), until each is cleared. mu guards it.
+	viewSuperseded map[*Conn]struct{}
 
 	// notifyFunc renders notifications via the TUI chat area.
 	// Set by InteractiveMode after TUI creation.
@@ -267,11 +294,13 @@ type HostCallbacks struct {
 	// upstream: types.ts:1451
 	SetSessionName func(name string) error
 
-	// SetLabel sets a label on a session entry; an empty label clears it.
+	// SetLabel records what pi.setLabel was given for a session entry: label is the string, an empty one included; a nil label with null set is a
+	// label written as null; a nil label without it is the call without a label. Pi writes a different entry for each
+	// (session-manager.ts appendLabelChange), and all but a string that is not empty clear the label.
 	// Its error fails the extension's call, as upstream appendLabelChange
 	// throws.
 	// upstream: types.ts:1453
-	SetLabel func(entryID, label string) error
+	SetLabel func(entryID string, label *string, null bool) error
 
 	// GetActiveTools returns the currently active tool names.
 	// upstream: types.ts:1454
@@ -312,9 +341,12 @@ type HostCallbacks struct {
 	// GetCommandsVersion numbers the states of the catalog GetCommands returns. A push re-encodes the catalog only when the number changes, so it must change whenever GetCommands can return something different, and never repeat. Nil means every push encodes it.
 	GetCommandsVersion func() uint64
 
-	// SetModel changes the active model.
+	// SetModel makes the model object an extension passed the active model. The model has no backend: the Session binds one for its provider.
 	// upstream: types.ts:1459
-	SetModel func(context.Context, string) (bool, error)
+	SetModel func(context.Context, *ai.Model) (bool, error)
+
+	// ResolveModel builds the model a `provider/id` name stands for (CallResolveModel).
+	ResolveModel func(context.Context, string) (*ai.Model, error)
 
 	// GetThinkingLevel returns the current thinking level.
 	// upstream: types.ts:1460
@@ -336,6 +368,9 @@ type HostCallbacks struct {
 	// build the system prompt. Backs ctx.getSystemPromptOptions().
 	// upstream: runner.ts:653 (createCommandContext getSystemPromptOptions)
 	GetSystemPromptOptions func() extension.BuildSystemPromptOptions
+
+	// GetSystemPromptOptionsKey returns a key for the contents of the options GetSystemPromptOptions returns: it changes whenever they change, whether the host replaced the options or an in-process extension wrote the object it was handed, so a state push encodes them again only when the key changes. Nil means every push encodes them.
+	GetSystemPromptOptionsKey func() any
 
 	// GetModelInfo returns the active model's object (extension.ModelObject), or nil without a model.
 	// upstream: runner.ts:609 (model getter on ExtensionContext)
@@ -364,6 +399,9 @@ type HostCallbacks struct {
 	// GetEntriesPage returns a bounded page at or after cursor, the cursor after
 	// that page, whether more entries remain, and the current branch leaf.
 	GetEntriesPage func(cursor, maxBytes int) ([]json.RawMessage, int, bool, string)
+
+	// GetMessageEntries returns the entries message_end persisted since cursor, each with the sequence its message was numbered by, and the cursor after them.
+	GetMessageEntries func(cursor int) ([]sessionentry.MessageSeq, int)
 
 	// GetModelAuth resolves request auth for a model lookup.
 	// upstream: modelRegistry.getApiKeyAndHeaders(model)
@@ -483,11 +521,18 @@ type HostCallbacks struct {
 type SendMessageOptions struct {
 	TriggerTurn *bool  `json:"triggerTurn,omitempty"`
 	DeliverAs   string `json:"deliverAs,omitempty"` // "steer" | "followUp" | "nextTurn"
+	// AfterRun is SendUserMessageOptions.AfterRun for the failure of a message that starts or joins a run (agent-session.ts:3544-3546).
+	AfterRun func(report func()) `json:"-"`
 }
 
 // SendUserMessageOptions mirrors upstream options for sendUserMessage.
 type SendUserMessageOptions struct {
 	DeliverAs string `json:"deliverAs,omitempty"` // "steer" | "followUp"
+	// ExpandPromptTemplates is Pi's option (types.ts:1792, agent-session.ts:2557): true dispatches extension commands and expands skill commands and prompt templates; absent is false.
+	ExpandPromptTemplates *bool `json:"expandPromptTemplates,omitempty"`
+	// AfterRun, when set, takes the function that reports a failure of this send. Pi reports it from a catch callback, a microtask after the sending code's run
+	// (agent-session.ts:3552-3555), so the host makes the report when that run ends (sync_run_report.go). Nil: the Session reports at once.
+	AfterRun func(report func()) `json:"-"`
 }
 
 // ToolInfo is one entry of getAllTools on the wire. Mirrors upstream ToolInfo
@@ -543,7 +588,7 @@ type CommandInfo struct {
 }
 
 // Snapshot returns the current host-side state visible to the extension via
-// upstream-faithful synchronous getters. Missing usage stays absent; unknown token and percentage counts stay null.
+// upstream-faithful synchronous getters.
 //
 // The result is suitable for the protocol's [StatePayload]: callers send it
 // at handshake time (embedded in [ReadyPayload]) and on host-side state
@@ -577,6 +622,7 @@ func (b *UIBridge) Snapshot(flagNames []string, cursor int, wantSessionLog bool)
 	// dispatching a tool, command, or event handler, so these are current when
 	// an extension reads them. They come from the UI context rather than the
 	// host actions, so they are filled before the unbound-actions return.
+	state.UIAbilities = b.views.Abilities()
 	if terminalCapabilities != nil {
 		caps := terminalCapabilities()
 		state.TerminalCapabilities = &caps
@@ -677,22 +723,60 @@ func (b *UIBridge) Snapshot(flagNames []string, cursor int, wantSessionLog bool)
 	if actions.HasPendingMessages != nil {
 		state.HasPendingMessages = actions.HasPendingMessages()
 	}
-	if actions.GetContextUsage != nil {
-		if cu := actions.GetContextUsage(); cu != nil {
-			state.ContextUsage = &extensionContextUsageDTO{Tokens: cu.Tokens, ContextWindow: cu.ContextWindow, Percent: cu.Percent}
-		}
-	}
 	if actions.GetSystemPrompt != nil {
 		state.SystemPrompt = actions.GetSystemPrompt()
 	}
 	// ExtensionCommandContext.getSystemPromptOptions (types.ts:355) is
 	// synchronous upstream, so the Node runtime answers it from state.
 	if actions.GetSystemPromptOptions != nil {
-		if encoded, err := json.Marshal(actions.GetSystemPromptOptions()); err == nil {
+		if encoded, ok := b.systemPromptOptionsWire(actions); ok {
 			state.SystemPromptOptions = encoded
 		}
 	}
 	return state
+}
+
+// systemPromptOptionsWire is the encoded system prompt options for a state push, made once for each key the host reports.
+func (b *UIBridge) systemPromptOptionsWire(actions *HostCallbacks) (json.RawMessage, bool) {
+	if actions.GetSystemPromptOptionsKey == nil {
+		encoded, err := json.Marshal(actions.GetSystemPromptOptions())
+		return encoded, err == nil
+	}
+	key := actions.GetSystemPromptOptionsKey()
+	if key == nil {
+		encoded, err := json.Marshal(actions.GetSystemPromptOptions())
+		return encoded, err == nil
+	}
+	b.mu.Lock()
+	if b.optionsCache.valid && b.optionsCache.key == key {
+		encoded := b.optionsCache.encoded
+		b.mu.Unlock()
+		return encoded, true
+	}
+	b.mu.Unlock()
+	encoded, err := json.Marshal(actions.GetSystemPromptOptions())
+	if err != nil {
+		return nil, false
+	}
+	// The Session can replace its options between the two reads; an encoding is kept only for a key that held across them.
+	if actions.GetSystemPromptOptionsKey() != key {
+		return encoded, true
+	}
+	b.mu.Lock()
+	b.optionsCache.key, b.optionsCache.encoded, b.optionsCache.valid = key, encoded, true
+	b.mu.Unlock()
+	return encoded, true
+}
+
+// messageEntries returns the message entries persisted since cursor and the cursor after them.
+func (b *UIBridge) messageEntries(cursor int) ([]sessionentry.MessageSeq, int) {
+	b.mu.RLock()
+	get := b.actions.GetMessageEntries
+	b.mu.RUnlock()
+	if get == nil {
+		return nil, cursor
+	}
+	return get(cursor)
 }
 
 // SetThemeFunc registers the source of the host's active theme palette,
@@ -735,6 +819,11 @@ func (b *UIBridge) SetFrontend(on bool) {
 	if !changed {
 		return
 	}
+	b.schedulePush()
+}
+
+// schedulePush asks the push worker for one state_update; requests made while a push runs coalesce.
+func (b *UIBridge) schedulePush() {
 	w := &b.frontendPush
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -744,22 +833,18 @@ func (b *UIBridge) SetFrontend(on bool) {
 	w.pending = true
 	if !w.started {
 		w.started = true
-		w.cond = sync.NewCond(&w.mu)
 		w.wg.Go(b.runFrontendPushes)
 	}
-	w.cond.Signal()
 }
 
-// runFrontendPushes pushes one state_update per batch of SetFrontend changes
-// until StopFrontendPushes.
+// runFrontendPushes pushes one state_update per batch of changes and ends
+// when none is pending or StopFrontendPushes stopped it.
 func (b *UIBridge) runFrontendPushes() {
 	w := &b.frontendPush
 	for {
 		w.mu.Lock()
-		for !w.pending && !w.stopped {
-			w.cond.Wait()
-		}
-		if w.stopped {
+		if !w.pending || w.stopped {
+			w.started = false
 			w.mu.Unlock()
 			return
 		}
@@ -780,26 +865,27 @@ func (b *UIBridge) StopFrontendPushes() {
 	w := &b.frontendPush
 	w.mu.Lock()
 	w.stopped = true
-	if w.cond != nil {
-		w.cond.Broadcast()
-	}
 	w.mu.Unlock()
 	w.wg.Wait()
 }
 
 func NewUIBridge(invalidateTUI func()) *UIBridge {
-	return &UIBridge{
+	b := &UIBridge{
 		widgets:         make(map[string]*PushProxy),
-		widgetOwners:    make(map[string]string),
+		widgetOwners:    make(map[string]widgetOwner),
 		surfaceOwners:   make(map[string]surfaceOwner),
 		customOverlays:  make(map[string]extension.RemoteOverlayHandle),
 		extConns:        make(map[string]*Conn),
+		viewSuperseded:  make(map[*Conn]struct{}),
 		editorsByConn:   make(map[string]*editorProxy),
 		modelStreams:    make(map[modelStreamKey]context.CancelFunc),
 		uiCtx:           extension.NoopUIContext,
 		pendingStatuses: make(map[string]*string),
 		invalidateTUI:   invalidateTUI,
 	}
+	b.views = uiview.New(uiview.Options{KnownKind: knownViewKind})
+	b.views.OnAbilities(b.schedulePush)
+	return b
 }
 
 // SetInvalidate replaces the TUI invalidation callback. Thread-safe.
@@ -965,6 +1051,61 @@ func (b *UIBridge) RemoveWidget(key string) {
 	}
 }
 
+// ResetExtensionUI drops what the extension processes put on screen that Pi's resetExtensionUI resets (interactive-mode.ts), when a
+// /reload begins and before a Session replacement: every widget they set (clearExtensionWidgets), and it tells the widget sync
+// callback; the statuses, the footer and the header the bridge keeps to show a UI bound later; and their terminal input listeners. The
+// UI resets what it draws itself. The connection of a footer or header factory is told that its surface is retired, as Pi disposes the
+// component, and a frame the factory renders afterwards is not installed. What an extension sets after the reset is its own.
+func (b *UIBridge) ResetExtensionUI() {
+	b.headerMu.Lock()
+	b.footerMu.Lock()
+	b.mu.Lock()
+	widgets := make([]*PushProxy, 0, len(b.widgets))
+	for key, proxy := range b.widgets {
+		widgets = append(widgets, proxy)
+		delete(b.widgets, key)
+		delete(b.widgetOwners, key)
+	}
+	clear(b.pendingStatuses)
+	retired := maps.Clone(b.surfaceOwners)
+	clear(b.surfaceOwners)
+	b.pendingFooterSet, b.pendingFooterClear, b.pendingFooter, b.pendingFooterView = false, false, nil, nil
+	b.pendingHeaderSet, b.pendingHeaderClear, b.pendingHeader, b.pendingHeaderView = false, false, nil, nil
+	if b.footerView != nil {
+		b.footerView.close()
+		b.footerView, b.footerViewConn = nil, nil
+	}
+	if b.headerView != nil {
+		b.headerView.close()
+		b.headerView, b.headerViewConn = nil, nil
+	}
+	listeners := b.terminalInputSubs
+	b.terminalInputSubs = nil
+	b.mu.Unlock()
+	b.footerMu.Unlock()
+	b.headerMu.Unlock()
+	for kind, owner := range retired {
+		if owner.conn == nil || owner.id == 0 {
+			continue
+		}
+		args, _ := json.Marshal(struct {
+			Kind      string `json:"kind"`
+			SurfaceID int    `json:"surfaceId"`
+		}{kind, owner.id})
+		_ = owner.conn.Send(&Envelope{Type: MsgNotify, Notify: &NotifyPayload{Method: "ui.surface_retired", Args: args}})
+	}
+	for _, retire := range listeners {
+		retire()
+	}
+	// Clear outside b.mu: it requests a render through b.Invalidate.
+	for _, proxy := range widgets {
+		proxy.Clear()
+	}
+	if len(widgets) > 0 {
+		b.notifyWidgetSync()
+	}
+}
+
 // SetWidgetRequestFunc installs a mode-specific serialized-widget observer.
 func (b *UIBridge) SetWidgetRequestFunc(fn func(extName, key string, lines []string, opts *extension.ExtensionWidgetOptions)) {
 	b.mu.Lock()
@@ -1095,6 +1236,26 @@ func (b *UIBridge) HostStateChanged() {
 	}
 }
 
+// HostStateChanging tells the Host that the Session's model, session id, name or file is about to change, and HostStateSettled that the change was reported through [UIBridge.HostStateChanged]. A host call can read the new state before the owner reports it, and its reply must not outrun the push of that state to the runtime that made it, so the Host flushes the state before every reply while a change is in flight. Every HostStateChanging has one HostStateSettled; both return at once.
+func (b *UIBridge) HostStateChanging() {
+	b.mu.RLock()
+	changing := b.OnHostStateChanging
+	b.mu.RUnlock()
+	if changing != nil {
+		changing()
+	}
+}
+
+// HostStateSettled ends the change HostStateChanging began.
+func (b *UIBridge) HostStateSettled() {
+	b.mu.RLock()
+	settled := b.OnHostStateSettled
+	b.mu.RUnlock()
+	if settled != nil {
+		settled()
+	}
+}
+
 // SetHostAction sets a single host callback by name. Thread-safe.
 // This allows the interactive mode to wire callbacks one-by-one without
 // importing the HostCallbacks type (avoiding circular deps).
@@ -1121,10 +1282,11 @@ func (b *UIBridge) HostStateChanged() {
 //   - "sendMessage":     func(extension.CustomMessageRef, SendMessageOptions) error
 //   - "sendUserMessage": func(any, SendUserMessageOptions) error
 //   - "appendEntry":     func(string, any, *DirectEntryAppend) error
-//   - "setLabel":        func(string, string) error
+//   - "setLabel":        func(string, *string, bool) error
 //   - "setActiveTools":  func([]string)
 //   - "refreshTools":    func() error
-//   - "setModel":        func(context.Context, string) (bool, error)
+//   - "setModel":        func(context.Context, *ai.Model) (bool, error)
+//   - "resolveModel":    func(context.Context, string) (*ai.Model, error)
 //   - "isIdle":          func() bool
 //   - "getSignal":       func() context.Context
 //   - "abort":           func()
@@ -1172,6 +1334,10 @@ func (b *UIBridge) SetHostAction(key string, fn any) {
 		b.actions.GetSystemPrompt = fn.(func() string)
 	case "getSystemPromptOptions":
 		b.actions.GetSystemPromptOptions = fn.(func() extension.BuildSystemPromptOptions)
+		b.optionsCache.valid = false
+	case "getSystemPromptOptionsKey":
+		b.actions.GetSystemPromptOptionsKey = fn.(func() any)
+		b.optionsCache.valid = false
 	case "exec":
 		switch f := fn.(type) {
 		case func(context.Context, string, []string, *extension.ExecOptions) (extension.ExecResult, error):
@@ -1189,13 +1355,15 @@ func (b *UIBridge) SetHostAction(key string, fn any) {
 	case "appendEntry":
 		b.actions.AppendEntry = fn.(func(string, any, *DirectEntryAppend) error)
 	case "setLabel":
-		b.actions.SetLabel = fn.(func(string, string) error)
+		b.actions.SetLabel = fn.(func(string, *string, bool) error)
 	case "setActiveTools":
 		b.actions.SetActiveTools = fn.(func([]string))
 	case "refreshTools":
 		b.actions.RefreshTools = fn.(func() error)
 	case "setModel":
-		b.actions.SetModel = fn.(func(context.Context, string) (bool, error))
+		b.actions.SetModel = fn.(func(context.Context, *ai.Model) (bool, error))
+	case CallResolveModel:
+		b.actions.ResolveModel = fn.(func(context.Context, string) (*ai.Model, error))
 	case "isIdle":
 		b.actions.IsIdle = fn.(func() bool)
 	case "getSignal":
@@ -1249,6 +1417,8 @@ func (b *UIBridge) SetHostAction(key string, fn any) {
 		b.actions.GetEntries = fn.(func() []json.RawMessage)
 	case "getEntriesPage":
 		b.actions.GetEntriesPage = fn.(func(int, int) ([]json.RawMessage, int, bool, string))
+	case "getMessageEntries":
+		b.actions.GetMessageEntries = fn.(func(int) ([]sessionentry.MessageSeq, int))
 	case "getSessionID":
 		b.actions.GetSessionID = fn.(func() string)
 	case "getSessionFile":
@@ -1382,6 +1552,10 @@ func (b *UIBridge) handleCall(ctx context.Context, extName string, owner *Conn, 
 		extension.CallInitiated(ctx)
 	}
 
+	if isViewCall(call.Method) {
+		return b.handleViewCall(extName, owner, call)
+	}
+
 	switch call.Method {
 	// ── Category 1: Notifications & Status ───────────────────────────────
 	case "ui.notify":
@@ -1486,9 +1660,9 @@ func (b *UIBridge) handleCall(ctx context.Context, extName string, owner *Conn, 
 
 	// ── Category 8: Agent Actions (ExtensionActions) ─────────────────────
 	case "sendMessage":
-		return b.handleSendMessage(actions, call.Args)
+		return b.handleSendMessage(owner, call, actions)
 	case "sendUserMessage":
-		return b.handleSendUserMessage(actions, call.Args)
+		return b.handleSendUserMessage(owner, call, actions)
 	case "appendEntry":
 		return b.handleAppendEntry(actions, call.Args)
 	case "exec":
@@ -1523,8 +1697,10 @@ func (b *UIBridge) handleCall(ctx context.Context, extName string, owner *Conn, 
 		return b.handleRefreshTools(actions)
 	case "getCommands":
 		return b.handleGetCommands(actions)
-	case "setModel":
+	case CallSetModel:
 		return b.handleSetModel(ctx, actions, call.Args)
+	case CallResolveModel:
+		return b.handleResolveModel(ctx, actions, call.Args)
 	case "getThinkingLevel":
 		return b.handleGetThinkingLevel(actions)
 	case "setThinkingLevel":
@@ -1561,7 +1737,7 @@ func (b *UIBridge) handleCall(ctx context.Context, extName string, owner *Conn, 
 	case "generateImages":
 		return b.handleGenerateImages(ctx, actions, call.Args)
 	case "refreshModelRegistry":
-		return b.handleRefreshModelRegistry(ctx, actions, call.Args)
+		return b.handleRefreshModelRegistry(ctx, actions, extName, owner, call.Args)
 	case "sessionRead":
 		return b.handleSessionRead(actions, call.Args)
 	case "complete":
@@ -1623,7 +1799,23 @@ func (b *UIBridge) HandleWidgetPush(extName string, conn *Conn, push *WidgetPush
 	if push.Width == 0 {
 		placement = "aboveEditor"
 	}
-	b.updateWidget(extName, push.Key, push.Lines, push.Width, placement)
+	b.updateWidget(extName, conn, push.Key, push.Lines, push.Width, placement)
+}
+
+// widgetOwner is the extension that set a widget and the connection it set it through. A reload runs the extension again over a new
+// connection: the widget the generation before it set goes with that generation (clearExtension), and the same key set through the new
+// connection is a new widget, as Pi clears every widget when a reload begins and the reloaded extension sets its own.
+type widgetOwner struct {
+	name string
+	conn *Conn
+}
+
+// replacedLocked reports whether conn is the connection of a generation of extName that a reload replaced: the extension registered
+// another connection since. Such a generation draws no widget: what it set now would replace its successor's widget under the key and
+// go when it is stopped. b.mu is held.
+func (b *UIBridge) replacedLocked(extName string, conn *Conn) bool {
+	current := b.extConns[extName]
+	return conn != nil && current != nil && current != conn
 }
 
 // hasView reports a carrier's view field that holds a view.
@@ -1641,17 +1833,23 @@ func (b *UIBridge) updateWidgetView(extName string, conn *Conn, widgetKey string
 		b.mu.Unlock()
 		return
 	}
+	if b.replacedLocked(extName, conn) {
+		b.mu.Unlock()
+		return
+	}
 	proxy, exists := b.widgets[key]
-	// Another extension's widget under the same key is replaced, as Pi's setExtensionWidget removes whatever the key held.
+	// Another extension's widget under the same key is replaced, as Pi's setExtensionWidget removes whatever the key held; so is the
+	// widget of the extension's generation before a reload, whose view surface is its connection's.
 	var displaced *PushProxy
-	if exists && b.widgetOwners[key] != extName {
+	owner := widgetOwner{name: extName, conn: conn}
+	if exists && b.widgetOwners[key] != owner {
 		displaced, exists = proxy, false
 	}
 	if !exists {
-		proxy = NewPushProxy(b.Invalidate, nil)
+		proxy = NewPushProxy(b.Invalidate)
 		b.widgets[key] = proxy
 	}
-	b.widgetOwners[key] = extName
+	b.widgetOwners[key] = owner
 	proxy.mu.Lock()
 	moved := placement != "" && placement != proxy.placement
 	if !exists || moved {
@@ -1681,7 +1879,7 @@ func (b *UIBridge) updateWidgetView(extName string, conn *Conn, widgetKey string
 }
 
 // updateWidget replaces string-list widgets and updates component frames. An empty placement keeps a frame's current slot.
-func (b *UIBridge) updateWidget(extName, widgetKey string, lines []string, width int, placement string) {
+func (b *UIBridge) updateWidget(extName string, conn *Conn, widgetKey string, lines []string, width int, placement string) {
 	key := widgetKey
 
 	b.mu.Lock()
@@ -1689,17 +1887,22 @@ func (b *UIBridge) updateWidget(extName, widgetKey string, lines []string, width
 		b.mu.Unlock()
 		return
 	}
+	if b.replacedLocked(extName, conn) {
+		b.mu.Unlock()
+		return
+	}
 	proxy, exists := b.widgets[key]
 	var displaced *PushProxy
-	if exists && b.widgetOwners[key] != extName {
+	owner := widgetOwner{name: extName, conn: conn}
+	if exists && b.widgetOwners[key] != owner {
 		displaced, exists = proxy, false
 	}
 	replaced := !exists || width == 0
 	if replaced {
-		proxy = NewPushProxy(b.Invalidate, nil)
+		proxy = NewPushProxy(b.Invalidate)
 		b.widgets[key] = proxy
 	}
-	b.widgetOwners[key] = extName
+	b.widgetOwners[key] = owner
 	proxy.mu.Lock()
 	moved := placement != "" && placement != proxy.placement
 	if replaced || moved {
@@ -1741,7 +1944,7 @@ func (b *UIBridge) notifyWidgetSync() {
 func (b *UIBridge) GetWidget(extName, key string) *PushProxy {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	if b.widgetOwners[key] != extName {
+	if b.widgetOwners[key].name != extName {
 		return nil
 	}
 	return b.widgets[key]
@@ -1758,14 +1961,27 @@ func (b *UIBridge) AllWidgets() map[string]*PushProxy {
 
 // ClearExtension removes all widgets for a given extension (on crash/shutdown).
 func (b *UIBridge) ClearExtension(extName string) {
-	b.clearExtension(extName, nil, false)
+	b.clearExtension(extName, nil, false, false)
 }
 
 func (b *UIBridge) ClearExtensionConn(extName string, owner *Conn) {
-	b.clearExtension(extName, owner, true)
+	b.clearExtension(extName, owner, true, false)
 }
 
-func (b *UIBridge) clearExtension(extName string, owner *Conn, ownerOnly bool) {
+// RetireExtensionConn takes off the screen what the generation on owner put there, as ClearExtensionConn does, for a generation whose process lives on after a reload
+// replaced or removed it: Pi's resetExtensionUI removes the extension overlays and leaves their promises pending (interactive-mode.ts:2592-2598), so a ui.custom call
+// that command awaits stays pending, and its component's own done still settles it. The call ends with the connection, as every pending call does.
+func (b *UIBridge) RetireExtensionConn(extName string, owner *Conn) {
+	b.clearExtension(extName, owner, true, true)
+}
+
+func (b *UIBridge) clearExtension(extName string, owner *Conn, ownerOnly, retire bool) {
+	b.mu.RLock()
+	endsOwner := !ownerOnly || b.extConns[extName] == owner
+	b.mu.RUnlock()
+	if endsOwner {
+		b.views.Break(extName, uiview.ReasonOwnerGone)
+	}
 	prefix := extName + ":"
 	var widgets []*PushProxy
 	var overlays []extension.RemoteOverlayHandle
@@ -1777,19 +1993,23 @@ func (b *UIBridge) clearExtension(extName string, owner *Conn, ownerOnly bool) {
 			delete(b.autocompleteQueries, key)
 		}
 	}
-	if !ownerOnly || currentOwner {
-		for k, proxy := range b.widgets {
-			if b.widgetOwners[k] == extName {
-				widgets = append(widgets, proxy)
-				delete(b.widgets, k)
-				delete(b.widgetOwners, k)
-			}
+	for k, proxy := range b.widgets {
+		// A widget goes with the connection that set it: the generation a reload replaced is cleared after its successor registered, when the
+		// bridge no longer names its connection, and its widget would stay drawn, with its view surface and that connection, until the
+		// extension set the key again. The extension's every widget goes when the extension does.
+		if set := b.widgetOwners[k]; set.name == extName && (!ownerOnly || currentOwner || set.conn == owner) {
+			widgets = append(widgets, proxy)
+			delete(b.widgets, k)
+			delete(b.widgetOwners, k)
 		}
 	}
 	for k, handle := range b.customOverlays {
 		if strings.HasPrefix(k, customOverlayOwnerPrefix(extName, owner)) || (!ownerOnly && strings.HasPrefix(k, prefix)) {
 			overlays = append(overlays, handle)
-			delete(b.customOverlays, k)
+			// A retired overlay stays registered: its call is still waiting, and the component's own close settles it.
+			if !retire {
+				delete(b.customOverlays, k)
+			}
 		}
 	}
 	for id, ref := range b.autocompleteReferences {
@@ -1801,6 +2021,10 @@ func (b *UIBridge) clearExtension(extName string, owner *Conn, ownerOnly bool) {
 		if origin.owner == owner || (!ownerOnly && origin.owner == b.extConns[extName]) {
 			delete(b.autocompleteOrigins, provider)
 		}
+	}
+	delete(b.viewSuperseded, owner)
+	if !ownerOnly {
+		delete(b.viewSuperseded, b.extConns[extName])
 	}
 	ownerGone := !ownerOnly || currentOwner
 	if ownerGone {
@@ -1817,7 +2041,11 @@ func (b *UIBridge) clearExtension(extName string, owner *Conn, ownerOnly bool) {
 		b.notifyWidgetSync()
 	}
 	for _, handle := range overlays {
-		handle.Close(nil)
+		if !retire {
+			handle.Close(nil)
+		} else if retirer, ok := handle.(extension.RemoteOverlayRetirer); ok {
+			retirer.Retire()
+		}
 	}
 	b.clearEditorConn(extName, owner, ownerOnly)
 	b.clearTuiAlt(extName, owner, ownerOnly)
@@ -1850,10 +2078,21 @@ func (b *UIBridge) ModelCatalog() []json.RawMessage {
 // extension that replicates the model registry (RegisterPayload.WantsModelRegistry).
 // With no such connection it builds nothing: a later one receives its own
 // snapshot from RegisterExtConn.
-func (b *UIBridge) PublishModelCatalog() {
+func (b *UIBridge) PublishModelCatalog() { b.publishModelCatalog(true) }
+
+// PublishModelCatalogChange is PublishModelCatalog for a publisher that knows the registry committed something, not that anything differs: a
+// refresh notifies once it reloaded models.json and once its catalog refresh ended, changed or not. A replica whose last catalog frame holds the
+// same bytes is sent nothing: its reads answer the same either way, and it is spared decoding and applying the whole catalog once per step.
+// A publication that answers an extension's own registry write stays a PublishModelCatalog: the replica keeps that write over the snapshot until
+// a frame shows it (runtime.mjs applyModelRegistryState), whatever bytes the frame holds.
+// pig additive (D19): Pi's extensions read its ModelRegistry in process, so a refresh sends them nothing.
+func (b *UIBridge) PublishModelCatalogChange() { b.publishModelCatalog(false) }
+
+func (b *UIBridge) publishModelCatalog(all bool) {
 	b.mu.Lock()
 	if b.modelCatalogBatches > 0 {
 		b.modelCatalogPending = true
+		b.modelCatalogPendingAll = b.modelCatalogPendingAll || all
 		b.mu.Unlock()
 		return
 	}
@@ -1870,17 +2109,33 @@ func (b *UIBridge) PublishModelCatalog() {
 	if len(connections) == 0 {
 		return
 	}
-	message := b.modelCatalogUpdate()
-	if message == nil {
+	state, err := b.modelRegistryState(true)
+	if err != nil {
 		return
 	}
+	update, err := newModelRegistryUpdate(state)
+	if err != nil {
+		return
+	}
+	digest := update.digest()
+	var message encodedEnvelope
 	for _, connection := range connections {
-		_ = connection.sendEncoded(message)
+		connection.modelCatalogMu.Lock()
+		if all || connection.modelCatalogAlways || !connection.modelCatalogSentSet || connection.modelCatalogSent != digest {
+			if message == nil {
+				message = update.encode()
+			}
+			// A frame that was not queued says nothing about the replica.
+			connection.modelCatalogSentSet = connection.sendEncoded(message) == nil
+			connection.modelCatalogSent = digest
+		}
+		connection.modelCatalogMu.Unlock()
 	}
 }
 
 // BatchModelCatalogPublication defers every PublishModelCatalog, including the ones SetModelCatalog and binding getModels or
-// getModelRegistryState make, until the returned function runs; that function then publishes once if any publication was deferred.
+// getModelRegistryState make, until the returned function runs; that function then publishes once if any publication was deferred, as a
+// PublishModelCatalogChange when every deferred one was.
 // Binding the model operations together so sends each replica one snapshot of the finished binding instead of one per step: an
 // extension idle until session_start would otherwise decode the whole catalog several times on the startup path.
 // pig additive (D19): Pi's extensions read its ModelRegistry in process, so no snapshot crosses a process boundary there.
@@ -1893,13 +2148,13 @@ func (b *UIBridge) BatchModelCatalogPublication() func() {
 		once.Do(func() {
 			b.mu.Lock()
 			b.modelCatalogBatches--
-			publish := b.modelCatalogBatches == 0 && b.modelCatalogPending
+			publish, all := b.modelCatalogBatches == 0 && b.modelCatalogPending, b.modelCatalogPendingAll
 			if publish {
-				b.modelCatalogPending = false
+				b.modelCatalogPending, b.modelCatalogPendingAll = false, false
 			}
 			b.mu.Unlock()
 			if publish {
-				b.PublishModelCatalog()
+				b.publishModelCatalog(all)
 			}
 		})
 	}
@@ -1922,14 +2177,40 @@ func (b *UIBridge) modelCatalogUpdate() encodedEnvelope {
 // and are copied once. Marshaling the whole state would run the catalog through a pooled encode buffer that grows by doubling, so a publication's allocation
 // would depend on the capacity the pool happened to hand out: one publication cost from one to several catalog sizes.
 func encodeModelRegistryUpdate(state map[string]any) (encodedEnvelope, error) {
-	const prefix = `{"type":"notify","notify":{"method":"model_registry_update","args":{`
+	update, err := newModelRegistryUpdate(state)
+	if err != nil {
+		return nil, err
+	}
+	return update.encode(), nil
+}
+
+// modelCatalogDigest identifies the bytes of a model_registry_update frame.
+type modelCatalogDigest [sha256.Size]byte
+
+// modelRegistryUpdate is a model_registry_update frame before its bytes are put together: the members of the registry state in sorted key order,
+// each name and value encoded, and the size of the frame.
+type modelRegistryUpdate struct {
+	members [][2][]byte
+	size    int
+}
+
+var (
+	modelRegistryUpdatePrefix = []byte(`{"type":"notify","notify":{"method":"model_registry_update","args":{`)
+	modelRegistryUpdateSuffix = []byte("}}}")
+	modelRegistryUpdateComma  = []byte(",")
+	modelRegistryUpdateColon  = []byte(":")
+)
+
+func newModelRegistryUpdate(state map[string]any) (modelRegistryUpdate, error) {
 	keys := slices.Sorted(maps.Keys(state))
-	members := make([][2][]byte, len(keys))
-	size := len(prefix) + len("}}}") + max(len(keys)-1, 0)
+	update := modelRegistryUpdate{
+		members: make([][2][]byte, len(keys)),
+		size:    len(modelRegistryUpdatePrefix) + len(modelRegistryUpdateSuffix) + max(len(keys)-1, 0),
+	}
 	for i, key := range keys {
 		name, err := json.Marshal(key)
 		if err != nil {
-			return nil, err
+			return modelRegistryUpdate{}, err
 		}
 		var value []byte
 		switch raw, isRaw := state[key].(json.RawMessage); {
@@ -1937,26 +2218,48 @@ func encodeModelRegistryUpdate(state map[string]any) (encodedEnvelope, error) {
 			value = []byte("null")
 		case isRaw:
 			if !json.Valid(raw) {
-				return nil, fmt.Errorf("model registry state %s is not JSON", key)
+				return modelRegistryUpdate{}, fmt.Errorf("model registry state %s is not JSON", key)
 			}
 			value = raw
 		default:
 			if value, err = json.Marshal(state[key]); err != nil {
-				return nil, err
+				return modelRegistryUpdate{}, err
 			}
 		}
-		members[i] = [2][]byte{name, value}
-		size += len(name) + 1 + len(value)
+		update.members[i] = [2][]byte{name, value}
+		update.size += len(name) + 1 + len(value)
 	}
-	data := make(encodedEnvelope, 0, size)
-	data = append(data, prefix...)
-	for i, member := range members {
+	return update, nil
+}
+
+// encode puts the frame together in one buffer of its exact size.
+func (u modelRegistryUpdate) encode() encodedEnvelope {
+	data := make(encodedEnvelope, 0, u.size)
+	data = append(data, modelRegistryUpdatePrefix...)
+	for i, member := range u.members {
 		if i > 0 {
-			data = append(data, ',')
+			data = append(data, modelRegistryUpdateComma...)
 		}
-		data = append(append(append(data, member[0]...), ':'), member[1]...)
+		data = append(append(append(data, member[0]...), modelRegistryUpdateColon...), member[1]...)
 	}
-	return append(data, "}}}"...), nil
+	return append(data, modelRegistryUpdateSuffix...)
+}
+
+// digest hashes the bytes encode writes without putting them together: a publication that repeats the frame a replica holds builds no frame.
+func (u modelRegistryUpdate) digest() (sum modelCatalogDigest) {
+	hash := sha256.New()
+	hash.Write(modelRegistryUpdatePrefix)
+	for i, member := range u.members {
+		if i > 0 {
+			hash.Write(modelRegistryUpdateComma)
+		}
+		hash.Write(member[0])
+		hash.Write(modelRegistryUpdateColon)
+		hash.Write(member[1])
+	}
+	hash.Write(modelRegistryUpdateSuffix)
+	hash.Sum(sum[:0])
+	return sum
 }
 
 // ModelRegistryState is the registry snapshot an extension's synchronous
@@ -2123,9 +2426,15 @@ func (b *UIBridge) RegisterExtConn(extName string, conn *Conn, wantsModelRegistr
 	if !wantsModelRegistry {
 		return
 	}
-	if message := b.modelCatalogUpdate(); message != nil {
+	message := b.modelCatalogUpdate()
+	// The runtime applies the ready frame's catalog (ReadyPayload.Models, read before this registration) after this frame, so the frame is not
+	// recorded as what the replica holds: the first publication reaches the connection whatever it carries.
+	conn.modelCatalogMu.Lock()
+	conn.modelCatalogSentSet = false
+	if message != nil {
 		_ = conn.sendEncoded(message)
 	}
+	conn.modelCatalogMu.Unlock()
 }
 
 // HandleNotify routes a Node→Go fire-and-forget notification. Currently
@@ -2515,6 +2824,9 @@ func (b *UIBridge) handleNewSession(ctx context.Context, extName string, owner *
 	if err != nil {
 		return &CallResultPayload{Error: &ErrorInfo{Code: "session_error", Message: err.Error()}}, nil
 	}
+	if !res.Cancelled {
+		b.ViewsSessionReplaced()
+	}
 	result, _ := json.Marshal(res)
 	return &CallResultPayload{Result: result}, nil
 }
@@ -2537,6 +2849,9 @@ func (b *UIBridge) handleFork(ctx context.Context, extName string, owner *Conn, 
 	res, err := actions.Fork(ctx, p.EntryID, opts)
 	if err != nil {
 		return &CallResultPayload{Error: &ErrorInfo{Code: "fork_error", Message: err.Error()}}, nil
+	}
+	if !res.Cancelled {
+		b.ViewsSessionReplaced()
 	}
 	result, _ := json.Marshal(res)
 	return &CallResultPayload{Result: result}, nil
@@ -2589,6 +2904,9 @@ func (b *UIBridge) handleSwitchSession(ctx context.Context, extName string, owne
 	res, err := actions.SwitchSession(ctx, p.SessionPath, &extension.SwitchSessionOptions{WithSession: b.replacementCallback(ctx, extName, owner, args)})
 	if err != nil {
 		return &CallResultPayload{Error: &ErrorInfo{Code: "session_error", Message: err.Error()}}, nil
+	}
+	if !res.Cancelled {
+		b.ViewsSessionReplaced()
 	}
 	result, _ := json.Marshal(res)
 	return &CallResultPayload{Result: result}, nil
@@ -2841,7 +3159,7 @@ func (b *UIBridge) handleCustom(ctx context.Context, extName string, owner *Conn
 	stopCancel := context.AfterFunc(ctx, func() { proxy.Close(nil) })
 	defer stopCancel()
 
-	host := &customOverlayHost{ctx: ctx, bridge: b, extName: extName, owner: owner, key: p.Key}
+	host := &customOverlayHost{ctx: ctx, bridge: b, extName: extName, owner: owner, key: p.Key, ui: ui}
 	value, ok := ui.RunRemoteOverlay(
 		extension.RemoteOverlayOptions{
 			Title:          p.Title,
@@ -2885,6 +3203,10 @@ type customOverlayHost struct {
 	extName string
 	owner   *Conn
 	key     string
+	// ui is the context whose theme OnInvalidate reads; sentPalette is the palette it last sent, read and written only by the
+	// goroutine that delivers the component's input.
+	ui          extension.UIContext
+	sentPalette string
 }
 
 func (h *customOverlayHost) OnInput(data string) {
@@ -2913,6 +3235,30 @@ func (h *customOverlayHost) OnFocus(focused bool) {
 	h.bridge.sendCustomFocus(h.extName, h.owner, h.key, focused)
 }
 
+// OnInvalidate publishes one invalidation of the host's TUI ([NotifyUICustomInvalidate]); see
+// [extension.RemoteOverlayInvalidateHost]. A theme_change with the active palette goes first when it differs from the one this
+// component was last sent, so the component builds its rows from the new colors. Both are notifies on the owner's own connection.
+func (h *customOverlayHost) OnInvalidate(count int) {
+	if h.owner == nil || count < 1 {
+		return
+	}
+	if h.ui != nil {
+		if theme := h.ui.Theme(); theme != nil {
+			//portlint:allow jsonescape host-runtime IPC frame argument, not Pi output: the runtime reads it with JSON.parse (runtime-node/runtime.mjs theme_change), and the string is only the equality key of the palette last sent
+			if palette, err := json.Marshal(theme); err == nil && string(palette) != h.sentPalette {
+				h.sentPalette = string(palette)
+				if h.owner.SendContext(h.ctx, &Envelope{Type: MsgNotify, Notify: &NotifyPayload{Method: "theme_change", Args: palette}}) != nil {
+					// Not queued (the component's context ended or the connection closed): the palette counts as not sent.
+					h.sentPalette = ""
+					return
+				}
+			}
+		}
+	}
+	args, _ := json.Marshal(RemoteOverlayInvalidatePayload{Key: h.key, Count: count})
+	_ = h.owner.SendContext(h.ctx, &Envelope{Type: MsgNotify, Notify: &NotifyPayload{Method: NotifyUICustomInvalidate, Args: args}})
+}
+
 // overlayProxy is the buffering RemoteOverlayHandle registered
 // synchronously when handleCustom starts. It absorbs UpdateLines/Close
 // calls that arrive before the UI-side overlay constructor binds the
@@ -2926,6 +3272,7 @@ type overlayProxy struct {
 	width    int
 	hasBuf   bool
 	closed   bool
+	retired  bool
 	closeVal any
 	lastSeq  uint64
 	// view is the overlay's view surface once a frame carries a view
@@ -3048,6 +3395,24 @@ func (p *overlayProxy) Close(result any) {
 	p.mu.Unlock()
 }
 
+// Retire takes the overlay off the screen and leaves the ui.custom call waiting (extension.RemoteOverlayRetirer). A retire before the target binds is applied
+// when it does.
+func (p *overlayProxy) Retire() {
+	p.mu.Lock()
+	p.retired = true
+	target := p.target
+	p.mu.Unlock()
+	if target != nil {
+		retireOverlayTarget(target)
+	}
+}
+
+func retireOverlayTarget(target extension.RemoteOverlayHandle) {
+	if retirer, ok := target.(extension.RemoteOverlayRetirer); ok {
+		retirer.Retire()
+	}
+}
+
 // SetTarget binds the real overlay handle. Any buffered lines or close
 // signal collected before binding is drained into the target.
 func (p *overlayProxy) SetTarget(target extension.RemoteOverlayHandle) {
@@ -3065,7 +3430,7 @@ func (p *overlayProxy) SetTarget(target extension.RemoteOverlayHandle) {
 	lines := p.buffered
 	width := p.width
 	hasView, view, viewWidth := p.hasView, p.view, p.viewWidth
-	closed := p.closed
+	closed, retired := p.closed, p.retired
 	closeVal := p.closeVal
 	p.buffered = nil
 	p.hasBuf = false
@@ -3079,6 +3444,9 @@ func (p *overlayProxy) SetTarget(target extension.RemoteOverlayHandle) {
 	}
 	if closed {
 		target.Close(closeVal)
+	}
+	if retired {
+		retireOverlayTarget(target)
 	}
 }
 
@@ -3649,13 +4017,19 @@ func (b *UIBridge) handleOffTerminalInput(extName string, _ json.RawMessage) (*C
 // Category 8: Agent Actions (ExtensionActions)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-func (b *UIBridge) handleSendMessage(actions *HostCallbacks, args json.RawMessage) (*CallResultPayload, error) {
+func (b *UIBridge) handleSendMessage(owner *Conn, call *CallPayload, actions *HostCallbacks) (*CallResultPayload, error) {
 	var p struct {
-		Message extension.CustomMessageRef `json:"message"`
-		Options SendMessageOptions         `json:"options"`
+		Message    extension.CustomMessageRef `json:"message"`
+		Options    SendMessageOptions         `json:"options"`
+		YieldToken string                     `json:"yield_token"`
 	}
-	if err := json.Unmarshal(args, &p); err != nil {
+	if err := json.Unmarshal(call.Args, &p); err != nil {
 		return nil, fmt.Errorf("parse sendMessage args: %w", err)
+	}
+	// A message that starts or joins a run is the one whose Session method can reject (agent-session.ts:2339-2344). The runtime reports no yield for a send
+	// made while the agent_settled handlers run, which the Session holds back (holdAfterSend), so nothing would end its run.
+	if p.Options.TriggerTurn != nil && *p.Options.TriggerTurn && p.Options.DeliverAs != string(extension.DeliverAsNextTurn) && b.afterRun != nil && owner != nil && !inAgentSettled(owner, call.ParentRequestID) {
+		p.Options.AfterRun = b.afterRun(owner, call.ParentRequestID, p.YieldToken)
 	}
 	if actions == nil || actions.SendMessage == nil {
 		return &CallResultPayload{
@@ -3670,13 +4044,19 @@ func (b *UIBridge) handleSendMessage(actions *HostCallbacks, args json.RawMessag
 	return &CallResultPayload{}, nil
 }
 
-func (b *UIBridge) handleSendUserMessage(actions *HostCallbacks, args json.RawMessage) (*CallResultPayload, error) {
+func (b *UIBridge) handleSendUserMessage(owner *Conn, call *CallPayload, actions *HostCallbacks) (*CallResultPayload, error) {
 	var p struct {
 		Content any                    `json:"content"`
 		Options SendUserMessageOptions `json:"options"`
+		// YieldToken names the send for NotifyHandlerYielded; a runtime with an event loop sends it when the message names no delivery, the only send Pi can refuse.
+		YieldToken string `json:"yield_token"`
 	}
-	if err := json.Unmarshal(args, &p); err != nil {
+	if err := json.Unmarshal(call.Args, &p); err != nil {
 		return nil, fmt.Errorf("parse sendUserMessage args: %w", err)
+	}
+	// Only a send that names no delivery can be refused (agent-session.ts:2240-2244), so a queued one pays for no report.
+	if p.Options.DeliverAs == "" && b.afterRun != nil && owner != nil {
+		p.Options.AfterRun = b.afterRun(owner, call.ParentRequestID, p.YieldToken)
 	}
 	if actions == nil || actions.SendUserMessage == nil {
 		return &CallResultPayload{
@@ -3759,6 +4139,14 @@ func (b *UIBridge) handleExec(ctx context.Context, actions *HostCallbacks, args 
 	return &CallResultPayload{Result: result}, nil
 }
 
+// extensionPathOf is the path extName was selected from, or extName itself when the bridge has no host.
+func (b *UIBridge) extensionPathOf(extName string) string {
+	if b.extensionPath != nil {
+		return b.extensionPath(extName)
+	}
+	return extName
+}
+
 func (b *UIBridge) flagValue(actions *HostCallbacks, extName, name string) any {
 	var value any
 	if actions != nil && actions.GetFlag != nil {
@@ -3835,15 +4223,16 @@ func (b *UIBridge) handleSetSessionName(actions *HostCallbacks, args json.RawMes
 }
 
 func (b *UIBridge) handleSetLabel(actions *HostCallbacks, args json.RawMessage) (*CallResultPayload, error) {
+	// The label as the extension gave it: a string, null, or no member for a call without a label (JSON.stringify leaves an undefined argument out).
 	var p struct {
-		EntryID string `json:"entryId"`
-		Label   string `json:"label"`
+		EntryID string  `json:"entryId"`
+		Label   *string `json:"label"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return nil, fmt.Errorf("parse setLabel args: %w", err)
 	}
 	if actions != nil && actions.SetLabel != nil {
-		if err := actions.SetLabel(p.EntryID, p.Label); err != nil {
+		if err := actions.SetLabel(p.EntryID, p.Label, p.Label == nil && orderedjson.IsNullMember(args, "label")); err != nil {
 			return nil, err
 		}
 	}
@@ -3984,24 +4373,79 @@ func (b *UIBridge) handleGetCommands(actions *HostCallbacks) (*CallResultPayload
 }
 
 func (b *UIBridge) handleSetModel(ctx context.Context, actions *HostCallbacks, args json.RawMessage) (*CallResultPayload, error) {
-	var p struct {
-		Model string `json:"model"`
-	}
+	var p SetModelArgs
 	if err := json.Unmarshal(args, &p); err != nil {
 		return nil, fmt.Errorf("parse setModel args: %w", err)
 	}
+	model, err := decodeSetModelObject(p.Model)
+	if err != nil {
+		return nil, err
+	}
 	if actions == nil || actions.SetModel == nil {
 		extension.CallInitiated(ctx)
-		result, _ := json.Marshal(map[string]any{"success": false, "error": "not ready"})
+		result, _ := json.Marshal(SetModelResult{Error: "not ready"})
 		return &CallResultPayload{Result: result}, nil
 	}
-	ok, err := actions.SetModel(ctx, p.Model)
+	ok, err := actions.SetModel(ctx, model)
 	if err != nil {
-		result, _ := json.Marshal(map[string]any{"success": false, "error": err.Error()})
+		result, _ := json.Marshal(SetModelResult{Error: err.Error()})
 		return &CallResultPayload{Result: result}, nil
 	}
-	result, _ := json.Marshal(map[string]any{"success": ok})
+	result, _ := json.Marshal(SetModelResult{Success: ok})
 	return &CallResultPayload{Result: result}, nil
+}
+
+// decodeSetModelObject reads the model object of a setModel call. The wire has one shape for a model, the object: a `provider/id` string, which an
+// extension built with an SDK older than the object form sends, is rejected rather than looked up.
+func decodeSetModelObject(raw json.RawMessage) (*ai.Model, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] != '{' {
+		return nil, errors.New("setModel: model must be a model object")
+	}
+	decoded, known, err := ai.DecodeStoredModel(raw)
+	if err != nil {
+		return nil, fmt.Errorf("setModel: %w", err)
+	}
+	model, chat := decoded.(*ai.Model)
+	if !known || !chat || model == nil {
+		return nil, errors.New("setModel: model must be a chat model object")
+	}
+	if model.ID == "" {
+		return nil, errors.New("setModel: model has no id")
+	}
+	return model, nil
+}
+
+// handleResolveModel answers CallResolveModel. An error of the build is the result's error, which the SDK's string form reports as the error of its
+// set-model without sending one.
+func (b *UIBridge) handleResolveModel(ctx context.Context, actions *HostCallbacks, args json.RawMessage) (*CallResultPayload, error) {
+	var p ResolveModelArgs
+	if err := json.Unmarshal(args, &p); err != nil {
+		return nil, fmt.Errorf("parse resolveModel args: %w", err)
+	}
+	reply := func(result ResolveModelResult) (*CallResultPayload, error) {
+		encoded, err := json.Marshal(result)
+		if err != nil {
+			return nil, err
+		}
+		return &CallResultPayload{Result: encoded}, nil
+	}
+	if actions == nil || actions.ResolveModel == nil {
+		extension.CallInitiated(ctx)
+		return reply(ResolveModelResult{Error: "not ready"})
+	}
+	model, err := actions.ResolveModel(ctx, p.Spec)
+	if err != nil {
+		return reply(ResolveModelResult{Error: err.Error()})
+	}
+	object, err := extension.ModelObject(model)
+	if err != nil {
+		return reply(ResolveModelResult{Error: err.Error()})
+	}
+	if object == nil {
+		return reply(ResolveModelResult{Error: "model not found: " + p.Spec})
+	}
+	return reply(ResolveModelResult{Model: object})
 }
 
 func (b *UIBridge) handleGetThinkingLevel(actions *HostCallbacks) (*CallResultPayload, error) {
@@ -4217,7 +4661,7 @@ func (b *UIBridge) handleGenerateImages(ctx context.Context, actions *HostCallba
 	return &CallResultPayload{Result: result}, nil
 }
 
-func (b *UIBridge) handleRefreshModelRegistry(ctx context.Context, actions *HostCallbacks, args json.RawMessage) (*CallResultPayload, error) {
+func (b *UIBridge) handleRefreshModelRegistry(ctx context.Context, actions *HostCallbacks, extName string, owner *Conn, args json.RawMessage) (*CallResultPayload, error) {
 	var p struct {
 		AllowNetwork *bool    `json:"allowNetwork"`
 		Providers    []string `json:"providers"`
@@ -4239,6 +4683,18 @@ func (b *UIBridge) handleRefreshModelRegistry(ctx context.Context, actions *Host
 	// The caller's synchronous reads after `await refresh()` see the
 	// refreshed registry, so the result carries the state it applies.
 	refreshed["state"] = b.ModelRegistryState()
+	// The replica applies that state in place of its last catalog frame, and the host cannot tell where among the frames: from here on it is sent
+	// every publication (Conn.modelCatalogAlways).
+	if owner == nil {
+		b.mu.RLock()
+		owner = b.extConns[extName]
+		b.mu.RUnlock()
+	}
+	if owner != nil {
+		owner.modelCatalogMu.Lock()
+		owner.modelCatalogAlways = true
+		owner.modelCatalogMu.Unlock()
+	}
 	result, err := json.Marshal(refreshed)
 	if err != nil {
 		return nil, err
@@ -4285,9 +4741,13 @@ func (b *UIBridge) handleComplete(ctx context.Context, actions *HostCallbacks, a
 		}
 		var fields struct {
 			RequestMetadata json.RawMessage `json:"requestMetadata"`
+			SamplingParams  json.RawMessage `json:"samplingParams"`
+			ToolChoice      json.RawMessage `json:"toolChoice"`
 		}
 		if json.Unmarshal(p.Request, &fields) == nil {
 			orderRequestMetadata(request, fields.RequestMetadata)
+			orderSamplingParams(request, fields.SamplingParams)
+			keepToolChoiceText(request, fields.ToolChoice)
 		}
 	}
 	if actions == nil || actions.Complete == nil {
@@ -4314,6 +4774,26 @@ func orderRequestMetadata(request map[string]any, raw json.RawMessage) {
 	}
 }
 
+// orderSamplingParams replaces a samplingParams object whose members are not in sorted order with its *orderedjson.Object, so the provider
+// sends them in the extension's order (Pi assigns the caller's object to the request: openai-completions.ts:994-997). A sorted object stays
+// the decoded map, which is written sorted.
+func orderSamplingParams(request map[string]any, raw json.RawMessage) {
+	if request == nil || !orderedjson.IsObject(raw) {
+		return
+	}
+	if object, err := orderedjson.Parse(raw); err == nil && !slices.IsSorted(object.Keys()) {
+		request["samplingParams"] = object
+	}
+}
+
+// keepToolChoiceText replaces a toolChoice object with the JSON text the extension sent. Pi hands the caller's object to the provider, which
+// writes its members in the caller's order (anthropic-messages.ts:1587-1593), and a Go map has no order. A name or null stays as decoded.
+func keepToolChoiceText(request map[string]any, raw json.RawMessage) {
+	if request != nil && orderedjson.IsObject(raw) {
+		request["toolChoice"] = raw
+	}
+}
+
 func decodeModelStreamRequest(raw json.RawMessage) (map[string]any, error) {
 	var request map[string]any
 	if err := json.Unmarshal(raw, &request); err != nil {
@@ -4324,6 +4804,8 @@ func decodeModelStreamRequest(raw json.RawMessage) (map[string]any, error) {
 		return nil, err
 	}
 	orderRequestMetadata(request, fields["requestMetadata"])
+	orderSamplingParams(request, fields["samplingParams"])
+	keepToolChoiceText(request, fields["toolChoice"])
 	var rawMessages []json.RawMessage
 	if messages, exists := fields["messages"]; exists {
 		if err := json.Unmarshal(messages, &rawMessages); err != nil {
@@ -4529,7 +5011,7 @@ func (b *UIBridge) handleSetWidget(extName string, owner *Conn, args json.RawMes
 		if p.Options != nil && p.Options.Placement == extension.WidgetPlacementBelowEditor {
 			placement = string(extension.WidgetPlacementBelowEditor)
 		}
-		b.updateWidget(extName, p.Key, lines, p.Width, placement)
+		b.updateWidget(extName, owner, p.Key, lines, p.Width, placement)
 	}
 
 	return &CallResultPayload{}, nil
@@ -4572,7 +5054,7 @@ func (b *UIBridge) modelWire(actions *HostCallbacks) any {
 		if info := actions.GetModelInfo(); info != nil {
 			return info
 		}
-		return nil
+		return json.RawMessage("null")
 	}
 	key := actions.GetModelKey()
 	b.mu.Lock()

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"strings"
 	"sync"
@@ -106,6 +107,17 @@ func builtinProbeSpec(c builtinProbeCase, log *builtinCallLog) (definition func(
 				Access:   func(path string) error { log.add("access:%s", path); return nil },
 			}
 		}
+		if c.Ops == "stream" {
+			// The stream is the file's text in two pieces; ReadFile is there to show the tool does not use it when a stream is.
+			options.Operations = &sdk.ReadOperations{
+				ReadFile: func(path string) ([]byte, error) { log.add("readFile:%s", path); return []byte("OPS:" + path), nil },
+				Access:   func(path string) error { log.add("access:%s", path); return nil },
+				CreateReadStream: func(path string) (io.ReadCloser, error) {
+					log.add("createReadStream:%s", path)
+					return io.NopCloser(io.MultiReader(strings.NewReader("STREAM:"), strings.NewReader(path+"\n"))), nil
+				},
+			}
+		}
 		return func() (sdk.BuiltinToolDefinition, error) { return sdk.CreateReadToolDefinition(cwd, options) },
 			func() (sdk.BuiltinTool, error) { return sdk.CreateReadTool(cwd, options) }
 	case "write":
@@ -154,10 +166,28 @@ func builtinProbeSpec(c builtinProbeCase, log *builtinCallLog) (definition func(
 				return false, errors.New("no such path for the probe")
 			}}
 		}
+		if c.Ops == "grepdir" {
+			// The deprecated ReadFile member builds and is ignored: it is not announced and never called.
+			options.Operations = &sdk.GrepOperations{
+				IsDirectory: func(path string) (bool, error) { log.add("isDirectory:%s", path); return true, nil },
+				//lint:ignore SA1019 the row proves the deprecated member is accepted and never called
+				ReadFile: func(path string) (string, error) { log.add("readFile:%s", path); return "", nil }, //nolint:staticcheck // SA1019: the row proves the deprecated member is accepted and never called.
+			}
+		}
 		return func() (sdk.BuiltinToolDefinition, error) { return sdk.CreateGrepToolDefinition(cwd, options) },
 			func() (sdk.BuiltinTool, error) { return sdk.CreateGrepTool(cwd, options) }
 	case "find":
 		options := &sdk.FindToolOptions{}
+		if c.Ops == "globlimit" {
+			// Pi main 676af1d77 (#11747): the tool asks glob for one result past its limit.
+			options.Operations = &sdk.FindOperations{
+				Exists: func(path string) (bool, error) { log.add("exists:%s", path); return true, nil },
+				Glob: func(pattern, cwd string, o sdk.FindGlobOptions) ([]string, error) {
+					log.add("glob:%s:limit=%d", pattern, int(o.Limit))
+					return []string{"a.txt", "b.txt", "c.txt"}[:min(3, int(o.Limit))], nil
+				},
+			}
+		}
 		if c.Ops == "custom" {
 			options.Operations = &sdk.FindOperations{
 				Exists: func(path string) (bool, error) { log.add("exists:%s", path); return false, nil },
@@ -180,6 +210,35 @@ func builtinProbeSpec(c builtinProbeCase, log *builtinCallLog) (definition func(
 				log.add("exec:%s|cwd=%s", command, cwd)
 				o.OnData([]byte("custom:" + command))
 				return sdk.BashExecResult{ExitCode: new(0)}, nil
+			}}
+		}
+		if c.Ops == "localThread" {
+			// The local operations run on another goroutine and their error comes back unchanged.
+			local := sdk.CreateLocalBashOperations(nil)
+			options.Operations = &sdk.BashOperations{Exec: func(command, cwd string, o sdk.BashExecOptions) (sdk.BashExecResult, error) {
+				type outcome struct {
+					result sdk.BashExecResult
+					err    error
+				}
+				done := make(chan outcome, 1)
+				go func() {
+					result, err := local.Exec(command, cwd, o)
+					done <- outcome{result, err}
+				}()
+				got := <-done
+				return got.result, got.err
+			}}
+		}
+		if c.Ops == "local" || c.Ops == "localWrapped" {
+			// The bash tool runs on the local operations. "local" returns their error unchanged, as Pi's wrapper that rethrows what the local backend threw; "localWrapped" makes a
+			// new error with the same message, which is not the backend's error, so it keeps nothing of it (Pi matches the backend's class, bash.ts).
+			local := sdk.CreateLocalBashOperations(nil)
+			options.Operations = &sdk.BashOperations{Exec: func(command, cwd string, o sdk.BashExecOptions) (sdk.BashExecResult, error) {
+				result, err := local.Exec(command, cwd, o)
+				if err != nil && c.Ops == "localWrapped" {
+					return result, errors.New(err.Error())
+				}
+				return result, err
 			}}
 		}
 		return func() (sdk.BuiltinToolDefinition, error) { return sdk.CreateBashToolDefinition(cwd, options) },

@@ -1,4 +1,4 @@
-//go:build !pig_strip_mcp
+//go:build !pig_strip_mcp && !pig_strip_codemode && !pig_strip_tool_search
 
 package coding
 
@@ -25,15 +25,6 @@ import (
 // whole Session with the built-in codemode, tool-search and MCP extensions, loaded as the CLI loads them. The extension
 // boundary forms of the same cases are in coding/mcpext/extension_test.go.
 
-func requireEqual[T any](t *testing.T, what string, got, want T) {
-	t.Helper()
-	gotJSON, _ := json.Marshal(got)
-	wantJSON, _ := json.Marshal(want)
-	if string(gotJSON) != string(wantJSON) {
-		t.Errorf("%s = %s, want %s", what, gotJSON, wantJSON)
-	}
-}
-
 func requireNotContains(t *testing.T, what, text, substring string) {
 	t.Helper()
 	if strings.Contains(text, substring) {
@@ -49,7 +40,7 @@ func mcpLastLine(t *testing.T, result agent.ToolResultMessage) string {
 
 func TestAgentSessionMCPExposesCodemodeOnlyMCPToolsThroughCodemodeAndHidesThemFromTheModel(t *testing.T) {
 	h := setupMCP(t, extension.McpExposureCodemode, nil, mcpSessionOptions{})
-	searchName := mcpext.CreateMcpToolName("docs", "search", nil)
+	searchName := mcp.CreateMcpToolName("docs", "search", nil)
 	// MCP tools resolve to their CallToolResult, errors included.
 	h.respond(mcpCodemode(`
 							const [a, b] = await Promise.allSettled([
@@ -110,7 +101,7 @@ func TestAgentSessionMCPExposesCodemodeOnlyMCPToolsThroughCodemodeAndHidesThemFr
 
 func TestAgentSessionMCPKeepsCodemodeOnlyMCPToolsCallableAcrossTreeNavigation(t *testing.T) {
 	h := setupMCP(t, extension.McpExposureCodemode, nil, mcpSessionOptions{})
-	searchName := mcpext.CreateMcpToolName("docs", "search", nil)
+	searchName := mcp.CreateMcpToolName("docs", "search", nil)
 	h.respond(boundaryReply("one", ai.StopReasonStop, 0), boundaryReply("two", ai.StopReasonStop, 0))
 	h.prompt(t, "first")
 	h.prompt(t, "second")
@@ -162,7 +153,7 @@ func TestAgentSessionMCPRoutesToolsWhoseNamesDifferOnlyInDashAndUnderscore(t *te
 
 func TestAgentSessionMCPRejectsDirectModelCallsToCodemodeOnlyMCPTools(t *testing.T) {
 	h := setupMCP(t, extension.McpExposureCodemode, nil, mcpSessionOptions{})
-	h.respond(mcpToolCalls(mcpToolCall{mcpext.CreateMcpToolName("docs", "search", nil), ai.JsonObject{"query": "x"}}), mcpDone())
+	h.respond(mcpToolCalls(mcpToolCall{mcp.CreateMcpToolName("docs", "search", nil), ai.JsonObject{"query": "x"}}), mcpDone())
 
 	h.prompt(t, "go")
 
@@ -499,7 +490,9 @@ func TestAgentSessionMCPDoesNotActivateAnotherExtensionsToolNamedCodemode(t *tes
 }
 
 // setupSlow is setupSlow() of agent-session-mcp.test.ts: a server named `slow` (by default) whose answer to `initialize`
-// takes initializeDelay, without waiting for it.
+// takes initializeDelay, without waiting for it. A config.initializeGate holds the answer until the test closes it instead
+// (initializeDelay is then 0): a test that orders a prompt against the connect needs the gate, since a delay is a wall-clock
+// time that a slow prompt outlasts.
 func setupSlow(t *testing.T, config mcpSessionOptions, exposure extension.McpExposure, initializeDelay time.Duration) *mcpSession {
 	t.Helper()
 	if config.name == "" {
@@ -552,10 +545,16 @@ func TestAgentSessionMCPKeepsTheCodemodeDescriptionUnchangedWhenTheServerConnect
 }
 
 func TestAgentSessionMCPListsAServerBeforeItConnectsAndAppendsItsSummaryWithTheNextPrompt(t *testing.T) {
-	h := setupSlow(t, mcpSessionOptions{instructions: "Slow docs.\nMore."}, extension.McpExposureCodemode, 30*time.Millisecond)
+	// Pi's test answers `initialize` after 30 ms (agent-session-mcp.test.ts:790) and relies on the first prompt starting
+	// before then. Here the delay's timer fires on its own thread, so a first prompt that starts later than that (a loaded
+	// host) finds the server connected: it lists the server with its summary, the section does not change, and no patch is
+	// appended (the pin below is that case). The gate holds the answer until the first prompt has returned.
+	gate := make(chan struct{})
+	h := setupSlow(t, mcpSessionOptions{instructions: "Slow docs.\nMore.", initializeGate: gate}, extension.McpExposureCodemode, 0)
 	h.respond(boundaryReply("one", ai.StopReasonStop, 0), boundaryReply("two", ai.StopReasonStop, 0))
 
 	h.prompt(t, "first")
+	close(gate)
 	mcpWaitFor(t, "mcp__slow__search to be callable", func() bool { return slices.Contains(h.nestedToolNames(), "mcp__slow__search") })
 	h.prompt(t, "second")
 
@@ -564,21 +563,13 @@ func TestAgentSessionMCPListsAServerBeforeItConnectsAndAppendsItsSummaryWithTheN
 	if len(systemMessages) != 2 {
 		t.Fatalf("system messages = %d, want 2", len(systemMessages))
 	}
-	sectionOf := func(message *ai.SystemMessage) (string, bool) {
-		for _, section := range message.Sections {
-			if section.Name == mcpext.McpServersSection && section.Value != nil {
-				return *section.Value, true
-			}
-		}
-		return "", false
-	}
-	if first, _ := sectionOf(systemMessages[0]); !strings.Contains(first, "- mcp__slow (codemode)\n") {
+	if first, _ := mcpServersSectionOf(systemMessages[0]); !strings.Contains(first, "- mcp__slow (codemode)\n") {
 		t.Errorf("first section = %q", first)
 	}
 	if len(systemMessages[1].Sections) != 1 {
 		t.Errorf("second sections = %+v, want only the servers section", systemMessages[1].Sections)
 	}
-	if second, _ := sectionOf(systemMessages[1]); !strings.Contains(second, "- mcp__slow (codemode): Slow docs.") {
+	if second, _ := mcpServersSectionOf(systemMessages[1]); !strings.Contains(second, "- mcp__slow (codemode): Slow docs.") {
 		t.Errorf("second section = %q", second)
 	}
 	messages := h.session.Messages()
@@ -586,6 +577,38 @@ func TestAgentSessionMCPListsAServerBeforeItConnectsAndAppendsItsSummaryWithTheN
 	firstAssistant := slices.IndexFunc(messages, func(message agent.AgentMessage) bool { return message.Assistant != nil })
 	if secondIndex <= firstAssistant {
 		t.Errorf("second system message at %d, first assistant message at %d", secondIndex, firstAssistant)
+	}
+}
+
+// mcpServersSectionOf is the `mcp_servers` section of a system message.
+func mcpServersSectionOf(message *ai.SystemMessage) (string, bool) {
+	for _, section := range message.Sections {
+		if section.Name == mcpext.McpServersSection && section.Value != nil {
+			return *section.Value, true
+		}
+	}
+	return "", false
+}
+
+// Not in Pi's suite: the other half of what the test above rests on. Every prompt lists the servers as they are when it
+// starts (extensions/mcp/index.ts:1177-1185), so a server that connected before the first prompt is listed with its
+// summary in the first system message, and no patch follows because the section did not change.
+func TestAgentSessionMCPListsAServerThatConnectedBeforeTheFirstPromptWithItsSummaryAndAppendsNoPatch(t *testing.T) {
+	gate := make(chan struct{})
+	h := setupSlow(t, mcpSessionOptions{instructions: "Slow docs.\nMore.", initializeGate: gate}, extension.McpExposureCodemode, 0)
+	h.respond(boundaryReply("one", ai.StopReasonStop, 0), boundaryReply("two", ai.StopReasonStop, 0))
+	close(gate)
+	mcpWaitFor(t, "mcp__slow__search to be callable", func() bool { return slices.Contains(h.nestedToolNames(), "mcp__slow__search") })
+
+	h.prompt(t, "first")
+	h.prompt(t, "second")
+
+	systemMessages := h.systemMessages()
+	if len(systemMessages) != 1 {
+		t.Fatalf("system messages = %d, want 1", len(systemMessages))
+	}
+	if section, _ := mcpServersSectionOf(systemMessages[0]); !strings.Contains(section, "- mcp__slow (codemode): Slow docs.") {
+		t.Errorf("first section = %q", section)
 	}
 }
 
@@ -740,7 +763,7 @@ func TestAgentSessionMCPFindsToolsFromScriptsWithSearchToolsAndDescribeTool(t *t
 func TestAgentSessionMCPActivatesToolSearchForDeferredMCPToolsAndKeepsLoadedToolsDeclaredOnTheBranch(t *testing.T) {
 	// No built-in tools are active; the MCP extension activates tool_search, not codemode.
 	h := setupMCP(t, extension.McpExposureDeferred, nil, mcpSessionOptions{})
-	searchName := mcpext.CreateMcpToolName("docs", "search", nil)
+	searchName := mcp.CreateMcpToolName("docs", "search", nil)
 	h.respond(
 		mcpToolCalls(mcpToolCall{"tool_search", ai.JsonObject{"query": "search the docs", "limit": float64(1)}}),
 		mcpToolCalls(mcpToolCall{searchName, ai.JsonObject{"query": "loaded"}}),

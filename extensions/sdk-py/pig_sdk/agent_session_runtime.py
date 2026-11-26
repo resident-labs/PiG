@@ -105,6 +105,7 @@ class AgentSessionRuntime:
         self._services: AgentSessionServices
         self._diagnostics: list[dict[str, str]] = []
         self._model_fallback_message: str | None = None
+        self._reported_diagnostic_keys: set[str] = set()
 
     @property
     def services(self) -> AgentSessionServices:
@@ -125,6 +126,17 @@ class AgentSessionRuntime:
     def diagnostics(self) -> list[dict[str, str]]:
         """``runtime.diagnostics``."""
         return self._diagnostics
+
+    def take_unreported_diagnostics(self) -> list[dict[str, str]]:
+        """``takeUnreportedDiagnostics()``: the current diagnostics that were not returned yet, marked as returned. A diagnostic whose type and message equal one returned before is left out, so an unchanged warning is not returned again after each replacement. The set belongs to the runtime, not to one construction."""
+        unreported: list[dict[str, str]] = []
+        for diagnostic in self._diagnostics:
+            key = f"{diagnostic['type']}\0{diagnostic['message']}"
+            if key in self._reported_diagnostic_keys:
+                continue
+            self._reported_diagnostic_keys.add(key)
+            unreported.append(diagnostic)
+        return unreported
 
     @property
     def model_fallback_message(self) -> str | None:
@@ -296,7 +308,8 @@ class AgentSessionRuntime:
         return {"cancelled": False}
 
     def dispose(self) -> None:
-        """``dispose()``: it emits session_shutdown with the reason ``"quit"`` to the current session's extensions, runs the before-invalidate callback and disposes the session."""
+        """``dispose()``: it settles the active response, emits session_shutdown with the reason ``"quit"`` to the current session's extensions, runs the before-invalidate callback and disposes the session."""
+        self._session.abort()
         self._session._emit_extension_event({"type": "session_shutdown", "reason": "quit"})
         if self._before_session_invalidate is not None:
             self._before_session_invalidate()

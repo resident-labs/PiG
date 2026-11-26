@@ -10,7 +10,10 @@ import (
 	"maps"
 	"os"
 	"slices"
+	"strconv"
 	"sync"
+
+	"github.com/MichaelKinsy/PiG/coding/extension"
 )
 
 // pig additive (D19): the Host's ordered pi.events registry for several Node realms. EventEmitter keeps one ordered listener array per channel, clones it for each emit, and calls each listener in turn; each listener's synchronous prefix runs before the next. The Host keeps that array and runs each listener's prefix in its own realm through a restricted synchronous request, while the emitter waits in its synchronous emit call. A realm that is the Host's only Node realm keeps the listeners in its own EventEmitter until a second realm appears.
@@ -47,6 +50,8 @@ func (h *Host) observeXref(conn *Conn) {
 	conn.onLoopTurned = func(args json.RawMessage) { h.forwardLoopTurned(conn, args) }
 	conn.onLoopTurnTaken = func(args json.RawMessage) { h.loopTurns.take(conn, args) }
 	conn.onTimerDeferAck = func(args json.RawMessage) { conn.timerDefer.ack(args) }
+	conn.emissionsCreated = h.eventBus.emissionsCreated
+	conn.onHeldNotify = func(env *Envelope) { h.eventBus.quiesce(conn, env.Notify.Args) }
 	conn.reportView = func(surface string, err error) { h.reportViewRejection(conn, surface, err) }
 	conn.terminalRows = h.terminalHeight
 	if outbound := h.outboundObserver; outbound != nil {
@@ -58,18 +63,26 @@ func (h *Host) observeXref(conn *Conn) {
 			observe(conn.name, env)
 		}
 		if env.Type == MsgNotify && env.Notify != nil && env.Notify.Method == notifyEventsQuiesce {
+			// A realm reports a rejected listener's error before it quiesces, and Pi reports it before the emitter goes on: an unapplied report holds the quiesce behind it (Conn.applyHeld runs it).
+			if conn.reports.pending() && h.eventBus.holdQuiesce(conn, env) {
+				return
+			}
 			h.eventBus.quiesce(conn, env.Notify.Args)
 			return
 		}
 		h.xref.inbound(conn, env)
 	}
+	// Cross-process accounting reads the response of a request it expects and an observer reads every response; any other response is routed without a decode.
+	conn.inboundWantsResponse = func(id string) bool { return observe != nil || h.xref.expects(conn, id) }
 	conn.onClosed = func() {
 		h.eventBus.closed(conn)
 		h.forgetLocalRealm(conn)
 		h.xref.closed(conn)
 		h.loopTurns.closed(conn)
 		h.syncRuns.closed(conn)
+		h.syncReports.closed(conn)
 	}
+	conn.onRequestDone = func(requestID string) { h.syncReports.endRequest(conn, requestID) }
 }
 
 type busListener struct {
@@ -77,6 +90,8 @@ type busListener struct {
 	realm     string
 	handlerID string
 	channel   string
+	// owner is the generation that registered the listener: a failure of its handler is reported as that extension's error.
+	owner *managedExt
 	// value marks a native listener: it receives the payload as JSON, not as cross-process references.
 	value     bool
 	snapshots int
@@ -167,6 +182,30 @@ func (b *hostEventBus) quiesce(conn *Conn, raw json.RawMessage) {
 	}
 }
 
+// emissionsCreated is the number of emissions the bus has created; emissions are numbered from 1 in creation order.
+func (b *hostEventBus) emissionsCreated() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.nextEmission
+}
+
+// holdQuiesce marks the quiesce notification env as held (Envelope.held) when the emission it names was created before conn's oldest unapplied report was read, and reports whether it did: the realm wrote the report before the quiesce, and Pi reports a listener's error before the emitter goes on. A quiesce of a later emission is not held (the report's own listener may have emitted it and wait for it), and neither is one that names no emission.
+func (b *hostEventBus) holdQuiesce(conn *Conn, env *Envelope) bool {
+	var args struct {
+		Emission string `json:"emission"`
+	}
+	if json.Unmarshal(env.Notify.Args, &args) != nil {
+		return false
+	}
+	//portlint:allow numbers the emission is a decimal counter the host itself wrote into the frame (reportOrder.holdsEmission), never a number a JS value produced
+	n, err := strconv.ParseUint(args.Emission, 10, 64)
+	if err != nil || !conn.reports.holdsEmission(n) {
+		return false
+	}
+	env.held = true
+	return true
+}
+
 // settle lets the emission's waiting listener realms run their continuations, then waits for their microtask checkpoints and forgets the emission.
 func (b *hostEventBus) settle(ctx context.Context, id string) error {
 	b.mu.Lock()
@@ -243,7 +282,7 @@ func (h *Host) planEventBus(ctx context.Context, cells []CellSpec) {
 	surviving := map[any]*managedExt{}
 	replaced := map[any]bool{}
 	for name, me := range h.exts {
-		if conn := me.connection(); conn == nil || conn.closed.Load() || !me.nodeRealm {
+		if conn := me.connection(); conn == nil || conn.closed.Load() || !me.inNodeRealm() {
 			continue
 		}
 		process := processIdentity(me)
@@ -319,7 +358,10 @@ func (h *Host) migrateEventBus(ctx context.Context, me *managedExt) error {
 		if err := h.xref.bind(memberConn, member, result.Realm); err != nil {
 			return err
 		}
-		h.eventBus.add(&busListener{conn: memberConn, realm: result.Realm, handlerID: listener.HandlerID, channel: listener.Channel})
+		migrated := &busListener{conn: memberConn, realm: result.Realm, handlerID: listener.HandlerID, channel: listener.Channel, owner: member}
+		// A migrated listener is retained and released like one events.on registered (loader.ts:201 trackEventBusSubscription), so a later events.off or invalidate finds its unsubscribe.
+		migrated.untrack = h.providerRuntime.TrackEventBusSubscription(func() { h.removeBusListener(context.WithoutCancel(ctx), migrated) })
+		h.eventBus.add(migrated)
 	}
 	return nil
 }
@@ -521,7 +563,7 @@ func (h *Host) handleEventBusCall(ctx context.Context, me *managedExt, conn *Con
 		}
 		// EventEmitter emits newListener before adding the listener.
 		h.dispatchEvent(dispatchCtx, "newListener", newChannelPayload(*args.Channel), nil, realm, "", nil)
-		listener := &busListener{conn: conn, realm: realm, handlerID: args.HandlerID, channel: *args.Channel, value: args.Value}
+		listener := &busListener{conn: conn, realm: realm, handlerID: args.HandlerID, channel: *args.Channel, value: args.Value, owner: me}
 		listener.untrack = h.providerRuntime.TrackEventBusSubscription(func() { h.removeBusListener(dispatchCtx, listener) })
 		h.eventBus.add(listener)
 	case callEventsOff:
@@ -607,7 +649,7 @@ func (h *Host) dispatchEvent(ctx context.Context, channel string, payload *busPa
 		}
 		h.xref.deliver(listener.realm, refs)
 		var args json.RawMessage
-		var err error
+		var err, handlerErr error
 		if j-i == 1 {
 			args, err = json.Marshal(struct {
 				HandlerID string          `json:"handlerId"`
@@ -631,32 +673,36 @@ func (h *Host) dispatchEvent(ctx context.Context, channel string, payload *busPa
 			var response *Envelope
 			response, err = listener.conn.Request(ctx, &Envelope{Type: MsgRequest, Request: &RequestPayload{Method: methodEventsDispatch, Args: args}})
 			if err == nil && response.Response != nil && response.Response.Error != nil {
-				err = response.Response.Error.ToError()
+				handlerErr = response.Response.Error.ToError()
 			}
 		}
-		if err != nil {
+		if err != nil || handlerErr != nil {
 			if foreign {
 				h.eventBus.addPending(emission, listener.conn, -1)
 			}
-			reportEventBusError(channel, err)
+			if err != nil {
+				reportEventBusError(channel, err)
+			} else {
+				h.reportEventHandlerError(listener, channel, handlerErr)
+			}
 		}
 		i = j
 	}
 	return len(listeners) != 0
 }
 
-// dispatchNativeListener serves one in-process value listener.
+// dispatchNativeListener serves one in-process value listener. A payload the listener cannot receive (no JSON form) fails only this delivery, as a throwing handler does, so it is that extension's error too.
 func (h *Host) dispatchNativeListener(ctx context.Context, listener *busListener, channel string, payload *busPayload) {
 	args, err := h.nativeDispatchArgs(ctx, listener, channel, payload)
-	if err == nil {
-		var response *Envelope
-		response, err = listener.conn.Request(ctx, &Envelope{Type: MsgRequest, Request: &RequestPayload{Method: methodEventsDispatch, Args: args}})
-		if err == nil && response.Response != nil && response.Response.Error != nil {
-			err = response.Response.Error.ToError()
-		}
+	if err != nil {
+		h.reportEventHandlerError(listener, channel, err)
+		return
 	}
+	response, err := listener.conn.Request(ctx, &Envelope{Type: MsgRequest, Request: &RequestPayload{Method: methodEventsDispatch, Args: args}})
 	if err != nil {
 		reportEventBusError(channel, err)
+	} else if response.Response != nil && response.Response.Error != nil {
+		h.reportEventHandlerError(listener, channel, response.Response.Error.ToError())
 	}
 }
 
@@ -665,6 +711,58 @@ func mustJSONObject(value any) json.RawMessage {
 	return data
 }
 
+// reportEventBusError writes a failure of the bus itself to stderr: a dispatch request that could not be delivered or answered, which Pi's bus has no counterpart for. A listener's own failure goes to reportEventHandlerError.
 func reportEventBusError(channel string, err error) {
 	fmt.Fprintf(os.Stderr, "Event handler error (%s): %v\n", channel, err)
+}
+
+// reportEventHandlerError reports the failure of a listener's handler like any other extension error: the extension's path, event `events:<channel>`, the handler's message and its stack. The handler's own error reply is what the host sees; a failure of the dispatch request itself is the bus's (reportEventBusError).
+// upstream: loader.ts:537-549 (on)
+func (h *Host) reportEventHandlerError(listener *busListener, channel string, err error) {
+	h.reportExtensionError(listener.owner, "events:"+channel, err.Error(), extension.ErrorStack(err))
+}
+
+// reportExtensionError is Pi's runtime.reportError for owner's extension: the runtime's error reporter gets the error with the extension's path. It is dropped, as Pi drops it, when no runner exists yet or the runner is stale, and for a generation a reload replaced, whose runtime the replacement's runner now reports through.
+// upstream: runner.ts:411-414 (reportError), types.ts:2219-2223
+func (h *Host) reportExtensionError(owner *managedExt, event, message, stack string) {
+	if owner == nil || owner.replaced.Load() || h.supersedes(owner) {
+		return
+	}
+	path, _ := extensionSourcePaths(owner.config)
+	h.providerRuntime.ReportRuntimeError(&extension.ExtensionError{ExtensionPath: path, Event: event, Error: message, Stack: stack})
+}
+
+// applyReportError applies the report_error notification the read loop counted (Conn.noteReportRead), then counts it applied, so the responses queued behind it go on. A generation the host no longer accepts reports nothing, as it serves no other frame.
+// A malformed report (arguments that are not the payload, or no event name) is dropped like a malformed argument of any other notification; its size is bounded by MaxFrameSize, the cap of the frame that carries it.
+// A report is never lost for the extension it names: a name (ReportErrorPayload.Extension) that is no extension of this connection's own process is ignored, the report is applied as the connection's own extension's, in its place in the order, and the refused name is reported first as an error of the connection's extension, through the runner's error listeners (the same mode-aware path as the report itself).
+func (h *Host) applyReportError(me *managedExt, conn *Conn, args json.RawMessage) {
+	defer conn.reportApplied()
+	if !h.acceptsNodeGeneration(me) {
+		return
+	}
+	var report ReportErrorPayload
+	if json.Unmarshal(args, &report) != nil || report.Event == "" {
+		return
+	}
+	owner := h.reportOwner(me, report.Extension)
+	if owner == nil {
+		// The diagnostic goes through the runner's error listeners like every extension error (the chat in the TUI, extension_error in RPC mode, stderr only in print mode, as Pi's), never to the terminal's own stderr.
+		h.reportExtensionError(me, report.Event, fmt.Sprintf("report_error names the extension %q, which does not run in the process of %s: reported as %s's error", report.Extension, me.config.Name, me.config.Name), "")
+		owner = me
+	}
+	h.reportExtensionError(owner, report.Event, report.Error, report.Stack)
+}
+
+// reportOwner is the extension whose error a report_error notification on me's connection is: me, or the extension the report names (ReportErrorPayload.Extension) when it runs in me's own process (the shared realm of a Node cell). A name that is no loaded extension or runs in another process has no owner: nil.
+func (h *Host) reportOwner(me *managedExt, name string) *managedExt {
+	if name == "" || name == me.config.Name {
+		return me
+	}
+	h.mu.Lock()
+	member := h.exts[name]
+	h.mu.Unlock()
+	if member == nil || processIdentity(member) != processIdentity(me) {
+		return nil
+	}
+	return member
 }

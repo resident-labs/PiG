@@ -61,9 +61,9 @@ mod provider;
 pub use provider::{
     APIKeyAuth, APIKeyAuthInput, AuthCheck, AuthContext, AuthInteraction, AuthResult, LoginOptions,
     ModelsPublication, OAuthAuth, Provider, ProviderAuth, ProviderFilterFn, ProviderModel,
-    ProviderOperationFn, ProviderOperationOptions, ProviderOperations, ProviderResult,
-    ProviderSignal, ProviderSignalSubscription, ProviderStreamFn, ProviderStreamOptions,
-    ProviderStreamSimpleFn, RefreshModelsContext,
+    ProviderOperationFn, ProviderOperationOptions, ProviderOperations, ProviderRefreshModelsFn,
+    ProviderResult, ProviderSignal, ProviderSignalSubscription, ProviderStreamFn,
+    ProviderStreamOptions, ProviderStreamSimpleFn, RefreshModelsContext,
 };
 mod constrained_sampling;
 pub use constrained_sampling::ToolConstrainedSampling;
@@ -164,6 +164,7 @@ mod session_context;
 pub use session_context::{SessionLeaf, build_session_context};
 mod type_engine;
 mod type_schema;
+pub mod value;
 pub use type_engine::ExtendsResult;
 pub use type_schema::{BigInt, LiteralValue, Refinement, TSchema, TValue, Type};
 mod stored_credential;
@@ -210,8 +211,17 @@ pub use truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH, TruncatedBy, TruncationOptions,
     TruncationResult, format_size, truncate_head, truncate_line, truncate_tail,
 };
+mod diagnostic;
 mod extension;
 pub mod kit;
+mod ui_view;
+pub use ui_view::{
+    ViewA11y, ViewAbilities, ViewAlternative, ViewAsset, ViewBinding, ViewClaim, ViewClause,
+    ViewDrawShape, ViewDrawing, ViewDrawingAbilities, ViewError, ViewFocus, ViewInput, ViewIntent,
+    ViewIntentInvocation, ViewIntentResult, ViewLimits, ViewMount, ViewNotice, ViewPathCommand,
+    ViewPixels, ViewPoint, ViewRef, ViewRegion, ViewRelation, ViewShape, ViewSlotClaims,
+    ViewStatus, ViewStroke, ViewTarget, ViewUpdate, ViewViewport, ViewWhen, ViewWhenAll,
+};
 pub mod tui;
 mod tui_alt_screen;
 pub use tui_alt_screen::{
@@ -238,26 +248,28 @@ pub use theme_helpers::{
     StyleFn, get_editor_theme, get_markdown_theme, get_select_list_theme, get_settings_list_theme,
     highlight_code, init_theme,
 };
+mod render_card;
+pub use render_card::RenderState;
 mod request_start_order;
 mod tool_render;
 mod tool_start_order;
 mod transport;
 mod user_bash;
-pub use user_bash::{BashExecFn, BashExecOptions, BashOperations};
+pub use user_bash::{BashExecError, BashExecFn, BashExecOptions, BashOperations};
 mod builtin_tool;
 pub use builtin_tool::{
     BashSpawnContext, BashSpawnHook, BashToolOptions, BuiltinTool, BuiltinToolDefinition,
     BuiltinToolExecutor, EditOperations, EditToolOptions, FindGlobOptions, FindOperations,
     FindToolOptions, GrepOperations, GrepToolOptions, LocalBashOperationsOptions, LsOperations,
     LsStat, LsToolOptions, ModelImageResizeOptions, OperationResult, PathOperation,
-    PowerShellToolOptions, ReadOperations, ReadToolOptions, ToolsOptions, WriteOperation,
-    WriteOperations, WriteToolOptions, create_bash_tool, create_bash_tool_definition,
-    create_coding_tools, create_edit_tool, create_edit_tool_definition, create_find_tool,
-    create_find_tool_definition, create_grep_tool, create_grep_tool_definition,
-    create_local_bash_operations, create_local_powershell_operations, create_ls_tool,
-    create_ls_tool_definition, create_powershell_tool, create_powershell_tool_definition,
-    create_read_only_tools, create_read_tool, create_read_tool_definition, create_write_tool,
-    create_write_tool_definition,
+    PowerShellToolOptions, ReadOperations, ReadStream, ReadToolOptions, ToolsOptions,
+    WriteOperation, WriteOperations, WriteToolOptions, create_bash_tool,
+    create_bash_tool_definition, create_coding_tools, create_edit_tool,
+    create_edit_tool_definition, create_find_tool, create_find_tool_definition, create_grep_tool,
+    create_grep_tool_definition, create_local_bash_operations, create_local_powershell_operations,
+    create_ls_tool, create_ls_tool_definition, create_powershell_tool,
+    create_powershell_tool_definition, create_read_only_tools, create_read_tool,
+    create_read_tool_definition, create_write_tool, create_write_tool_definition,
 };
 
 mod js_string;
@@ -273,17 +285,21 @@ pub use context::{
     CustomMessage, DialogOptions, ExecOptions, ExecResult, ModelEventStream, ModelFetchRequest,
     ModelFetchResponse, ModelRegistry, ModelStreamCallbacks, MouseEvent, OverlayBounds,
     OverlayHandle, OverlayState, RemoteComponent, RemoteComponentInvalidate, RemoteComponentResult,
-    SendMessageOptions, SourceInfo, TerminalInputResult, TerminalInputSubscription, ToolInfo,
-    ToolInfoReachesTools, UnfocusTarget, UsageInfo, ViewComponent,
+    SendMessageOptions, SetModelArg, SourceInfo, TerminalInputResult, TerminalInputSubscription,
+    ToolInfo, ToolInfoReachesTools, UnfocusTarget, UsageInfo, ViewComponent,
     create_assistant_message_event_stream, is_bash_tool_result, is_edit_tool_result,
     is_find_tool_result, is_grep_tool_result, is_ls_tool_result, is_powershell_tool_result,
     is_read_tool_result, is_tool_call_event_type, is_write_tool_result, message_role, message_text,
 };
 pub use events::*;
 mod child_session;
+mod child_session_members;
 pub use child_session::{
     AgentSession, CreateAgentSessionOptions, PromptOptions, ResourceOptions, SessionStartEvent,
     SessionSubscription,
+};
+pub use child_session_members::{
+    ExecuteBashOptions, ForkMessage, ModelMutationOptions, QueuedMessages, SendUserMessageOptions,
 };
 mod create_provider;
 pub use create_provider::{
@@ -306,15 +322,15 @@ pub use agent_session_runtime::{
 pub use extension::report_load_failure;
 pub use extension::{
     CommandResult, EventSubscriber, EventSubscription, Extension, Factory, FlagOptions, FlagType,
-    MarkdownTransformContext, ProjectTrustDecision, ProjectTrustResult, ToolDefinition,
-    ToolHandler, ToolPrepareArguments, ToolResult, context_unchanged,
+    MarkdownTransformContext, MarkdownTransformerOptions, ProjectTrustDecision, ProjectTrustResult,
+    ToolDefinition, ToolHandler, ToolPrepareArguments, ToolResult, context_unchanged,
 };
 pub use host_subscriptions::HostSubscription;
 pub use login::{LoginDefinition, SpriteDefinition};
 pub use oauth::{
     OAUTH_CANCELLED, OAuthAuthInfo, OAuthCredentialStatus, OAuthCredentialStore, OAuthCredentials,
-    OAuthDeviceCodeInfo, OAuthGetApiKeyFn, OAuthLoginCallbacks, OAuthLoginFn, OAuthPrompt,
-    OAuthProvider, OAuthRefreshFn, OAuthSelectOption, OAuthSelectPrompt,
+    OAuthDeviceCodeInfo, OAuthGetApiKeyFn, OAuthLoginCallbacks, OAuthLoginFn, OAuthModifyModelsFn,
+    OAuthPrompt, OAuthProvider, OAuthRefreshFn, OAuthSelectOption, OAuthSelectPrompt,
 };
 pub use protocol::{AutocompleteItem, ConstrainedSampling, Schema, empty_schema};
 pub use theme::{
@@ -323,6 +339,7 @@ pub use theme::{
 pub use tool_render::{
     SharedToolRenderCall, SharedToolRenderCallView, SharedToolRenderResult,
     SharedToolRenderResultView, ToolRenderCallHandler, ToolRenderCallViewHandler,
-    ToolRenderContext, ToolRenderResult, ToolRenderResultHandler, ToolRenderResultOptions,
-    ToolRenderResultViewHandler, ToolRenderShell, ToolRendererResolver, ToolRendererSet,
+    ToolRenderComponent, ToolRenderContext, ToolRenderResult, ToolRenderResultHandler,
+    ToolRenderResultOptions, ToolRenderResultViewHandler, ToolRenderShell, ToolRendererResolver,
+    ToolRendererSet,
 };

@@ -5,7 +5,6 @@ import {
   DEFAULT_THINKING_LEVEL,
   DEFAULT_TOOL_NAMES,
   DefaultResourceLoader,
-  ModelRuntime,
   SessionImportFileNotFoundError,
   SessionManager,
   SettingsManager,
@@ -16,14 +15,17 @@ import {
   createAgentSessionServices,
   findInitialModel,
   formatNoModelsAvailableMessage,
-  getBranchSelection,
   getDefaultSessionDir,
   getToolListError,
   isInstallTelemetryEnabled,
   isToolModifier,
   markRuntimeStreamFunction,
   time
-} from "./chunk-NFOIYUJ5.js";
+} from "./chunk-OSE7DX4D.js";
+import {
+  ModelRuntime,
+  getBranchSelection
+} from "./chunk-LWMW44S6.js";
 import {
   createBashTool,
   createCodingTools,
@@ -36,14 +38,15 @@ import {
   createReadTool,
   createWriteTool,
   withFileMutationQueue
-} from "./chunk-HOGQJAZD.js";
-import "./chunk-IJFG4BUL.js";
-import "./chunk-HAAXE2S5.js";
-import "./chunk-2W3FEVNE.js";
+} from "./chunk-W25FOIG4.js";
+import "./chunk-PNTN457B.js";
+import "./chunk-2VCX4NLH.js";
+import "./chunk-QSKV7LUU.js";
+import "./chunk-F4Z3QMHU.js";
 import {
   createToolNameMatcher
-} from "./chunk-QWVFFAFF.js";
-import "./chunk-F2BIFG4N.js";
+} from "./chunk-4Q37KZ2Z.js";
+import "./chunk-RWSVZTAH.js";
 import {
   VERSION,
   getAgentDir,

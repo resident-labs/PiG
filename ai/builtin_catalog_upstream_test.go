@@ -57,7 +57,7 @@ import (
 // The pinned 1.0.4 provider catalogs are `providers/<id>.models.ts` modules that flatten `providers/data/<id>.json` into
 // a chat, an image and a classifier model record per provider. The Go catalogs are generated from the same data: every
 // provider module must list the same model keys with the same identity, endpoint, capability and price fields.
-func TestBuiltinCatalogsMatchPinnedProviderDataModules(t *testing.T) {
+func TestBuiltinCatalogsMatchOracleProviderData(t *testing.T) {
 	modules, err := filepath.Glob("../.upstream/current/packages/ai/src/providers/*.models.ts")
 	if err != nil || len(modules) == 0 {
 		t.Fatalf("upstream provider model modules: %v", err)
@@ -77,10 +77,7 @@ func TestBuiltinCatalogsMatchPinnedProviderDataModules(t *testing.T) {
 		}
 		seen[provider[1]] = true
 		t.Run(provider[1], func(t *testing.T) {
-			raw, err := os.ReadFile(filepath.Join("../.upstream/current/packages/ai/src/providers/data", data[1]+".json"))
-			if err != nil {
-				t.Fatal(err)
-			}
+			raw := readOracleProviderData(t, data[1])
 			var groups map[string]map[string]map[string]any
 			if err := json.Unmarshal(raw, &groups); err != nil {
 				t.Fatal(err)
@@ -103,6 +100,10 @@ func TestBuiltinCatalogsMatchPinnedProviderDataModules(t *testing.T) {
 						t.Fatalf("%s: unknown model type in key %q", data[1], key)
 					}
 				}
+			}
+			if slices.Contains(BuiltStrippedProviders(), provider[1]) {
+				// A build with the pig_strip tag of this provider's API offers none of its chat models.
+				wantChat = map[string]map[string]any{}
 			}
 			checkChatCatalog(t, provider[1], wantChat)
 			checkImageCatalog(t, provider[1], wantImage)

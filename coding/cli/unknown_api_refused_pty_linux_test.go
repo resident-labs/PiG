@@ -14,8 +14,8 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/testbudget"
 )
 
-// Interactive mode shows the refusal as the turn's error ("Error: No API provider registered for api: nosuchapi" in Pi)
-// and sends nothing.
+// Interactive mode shows the refusal as the turn's error ("Error: No API provider registered for api: nosuchapi" in Pi 1.5.2 under tmux,
+// xd6702 ~/lanes/UnknownApiName.out/p1.log) and sends nothing.
 func TestUnknownAPINameInteractiveShowsPiTextAndSendsNothing(t *testing.T) {
 	if testing.Short() {
 		t.Skip("starts the pig binary on a pseudo-terminal")

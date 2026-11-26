@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
+	"fmt"
 
 	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/internal/jsonopts"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
 // ProviderConfig is the registration payload for [API.RegisterProvider].
@@ -39,8 +43,13 @@ type ProviderConfig struct {
 	OAuth         *ProviderOAuth        `json:"oauth,omitempty"`
 	// Insecure skips TLS certificate verification for this provider's
 	// endpoint. Opt-in only, for self-signed/internal-CA on-prem gateways.
-	// pig additive (D36): additive optional field; no upstream per-provider TLS-skip.
+	// pig additive (D36): additive optional field; no upstream per-provider TLS-skip. True is on; the zero value is the omitted value, so a
+	// re-registration that leaves it out keeps the earlier opt-in. A decoded `"insecure": false` is a defined value that turns it off: InsecureSetting
+	// returns the three states. Against a `models.json` entry of the same provider an explicit value wins; an omitted one keeps the entry's opt-in only
+	// while the registration keeps the entry's endpoint (providerTLSOptIn in internal/codingagent).
 	Insecure bool `json:"insecure,omitempty"`
+	// insecureOff is a decoded `"insecure": false`.
+	insecureOff bool
 }
 
 // RefreshModelsContext is the context a RefreshModels callback receives: the credential and stored catalog, whether the
@@ -121,7 +130,29 @@ type providerHeaderEntry struct {
 	Value string
 }
 
-type providerConfigJSON ProviderConfig
+// providerConfigFields is ProviderConfig without its methods, so decoding it does not call ProviderConfig.UnmarshalJSON.
+type providerConfigFields ProviderConfig
+
+// providerConfigJSON is the JSON form of ProviderConfig. Its Insecure member has the three states of the member: absent, false and true.
+type providerConfigJSON struct {
+	providerConfigFields
+	Insecure *bool `json:"insecure,omitempty"`
+}
+
+// InsecureSetting is the TLS opt-in the registration states: nil when it leaves insecure out, otherwise true or false (D36).
+func (config ProviderConfig) InsecureSetting() *bool {
+	return insecureSetting(config.Insecure, config.insecureOff)
+}
+
+func insecureSetting(on, off bool) *bool {
+	switch {
+	case on:
+		return new(true)
+	case off:
+		return new(false)
+	}
+	return nil
+}
 
 type providerModelConfigJSON ProviderModelConfig
 
@@ -130,7 +161,9 @@ func (config *ProviderConfig) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		return err
 	}
-	*config = ProviderConfig(decoded)
+	*config = ProviderConfig(decoded.providerConfigFields)
+	config.Insecure = decoded.Insecure != nil && *decoded.Insecure
+	config.insecureOff = decoded.Insecure != nil && !*decoded.Insecure
 	entries, err := decodeProviderHeaderEntries(data)
 	if err != nil {
 		return err
@@ -140,7 +173,8 @@ func (config *ProviderConfig) UnmarshalJSON(data []byte) error {
 }
 
 func (config ProviderConfig) MarshalJSON() ([]byte, error) {
-	data, err := json.Marshal(providerConfigJSON(config))
+	//perf:ok once per provider registration, not per delta: the wrapper embeds providerConfigFields, which has no MarshalJSON, so it cannot recurse
+	data, err := json.Marshal(providerConfigJSON{providerConfigFields: providerConfigFields(config), Insecure: config.InsecureSetting()})
 	if err != nil || config.headerEntries == nil {
 		return data, err
 	}
@@ -149,7 +183,7 @@ func (config ProviderConfig) MarshalJSON() ([]byte, error) {
 
 func (config *ProviderModelConfig) UnmarshalJSON(data []byte) error {
 	var decoded providerModelConfigJSON
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := jsstring.UnmarshalKeepingSurrogates(data, &decoded); err != nil {
 		return err
 	}
 	*config = ProviderModelConfig(decoded)
@@ -163,7 +197,7 @@ func (config *ProviderModelConfig) UnmarshalJSON(data []byte) error {
 }
 
 func (config ProviderModelConfig) MarshalJSON() ([]byte, error) {
-	data, err := json.Marshal(providerModelConfigJSON(config))
+	data, err := jsstring.MarshalKeepingSurrogates(providerModelConfigJSON(config))
 	if err != nil {
 		return data, err
 	}
@@ -201,19 +235,18 @@ func omitJSONFields(data []byte, fields []string) ([]byte, error) {
 }
 
 func decodeProviderHeaderEntries(data []byte) ([]providerHeaderEntry, error) {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	token, err := decoder.Token()
-	if err != nil || token != json.Delim('{') {
+	decoder := jsontext.NewDecoder(bytes.NewReader(data), jsonopts.Parse)
+	token, err := decoder.ReadToken()
+	if err != nil || token.Kind() != '{' {
 		return nil, err
 	}
-	for decoder.More() {
-		key, err := decoder.Token()
+	for decoder.PeekKind() != '}' {
+		key, err := decoder.ReadToken()
 		if err != nil {
 			return nil, err
 		}
-		if key != "headers" {
-			var discard json.RawMessage
-			if err := decoder.Decode(&discard); err != nil {
+		if key.String() != "headers" {
+			if err := decoder.SkipValue(); err != nil {
 				return nil, err
 			}
 			continue
@@ -223,24 +256,33 @@ func decodeProviderHeaderEntries(data []byte) ([]providerHeaderEntry, error) {
 	return nil, nil
 }
 
-func decodeProviderHeaderObject(decoder *json.Decoder) ([]providerHeaderEntry, error) {
-	token, err := decoder.Token()
-	if err != nil || token != json.Delim('{') {
+func decodeProviderHeaderObject(decoder *jsontext.Decoder) ([]providerHeaderEntry, error) {
+	token, err := decoder.ReadToken()
+	if err != nil || token.Kind() != '{' {
 		return nil, err
 	}
 	var entries []providerHeaderEntry
-	for decoder.More() {
-		name, err := decoder.Token()
+	for decoder.PeekKind() != '}' {
+		nameToken, err := decoder.ReadToken()
+		if err != nil {
+			return nil, err
+		}
+		name := nameToken.String() // a Token is void after the next call on the decoder
+		valueToken, err := decoder.ReadToken()
 		if err != nil {
 			return nil, err
 		}
 		var value string
-		if err := decoder.Decode(&value); err != nil {
-			return nil, err
+		switch valueToken.Kind() {
+		case '"':
+			value = valueToken.String()
+		case 'n': // a null header value is the empty string, as before
+		default:
+			return nil, fmt.Errorf("header %q must be a string or null", name)
 		}
-		entries = append(entries, providerHeaderEntry{Name: name.(string), Value: value})
+		entries = append(entries, providerHeaderEntry{Name: name, Value: value})
 	}
-	_, err = decoder.Token()
+	_, err = decoder.ReadToken()
 	return entries, err
 }
 
@@ -286,5 +328,6 @@ type ProviderOAuth struct {
 	// RefreshToken refreshes expired credentials; ctx is the refresh's AbortSignal (types.ts:1944 refreshToken(credentials, signal)).
 	RefreshToken func(ctx context.Context, creds OAuthCredentials) (OAuthCredentials, error) `json:"-"`
 	GetAPIKey    func(creds OAuthCredentials) string                                         `json:"-"`
-	ModifyModels func(models []Model, creds OAuthCredentials) []Model                        `json:"-"`
+	// ModifyModels is the synchronous credential-dependent projection of the provider's chat models (types.ts:2034). Pi's callback may throw and the exception reaches the caller of the model listing; here the returned error is the listing's error.
+	ModifyModels func(models []Model, creds OAuthCredentials) ([]Model, error) `json:"-"`
 }

@@ -34,6 +34,10 @@ mod request_lifetime_tests;
 /// MaxFrameSize constants.
 pub const MAX_FRAME_SIZE: u32 = 128 * 1024 * 1024;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn is_zero(value: &u32) -> bool {
     *value == 0
 }
@@ -120,6 +124,9 @@ pub struct RegisterMsg {
     /// `markdown_transform` requests.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub markdown_transformer: bool,
+    /// The surfaces the transformer runs on, listed whenever one is registered (an empty list runs it nowhere).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown_message_types: Option<Vec<String>>,
     /// PiG-only: the extension owns the thinking runs of assistant messages, so a hidden or zero-row run leaves no spacer rows. Omitted when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub owns_thinking_runs: bool,
@@ -302,6 +309,9 @@ pub struct ProviderDef {
     pub image_apis: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub classifier_apis: Vec<String>,
+    /// The config's `refreshModels` callback runs in the extension (types.ts:1930).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refresh_models: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -355,8 +365,14 @@ pub struct RequestMsg {
     pub stream_error: Option<String>,
     /// On `tool_call`: the call's position among the tool calls of the assistant message that issued it (the host's `tool_call_index`).
     pub tool_call_index: Option<u32>,
+    /// On `session_before_compact`, `session_before_tree` and `tool_call`: the request's AbortSignal had already aborted when the host dispatched the handler (the host's `signal_aborted`).
+    pub signal_aborted: bool,
     /// On `tool_call`: the JSON text of `args` as the host wrote it.
     pub args_raw: Option<String>,
+    /// Why the arguments were not decoded: they nest deeper than `MAX_NESTING_DEPTH`, which is Pi's `RangeError` (`Maximum call stack size exceeded`) and not a reason to end the connection. The request is answered with this error.
+    pub args_error: Option<String>,
+    /// The arguments nest past serde_json's limit and were decoded on the deep stack: the request runs on a stack made for them (`request_stack_size`).
+    pub deep_args: bool,
 }
 
 /// The delta of an event payload: a request with args is a keyframe the extension keeps, one without applies `ops` to the payload numbered `base`.
@@ -401,30 +417,102 @@ struct RawRequestMsg {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     batch: Option<String>,
     tool_call_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    signal_aborted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     args: Option<Box<serde_json::value::RawValue>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     child_session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    stream: Option<EventStream>,
+    stream: Option<RawEventStream>,
+}
+
+/// [`EventStream`] with `ops` as the JSON text the host wrote: a `set` operation carries a whole new subtree (a tool call's arguments), which nests as deep as the host's
+/// marshal allows, and decoding it inside the frame would stop at serde_json's 128 levels and end the connection. `TryFrom<RawRequestMsg>` decodes it with `decode_json_str`.
+#[derive(Serialize, Deserialize)]
+struct RawEventStream {
+    #[serde(default)]
+    seq: u64,
+    #[serde(default)]
+    base: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ops: Option<Box<serde_json::value::RawValue>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    key: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    evict: Vec<String>,
+}
+
+/// The message of the error a value nested past `MAX_NESTING_DEPTH` is answered with: V8's `RangeError`, as Pi's JavaScript parser or stringify throws it.
+pub(crate) const TOO_DEEP_MESSAGE: &str = "Maximum call stack size exceeded";
+
+/// Whether `err` is a value refused for its nesting (`from_json_str` leaves serde_json's recursion error for a value past the bound).
+fn is_too_deep(err: &serde_json::Error) -> bool {
+    err.to_string().starts_with("recursion limit exceeded")
 }
 
 impl TryFrom<RawRequestMsg> for RequestMsg {
     type Error = serde_json::Error;
     fn try_from(raw: RawRequestMsg) -> Result<Self, Self::Error> {
         let mut terminal_input = None;
+        let mut args_error = None;
+        let mut deep_args = false;
         let args = if raw.method == "terminal_input" {
-            terminal_input = raw
+            match raw
                 .args
                 .as_ref()
-                .map(|a| from_json_str(a.get()))
-                .transpose()?;
+                .map(|a| decode_json_str(a.get(), &mut deep_args))
+                .transpose()
+            {
+                Ok(decoded) => terminal_input = decoded,
+                Err(err) if is_too_deep(&err) => args_error = Some(TOO_DEEP_MESSAGE.to_string()),
+                Err(err) => return Err(err),
+            }
             None
         } else {
-            raw.args
+            match raw
+                .args
                 .as_ref()
-                .map(|a| from_json_str(a.get()))
-                .transpose()?
+                .map(|a| decode_json_str(a.get(), &mut deep_args))
+                .transpose()
+            {
+                Ok(decoded) => decoded,
+                Err(err) if is_too_deep(&err) => {
+                    args_error = Some(TOO_DEEP_MESSAGE.to_string());
+                    None
+                }
+                Err(err) => return Err(err),
+            }
+        };
+        let stream = match raw.stream {
+            Some(RawEventStream {
+                seq,
+                base,
+                ops,
+                key,
+                evict,
+            }) => {
+                let ops = match ops
+                    .as_ref()
+                    .map(|ops| decode_json_str(ops.get(), &mut deep_args))
+                    .transpose()
+                {
+                    Ok(ops) => ops,
+                    Err(err) if is_too_deep(&err) => {
+                        args_error = Some(TOO_DEEP_MESSAGE.to_string());
+                        None
+                    }
+                    Err(err) => return Err(err),
+                };
+                Some(EventStream {
+                    seq,
+                    base,
+                    ops,
+                    key,
+                    evict,
+                })
+            }
+            None => None,
         };
         let args_raw = if raw.method == "tool_call" {
             raw.args.as_ref().map(|a| a.get().to_string())
@@ -441,10 +529,13 @@ impl TryFrom<RawRequestMsg> for RequestMsg {
             args,
             child_session: raw.child_session,
             terminal_input,
-            stream: raw.stream,
+            stream,
             stream_error: None,
             tool_call_index: raw.tool_call_index,
+            signal_aborted: raw.signal_aborted,
             args_raw,
+            args_error,
+            deep_args,
         })
     }
 }
@@ -467,9 +558,18 @@ impl From<RequestMsg> for RawRequestMsg {
             tool_call_id: req.tool_call_id,
             batch: req.batch,
             tool_call_index: req.tool_call_index,
+            signal_aborted: req.signal_aborted,
             args,
             child_session: req.child_session,
-            stream: req.stream,
+            stream: req.stream.map(|stream| RawEventStream {
+                seq: stream.seq,
+                base: stream.base,
+                ops: stream
+                    .ops
+                    .map(|ops| serde_json::value::to_raw_value(&ops).expect("Value is JSON")),
+                key: stream.key,
+                evict: stream.evict,
+            }),
         }
     }
 }
@@ -491,6 +591,9 @@ pub struct NotifyMsg {
     pub args: Option<Value>,
     #[serde(skip)]
     pub custom_input: Option<CustomInputArgs>,
+    /// Why the arguments were not decoded: they nest deeper than `MAX_NESTING_DEPTH` (a frame the host cannot send). The notification is dropped with a diagnostic, and the connection keeps serving.
+    #[serde(skip)]
+    pub args_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -527,6 +630,14 @@ struct RawNotifyMsg {
 impl TryFrom<RawNotifyMsg> for NotifyMsg {
     type Error = serde_json::Error;
     fn try_from(raw: RawNotifyMsg) -> Result<Self, Self::Error> {
+        let too_deep = |method: String| {
+            Ok(NotifyMsg {
+                method,
+                args: None,
+                custom_input: None,
+                args_error: Some(TOO_DEEP_MESSAGE.to_string()),
+            })
+        };
         if matches!(
             raw.method.as_str(),
             "ui.custom.input"
@@ -535,18 +646,24 @@ impl TryFrom<RawNotifyMsg> for NotifyMsg {
                 | "ui.editor.insertText"
                 | "ui.editor.addToHistory"
         ) {
-            let custom_input = raw
+            let custom_input = match raw
                 .args
                 .as_ref()
                 .map(|args| from_json_str(args.get()))
-                .transpose()?;
+                .transpose()
+            {
+                Ok(decoded) => decoded,
+                Err(err) if is_too_deep(&err) => return too_deep(raw.method),
+                Err(err) => return Err(err),
+            };
             return Ok(Self {
                 method: raw.method,
                 args: None,
                 custom_input,
+                args_error: None,
             });
         }
-        let args = raw
+        let args = match raw
             .args
             .map(|args| {
                 if raw.method == "state_update" {
@@ -561,11 +678,17 @@ impl TryFrom<RawNotifyMsg> for NotifyMsg {
                     from_json_str(args.get())
                 }
             })
-            .transpose()?;
+            .transpose()
+        {
+            Ok(decoded) => decoded,
+            Err(err) if is_too_deep(&err) => return too_deep(raw.method),
+            Err(err) => return Err(err),
+        };
         Ok(Self {
             method: raw.method,
             args,
             custom_input: None,
+            args_error: None,
         })
     }
 }
@@ -590,6 +713,9 @@ pub struct CancelMsg {
     pub request_id: String,
     #[serde(default)]
     pub reason: String,
+    /// Only the request's AbortSignal ended (`session_before_compact`, `session_before_tree`) and the request goes on: the signal the handler holds aborts and no host call is cancelled.
+    #[serde(default)]
+    pub signal_only: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -599,6 +725,9 @@ pub struct CallMsg {
     pub args: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_request_id: Option<String>,
+    /// Set on a call made through a command context (a command handler's or a withSession callback's), kept with the context after its request ended: Pi gives `newSession`, `fork`, `navigateTree`, `switchSession` and `reload` to no other context, and the host refuses them from any call that does not carry this mark.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub command_context: bool,
     /// Set on a call made through a request's scope after its handler returned: deferred work, which the host runs once Pi's loop turns.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub timer: bool,
@@ -653,6 +782,18 @@ pub struct ErrorInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     pub message: String,
+    /// Pi's `ShellTimeoutError.shellExit`: on the error of a local shell command that timed out after its shell had exited.
+    #[serde(default, rename = "shellExit", skip_serializing_if = "Option::is_none")]
+    pub shell_exit: Option<ShellExit>,
+}
+
+/// The shell's own exit code and the seconds it ran, rounded to a tenth as Pi rounds them.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
+pub struct ShellExit {
+    #[serde(rename = "exitCode")]
+    pub exit_code: i64,
+    #[serde(rename = "afterSeconds")]
+    pub after_seconds: f64,
 }
 
 // ─── Connection ──────────────────────────────────────────────────────────────
@@ -662,6 +803,8 @@ pub(crate) struct RequestParent {
     id: String,
     state: AtomicU8,
     finished: AtomicBool,
+    /// Set when the request hands its handler a command context (a command handler, a withSession callback). The context keeps the kind after the request ended.
+    command: AtomicBool,
     /// A `tool_call` request's place in the batch orders (`ToolStartOrder`), set once by the read loop. Its host calls are awaits of
     /// the handler, so the ones carrying this request's id keep the place.
     start: std::sync::OnceLock<Arc<crate::tool_start_order::ToolStart>>,
@@ -673,6 +816,14 @@ impl RequestParent {
     }
     pub(crate) fn cancelled(&self) -> bool {
         self.state.load(Ordering::Acquire) == 2
+    }
+    // pig divergence (D617): the Rust SDK has one static Context type, so the method exists on every context; the host answers a command-only call from a context that did not send this mark with not_a_command_context.
+    /// Marks the request as one whose handler receives a command context. The read loop calls it once, before the request's thread starts.
+    pub(crate) fn mark_command(&self) {
+        self.command.store(true, Ordering::Release);
+    }
+    pub(crate) fn command(&self) -> bool {
+        self.command.load(Ordering::Acquire)
     }
 
     /// Gives the request its place in the batch orders. The read loop calls it once, before the request's thread starts.
@@ -724,6 +875,8 @@ pub struct Connection {
     pub(crate) with_sessions: crate::replaced_session::WithSessionRegistry,
     /// The frontend flag, the image refs sent, and the live widget, header and footer views (D107).
     pub(crate) views: crate::kit::ViewLedger,
+    /// D614: the replicated client abilities.
+    pub(crate) view_state: crate::ui_view::ViewState,
     /// The setup callbacks of this connection's newSession calls in flight.
     pub(crate) setups: crate::setup_session::SetupRegistry,
     /// The functions passed in options of session graph objects (DefaultResourceLoader's overrides), by the name the host runs them under.
@@ -744,6 +897,8 @@ pub struct Connection {
     pump: Mutex<()>,
     /// What serves the requests and notifies a loading connection receives while a call waits (event_bus.rs `serve_loading`); cleared when `run` takes the connection.
     loading_server: Mutex<Option<LoadingServer>>,
+    /// The notifies a loading connection read while a call waited that its loading server does not serve, in arrival order: state the host sent the extension that will run on the connection. `run` takes them (`take_early_notifies`).
+    early_notifies: Mutex<Vec<Envelope<Box<serde_json::value::RawValue>>>>,
     pub(crate) closed_signal: crate::provider::ProviderSignal,
 }
 
@@ -849,6 +1004,7 @@ impl Connection {
             shutdown_read: AtomicBool::new(false),
             pump: Mutex::new(()),
             loading_server: Mutex::new(None),
+            early_notifies: Mutex::new(Vec::new()),
             closed_signal: crate::provider::ProviderSignal::new(),
             provider_objects: std::sync::OnceLock::new(),
             provider_callbacks: std::sync::OnceLock::new(),
@@ -861,6 +1017,7 @@ impl Connection {
             bash_operations: Default::default(),
             with_sessions: Default::default(),
             views: Default::default(),
+            view_state: Default::default(),
             setups: Default::default(),
             graph_callbacks: Default::default(),
             children: Default::default(),
@@ -879,6 +1036,7 @@ impl Connection {
             id: id.to_owned(),
             state: AtomicU8::new(0),
             finished: AtomicBool::new(false),
+            command: AtomicBool::new(false),
             start: std::sync::OnceLock::new(),
         });
         self.request_parents
@@ -899,6 +1057,11 @@ impl Connection {
     /// Sets what serves the host's dispatches on a loading connection while a call waits.
     pub(crate) fn set_loading_server(&self, server: LoadingServer) {
         *self.loading_server.lock().unwrap() = Some(server);
+    }
+
+    /// The notifies the calls made while this connection loaded read and did not serve, in arrival order.
+    pub(crate) fn take_early_notifies(&self) -> Vec<Envelope<Box<serde_json::value::RawValue>>> {
+        std::mem::take(&mut *self.early_notifies.lock().unwrap())
     }
 
     /// Whether a call made while this connection loaded read the host's shutdown frame.
@@ -948,6 +1111,16 @@ impl Connection {
                 self.shutdown_read.store(true, Ordering::Release);
                 continue;
             }
+            // A notify other than a listener's release is for the extension that will run on this connection (a state the host pushed before the register): it is kept for `run`, never dropped.
+            if env.msg_type == "notify"
+                && env
+                    .notify
+                    .as_ref()
+                    .is_some_and(|notify| notify.method != "events.release")
+            {
+                self.early_notifies.lock().unwrap().push(env);
+                continue;
+            }
             let server = self.loading_server.lock().unwrap().clone();
             match server {
                 Some(server) => server(&env),
@@ -960,6 +1133,7 @@ impl Connection {
                                 code: None,
                                 message: "the extension has not registered with the host yet"
                                     .to_string(),
+                                shell_exit: None,
                             }),
                         );
                     }
@@ -1083,6 +1257,7 @@ impl Connection {
                         error: Some(ErrorInfo {
                             code: None,
                             message: err.to_string(),
+                            shell_exit: None,
                         }),
                     },
                 })
@@ -1255,6 +1430,7 @@ impl Connection {
             Some(parent) => Some(parent.id.as_str()),
             None => parent_request_id,
         };
+        let command_context = scope.is_some_and(RequestParent::command);
         let id = format!(
             "c{}",
             self.call_id
@@ -1278,6 +1454,8 @@ impl Connection {
             #[serde(skip_serializing_if = "Option::is_none")]
             parent_request_id: Option<&'a str>,
             #[serde(skip_serializing_if = "std::ops::Not::not")]
+            command_context: bool,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
             timer: bool,
         }
         #[derive(Serialize)]
@@ -1296,6 +1474,7 @@ impl Connection {
                     method,
                     args,
                     parent_request_id,
+                    command_context,
                     timer,
                 },
             },
@@ -1343,6 +1522,7 @@ impl Connection {
             msg_type: "notify".to_string(),
             notify: Some(NotifyMsg {
                 custom_input: None,
+                args_error: None,
                 method: method.to_string(),
                 args,
             }),
@@ -1457,11 +1637,14 @@ fn is_zero_usize(value: &usize) -> bool {
     *value == 0
 }
 
-/// The deepest JSON nesting `from_json_str` accepts. serde_json refuses past 128 levels, and Pi's JavaScript parser, Go, and Python take
-/// far more; a refused frame ends the connection. A bound stays so a hostile frame cannot overflow the stack of the recursive decoder.
-const MAX_NESTING_DEPTH: usize = 4096;
+/// The deepest JSON nesting `from_json_str` accepts. serde_json refuses past 128 levels, and a refused frame would end the connection. The host's own JSON
+/// marshal refuses a value nested past 10000 levels, so no frame the host sends nests deeper than that (its envelope adds a few levels); the bound has headroom
+/// over it, and a value beyond is answered with Pi's RangeError (a request) or dropped (a notification). A bound stays so a hostile frame cannot overflow the
+/// stack of the recursive decoder.
+// pig divergence (D268): Pi fails a call at a V8-stack-dependent depth (about 4400 levels); the SDK reads every frame the host can send.
+const MAX_NESTING_DEPTH: usize = 10_016;
 
-/// Stack of the thread that decodes a value nested past serde_json's limit: a debug build uses about 2 KiB of it per level.
+/// Stack of the thread that decodes a value nested past serde_json's limit: a debug build uses about 2 KiB of it per level, so `MAX_NESTING_DEPTH` levels take about 20 MiB of it.
 const DEEP_DECODE_STACK: usize = 64 * 1024 * 1024;
 
 /// Runs a recursive decode on a thread with `DEEP_DECODE_STACK` bytes of stack, so the caller's own stack does not bound the depth.
@@ -1479,10 +1662,12 @@ pub(crate) fn on_deep_stack<R: Send>(decode: impl FnOnce() -> R + Send) -> io::R
 /// Decodes one frame body. serde_json refuses an unpaired surrogate, which every other runtime accepts, and refusing a frame ends the
 /// connection (the host sees EOF and the extension is gone). A JavaScript string may carry one (Pi keeps it as the UTF-16 unit) and the
 /// host sends it as a `\ud800` escape. The typed UTF-16 fields (`JsString`) take it losslessly; a `Value` or `String` position cannot
-/// hold it, so a refused frame is decoded again with each unpaired surrogate written as U+FFFD, the replacement Go's decoder makes in a
-/// `string`. A frame that decodes the first time is untouched, so the lossless fields keep their units.
+/// hold it, so a refused frame is decoded again with each unpaired surrogate written as U+FFFD (divergence D648: a Rust extension holds
+/// U+FFFD where Pi's handler holds the unit, and writes U+FFFD back when it echoes the text). A frame that decodes the first time is
+/// untouched, so the lossless fields keep their units.
 fn decode_frame(buf: &[u8]) -> io::Result<Envelope<Box<serde_json::value::RawValue>>> {
     match serde_json::from_slice(buf) {
+        // pig divergence (D648): a lone UTF-16 surrogate becomes U+FFFD here, where Pi's JavaScript string keeps the unit; the lossless Rust value type removes it.
         Err(err) if err.is_data() || err.is_syntax() => {
             match replace_unpaired_surrogate_escapes(buf) {
                 Some(repaired) => serde_json::from_slice(&repaired),
@@ -1501,11 +1686,21 @@ fn decode_frame(buf: &[u8]) -> io::Result<Envelope<Box<serde_json::value::RawVal
 pub(crate) fn from_json_str<T: serde::de::DeserializeOwned + Send>(
     text: &str,
 ) -> serde_json::Result<T> {
+    decode_json_str(text, &mut false)
+}
+
+/// [`from_json_str`], that also sets `deep` when the value nests past serde_json's limit and was decoded on the deep stack: a value like that is dropped, ordered and written
+/// recursively once per level, so the request that carries it runs on a stack made for it (see `request_stack_size`), and a normal request keeps the default one.
+pub(crate) fn decode_json_str<T: serde::de::DeserializeOwned + Send>(
+    text: &str,
+    deep: &mut bool,
+) -> serde_json::Result<T> {
     let decoded = match serde_json::from_str(text) {
         Err(err)
             if err.to_string().starts_with("recursion limit exceeded")
                 && nesting_depth(text.as_bytes()) <= MAX_NESTING_DEPTH =>
         {
+            *deep = true;
             on_deep_stack(|| {
                 let mut de = serde_json::Deserializer::from_str(text);
                 de.disable_recursion_limit();
@@ -1520,7 +1715,19 @@ pub(crate) fn from_json_str<T: serde::de::DeserializeOwned + Send>(
     match decoded {
         Err(err) if err.to_string().starts_with("number out of range") => {
             match replace_out_of_range_numbers(text) {
-                Some(repaired) => from_json_str(&repaired),
+                Some(repaired) => decode_json_str(&repaired, deep),
+                None => Err(err),
+            }
+        }
+        // A value cut out of a frame (a request's arguments, a host call's result) may spell an unpaired surrogate as an escape, which
+        // `decode_frame` let through inside the raw value. Rust text cannot hold the unit, so a refused value is decoded again with each
+        // one written as U+FFFD, as `decode_frame` does for the frame; one that decodes the first time keeps its typed UTF-16 fields.
+        // pig divergence (D648): a lone UTF-16 surrogate becomes U+FFFD here, where Pi's JavaScript string keeps the unit.
+        Err(err) if err.is_data() || err.is_syntax() => {
+            match replace_unpaired_surrogate_escapes(text.as_bytes())
+                .and_then(|repaired| String::from_utf8(repaired).ok())
+            {
+                Some(repaired) => decode_json_str(&repaired, deep),
                 None => Err(err),
             }
         }

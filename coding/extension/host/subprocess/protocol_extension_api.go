@@ -73,6 +73,43 @@ type VirtualModelDecl struct {
 	Input          []string `json:"input,omitempty"`
 }
 
+// ── Model selection ──────────────────────────────────────────────────────────
+
+// CallSetModel (ext→host) is upstream's pi.setModel(model) (types.ts ExtensionAPI.setModel; agent-session.ts _bindExtensionCore setModel). Args is a
+// SetModelArgs and the result a SetModelResult.
+const CallSetModel = "setModel"
+
+// SetModelArgs is the argument of CallSetModel. Model is Pi's model object: the stored-model record every model crosses the wire as (ctx.model, model_select,
+// ctx.modelRegistry), which ai.DecodeStoredModel reads. The Session takes the object as given, with the members the extension left on it; the host looks no
+// model up by its provider and id. A value that is not a chat model object is rejected.
+type SetModelArgs struct {
+	Model json.RawMessage `json:"model"`
+}
+
+// SetModelResult is the result of CallSetModel. Success is Pi's boolean: false when the model's provider has no configured auth. Error is the message of
+// the rejection Pi's Promise would carry.
+type SetModelResult struct {
+	Success bool   `json:"success"`
+	Error   string `json:"error,omitempty"`
+}
+
+// CallResolveModel (ext→host) builds the model object a `provider/id` name stands for, as coding.BuildModel builds it. It is a PiG-only call with no Pi
+// counterpart and is not SDK API: the string form of an SDK's set-model (Go SetModelNamed, Python set_model(str), Rust set_model(&str), Lisp ctx-set-model
+// with a string) calls it and then CallSetModel with the object, so CallSetModel has one shape. Args is a ResolveModelArgs and the result a
+// ResolveModelResult.
+const CallResolveModel = "resolveModel"
+
+// ResolveModelArgs is the argument of CallResolveModel. Spec is `provider/id`; a spec with no slash names an openai model.
+type ResolveModelArgs struct {
+	Spec string `json:"spec"`
+}
+
+// ResolveModelResult is the result of CallResolveModel: the model object, or the message of the error that building it met.
+type ResolveModelResult struct {
+	Model json.RawMessage `json:"model,omitempty"`
+	Error string          `json:"error,omitempty"`
+}
+
 // CallRegisterVirtualModel (ext→host) registers a virtual model after load. Args is a VirtualModelDecl.
 const CallRegisterVirtualModel = "registerVirtualModel"
 
@@ -350,10 +387,22 @@ type ParseDateResult struct {
 // state, so it may arrive before the register frame.
 const CallHighlightCode = "highlight.code"
 
-// CallTypeEngine (ext→host) is one member of TypeBox's `Type` namespace that computes a schema (Pick, Omit, Partial, KeyOf, Mapped, Conditional, Extends, Script, ...), run by the
-// host's one port of TypeBox's type engine (internal/typebox/engine) so every SDK returns what Pi's `Type` returns. The args are a TypeEngineArgs: the member and its arguments in
-// the engine's wire form (JSON, with an envelope for the hidden members a schema carries); the result is `{"value": <wire>}`, or `{"error": {"name", "message"}}` for what TypeBox
-// throws. It reads no session or extension state, so it may arrive before the register frame (Type.X runs while the factory is loading).
+// CallTypeEngine (ext→host) is one request to the host's port of TypeBox (internal/typebox/engine), so that every SDK answers what Pi's `Type` and `Value` answer. The args are a
+// TypeEngineArgs: the member and its arguments in the engine's wire form (JSON, with an envelope for the hidden members a schema carries). The result is `{"value": <wire>}`, or
+// `{"error": {"name", "message"}}` for what TypeBox throws. The members are:
+//
+//   - the members of `Type` that compute a schema (Pick, Omit, Partial, KeyOf, Mapped, Conditional, Extends, Script, ...): stateless, so they may arrive before the register frame
+//     (Type.X runs while the factory is loading);
+//   - `Value.Check` and `Value.Errors`, args `[schema, value]`: TypeBox's Value.Check and Value.Errors, running the `Type.Refine` refinements the schema carries. A refinement is a
+//     function of the extension, so the host's walk parks at each call of one and replies `{"call": {"token", "id", "message", "value"}}` instead of a result: `id` is the index of the
+//     refinement in the schema's wire form (`{"\u0000":"f","i":N}`), `message` asks for its error text rather than its check, and `value` is the JSON it runs on. The extension runs
+//     it and continues the walk with `Value.Answer`, args `[token, answer]` (a boolean for a check, a string for an error text), which replies with the next call or the result.
+//     `Value.Cancel`, args `[token]`, drops a parked walk (the extension sends it when a refinement fails; the reply is `{"value": null}`). The schema and the value are sent once and the
+//     cost is linear in the number of refinement calls. A walk that cycles (`{"$ref":"#"}`) or is nested more than the host's safety bound ends with the error RangeError "Maximum call
+//     stack size exceeded", as TypeBox's does. See internal/typebox/engine/value_check.go.
+//
+// The Value members keep state: the parked walks belong to the connection that started them. They are cancelled when the connection closes (a reload, a crash, the end of the
+// session) and when the host shuts down, so a walk never outlives its extension and one extension's walks are invisible to another's (a token names a walk of its own connection only).
 const CallTypeEngine = "type.engine"
 
 // TypeEngineArgs is the argument of CallTypeEngine. Args is the JSON list of the wire values of the member's arguments.
@@ -408,6 +457,11 @@ const CallFileMutationExit = "fileMutation.exit"
 // directory, as Pi's `resolve(filePath)` does; the host takes its real path as the queue key (a missing path or one below a regular file keys by itself).
 type FileMutationEnterArgs struct {
 	Path string `json:"path"`
+	// Request, when set, is the id of the tool_call request the enter serves (an SDK's Context sends its own request id; the free function has none). The host
+	// registers the enter once the start windows of the extension tools before that request in its batch closed, which is the order Pi's one thread gives the
+	// registrations of tools that reach withFileMutationQueue after the same number of awaits, and closes the request's own window when the turn is registered.
+	// An id that names no pending tool call, or a tool with no extension tool before it in its batch, waits for nothing.
+	Request string `json:"request,omitempty"`
 }
 
 // FileMutationEnterResult is the result of CallFileMutationEnter.

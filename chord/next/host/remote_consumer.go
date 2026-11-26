@@ -4,28 +4,42 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
+	chordctx "github.com/MichaelKinsy/PiG/chord/context"
 	"github.com/MichaelKinsy/PiG/chord/next/contracts"
 	"github.com/MichaelKinsy/PiG/chord/next/data"
 	"github.com/MichaelKinsy/PiG/chord/next/link"
+	chordtelemetry "github.com/MichaelKinsy/PiG/chord/next/telemetry"
+	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
-// Ports packages/chord/src/next/remote/consumer.ts. The consumer side of a link (§7, §22, W1): the holds this host's own
+// Ports packages/chord/src/remote/consumer.ts. The consumer side of a link (§7, §22, W1): the holds this host's own
 // remote references sent on it, by this side's ids, the calls through them within the peer's call window, and each
 // `bound` and `state` message applied to their replicas as one batch, then acknowledged. Messages with an origin answer
-// holds this host relays: they go to that origin's provider side. On a host without a compressor, the deflated parts of
-// this host's own holds and calls are inflated asynchronously first, and the message is handled once they are.
+// holds this host relays: they go to that origin's provider side; the calls this host relays for an origin wait here
+// within the same window (one per origin). Each `event` message of its own holds is consumed (its values handed to the
+// host's event flush, or deliberately dropped) and acknowledged with one event `ack` per inbound turn (decision
+// "Events: fire-and-forget members"). On a host without a compressor, the deflated parts of this host's own holds and
+// calls are inflated asynchronously first, and the message is handled once they are.
 
 // outgoingCall is a call through this side: waiting for a slot of the call window (no id yet), then in flight under its
 // id until its reply, its abort, its hold's release or `gone`, or the link's close.
 type outgoingCall struct {
 	side *consumerSide
 	hold int
+	// owner is the reference that made it (its binding; never on the wire): releasing one of several references sharing
+	// the hold cancels its own calls only (decision "References share one wire hold").
+	owner *binding
 	// method is the method's index in the bound variant, args its arguments' part (nil for none).
 	method   int
 	args     link.Part
 	segments [][]byte
 	result   *parkedCallResult
+	// old is whether the caller is old work of a reload here (`call.old`: the provider routes it to open old attempts).
+	old bool
+	// trace is the caller's carrier, sent with the call.
+	trace telemetry.TelemetryCarrier
 	// id is the call's id once it got its slot; hasID tells it has one.
 	id    int
 	hasID bool
@@ -59,10 +73,17 @@ func (c *outgoingCall) stopListening() {
 // consumerSide is the consumer side of one link. Ids are its own counters, from 0; a reply naming an id this side gave up
 // is ignored (Q1). When the link closes, every call rejects `unavailable` (never resent) and its path tells every holder.
 type consumerSide struct {
-	link     *hostLink
-	entries  orderedTable[int, *remoteObject]
-	calls    orderedTable[int, *outgoingCall]
-	window   callWindow[*outgoingCall]
+	link    *hostLink
+	entries orderedTable[int, *remoteObject]
+	calls   orderedTable[int, *outgoingCall]
+	window  callWindow[*outgoingCall]
+	// relayed are the calls this host relays upstream on this link, one window per downstream origin's number here (decision
+	// "Call windows only for untrusted links": a relay honours each upstream window); made by an origin's first call.
+	relayed map[int]*callWindow[*relayedCall]
+	// greeted is the peer's `hello` call window (0: none), once it arrived.
+	greeted *int
+	// consumed is the `event` messages consumed since the last event `ack` (one goes in a microtask after the first).
+	consumed int
 	nextHold int
 	nextCall int
 }
@@ -72,7 +93,7 @@ func newConsumerSide(l *hostLink) *consumerSide { return &consumerSide{link: l} 
 
 // attach holds holder on this link and returns its new id: its first hold, or a re-hold on a new link; chain is the
 // activation chain it is held for, if any (Q5).
-func (c *consumerSide) attach(holder *remoteObject, chain []string) int {
+func (c *consumerSide) attach(holder *remoteObject, chain []string, trace telemetry.TelemetryCarrier) int {
 	id := c.nextHold
 	c.nextHold++
 	c.entries.set(id, holder)
@@ -92,6 +113,7 @@ func (c *consumerSide) attach(holder *remoteObject, chain []string) int {
 		Limit:       request.Limit,
 		Principal:   principal,
 		Incarnation: incarnation,
+		Trace:       trace,
 	})
 	return id
 }
@@ -99,8 +121,8 @@ func (c *consumerSide) attach(holder *remoteObject, chain []string) int {
 // call calls method (an index into the bound variant) on hold with args: left out for a method without arguments, with
 // byte segments when its argument schema has a `bytes()` leaf, deflated above the threshold except on the parent link.
 // The result is parsed here. The caller's cancellation rejects it at once and sends `abort` when it is in flight. The
-// returned result settles in a section.
-func (c *consumerSide) call(hold int, method int, methodData *contracts.MethodData, args any, ctx context.Context) *parkedCallResult {
+// returned result settles in a section. owner is the reference making it.
+func (c *consumerSide) call(hold int, method int, methodData *contracts.MethodData, args any, owner *binding, ctx context.Context) *parkedCallResult {
 	result := newParkedCallResult()
 	if err := ctx.Err(); err != nil {
 		result.settle(nil, context.Cause(ctx))
@@ -122,14 +144,12 @@ func (c *consumerSide) call(hold int, method int, methodData *contracts.MethodDa
 			part = c.link.part(payload.Json, ctx)
 		}
 	}
-	call := &outgoingCall{side: c, hold: hold, method: method, args: part, segments: payload.Segments, result: result}
+	call := &outgoingCall{side: c, hold: hold, owner: owner, method: method, args: part, segments: payload.Segments, result: result, old: c.link.host.oldWork.of(ctx), trace: chordtelemetry.CarrierOf(chordctx.Telemetry(ctx))}
 	if ctx.Done() != nil {
 		loop := c.link.host.loop()
-		call.done = context.AfterFunc(ctx, func() {
-			loop.Run(func() {
-				c.cancel(call)
-				result.settle(nil, context.Cause(ctx))
-			})
+		call.done = onAbort(loop, ctx, func() {
+			c.cancel(call)
+			result.settle(nil, context.Cause(ctx))
 		})
 	}
 	c.window.submit(call)
@@ -140,6 +160,40 @@ func (c *consumerSide) call(hold int, method int, methodData *contracts.MethodDa
 func (c *consumerSide) release(hold int, err *data.ChordError) {
 	c.link.send(&link.ReleaseMessage{Hold: hold})
 	c.forget(hold, err)
+}
+
+// cancelCalls: one of several references sharing hold released (owner, of the object label): its calls reject `released`
+// and leave the tables, so its own end finds none (decision "References share one wire hold"). Its waiting calls leave
+// the window unsent first, then each of its sent calls is aborted, the last sent first (a relay drops a later call still
+// waiting in its upstream window before an earlier abort frees a slot for it); then their slots free. An owner without
+// calls costs no error.
+func (c *consumerSide) cancelCalls(hold int, owner *binding, label string) {
+	waiting := c.window.removeWhere(func(call *outgoingCall) bool { return call.hold == hold && call.owner == owner })
+	var sent []*outgoingCall
+	for _, call := range c.calls.values() {
+		if call.hold == hold && call.owner == owner {
+			sent = append(sent, call)
+		}
+	}
+	if len(waiting) == 0 && len(sent) == 0 {
+		return
+	}
+	// Ids grow in the order calls were sent.
+	slices.Reverse(sent)
+	for _, call := range sent {
+		c.calls.delete(call.id)
+		c.link.send(&link.AbortMessage{Call: call.id})
+	}
+	for range sent {
+		c.window.freed()
+	}
+	err := data.NewChordError(data.ChordErrorInit{Code: data.CodeReleased, Message: label + ": released"}, nil)
+	for _, call := range waiting {
+		call.reject(err)
+	}
+	for _, call := range sent {
+		call.reject(err)
+	}
 }
 
 // retry is `ref.retry()` on a failed hold, with hops left of its budget: the provider is asked for an attempt now.
@@ -153,15 +207,43 @@ func (c *consumerSide) forget(hold int, err *data.ChordError) {
 	c.failCalls(hold, err)
 }
 
-// opened: the peer's `hello` arrived: calls go out within its window.
-func (c *consumerSide) opened(calls int) { c.window.opened(calls) }
+// opened: the peer's `hello` arrived: calls go out within its window (0: none announced), relayed ones too.
+func (c *consumerSide) opened(calls int) {
+	c.greeted = &calls
+	c.window.opened(calls)
+	for _, window := range c.relayed {
+		window.opened(calls)
+	}
+}
+
+// relayWindow is the window of the calls this host relays on this link for the downstream origin with number origin here:
+// they wait in it while the peer's N calls of that origin are in flight (before its `hello`, all of them).
+func (c *consumerSide) relayWindow(origin int) *callWindow[*relayedCall] {
+	window, found := c.relayed[origin]
+	if !found {
+		window = &callWindow[*relayedCall]{}
+		if c.greeted != nil {
+			window.opened(*c.greeted)
+		}
+		if c.relayed == nil {
+			c.relayed = map[int]*callWindow[*relayedCall]{}
+		}
+		c.relayed[origin] = window
+	}
+	return window
+}
+
+// unrelay: the downstream origin with number origin here closed: its relayed calls' window goes (`closed` aborts them).
+func (c *consumerSide) unrelay(origin int) {
+	delete(c.relayed, origin)
+}
 
 // message handles one message from the provider: this host's own, or (with an origin) one for a relayed hold. A `bound`,
 // `state` or `result` with deflated parts to inflate asynchronously returns that handling and is handled after it.
 func (c *consumerSide) message(message link.Message) (*link.Handling, error) {
 	if origin := link.OriginOf(message); origin.Ok {
 		if side, found := c.link.host.relays.get(origin.Value); found {
-			side.forward(message.(link.ConsumerMessage), c.link)
+			return nil, side.forward(message.(link.ConsumerMessage), c.link)
 		}
 		return nil, nil
 	}
@@ -186,6 +268,15 @@ func (c *consumerSide) message(message link.Message) (*link.Handling, error) {
 		return c.reply(typed.Call, typed, nil, nil, typed.Error)
 	case *link.GoneMessage:
 		return nil, c.gone(typed)
+	case *link.EventMessage:
+		deflated, err := c.deflatedEvents(typed.Events)
+		if err != nil {
+			return nil, err
+		}
+		if deflated != nil {
+			return c.link.inflate(deflated, func() error { _, err := c.message(message); return err }), nil
+		}
+		return nil, c.events(typed.Events)
 	}
 	return nil, nil
 }
@@ -196,6 +287,8 @@ func (c *consumerSide) closed() {
 	calls := append(c.calls.values(), c.window.clear()...)
 	c.calls.clear()
 	c.entries.clear()
+	// The relays' upstream drops answer their calls (providerSide.upstreamDropped).
+	c.relayed = nil
 	for _, call := range calls {
 		call.reject(err)
 	}
@@ -207,7 +300,7 @@ func (c *consumerSide) send(call *outgoingCall) {
 	c.nextCall++
 	call.id, call.hasID = id, true
 	c.calls.set(id, call)
-	c.link.send(&link.CallMessage{Call: id, Hold: call.hold, Method: call.method, Args: call.args, Segments: call.segments})
+	c.link.send(&link.CallMessage{Call: id, Hold: call.hold, Method: call.method, Args: call.args, Segments: call.segments, Trace: call.trace, Old: call.old})
 }
 
 // cancel cancels call: a waiting one leaves the window and nothing is sent; one in flight sends `abort` and frees its
@@ -261,6 +354,55 @@ func (c *consumerSide) inflating(deflated []inflatePart, part link.Part) []infla
 	return deflated
 }
 
+// deflatedEvents is the deflated values of this side's own holds' events waiting for an asynchronous inflate, each with the
+// link's decoded limit; nil when none does. Only values something listens to are inflated: those of holds this side gave
+// up (Q1), of a hold not live or of a member nobody listens to are dropped unopened (an index outside the bound version is
+// an error here, a protocol error).
+func (c *consumerSide) deflatedEvents(events []link.WireEvent) ([]inflatePart, error) {
+	var deflated []inflatePart
+	for _, event := range events {
+		if _, waits := c.link.inflates(event.Value, c.link.limits); !waits {
+			continue
+		}
+		holder, held := c.entries.get(event.Hold)
+		if !held {
+			continue
+		}
+		node, err := holder.eventNodeOf(event.Member)
+		if err != nil {
+			return nil, err
+		}
+		if node == nil {
+			continue
+		}
+		deflated = c.inflating(deflated, event.Value)
+	}
+	return deflated, nil
+}
+
+// events handles one `event` message, its parts inflated: each entry goes to its holder (an unknown or released hold drops
+// it), which hands it to the host's event flush or drops it; then the message is consumed: one event `ack` per inbound
+// turn, sent after the flush delivered what it consumed (a microtask queued after the flush's).
+func (c *consumerSide) events(events []link.WireEvent) error {
+	for _, event := range events {
+		if holder, held := c.entries.get(event.Hold); held {
+			if err := holder.event(event.Member, event.At, event.Value, c.link); err != nil {
+				return err
+			}
+		}
+	}
+	c.consumed++
+	if c.consumed > 1 {
+		return nil
+	}
+	c.link.host.loop().Queue(func() {
+		consumed := c.consumed
+		c.consumed = 0
+		c.link.send(&link.AckMessage{Events: link.Some(consumed)})
+	})
+	return nil
+}
+
 // bound handles one `bound` message: every entry prepared first (one that does not fit closes the link before anything
 // changed) and applied in one batch; then the references go live, and the message is acknowledged. An entry with a part
 // past the link's limits fails only its hold (`too_large/part`); the others apply.
@@ -288,6 +430,9 @@ func (c *consumerSide) bound(holds []link.BoundEntry) error {
 	if err := c.adopt(adoptions); err != nil {
 		return err
 	}
+	// Acknowledged before the references go live: the calls they send then (their parked ones) follow the `ack`, so the
+	// provider decodes them by this binding's indexes, never by a rebinding's previous ones.
+	c.link.send(&link.AckMessage{})
 	// After the batch: the references go live with every replica of the message in place.
 	for _, holder := range bound {
 		holder.wentLive()
@@ -295,7 +440,6 @@ func (c *consumerSide) bound(holds []link.BoundEntry) error {
 	for _, each := range oversized {
 		each.holder.tooLarge(each.err)
 	}
-	c.link.send(&link.AckMessage{})
 	return nil
 }
 
@@ -349,7 +493,9 @@ func (c *consumerSide) adopt(adoptions []func()) error {
 }
 
 // failed: its holder fails; its calls still waiting for a slot reject with the cause (a bound hold is unbound by it,
-// slice 7b; its calls in flight are rejected by the provider).
+// slice 7b; its calls in flight are rejected by the provider). A denial is access withdrawn under those calls as under the
+// ones in flight (slice 14 §2.3): `forbidden/revoked` for both; a call made after it meets the denied reference and gets its
+// plain `forbidden`.
 func (c *consumerSide) failed(message *link.FailedMessage) error {
 	holder, found := c.entries.get(message.Hold)
 	if !found {
@@ -360,14 +506,19 @@ func (c *consumerSide) failed(message *link.FailedMessage) error {
 		return err
 	}
 	cause := data.AsChordError(received, fmt.Sprintf("hold %d", message.Hold))
+	rejected := cause
+	if message.Cause.Kind == string(data.FailureDenied) {
+		rejected = revoked(holder.label(), cause)
+	}
 	for _, call := range c.window.removeHold(message.Hold) {
-		call.reject(cause)
+		call.reject(rejected)
 	}
 	return holder.failed(message)
 }
 
 // loading: the hold's object, or its relay's upstream, starts over; its calls still waiting for a slot reject
-// `unavailable` (they may name a method of the old variant).
+// `unavailable` (they may name a method of the old variant); its calls in flight wait for their reply (a provider's `loading`
+// keeps them; a relay's upstream drop answered them before).
 func (c *consumerSide) loading(hold int) {
 	holder, found := c.entries.get(hold)
 	if !found {

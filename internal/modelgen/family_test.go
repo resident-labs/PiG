@@ -28,6 +28,8 @@ func TestApplyOpenAIFamilyRules(t *testing.T) {
 		{"gpt-5.6 on another API gets xhigh only", "x", "gpt-5.6-sol", "anthropic-messages", `{"xhigh":"xhigh"}`, `null`},
 		{"gpt-6 astra rejects none", "openai", "gpt-6-astra", "openai-responses", gpt6Levels, `null`},
 		{"gpt-6.1 sol rejects none", "openai-codex", "gpt-6.1-sol", "openai-codex-responses", gpt6Levels, `null`},
+		{"gpt-6.2 astra rejects none", "openai", "gpt-6.2-astra", "openai-responses", gpt6Levels, `null`},
+		{"gpt-6.2 sol rejects none", "azure", "gpt-6.2-sol", "azure-openai-responses", gpt6Levels, `null`},
 		{"gpt-6.1 terra accepts none", "openai-codex", "gpt-6.1-terra", "openai-codex-responses", `{"off":"none","minimal":null,"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":"max"}`, `null`},
 		{"gpt-6 sol on Chat Completions takes xhigh and max only", "openrouter", "gpt-6-sol", "openai-completions", `{"xhigh":"xhigh","max":"max"}`, `null`},
 		{"gpt-5.5-pro loses off, minimal and low after the xhigh rule", "openai", "gpt-5.5-pro", "openai-responses", `{"off":null,"xhigh":"xhigh","minimal":null,"low":null}`, `null`},
@@ -104,7 +106,7 @@ func TestOpenAILongContextPricing(t *testing.T) {
 func TestClaudeMidConvoSupport(t *testing.T) {
 	for id, want := range map[string]bool{
 		"claude-opus-5": true, "anthropic/claude-opus-5.5": true, "~anthropic/CLAUDE-SONNET-5-5-20260723": true, "claude-haiku-5.5": true,
-		"claude-fable-5-1": true, "claude-mythos-5.1-20260101": true, "claude-fable-5": false, "claude-opus-4-8": false, "claude-sonnet-5": false, "claude-opus-5.4": false,
+		"claude-fable-5-1": true, "claude-fable-5-2": true, "claude-fable-5.2": true, "claude-mythos-5.2-20260101": true, "claude-fable-5-3": false, "claude-mythos-5.1-20260101": true, "claude-fable-5": false, "claude-opus-4-8": false, "claude-sonnet-5": false, "claude-opus-5.4": false,
 	} {
 		if got := SupportsClaudeMidConvoEffort(id); got != want {
 			t.Errorf("SupportsClaudeMidConvoEffort(%q) = %v, want %v", id, got, want)
@@ -112,7 +114,7 @@ func TestClaudeMidConvoSupport(t *testing.T) {
 	}
 	// The system-message rule matches the id as given: no prefix stripping and no lowercasing.
 	for id, want := range map[string]bool{
-		"claude-opus-4.8": true, "claude-opus-5": true, "claude-fable-5": true, "claude-haiku-5-5-20260723": true, "claude-mythos-5-1": true,
+		"claude-opus-4.8": true, "claude-opus-5": true, "claude-fable-5": true, "claude-haiku-5-5-20260723": true, "claude-mythos-5-1": true, "claude-fable-5-2": true, "claude-mythos-5.2": true, "claude-fable-5-3": false,
 		"anthropic/claude-opus-5": false, "Claude-Opus-5": false, "claude-opus-4-7": false, "claude-sonnet-5": false,
 	} {
 		if got := SupportsClaudeMidConvoSystemMessages(id); got != want {
@@ -146,7 +148,7 @@ func TestApplyClaudeFamilyRules(t *testing.T) {
 		{"opus 4.7 adds xhigh and drops the temperature", "anthropic", "claude-opus-4-7", "anthropic-messages", `{"xhigh":"xhigh","max":"max"}`, `{"forceAdaptiveThinking":true,"supportsTemperature":false}`},
 		{"a dotted prefixed id matches", "openrouter", "anthropic/claude-opus-4.7", "anthropic-messages", `{"xhigh":"xhigh","max":"max"}`, `{"forceAdaptiveThinking":true,"supportsTemperature":false}`},
 		{"sonnet 5.5 drops the temperature", "anthropic", "claude-sonnet-5-5", "anthropic-messages", `{"xhigh":"xhigh","max":"max"}`, `{"forceAdaptiveThinking":true,"supportsTemperature":false}`},
-		{"sonnet 5 keeps the temperature", "anthropic", "claude-sonnet-5", "anthropic-messages", `{"xhigh":"xhigh","max":"max"}`, `{"forceAdaptiveThinking":true}`},
+		{"sonnet 5 drops the temperature", "anthropic", "claude-sonnet-5", "anthropic-messages", `{"xhigh":"xhigh","max":"max"}`, `{"forceAdaptiveThinking":true,"supportsTemperature":false}`},
 		{"fable 5 can not turn thinking off", "anthropic", "claude-fable-5-1", "anthropic-messages", `{"off":null,"xhigh":"xhigh","max":"max"}`, `{"forceAdaptiveThinking":true}`},
 		{"mythos 5 is adaptive without effort levels", "anthropic", "claude-mythos-5", "anthropic-messages", `null`, `{"forceAdaptiveThinking":true}`},
 		{"the latest alias is adaptive", "openrouter", "~anthropic/claude-opus-latest", "anthropic-messages", `null`, `{"forceAdaptiveThinking":true}`},
@@ -216,9 +218,9 @@ func TestIsKimiK3FamilyID(t *testing.T) {
 }
 
 func TestKimiTables(t *testing.T) {
-	requireJSON(t, KimiOpenAICompat(), `{"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","supportsStrictMode":false,"thinkingFormat":"deepseek"}`)
+	requireJSON(t, KimiOpenAICompat(), `{"supportsStore":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","supportsStrictMode":false,"thinkingFormat":"deepseek"}`)
 	// K3 overrides keep the base key positions and append the new key.
-	requireJSON(t, KimiK3OpenAICompat(), `{"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false,"thinkingFormat":"openai","requiresReasoningContentOnAssistantMessages":true}`)
+	requireJSON(t, KimiK3OpenAICompat(), `{"supportsStore":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false,"thinkingFormat":"openai","requiresReasoningContentOnAssistantMessages":true}`)
 	requireJSON(t, KimiK3Cost(), `{"input":3,"output":15,"cacheRead":0.3,"cacheWrite":0}`)
 	if KimiK3MaxTokens != 131072 {
 		t.Fatalf("KimiK3MaxTokens = %d", KimiK3MaxTokens)

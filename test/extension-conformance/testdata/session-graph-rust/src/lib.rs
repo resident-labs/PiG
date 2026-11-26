@@ -25,6 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod agent_session_runtime;
 mod extension_runner;
+mod extension_runner_signal;
 
 fn text(value: &Value) -> &str {
     value.as_str().unwrap_or_default()
@@ -1007,6 +1008,7 @@ fn child_last_text(session: &pig_sdk::AgentSession) -> io::Result<String> {
 }
 
 /// Creates a session with options over manager and settings, binds extensions when bind is set, prompts it and reports what Pi's createAgentSession run reports.
+#[allow(deprecated)]
 fn observe_child(
     ctx: &Context,
     mut options: CreateAgentSessionOptions,
@@ -1062,6 +1064,7 @@ type ChildrenBuilt = (
 );
 
 /// Builds the objects and creates two sessions over them; the runtime, settings and loaders are dropped when it returns.
+#[allow(deprecated)]
 fn child_handles_build(
     ctx: &Context,
     args: &Value,
@@ -1158,6 +1161,7 @@ fn child_handles_script(ctx: &Context, args: &Value) -> io::Result<Value> {
 }
 
 /// createAgentSessionServices and createAgentSessionFromServices over the options of testdata/session-graph.mjs servicesScript; the report is Pi's own run's.
+#[allow(deprecated)]
 fn services_script(ctx: &Context, args: &Value) -> io::Result<Value> {
     let (cwd, agent_dir) = (text(&args["cwd"]), text(&args["agentDir"]));
     let rt = Arc::new(ModelRuntime::create(
@@ -2213,11 +2217,48 @@ fn model_runtime_script(ctx: &Context, args: &Value) -> io::Result<Value> {
     rt.logout("openai")?;
     login["afterLogout"] = json!(listed(&rt)?);
     r.insert("login".into(), login);
+    rt.settle_credential_writes()?;
+    r.insert("settled".into(), json!(true));
     r.insert(
         "stored".into(),
         serde_json::from_str(&std::fs::read_to_string(auth)?).map_err(io::Error::other)?,
     );
+    r.insert("pending".into(), settle_pending_probe(&rt, auth)?);
     Ok(Value::Object(r))
+}
+
+/// Holds auth.json's lock so a login's credential write is in flight, then reports the stored key when `settle_credential_writes` returns with the lock released 1.5 s later.
+fn settle_pending_probe(rt: &ModelRuntime, auth: &str) -> io::Result<Value> {
+    let lock = format!("{auth}.lock");
+    std::fs::create_dir(&lock)?;
+    std::thread::scope(|scope| {
+        let login = scope.spawn(|| {
+            rt.login(
+                "openai",
+                "api_key",
+                Arc::new(|_: Value| Ok("sk-pending".to_string())),
+                Some(Arc::new(|_: Value| {})),
+                None,
+                None,
+            )
+            .is_ok()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let release = lock.clone();
+        scope.spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let _ = std::fs::remove_dir(release);
+        });
+        let start = std::time::Instant::now();
+        rt.settle_credential_writes()?;
+        let waited = start.elapsed() >= std::time::Duration::from_secs(1);
+        let stored: Value =
+            serde_json::from_str(&std::fs::read_to_string(auth)?).map_err(io::Error::other)?;
+        let key = stored["openai"]["key"].clone();
+        let logged_in = login.join().unwrap_or(false);
+        rt.logout("openai")?;
+        Ok(json!({"keyAtSettle": key, "waited": waited, "login": logged_in}))
+    })
 }
 
 /// `ModelRegistry::new(runtime)` over the parts of testdata/session-graph.mjs modelRegistryScript; the report is Pi's own run's except `builtin` (D78: Pi answers a builtin provider's Provider object, this SDK fails with the D78 error and the test expects that).
@@ -2585,6 +2626,15 @@ pub fn new_extension() -> Extension {
         "Runs the createExtensionRuntime and ExtensionRunner script.",
         empty_schema(),
         |ctx, args| match extension_runner::extension_runner_script(ctx, &args) {
+            Ok(report) => ToolResult::text(report.to_string()),
+            Err(error) => ToolResult::Error(error.to_string()),
+        },
+    );
+    ext.tool(
+        "extension_runner_signal",
+        "Runs the two-run signal script of the ExtensionRunner.",
+        empty_schema(),
+        |ctx, args| match extension_runner_signal::extension_runner_signal_script(ctx, &args) {
             Ok(report) => ToolResult::text(report.to_string()),
             Err(error) => ToolResult::Error(error.to_string()),
         },

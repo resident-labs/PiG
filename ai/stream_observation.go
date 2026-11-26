@@ -4,6 +4,8 @@ import (
 	"context"
 	"iter"
 	"sync"
+
+	"github.com/MichaelKinsy/PiG/internal/jsloop"
 )
 
 // Ports packages/agent/src/agent-loop.ts (the awaited event-sink continuations of the for-await loop in streamAssistantResponse).
@@ -44,7 +46,7 @@ func (observation *StreamObservation) Context(ctx context.Context) context.Conte
 	return context.WithValue(ctx, streamObservationContextKey{}, observation)
 }
 
-// StreamObservationFromContext returns the host observation, if this callback belongs to a scoped stream continuation. A callback that runs while a provider response turn holds execution belongs to that turn, even when its context was derived from a consumer that is parked in an await: an awaiting host callback must release the turn that is running.
+// StreamObservationFromContext returns the host observation when the calling goroutine owns the active turn of a scoped stream continuation, or nil for any other goroutine. A callback that runs on a provider response turn while that turn holds execution belongs to that turn, even when its context was derived from a consumer that is parked in an await: an awaiting host callback must release the turn that is running, never another goroutine's turn.
 func StreamObservationFromContext(ctx context.Context) *StreamObservation {
 	if ctx == nil {
 		return nil
@@ -65,20 +67,23 @@ func StreamObservationFromContext(ctx context.Context) *StreamObservation {
 	return observation
 }
 
-// callbackObservation resolves the observation a host callback derived from this one awaits through.
+// callbackObservation resolves the observation a host callback derived from this one awaits through, only when the calling goroutine runs that observation's turn.
 func (observation *StreamObservation) callbackObservation() *StreamObservation {
 	executor := observation.turn.executor
 	executor.mu.Lock()
 	active := executor.active
 	executor.mu.Unlock()
 	if active == observation.turn {
-		return observation
+		if observation.ownedByCaller() {
+			return observation
+		}
+		return nil
 	}
 	if producer := executor.activeProducer(); producer != nil {
 		return producer
 	}
-	if observation.suspendedOrResuming() {
-		// No other turn runs, so a nested await is a no-op.
+	if observation.suspendedOrResuming() && observation.ownedByCaller() {
+		// No other turn runs, so a nested await on the owning goroutine is a no-op.
 		return observation
 	}
 	return nil
@@ -91,14 +96,18 @@ func (observation *StreamObservation) suspendedOrResuming() bool {
 	return observation.suspensions > 0 || observation.acquiring || observation.ended
 }
 
-// activeProducer returns the observation of the provider response turn that holds execution, or nil.
+// activeProducer returns the observation of the provider response turn that holds execution when the calling goroutine runs that turn, or nil.
 func (executor *continuationExecutor) activeProducer() *StreamObservation {
 	executor.mu.Lock()
-	defer executor.mu.Unlock()
-	if executor.active == nil {
+	var producer *StreamObservation
+	if executor.active != nil {
+		producer = executor.active.producer
+	}
+	executor.mu.Unlock()
+	if producer == nil || !producer.ownedByCaller() {
 		return nil
 	}
-	return executor.active.producer
+	return producer
 }
 
 // ownedByCaller reports whether the calling goroutine runs the callback this observation scopes.
@@ -354,10 +363,30 @@ func (stream *AssistantMessageEventStream) observeEvents(ctx context.Context, ma
 			iterator := newContinuationEventIterator(ctx, stream, executor)
 			defer iterator.close()
 			owner := currentGoroutineID()
+			// The run's own reader reports the tasks of Pi's loop (jsloop.Task). A task runs from the event the reader takes and ends once every ready reaction has run, which is where the reader would wait for the provider. One process.nextTick-class reaction per task ends it: Node runs such a callback after the microtasks of the task and before the next I/O completion. Once the reader has handled the response's last event, the loop's end events follow in the same task (agent-loop.ts emits them back to back, awaiting nothing), so the task then runs on until the loop ends it (Tail).
+			task := jsloop.TaskReaderFrom(ctx)
+			parking := false
+			var park func()
+			if task != nil {
+				//perf:ok created once per response, and only for a run whose owner asked for its tasks
+				park = func() {
+					parking = false
+					task.Park()
+				}
+			}
 			for {
 				delivery := awaitContinuation(turn, iterator.next())
 				if delivery.done {
 					return
+				}
+				if task != nil {
+					task.Begin()
+					if !parking {
+						parking = true
+						if drain := executor.postTickDeferred(park); drain != nil {
+							drain()
+						}
+					}
 				}
 				observation := &StreamObservation{turn: turn, owner: owner}
 				executor.mu.Lock()
@@ -365,7 +394,16 @@ func (stream *AssistantMessageEventStream) observeEvents(ctx context.Context, ma
 				executor.mu.Unlock()
 				more := func() bool {
 					defer observation.end()
-					return yield(observation, stream.deliver(delivery.event, materialize))
+					event := stream.deliver(delivery.event, materialize)
+					more := yield(observation, event)
+					if task != nil {
+						switch event.(type) {
+						case DoneEvent, ErrorEvent:
+							// Before the observation ends: no reaction that parks the task runs between the reader's last event and the loop's end events.
+							task.Tail()
+						}
+					}
+					return more
 				}()
 				if !more {
 					return

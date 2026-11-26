@@ -13,6 +13,10 @@
 # its shard, in both runs. The optional fourth column names the make target a linux row runs in the light run when that
 # is a subset of the full run's (default: ci-<shard>). .github/AGENTS.md renders this table.
 #
+# Every row is a shard of the linux matrix, so a shard that fails fails "Linux verification" and with it "CI result", the required
+# check: every row blocks the merge, alloc-ratchet (the allocation baseline of the hot packages a change touches) included.
+# No ruleset change is needed for a row to block.
+#
 # job | shard | tier | light-run make target
 linux | portmap-1 | queue
 linux | portmap-2 | queue
@@ -22,10 +26,18 @@ linux | portmap-5 | queue
 linux | portmap-6 | queue
 linux | portmap-7 | queue
 linux | portmap-8 | queue
+linux | portmap-9 | queue
+linux | portmap-10 | queue
+linux | portmap-11 | queue
+linux | portmap-12 | queue
 linux | test-fast-sharded | pr
+linux | test-fast-sharded-2 | pr
+linux | alloc-ratchet | pr
 linux | test-fast | pr | ci-test-changed
 linux | test-conformance-1 | queue
 linux | test-conformance-2 | queue
+linux | test-conformance-3 | queue
+linux | test-conformance-4 | queue
 linux | build | pr | ci-build-pr
 linux | test-cli-1 | pr
 linux | test-cli-2 | pr
@@ -46,17 +58,28 @@ windows | native-2 | queue
 windows | native-1 | queue
 windows | extension-conformance-1 | queue
 windows | extension-conformance-3 | queue
+windows | extension-conformance-5 | queue
+windows | extension-conformance-6 | queue
+windows | extension-conformance-7 | queue
+windows | extension-conformance-8 | queue
+windows | extension-conformance-9 | queue
+windows | extension-conformance-10 | queue
 windows | extension-host-1 | queue
 windows | native-4 | queue
 windows | extension-host-2 | queue
 windows | extension-host-3 | queue
+windows | extension-host-4 | queue
+windows | extension-host-5 | queue
 macos | native | queue
-macos | cli-1 extension-host-3 packages | queue
-macos | cli-2 cli-8 extension-host-2 | queue
-macos | cli-4 cli-7 extension-host-1 | queue
-macos | cli-3 cli-5 cli-6 | queue
+macos | cli-1 cli-2 | queue
+macos | cli-3 cli-4 | queue
+macos | cli-5 cli-6 | queue
+macos | cli-7 cli-8 | queue
+macos | extension-host-3 extension-host-4 extension-host-5 | queue
+macos | extension-host-1 extension-host-2 packages | queue
 # Jobs that are not a matrix: the shard column is "-".
 single | node-runtime | queue
+single | chord | queue
 single | durable-cf-host | queue
 single | durable-contract | queue
 single | android | pr

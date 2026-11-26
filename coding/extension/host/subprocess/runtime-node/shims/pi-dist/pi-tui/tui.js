@@ -4,7 +4,7 @@
 import { performance } from "node:perf_hooks";
 import { isKeyRelease, matchesKey } from "./keys.js";
 import { parseOscColorResponse, parseTerminalColorSchemeReport, } from "./terminal-colors.js";
-import { getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.js";
+import { getCapabilities, getImageLineExtent, getMaxKittyImageRows, isImageLine, setCellDimensions, stripImageSequences, } from "./terminal-image.js";
 import { extractSegments, normalizeTerminalOutput, sliceByColumn, sliceWithWidth, visibleWidth } from "./utils.js";
 /**
  * Dispatch an event to a component and retain the exact target and coordinate
@@ -90,12 +90,57 @@ function parseSizeValue(value, referenceSize) {
     }
     return undefined;
 }
+function sameLines(a, b) {
+    if (a === b)
+        return true;
+    if (a.length !== b.length)
+        return false;
+    for (let index = 0; index < a.length; index++) {
+        if (a[index] !== b[index])
+            return false;
+    }
+    return true;
+}
+/**
+ * Render children and concatenate their lines.
+ *
+ * Returns `previous` unchanged when the children and their lines are unchanged. Unchanged subtrees
+ * then keep array identity, so every ancestor container skips its copy too. Without this, each
+ * frame of a long fullscreen transcript copied every rendered line once per nesting level.
+ * Callers must treat the returned lines as read-only, like any component's cached render output.
+ */
+export function renderChildLines(children, width, previous) {
+    const parts = children.map((child) => child.render(width));
+    if (previous?.width === width &&
+        previous.children.length === children.length &&
+        children.every((child, index) => child === previous.children[index] && sameLines(parts[index], previous.parts[index]))) {
+        return previous;
+    }
+    const lines = [];
+    for (const part of parts) {
+        for (const line of part)
+            lines.push(line);
+    }
+    return { width, children: [...children], parts, lines };
+}
+/** Dispatch a mouse event to the child of a vertical child layout that covers its row. */
+export function dispatchMouseToChildLines(layout, event) {
+    let childY = 0;
+    for (let index = 0; index < layout.children.length; index++) {
+        const childHeight = layout.parts[index].length;
+        if (event.y >= childY && event.y < childY + childHeight) {
+            return dispatchMouseEvent(layout.children[index], { ...event, y: event.y - childY, height: childHeight });
+        }
+        childY += childHeight;
+    }
+    return undefined;
+}
 /**
  * Container - a component that contains other components
  */
 export class Container {
     children = [];
-    mouseLayout;
+    childLines;
     addChild(component) {
         this.children.push(component);
     }
@@ -116,37 +161,17 @@ export class Container {
     handleMouse(event) {
         if (event.y < 0 || event.y >= event.height)
             return undefined;
-        const mouseChildren = this.mouseLayout?.width === event.width
-            ? this.mouseLayout.children
-            : this.children.map((component) => ({ component, height: component.render(event.width).length }));
-        let childY = 0;
-        for (const { component: child, height: childHeight } of mouseChildren) {
-            if (event.y >= childY && event.y < childY + childHeight) {
-                const result = dispatchMouseEvent(child, {
-                    ...event,
-                    y: event.y - childY,
-                    height: childHeight,
-                });
-                if (result?.focus && this.handleInput)
-                    return { ...result, focusTarget: this };
-                return result;
-            }
-            childY += childHeight;
-        }
-        return undefined;
+        const layout = this.childLines?.width === event.width
+            ? this.childLines
+            : renderChildLines(this.children, event.width, undefined);
+        const result = dispatchMouseToChildLines(layout, event);
+        if (result?.focus && this.handleInput)
+            return { ...result, focusTarget: this };
+        return result;
     }
     render(width) {
-        const lines = [];
-        const mouseChildren = [];
-        for (const child of this.children) {
-            const childLines = child.render(width);
-            mouseChildren.push({ component: child, height: childLines.length });
-            for (const line of childLines) {
-                lines.push(line);
-            }
-        }
-        this.mouseLayout = { width, children: mouseChildren };
-        return lines;
+        this.childLines = renderChildLines(this.children, width, this.childLines);
+        return this.childLines.lines;
     }
 }
 /**
@@ -176,6 +201,32 @@ export function compositeTuiLine(baseLine, overlayLine, startCol, overlayWidth, 
         " ".repeat(afterPad);
     return visibleWidth(result) <= totalWidth ? result : sliceByColumn(result, 0, totalWidth, true);
 }
+/**
+ * Drop image placements that intersect an overlay rectangle (`row` is viewport-relative).
+ * Terminals draw images above text, so an overlay cannot paint over them. The renderers delete a
+ * placement once its line changes and draw it again when the overlay no longer covers it.
+ * Images beside the overlay stay; on the row holding such an image's sequence the overlay is not
+ * drawn, because `compositeTuiLine` passes image lines through.
+ */
+function hideImagesUnderOverlay(lines, overlay, viewportStart) {
+    if (overlay.height === 0)
+        return;
+    // Kitty images extend downward, so an image line above the viewport can still reach into it.
+    for (let index = Math.max(0, viewportStart - getMaxKittyImageRows()); index < lines.length; index++) {
+        const line = lines[index];
+        const extent = getImageLineExtent(line);
+        if (!extent)
+            continue;
+        const firstRow = index + extent.firstRow - viewportStart;
+        const lastRow = index + extent.lastRow - viewportStart;
+        if (firstRow < overlay.row + overlay.height &&
+            lastRow >= overlay.row &&
+            extent.startCol < overlay.col + overlay.width &&
+            extent.endCol > overlay.col) {
+            lines[index] = stripImageSequences(line);
+        }
+    }
+}
 export const VIEWPORT_TUI = Symbol.for("@earendil-works/pi-tui/viewport");
 export function isViewportTUI(tui) {
     return tui[VIEWPORT_TUI] === true;
@@ -186,7 +237,17 @@ export class TuiBase extends Container {
     inputListeners = new Set();
     /** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
     onDebug;
+    suspendSignalHandler;
+    suspendSignalListener = () => this.suspendSignalHandler?.();
+    // From start() until stop(). Unlike `stopped`, false before the first start().
+    ownsTerminal = false;
+    suspendSignalListening = false;
     renderRequested = false;
+    /**
+     * Whether a render request since the last frame may have changed component output. Only
+     * `requestViewRender()` leaves it false, so a renderer may reuse the previous frame's output.
+     */
+    contentChanged = true;
     immediateRenderScheduled = false;
     renderTimer;
     lastRenderAt = 0;
@@ -280,6 +341,8 @@ export class TuiBase extends Container {
         this.setFocusInternal({ component, overlayFocusRestore: "clear" });
     }
     setFocusInternal({ component, overlayFocusRestore, }) {
+        // Focused components draw a cursor, so a focus change must not reuse earlier output.
+        this.contentChanged = true;
         const previousFocus = this.focusedComponent;
         let nextFocus = component;
         const previousFocusedOverlay = previousFocus
@@ -592,6 +655,8 @@ export class TuiBase extends Container {
         this.stopped = false;
         process.off("exit", this.exitRestoreHandler);
         process.on("exit", this.exitRestoreHandler);
+        this.ownsTerminal = true;
+        this.updateSuspendSignalListener();
         this.beforeTerminalStart();
         this.terminal.start((data) => this.handleTerminalInput(data), () => this.requestRender());
         this.afterTerminalStart();
@@ -626,6 +691,24 @@ export class TuiBase extends Container {
             this.terminal.write(enabled ? "\x1b[?2031h" : "\x1b[?2031l");
         }
     }
+    setSuspendSignalHandler(handler) {
+        this.suspendSignalHandler = handler;
+        this.updateSuspendSignalListener();
+    }
+    // Listen only while the TUI owns the terminal. After stop(), a child (external editor,
+    // interactive command) owns it, and a listener would keep SIGTSTP from stopping the process.
+    // Only real changes touch the listener: removing the last one restores the default action,
+    // so an off/on pair would let a SIGTSTP in between stop the process with the TUI running.
+    updateSuspendSignalListener() {
+        const listen = this.ownsTerminal && this.suspendSignalHandler !== undefined;
+        if (listen === this.suspendSignalListening)
+            return;
+        this.suspendSignalListening = listen;
+        if (listen)
+            process.on("SIGTSTP", this.suspendSignalListener);
+        else
+            process.off("SIGTSTP", this.suspendSignalListener);
+    }
     queryCellSize() {
         // Only query if terminal supports images (cell size is only used for image rendering)
         if (!getCapabilities().images) {
@@ -646,10 +729,15 @@ export class TuiBase extends Container {
         this.terminal.showCursor();
         this.terminal.stop();
         this.afterTerminalStop(options);
+        // Last, so a SIGTSTP during the restore above is caught (and dropped when the listener
+        // goes) instead of stopping the process with the terminal half restored.
+        this.ownsTerminal = false;
+        this.updateSuspendSignalListener();
     }
     renderNow(force = false) {
         if (force)
             this.resetRenderState();
+        this.contentChanged = true;
         this.renderRequested = false;
         this.cancelRenderTimer();
         this.lastRenderAt = performance.now();
@@ -661,12 +749,18 @@ export class TuiBase extends Container {
             this.requestImmediateRender();
             return;
         }
+        this.contentChanged = true;
+        this.requestViewRender();
+    }
+    /** Request a frame for a change that leaves component output unchanged, such as a scroll position. */
+    requestViewRender() {
         if (this.renderRequested)
             return;
         this.renderRequested = true;
         process.nextTick(() => this.scheduleRender());
     }
     requestImmediateRender() {
+        this.contentChanged = true;
         this.cancelRenderTimer();
         this.renderRequested = true;
         if (this.immediateRenderScheduled)
@@ -1027,8 +1121,9 @@ export class TuiBase extends Container {
             result.push("");
         }
         const viewportStart = Math.max(0, workingHeight - termHeight);
-        // Composite each overlay
+        // Composite each overlay, back to front. Hiding images per overlay also hides images drawn by overlays below it.
         for (const { overlayLines, row, col, w } of rendered) {
+            hideImagesUnderOverlay(result, { row, col, width: w, height: overlayLines.length }, viewportStart);
             for (let i = 0; i < overlayLines.length; i++) {
                 const idx = viewportStart + row + i;
                 if (idx >= 0 && idx < result.length) {
@@ -1046,7 +1141,8 @@ export class TuiBase extends Container {
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i];
             if (!isImageLine(line)) {
-                lines[i] = normalizeTerminalOutput(line) + reset;
+                // Cursor markers are internal render metadata and must never reach terminal output.
+                lines[i] = normalizeTerminalOutput(line.replaceAll(CURSOR_MARKER, "")) + reset;
             }
         }
         return lines;
@@ -1072,8 +1168,9 @@ export class TuiBase extends Container {
                 // Calculate visual column (width of text before marker)
                 const beforeMarker = line.slice(0, markerIndex);
                 const col = visibleWidth(beforeMarker);
-                // Strip marker from the line
-                lines[row] = line.slice(0, markerIndex) + line.slice(markerIndex + CURSOR_MARKER.length);
+                // Strip all markers from the selected line. The first marker determines the
+                // hardware cursor position; any others are stale internal sentinels.
+                lines[row] = line.replaceAll(CURSOR_MARKER, "");
                 return { row, col };
             }
         }

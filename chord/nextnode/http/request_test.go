@@ -1,6 +1,6 @@
 package http
 
-// pi: packages/chord/src/next-node/http/request.ts
+// pi: packages/chord/src/node/http/request.ts
 
 import (
 	"bufio"
@@ -20,13 +20,14 @@ import (
 
 // Tests of requests (slice 10 §2, D4): the summary a route gets, `json` and `body` with their limits and statuses (400, 413,
 // an `HttpFailure` escaping a route answering its status), and a body nobody read (drained or closed). Ports
-// packages/chord/test/next-node/http/request.test.ts.
+// packages/chord/test/node/http/request.test.ts.
 
+// The summary a route gets: `method` (packages/chord/src/node/http/request.ts:11), `query` (request.ts:16), `origin` (request.ts:20).
 func TestRequestHasItsMethodPathParamsQueryHeadersOriginProvenanceAndNonce(t *testing.T) {
 	var mu sync.Mutex
 	var seen HttpRequest
 	server := serving(t, []plugin{{"@app/a", contributing(HttpContribution{Routes: []HttpRouteEntry{
-		RouteFunc("GET /notes/:id", func(request HttpRequest, _ host.Ctx) (HttpResponse, error) {
+		publicRoute("GET /notes/:id", func(request HttpRequest, _ host.Ctx) (HttpResponse, error) {
 			mu.Lock()
 			seen = request
 			mu.Unlock()
@@ -59,14 +60,14 @@ func TestRequestHasItsMethodPathParamsQueryHeadersOriginProvenanceAndNonce(t *te
 // reading is a server whose `POST /json` answers the JSON it read (limit 16), `POST /body` the bytes it read (limit 16).
 func reading(t *testing.T) *testServer {
 	return serving(t, []plugin{{"@app/a", contributing(HttpContribution{Routes: []HttpRouteEntry{
-		RouteFunc("POST /json", func(request HttpRequest, _ host.Ctx) (HttpResponse, error) {
+		publicRoute("POST /json", func(request HttpRequest, _ host.Ctx) (HttpResponse, error) {
 			value, err := request.JSON(16)
 			if err != nil {
 				return HttpResponse{}, err
 			}
 			return jsonOf(value), nil
 		}),
-		RouteFunc("POST /body", func(request HttpRequest, _ host.Ctx) (HttpResponse, error) {
+		publicRoute("POST /body", func(request HttpRequest, _ host.Ctx) (HttpResponse, error) {
 			bytes := 0
 			for chunk, err := range request.Body(16) {
 				if err != nil {
@@ -79,6 +80,8 @@ func reading(t *testing.T) *testServer {
 	}})}}, servedOptions{})
 }
 
+// `body(limit)` yields the chunks of the body, at most `limit` bytes, a chunked one past it 413 (packages/chord/src/node/http/request.ts:33,
+// :108-:125); `json(limit)` reads them whole (request.ts:30).
 func TestBodiesParseJSONWithinItsLimitMalformedIs400LargerIs413(t *testing.T) {
 	server := reading(t)
 	port := server.port
@@ -129,7 +132,7 @@ func TestBodiesAnswer413BeforeAChunkedUploadPastTheLimitHasEnded(t *testing.T) {
 
 func TestBodiesDrainASmallBodyNobodyReadAndKeepTheConnectionALargeOneClosesIt(t *testing.T) {
 	server := serving(t, []plugin{{"@app/a", contributing(HttpContribution{Routes: []HttpRouteEntry{
-		RouteFunc("POST /ignore", func(HttpRequest, host.Ctx) (HttpResponse, error) { return jsonOf(float64(1)), nil }),
+		publicRoute("POST /ignore", func(HttpRequest, host.Ctx) (HttpResponse, error) { return jsonOf(float64(1)), nil }),
 	}})}}, servedOptions{})
 	transport := &nethttp.Transport{MaxConnsPerHost: 1}
 	client := &nethttp.Client{Transport: transport}

@@ -114,7 +114,7 @@ func collectSkillInputsIn(scan *codingagent.AgentsSkillScan, cwd, agentDir strin
 }
 
 func collectExtensionConfigs(cwd, agentDir string, sm *codingagent.SettingsManager, flags Args, ambientScopes *[]string, resolvers ...extsource.ResolveFunc) []subprocess.ExtConfig {
-	return collectExtensionConfigsWith(collectCLIExtensionConfigs(cwd, agentDir, sm, flags.Extensions, resolvers...), cwd, agentDir, sm, flags, ambientScopes, resolvers...)
+	return collectExtensionConfigsWith(collectCLIExtensionConfigs(cwd, agentDir, sm, flags.packages, flags.Extensions, resolvers...), cwd, agentDir, sm, flags, ambientScopes, resolvers...)
 }
 
 // cliExtensionSet is the extension configs of the -e sources: those that load first, and the missing or unresolved ones, reported after the rest.
@@ -125,7 +125,7 @@ type cliExtensionSet struct {
 }
 
 // collectCLIExtensionConfigs resolves the -e sources once, as Pi's resolveExtensionSources does for one load (resource-loader.ts:525-528).
-func collectCLIExtensionConfigs(cwd, agentDir string, sm *codingagent.SettingsManager, sources []string, resolvers ...extsource.ResolveFunc) cliExtensionSet {
+func collectCLIExtensionConfigs(cwd, agentDir string, sm *codingagent.SettingsManager, packages *packageRun, sources []string, resolvers ...extsource.ResolveFunc) cliExtensionSet {
 	var configs, missing []subprocess.ExtConfig
 	var installFailures []packagemanager.PackageInstallFailure
 	for _, p := range sources {
@@ -135,7 +135,7 @@ func collectCLIExtensionConfigs(cwd, agentDir string, sm *codingagent.SettingsMa
 		}
 		if kind := packagemanager.DetectSourceKind(p); kind == "git" || kind == "npm" {
 			// Pi package-manager.ts:1293-1307 collects an npm or git -e checkout only as a Package; unlike a local directory (:1346-1351), it never loads the checkout root itself.
-			resolved, err := resolveCLIPackageSource(cwd, agentDir, sm, p)
+			resolved, err := resolveCLIPackageSource(cwd, agentDir, sm, packages, p)
 			if err != nil {
 				// Pi resolves the sources in turn and stops at the first rejection, so no later source installs (package-manager.ts:1293-1342).
 				missing = append(missing, subprocess.UnresolvedExtConfig(p, &cliSourceResolveError{err: err}))
@@ -521,6 +521,12 @@ func extensionLoadDiagnostics(errs []error) []codingagent.AgentSessionRuntimeDia
 			diagnostics = append(diagnostics, codingagent.AgentSessionRuntimeDiagnostic{Type: "error", Message: group.Error()})
 			continue
 		}
+		if warning, ok := errors.AsType[*subprocess.FusedSourceWarning](err); ok {
+			// pig additive (D31): the fused member is loaded; the warning says its source is not what runs.
+			loadErr, _ := errors.AsType[*subprocess.ExtensionLoadError](err)
+			diagnostics = append(diagnostics, codingagent.AgentSessionRuntimeDiagnostic{Type: "warning", Message: `Extension "` + loadErr.Name + `": ` + warning.Message})
+			continue
+		}
 		if loadErr, ok := errors.AsType[*subprocess.ExtensionLoadError](err); ok && loadErr.Path != "" {
 			diagnostics = append(diagnostics, extensionLoadFailureDiagnostic(loadErr.Path, loadErr.Err))
 			continue
@@ -546,7 +552,7 @@ func extensionConflictDiagnostics(conflicts []codingagent.ExtensionConflict) []c
 // one of them is a load failure (main.ts:912-914). A failed virtual-model
 // registration alone reports no hint.
 func reportExtensionLoadFailures(diagnostics []codingagent.AgentSessionRuntimeDiagnostic) {
-	codingagent.ReportDiagnostics(codingagent.DeduplicateDiagnostics(diagnostics))
+	codingagent.WriteDiagnosticsToStderr(codingagent.DeduplicateDiagnostics(diagnostics))
 	if !slices.ContainsFunc(diagnostics, func(diagnostic codingagent.AgentSessionRuntimeDiagnostic) bool {
 		// pig additive (D20): a grouped build failure stands for one `Failed to load extension` error per member, so it gets Pi's hint too.
 		return strings.Contains(diagnostic.Message, "Failed to load extension") || subprocess.IsBuildFailureGroupMessage(diagnostic.Message)

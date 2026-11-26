@@ -25,6 +25,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/host"
 	"github.com/MichaelKinsy/PiG/chord/next/link"
 	"github.com/MichaelKinsy/PiG/chord/nextnode"
+	"github.com/MichaelKinsy/PiG/chord/nextnode/plugins/model"
 )
 
 // Not upstream's: the Node subprocess of the plugins component (docs/plan/chord-plugins-node-evaluator.md), exercised with
@@ -100,8 +101,8 @@ func acceptorOf(t testing.TB, node *NodeHost, principal data.Principal) host.Hos
 func handmade(t *testing.T, name, kind, source string) PluginScript {
 	t.Helper()
 	dir := t.TempDir()
-	plugin := Plugin{Name: name, Dir: dir, Facets: map[string]string{kind: filepath.Join(dir, kind+".ts")}, Dependencies: []string{}, External: []string{}}
-	return PluginScript{Plugin: plugin, Built: BuiltFacet{Kind: BuiltFacetScript, Plugin: name, Facet: kind, Source: source, Digest: sha256Hex(source)}}
+	plugin := model.Plugin{Name: name, Dir: dir, Root: dir, Layout: model.LayoutDirectory, Facets: map[string]string{kind: filepath.Join(dir, kind+".ts")}, Dependencies: []string{}, External: []string{}}
+	return PluginScript{Plugin: plugin, Built: model.BuiltFacet{Kind: model.BuiltFacetScript, Plugin: name, Facet: kind, Source: source, Digest: sha256Hex(source)}}
 }
 
 var (
@@ -124,7 +125,7 @@ func loadOn(t *testing.T, scripts ...PluginScript) (*NodeHost, host.LoadReport, 
 	return node, report, serverFor(t, workerRoute(node))
 }
 
-const emptyFacet = `(function (require, module, exports) { module.exports = { default: require("@earendil-works/chord/next").defineFacet(() => {}) }; })`
+const emptyFacet = `(function (require, module, exports) { module.exports = { default: require("@earendil-works/chord").defineFacet(() => {}) }; })`
 
 func TestNodeLoadsAFacetAndClosesWhenAskedTo(t *testing.T) {
 	node, report, _ := loadOn(t, handmade(t, "@test/p", "worker", emptyFacet))
@@ -197,7 +198,7 @@ func TestNodeAReloadAfterTheProcessEndedFailsWithItsExit(t *testing.T) {
 func TestNodeGivesTheProcessesOutputToOnOutputByStream(t *testing.T) {
 	var mu sync.Mutex
 	got := map[NodeStream]string{}
-	script := handmade(t, "@test/p", "worker", `(function (require, module, exports) { console.log("to stdout"); console.error("to stderr"); module.exports = { default: require("@earendil-works/chord/next").defineFacet(() => {}) }; })`)
+	script := handmade(t, "@test/p", "worker", `(function (require, module, exports) { console.log("to stdout"); console.error("to stderr"); module.exports = { default: require("@earendil-works/chord").defineFacet(() => {}) }; })`)
 	node, _, err := NewPluginRuntime(NodeOptions{OnOutput: func(stream NodeStream, chunk []byte) {
 		mu.Lock()
 		got[stream] += string(chunk)
@@ -219,7 +220,7 @@ func TestNodeGivesTheProcessesOutputToOnOutputByStream(t *testing.T) {
 
 func TestNodeAnUncaughtExceptionEndsTheProcessWithItsFatalAndClosesTheLink(t *testing.T) {
 	script := handmade(t, "@test/p", "worker", `(function (require, module, exports) {
-		module.exports = { default: require("@earendil-works/chord/next").defineFacet(() => { setTimeout(() => { throw new Error("late failure"); }, 0); }) };
+		module.exports = { default: require("@earendil-works/chord").defineFacet(() => { setTimeout(() => { throw new Error("late failure"); }, 0); }) };
 	})`)
 	node, _, _ := loadOn(t, script)
 	<-node.Exited()
@@ -238,7 +239,7 @@ func TestNodeAnUncaughtExceptionEndsTheProcessWithItsFatalAndClosesTheLink(t *te
 // NodeOptions.ExecArgv are Node's flags of the process: --expose-gc is how the tests that read the heap start it.
 func TestNodeExecArgvAreTheProcessesFlags(t *testing.T) {
 	script := handmade(t, "@test/p", "worker", `(function (require, module, exports) {
-		module.exports = { default: require("@earendil-works/chord/next").defineFacet(() => { if (typeof globalThis.gc !== "function") throw new Error("no gc"); }) };
+		module.exports = { default: require("@earendil-works/chord").defineFacet(() => { if (typeof globalThis.gc !== "function") throw new Error("no gc"); }) };
 	})`)
 	load := func(argv ...string) host.LoadReport {
 		node, report, err := NewPluginRuntime(NodeOptions{ExecArgv: argv}).Load(RuntimeLoad{Kind: "worker", Scripts: []PluginScript{script}, Principal: workerPrincipal, Peer: serverPrincipal}, background)
@@ -292,7 +293,7 @@ func TestNodeTreeIsExtractedOncePerContent(t *testing.T) {
 	if err != nil || second != first {
 		t.Fatalf("second = %q, %v; want %q", second, err, first)
 	}
-	if _, err := os.Stat(filepath.Join(first, "pi", "chord", "src", "next-node", "plugins", "evaluate.ts")); err != nil {
+	if _, err := os.Stat(filepath.Join(first, "pi", "chord", "src", "node", "plugins", "evaluate.ts")); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := os.ReadDir(cache)
@@ -306,16 +307,24 @@ func TestNodeTreeIsExtractedOncePerContent(t *testing.T) {
 // pin's (`.upstream/pin`), unless the manifest names it as an explicit `catchup`, which the script writes when it vendors a
 // commit other than the pin's; the manifest also records the pin it was made against, so a pin that moved since fails here
 // until the copy is regenerated (`make pin-bump` does it).
+// A manifest that lists `carried` Pi commits was vendored from the pin's tree with exactly those commits cherry-picked onto
+// it (PI_CARRIED of automation/gen/vendor-chord-common.sh, as the client surfaces' copy records them): each is a full Pi commit
+// id, and `make vendor-chord-carried-check` rebuilds that tree and compares what it vendors with this manifest.
 func TestNodeVendoredFilesAreExactlyTheManifests(t *testing.T) {
 	text, err := nodeFiles.ReadFile("node/manifest.json")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var manifest struct {
-		Commit  string `json:"commit"`
-		Pin     string `json:"pin"`
-		Catchup string `json:"catchup"`
-		Files   []struct {
+		Commit  string   `json:"commit"`
+		Pin     string   `json:"pin"`
+		Catchup string   `json:"catchup"`
+		Carried []string `json:"carried"`
+		Patches *[]struct {
+			Name   string `json:"name"`
+			Sha256 string `json:"sha256"`
+		} `json:"patches"`
+		Files []struct {
 			Path   string `json:"path"`
 			Sha256 string `json:"sha256"`
 		} `json:"files"`
@@ -325,6 +334,20 @@ func TestNodeVendoredFilesAreExactlyTheManifests(t *testing.T) {
 	}
 	if len(manifest.Commit) != 40 {
 		t.Fatalf("commit = %q", manifest.Commit)
+	}
+	if manifest.Patches == nil {
+		t.Fatal("the manifest has no patches list (an empty one when there is none)")
+	}
+	for _, patch := range *manifest.Patches {
+		content, err := os.ReadFile(filepath.Join("..", "..", "..", "automation", "gen", "chord-patches", patch.Name))
+		if err != nil {
+			t.Errorf("patch %s: %v", patch.Name, err)
+			continue
+		}
+		sum := sha256.Sum256(content)
+		if got := hex.EncodeToString(sum[:]); got != patch.Sha256 {
+			t.Errorf("patch %s: sha256 %s, manifest %s", patch.Name, got, patch.Sha256)
+		}
 	}
 	pinFile, err := os.ReadFile(filepath.Join("..", "..", "..", ".upstream", "pin"))
 	if err != nil {
@@ -344,6 +367,11 @@ func TestNodeVendoredFilesAreExactlyTheManifests(t *testing.T) {
 	}
 	if manifest.Commit != pin && manifest.Catchup != manifest.Commit {
 		t.Errorf("the copy is Pi %s, the pin %s, and the manifest names no catch-up for it (catchup = %q)", manifest.Commit, pin, manifest.Catchup)
+	}
+	for _, carried := range manifest.Carried {
+		if _, err := hex.DecodeString(carried); err != nil || len(carried) != 40 {
+			t.Errorf("carried commit %q is not a full Pi commit id", carried)
+		}
 	}
 	if manifest.Commit == pin && manifest.Catchup != "" {
 		t.Errorf("the copy is the pin's, yet the manifest names the catch-up %s", manifest.Catchup)
@@ -646,7 +674,7 @@ func TestNodeTreeIsRepairedWhenItIsPartialOrHasNoMarker(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, completeMarker)); err != nil {
 		t.Fatalf("a marker is written last: %v", err)
 	}
-	evaluate := filepath.Join(dir, "pi", "chord", "src", "next-node", "plugins", "evaluate.ts")
+	evaluate := filepath.Join(dir, "pi", "chord", "src", "node", "plugins", "evaluate.ts")
 	for _, damage := range []struct {
 		what string
 		do   func() error
@@ -786,7 +814,7 @@ func TestNodeDecodesEveryKindOfHostErrorWithItsFields(t *testing.T) {
 // anywhere in it, and a cycle ends the chain.
 func TestNodeAnUncaughtExceptionKeepsItsCauseChain(t *testing.T) {
 	script := handmade(t, "@test/p", "worker", `(function (require, module, exports) {
-		const next = require("@earendil-works/chord/next");
+		const next = require("@earendil-works/chord");
 		module.exports = { default: next.defineFacet(() => { setTimeout(() => {
 			const provider = new next.ChordError({ code: "unavailable", message: "no provider" });
 			provider.cause = "not an error";
@@ -816,7 +844,7 @@ func TestNodeAnUncaughtExceptionKeepsItsCauseChain(t *testing.T) {
 
 func TestNodeACauseThatIsItsOwnCauseEndsTheChain(t *testing.T) {
 	script := handmade(t, "@test/p", "worker", `(function (require, module, exports) {
-		module.exports = { default: require("@earendil-works/chord/next").defineFacet(() => { setTimeout(() => {
+		module.exports = { default: require("@earendil-works/chord").defineFacet(() => { setTimeout(() => {
 			const cycle = new Error("cycle");
 			cycle.cause = new Error("again", { cause: cycle });
 			throw cycle;
@@ -936,7 +964,7 @@ func TestNodeTheHostsKeepAliveCountsReachTheApp(t *testing.T) {
 func TestNodeACoreModuleImportsChordByItsPackageName(t *testing.T) {
 	cache := t.TempDir()
 	module := filepath.Join(t.TempDir(), "core.mjs")
-	source := `import { defineFacet, hostKind, method, remote, str } from "@earendil-works/chord/next";
+	source := `import { defineFacet, hostKind, method, remote, str } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 const Worker = hostKind("test.worker");
 const Hello = remote("test.hello", { version: 1, params: {}, hostAddress: () => Worker(), variants: { main: { state: {}, methods: { hi: method(str(), str()) } } } });
@@ -967,5 +995,68 @@ export default defineFacet((host) => host.serve(Hello, () => ({ variant: "main",
 	t.Cleanup(ref.Release)
 	if got, err := ref.Call("hi", "there", background); err != nil || got != "hi there" {
 		t.Fatalf("hi = %v, %v", got, err)
+	}
+}
+
+// holdingNode is a Node host (stop grace one second) whose process started a child that inherited its output pipes and sleeps
+// for a minute; the child is killed with the test.
+func holdingNode(t *testing.T) *NodeHost {
+	t.Helper()
+	grace := time.Second
+	_, node := probeNode(t, `hold: async () => { const { spawn } = await import("node:child_process"); const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: ["ignore", "inherit", "inherit"], detached: true }); child.unref(); return child.pid; }`, NodeOptions{StopGrace: &grace}, nil)
+	pid := probeOn(t, serverFor(t, workerRoute(node))).must("hold", nil)
+	t.Cleanup(func() {
+		if number, ok := pid.(float64); ok {
+			if process, err := os.FindProcess(int(number)); err == nil {
+				_ = process.Kill()
+			}
+		}
+	})
+	return node
+}
+
+// Not Pi's wording: the exit of the process is what the Go side waits for (Pi's server awaits `child.process.exited`), not the
+// end of its output pipes. A process the plugins started that inherited the pipes (here a Node that sleeps) outlives the host's
+// process and holds them; the host's exit must not wait for it, as `exec.Cmd.Wait` does without a WaitDelay, and the exit is a
+// clean one: the process exited with code 0.
+func TestNodeAProcessTheHostStartedThatHoldsItsPipesDoesNotHoldItsExit(t *testing.T) {
+	node := holdingNode(t)
+	done := make(chan error, 1)
+	go func() { done <- node.Close(background) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close = %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the process's exit waited for what holds its pipes")
+	}
+	select {
+	case <-node.Exited():
+	default:
+		t.Fatal("Close returned before the process ended")
+	}
+	if node.Err() != nil {
+		t.Fatalf("Err = %v after a requested close", node.Err())
+	}
+}
+
+// The same child holds the pipes when the link closes: the process exits by itself, so the grace of the closed link, which ends
+// before the exit is seen (the exit waits for the pipes up to the grace after the process ended), kills nothing and the exit says
+// no kill happened: it is a clean one that nobody asked for, not "its link closed and it did not exit within the grace".
+func TestNodeAProcessThatExitedByItselfAfterItsLinkClosedWhileAChildHeldItsPipesIsNotReportedKilled(t *testing.T) {
+	node := holdingNode(t)
+	node.Link().Close()
+	select {
+	case <-node.Exited():
+	case <-time.After(20 * time.Second):
+		t.Fatal("the process's exit waited for what holds its pipes")
+	}
+	var exit *NodeExit
+	if !errors.As(node.Err(), &exit) {
+		t.Fatalf("Err = %v, want the process's exit", node.Err())
+	}
+	if exit.Err != nil || exit.Reason != "" || exit.Signal != "" || exit.Code != 0 {
+		t.Fatalf("exit = %+v, want a clean exit with no kill reason (the Go side killed nothing)", exit)
 	}
 }

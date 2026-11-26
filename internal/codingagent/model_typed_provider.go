@@ -57,14 +57,11 @@ func builtinTypedBase(id string, fallback ai.ModelsStreamFunction) *ai.ModelsPro
 	auth, _ := ai.BuiltinProviderAuth(id)
 	chatModels := func() []*ai.Model {
 		// The models are read when the provider is listed, so OpenRouter's routing variants (D199) are derived then and not at startup.
-		listed := builtinChatCatalogListed(id)
-		models := make([]*ai.Model, 0, len(listed))
-		for _, generated := range listed {
-			model := generated.ToModel()
-			model.Capabilities = generated.ToCapabilities()
-			models = append(models, model)
+		// A provider without a chat model lists an empty, not a nil, slice.
+		if models := builtinChatModels(id); models != nil {
+			return models
 		}
-		return models
+		return []*ai.Model{}
 	}
 	base := &ai.ModelsProvider{ID: id, Name: ai.ProviderDisplayName(id), BaseURL: ai.ProviderBaseURL(id), Auth: auth, GetModels: func() ([]*ai.Model, error) { return chatModels(), nil }, Stream: fallback, StreamSimple: fallback}
 	base.GetAllModels = func() ([]ai.AnyModel, error) {
@@ -118,7 +115,7 @@ func (r *ModelRegistry) GetTypedProvider(id string, fallback ai.ModelsStreamFunc
 		if !registered && !configured {
 			return nil
 		}
-		base = &ai.ModelsProvider{ID: id, Name: id, GetModels: func() ([]*ai.Model, error) { return nil, nil }, Stream: fallback, StreamSimple: fallback}
+		base = &ai.ModelsProvider{ID: id, Name: id, GetModels: func() ([]*ai.Model, error) { return nil, nil }, Stream: fallback, StreamSimple: r.simpleFallback(id, fallback)}
 	}
 	var input *ProviderConfigInput
 	compose := r.composeNativeProvider
@@ -233,7 +230,7 @@ func (r *ModelRegistry) availableProviderAllModels(ctx context.Context, id strin
 	if err != nil || check == nil {
 		return nil, err
 	}
-	filter := r.accountModelFilter(id)
+	filter := r.accountModelFilter(context.WithoutCancel(ctx), id)
 	return slices.DeleteFunc(r.GetProviderAllModelData(id), func(model ai.AnyModel) bool {
 		return ai.IsModelType(model, ai.ModelTypeChat) && !filter(model.ModelID())
 	}), nil

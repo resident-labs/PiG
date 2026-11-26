@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"io"
 	"maps"
 	"slices"
 	"testing"
+
+	"github.com/MichaelKinsy/PiG/internal/zstdblob"
 )
 
-// callbackReadsPastTheMatch classifies every language-definition callback by whether it reads the input past the match. patternReach sees only patterns, so a language whose modes call such a callback must have an unbounded pattern too, or a resume point could precede text that changes the callback's decision.
+// callbackReadsPastTheMatch classifies every language-definition callback by whether it reads the input past the match. patternReach sees only patterns, so a language whose modes call such a callback must have an unbounded pattern too, or a check of its own (the angle guard of the JSX tag callback), or a resume point could precede text that changes the callback's decision.
 var callbackReadsPastTheMatch = map[string]bool{
 	"endSameAsBegin.begin":         false, // group 1 of the match
 	"endSameAsBegin.end":           false, // group 1 of the match
@@ -18,7 +21,7 @@ var callbackReadsPastTheMatch = map[string]bool{
 	"mathematica.systemSymbol":     false, // the lexeme
 }
 
-// TestCallbacksReadingPastTheMatchHaveNoResumePoints: every callback is classified, and every language whose grammar reaches a callback that reads past the match has an unbounded reach, so HighlightResumable offers it no resume point.
+// TestCallbacksReadingPastTheMatchHaveNoResumePoints: every callback is classified, and every language whose grammar reaches a callback that reads past the match has an unbounded reach or the guard that checks the text for that callback, so HighlightResumable offers it no resume point the callback could decide differently at.
 func TestCallbacksReadingPastTheMatchHaveNoResumePoints(t *testing.T) {
 	if got, want := slices.Sorted(maps.Keys(callbacks)), slices.Sorted(maps.Keys(callbackReadsPastTheMatch)); !slices.Equal(got, want) {
 		t.Fatalf("callbacks %v, classified %v: classify every callback", got, want)
@@ -29,17 +32,25 @@ func TestCallbacksReadingPastTheMatchHaveNoResumePoints(t *testing.T) {
 	}
 	var nodes []grammarNode
 	var registrations [][2]json.RawMessage
-	for _, data := range [][]byte{eagerGrammars, allGrammars} {
-		reader, err := gzip.NewReader(bytes.NewReader(data))
-		if err != nil {
-			t.Fatal(err)
-		}
+	eagerReader, err := gzip.NewReader(bytes.NewReader(eagerGrammars))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eagerJSON, err := io.ReadAll(eagerReader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allJSON, err := zstdblob.Decode(allGrammars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, data := range [][]byte{eagerJSON, allJSON} {
 		var document struct {
 			FirstNode     int                  `json:"firstNode"`
 			Nodes         []grammarNode        `json:"nodes"`
 			Registrations [][2]json.RawMessage `json:"registrations"`
 		}
-		if err := json.NewDecoder(reader).Decode(&document); err != nil {
+		if err := json.Unmarshal(data, &document); err != nil {
 			t.Fatal(err)
 		}
 		if document.FirstNode != len(nodes) {
@@ -90,8 +101,8 @@ func TestCallbacksReadingPastTheMatchHaveNoResumePoints(t *testing.T) {
 			continue
 		}
 		found = append(found, name)
-		if !languageReach(compileLanguage(r.getLanguage(name))).unbounded {
-			t.Errorf("%s calls a callback that reads past the match but its patterns are bounded, so it would offer resume points", name)
+		if reach := languageReach(compileLanguage(r.getLanguage(name))); !reach.unbounded && reach.guards&guardAngle == 0 {
+			t.Errorf("%s calls a callback that reads past the match but its patterns are bounded and guard nothing, so it would offer resume points", name)
 		}
 	}
 	if !slices.Contains(found, "javascript") || !slices.Contains(found, "typescript") {

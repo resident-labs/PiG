@@ -1,7 +1,6 @@
 package ai
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -244,6 +243,12 @@ func makeJSONSchemaNodeStrict(value any, order schemaObjectOrder, path string, i
 		}
 	}
 
+	// Pi 406e719a6bff (#12049, post-v1.5.2): OpenAI strict mode rejects a node without a type; a bare enum counts as typed, a bare const does not.
+	// `schema.type === undefined`: an explicit null is a value, so only an absent key counts.
+	if !hasJSONSchemaKey(schema, "type") && !hasJSONSchemaKey(schema, "anyOf") && !hasJSONSchemaKey(schema, "enum") {
+		return strictSchemaError("schemas without a type are unsupported")
+	}
+
 	if variantsValue, exists := schema["anyOf"]; exists {
 		variants, ok := variantsValue.([]any)
 		if !ok || len(variants) == 0 {
@@ -362,12 +367,12 @@ func MakeStrictJSONSchema(parameters map[string]any, isUnsupportedKeyword Unsupp
 // makeStrictJSONSchemaWithOrder returns the strict schema and the member order JSON.stringify writes for it. The authored order is not
 // modified.
 func makeStrictJSONSchemaWithOrder(parameters map[string]any, order schemaObjectOrder, isUnsupportedKeyword UnsupportedStrictSchemaKeywordCheck) (map[string]any, schemaObjectOrder, error) {
-	body, err := json.Marshal(parameters)
+	body, err := jsstring.MarshalKeepingSurrogates(parameters)
 	if err != nil {
 		return nil, nil, err
 	}
 	var cloned map[string]any
-	if err := json.Unmarshal(body, &cloned); err != nil {
+	if err := jsstring.UnmarshalKeepingSurrogates(body, &cloned); err != nil {
 		return nil, nil, err
 	}
 	if order = maps.Clone(order); order == nil {
@@ -387,21 +392,6 @@ func makeStrictJSONSchemaWithOrder(parameters map[string]any, order schemaObject
 func prefersJSONSchemaStrictSampling(tool ToolSchema) bool {
 	config := tool.ConstrainedSampling
 	return config != nil && config.Type == ConstrainedSamplingJSONSchema && config.Strict == ConstrainedSamplingStrictPrefer
-}
-
-// strictToolLimitErrorMessages are the messages Claude rejects a request with, on the Anthropic API and on Bedrock, when its strict
-// tools exceed its limits. Observed limits: 20 strict tools, and 16 optional or union-typed parameters across all strict tools.
-// Mirrors upstream STRICT_TOOL_LIMIT_ERROR_MESSAGES.
-var strictToolLimitErrorMessages = []string{
-	"The compiled grammar is too large",
-	"Too many strict tools (",
-	"Schemas contains too many parameters with union types (",
-}
-
-// isStrictToolLimitErrorMessage reports whether a provider error message says the request's strict tools exceed the provider's limits.
-// Mirrors upstream isStrictToolLimitErrorMessage.
-func isStrictToolLimitErrorMessage(message string) bool {
-	return slices.ContainsFunc(strictToolLimitErrorMessages, func(limitMessage string) bool { return strings.Contains(message, limitMessage) })
 }
 
 // jsonSchemaToolParameters is the schema getJSONSchemaToolParameters returns, with the member order of its objects.

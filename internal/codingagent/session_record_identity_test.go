@@ -62,13 +62,13 @@ func TestReleasedRecordEncodesToTheAppendedRecord(t *testing.T) {
 	for name, msg := range recordIdentityMessages() {
 		for parentName, parent := range parents {
 			t.Run(name+"/"+parentName, func(t *testing.T) {
-				entry := MessageEntry{SessionEntryBase: SessionEntryBase{Type: "message", ID: "4e5f6a7b", ParentID: parent, Timestamp: "2026-10-13T08:00:00.123Z"},
+				entry := MessageEntry{Type: "message", ID: "4e5f6a7b", ParentID: parent, Timestamp: "2026-10-13T08:00:00.123Z",
 					Message: msg}
 				raw, err := marshalSessionLine(entry)
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, appended := heldMessageEntry(entry, raw); !appended {
+				if _, appended := heldMessageEntry(entry, raw, proveHeldEntry(entry)); !appended {
 					t.Skip("the session holds the record's decode, with its record")
 				}
 				if got := entry.Raw(); !bytes.Equal(got, raw) {
@@ -164,7 +164,7 @@ func (s *Session) residentCountForTest() int {
 	defer s.mu.RUnlock()
 	n := 0
 	for i := range s.slots {
-		if s.slots[i].entry != nil {
+		if s.resident.get(i) != nil {
 			n++
 		}
 	}

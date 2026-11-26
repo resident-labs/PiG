@@ -16,7 +16,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/internal/nexttest"
 )
 
-// Ports packages/chord/test/next/store/export.test.ts: tests of `store.Export(ctx)` (slice 6a §13, rule 26): the
+// Ports packages/chord/test/store/export.test.ts: tests of `store.Export(ctx)` (slice 6a §13, rule 26): the
 // parts in archive order, lossless; the commit queue held from the first `Next` until the export ends, is closed or
 // aborts (also while the consumer is suspended); GC of closed and aborted iterators.
 //
@@ -24,7 +24,7 @@ import (
 // has no listener list; the `context.AfterFunc` registration is stopped when the export ends, and what the counts
 // proved there (the queue given back at once, nothing left held) is asserted by the commits that follow.
 //
-// pi: packages/chord/src/next/store/export.ts
+// pi: packages/chord/src/store/export.ts
 
 // exportFlushed waits until every goroutine that can make progress did (Pi's `flushed()`: pending promise callbacks).
 func exportFlushed() { time.Sleep(50 * time.Millisecond) }
@@ -436,6 +436,74 @@ func TestExportCommitQueue(t *testing.T) {
 			}
 		case <-time.After(5 * time.Second):
 			t.Fatal("the waiting Next did not reject")
+		}
+	})
+}
+
+func TestExportHostSelection(t *testing.T) {
+	t.Run("holds the tables with a host column of the key's kind and their rows of the key, and the records of the key", func(t *testing.T) {
+		store := memoryStore(t)
+		table := &TableDefinitionWrite{
+			Table: "app.s:pins", Version: 1, State: StateReady,
+			Columns: ColumnRecords{
+				{Name: "id", Record: ColumnRecord{Type: ColStr}},
+				{Name: "session", Record: ColumnRecord{Type: ColStr, Host: new("session")}},
+			},
+			Key: []string{"id"}, Fingerprint: "f",
+		}
+		other := &TableDefinitionWrite{
+			Table: "app.s:users", Version: 1, State: StateReady,
+			Columns: ColumnRecords{
+				{Name: "id", Record: ColumnRecord{Type: ColStr}},
+				{Name: "user", Record: ColumnRecord{Type: ColStr, Host: new("user")}},
+			},
+			Key: []string{"id"}, Fingerprint: "f",
+		}
+		put := func(id, session string) *PutWrite {
+			return &PutWrite{Table: "app.s:pins", Row: delta.JsonObjectOf("id", id, "session", session), Version: 1, Columns: delta.NewJsonObject(0)}
+		}
+		write := stagedWrite{order: OrderWrite, apply: func(step *Step) ([]StoreWrite, error) {
+			writes := []StoreWrite{table, other, put("a", "session|S1"), put("b", "session|S2")}
+			for _, each := range writes {
+				if err := applyWrite(step, each, "test"); err != nil {
+					return nil, err
+				}
+			}
+			base := DocumentBase{Version: 1, Fingerprint: "f", Value: delta.NewJsonObject(0)}
+			for _, key := range []string{"session|S1", "session|S2"} {
+				address := DocumentAddress{Owner: "app.s", Namespace: "chord", Kind: "meta", Key: &key, Host: &key}
+				if _, err := CreateDocument(address, base, "{}", nil).Apply(step); err != nil {
+					return nil, err
+				}
+			}
+			return writes, nil
+		}}
+		if _, err := store.Commit([]StagedWrite{write}, openFence, background); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		export := NewSelectionExport(store, background, ExportSelection{Kind: SelectHost, Key: "session|S1"})
+		var parts []ArchivePart
+		var summary []string
+		for {
+			part, ok, err := export.Next(background)
+			noError(t, err)
+			if !ok {
+				break
+			}
+			parts = append(parts, part)
+			if put, isPut := part.(*PutWrite); isPut {
+				summary = append(summary, "put "+put.Row.Value("id").(string))
+			} else {
+				summary = append(summary, part.StoreWriteKind())
+			}
+		}
+		qEqual(t, summary, []string{"manifest", "table", "put a", "document.create", "document.revision", "end"})
+		if manifest := parts[0].(*ManifestPart); manifest.Host == nil || *manifest.Host != "session|S1" {
+			t.Fatalf("manifest = %s", nexttest.JSONText(t, parts[0]))
+		}
+		record := parts[3].(*DocumentCreate).Record
+		if record.Key == nil || *record.Key != "session|S1" || record.Host == nil || *record.Host != "session|S1" {
+			t.Fatalf("record = %+v", record)
 		}
 	})
 }

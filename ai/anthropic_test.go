@@ -711,8 +711,9 @@ func TestAnthropicConvertToolsStrict(t *testing.T) {
 	if _, exists := legacyTools[0].InputSchema["title"]; exists {
 		t.Fatalf("legacy input schema retained title: %#v", legacyTools[0].InputSchema)
 	}
-	if _, exists := legacyTools[0].InputSchema["additionalProperties"]; exists {
-		t.Fatalf("legacy input schema retained additionalProperties: %#v", legacyTools[0].InputSchema)
+	// Pi aa47cedce (#12100): a non-strict schema keeps its root additionalProperties.
+	if got, exists := legacyTools[0].InputSchema["additionalProperties"]; !exists || got != false {
+		t.Fatalf("legacy input schema additionalProperties = %#v, want false: %#v", got, legacyTools[0].InputSchema)
 	}
 
 	strict := legacy
@@ -1105,6 +1106,7 @@ func TestAnthropicTemperatureCompatibility(t *testing.T) {
 	}{
 		{name: "omits zero for Claude Opus 4.7", model: "claude-opus-4-7", temperature: 0, set: true},
 		{name: "omits zero for Claude Opus 4.8", model: "claude-opus-4-8", temperature: 0, set: true},
+		{name: "omits zero for Claude Sonnet 5", model: "claude-sonnet-5", temperature: 0, set: true},
 		{name: "omits one for Claude Opus 4.7", model: "claude-opus-4-7", temperature: 1, set: true},
 		{name: "keeps zero for Claude Opus 4.6", model: "claude-opus-4-6", temperature: 0, set: true, want: new(float64)},
 		{name: "keeps zero for Claude Sonnet 4.6", model: "claude-sonnet-4-6", temperature: 0, set: true, want: new(float64)},
@@ -1247,16 +1249,19 @@ func TestAnthropicStreamUsesModelMaxTokensWhenUnset(t *testing.T) {
 
 	p := NewAnthropicProvider(AnthropicConfig{
 		APIKey:  "test-key",
-		Model:   "claude-sonnet-5",
+		Model:   "zz-fixture-anthropic",
 		BaseURL: srv.URL,
+		// A fixture record (id zz-fixture-..., never a models.dev id): with no maxTokens option the request carries the model output limit (Pi
+		// packages/ai/src/api/anthropic-messages.ts:1480 max_tokens: options?.maxTokens ?? model.maxTokens).
+		ModelMetadata: &Model{ID: "zz-fixture-anthropic", Capabilities: ModelCapabilities{MaxOutputTokens: 4321}},
 	})
 	stream, err := p.Stream(context.Background(), NormalizeContext(Context{Messages: []Message{UserMessage{Content: UserText("Hello")}}}), StreamOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = stream.Result()
-	if got, _ := body["max_tokens"].(float64); got != 128000 {
-		t.Fatalf("max_tokens = %v, want 128000", body["max_tokens"])
+	if got, _ := body["max_tokens"].(float64); got != 4321 {
+		t.Fatalf("max_tokens = %v, want 4321 (the fixture model's output limit)", body["max_tokens"])
 	}
 }
 
@@ -1602,8 +1607,8 @@ func TestAnthConvertMessages_ImageAndToolResultImage(t *testing.T) {
 	if !ok || len(blocks) != 1 || blocks[0].Type != "image" {
 		t.Fatalf("user image block = %#v", userImg[0].Content)
 	}
-	src, _ := blocks[0].Source.(map[string]any)
-	if src["type"] != "base64" || src["media_type"] != "image/png" || src["data"] != "QUJD" {
+	src := blocks[0].Source
+	if src == nil || src.Type != "base64" || src.MediaType != "image/png" || src.Data != "QUJD" {
 		t.Errorf("image source = %#v, want base64/image-png/QUJD", src)
 	}
 

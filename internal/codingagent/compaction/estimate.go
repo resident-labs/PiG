@@ -55,6 +55,22 @@ func contentBlocksChars[T any](blocks []T) int {
 // customContentChars sizes a decoded custom-message content value: a string or
 // an array of content-block objects.
 func customContentChars(content any) int {
+	if raw, ok := content.(json.RawMessage); ok {
+		// A content array an extension wrote is kept as its JSON text, which holds the members in the order it wrote them.
+		var text string
+		if json.Unmarshal(raw, &text) == nil {
+			return jsLength(text)
+		}
+		var blocks []json.RawMessage
+		if json.Unmarshal(raw, &blocks) != nil {
+			return 0
+		}
+		chars := 0
+		for _, block := range blocks {
+			chars += rawBlockChars(block)
+		}
+		return chars
+	}
 	switch content := content.(type) {
 	case string:
 		return jsLength(content)
@@ -71,6 +87,29 @@ func customContentChars(content any) int {
 			}
 		}
 		return chars
+	}
+	return 0
+}
+
+// rawBlockChars sizes one content block kept as JSON text: a text block by its text, an image block by the image estimate, anything else (or a block that does not decode) as 0.
+func rawBlockChars(block json.RawMessage) int {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(block, &fields) != nil {
+		return 0
+	}
+	var kind string
+	if json.Unmarshal(fields["type"], &kind) != nil {
+		return 0
+	}
+	switch kind {
+	case "text":
+		var text string
+		if json.Unmarshal(fields["text"], &text) != nil {
+			return 0
+		}
+		return jsLength(text)
+	case "image":
+		return estimatedImageChars
 	}
 	return 0
 }
@@ -217,7 +256,7 @@ func EstimateProjectedContextTokens(projection codingagent.SessionProjection, br
 		}
 	}
 	tokens := 0
-	if current := codingagent.CurrentSystemMessage(projection.Messages); current != nil {
+	if current := codingagent.CurrentSystemMessageView(projection.Messages); current != nil {
 		tokens = estimateSystemTokens(*current)
 	}
 	for _, message := range projection.Messages {
@@ -226,6 +265,23 @@ func EstimateProjectedContextTokens(projection codingagent.SessionProjection, br
 		}
 	}
 	return agent.ContextUsageEstimate{Tokens: tokens, TrailingTokens: tokens, LastUsageIndex: -1}
+}
+
+// providerTokenRatio is the ratio of the provider's real token count to this package's four-characters-per-token estimate, measured on the span the
+// context estimate takes from the latest trusted assistant usage: the usage's tokens over the estimate of the messages up to and including that
+// assistant message. 0 when the estimate rests on no usage (a session without usage, or usage invalidated by a later compaction or context edit)
+// or the span has no estimate. The usage also counts the system prompt, the tool definitions and the reasoning, which the messages do not hold,
+// so the ratio is high, never low: the side a request that must not overflow the window needs. The messages are in memory and are already
+// walked for the estimate; no session history is read for this.
+func providerTokenRatio(projection codingagent.SessionProjection, estimate agent.ContextUsageEstimate) float64 {
+	if estimate.LastUsageIndex < 0 || estimate.UsageTokens <= 0 {
+		return 0
+	}
+	span := estimateMessagesTokens(projection.Messages[:estimate.LastUsageIndex+1])
+	if span <= 0 {
+		return 0
+	}
+	return float64(estimate.UsageTokens) / float64(span)
 }
 
 // contextEditTargetsAfter reports whether a context_edit entry targets a branch entry after index.

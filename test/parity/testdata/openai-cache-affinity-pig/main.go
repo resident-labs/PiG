@@ -71,7 +71,11 @@ func probe(responses bool, test probeCase) error {
 		if responses {
 			api = "responses"
 		}
-		requests <- probeResult{api, test.Name, body.Key, body.Retention, r.Header.Get("session_id"), r.Header.Get("x-client-request-id"), r.Header.Get("x-session-affinity"), r.Header.Get("x-session-id"), body.Reasoning, body.Choice}
+		session := r.Header.Get("session_id")
+		if responses {
+			session = r.Header.Get("session-id")
+		}
+		requests <- probeResult{api, test.Name, body.Key, body.Retention, session, r.Header.Get("x-client-request-id"), r.Header.Get("x-session-affinity"), r.Header.Get("x-session-id"), body.Reasoning, body.Choice}
 		w.Header().Set("Content-Type", "text/event-stream")
 		if responses {
 			_, _ = fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
@@ -86,7 +90,7 @@ func probe(responses bool, test probeCase) error {
 	if responses {
 		provider = ai.NewOpenAIResponsesProvider(ai.OpenAIResponsesConfig{Model: "gpt-5-mini", ProviderID: "openai", APIKey: "test-key", BaseURL: server.URL + test.Path, Compat: test.Compat, ExtraHeaders: test.ModelHeaders, IsReasoning: true})
 		options.ToolChoice = "required"
-		request.Tools = []ai.ToolSchema{{Name: "ping", Description: "Ping", Parameters: ai.JsonObject{"type": "object", "properties": ai.JsonObject{"value": ai.JsonObject{"type": "string"}}, "required": []string{"value"}}}}
+		request.Tools = []ai.ToolSchema{toolFromJSON(`{"name":"ping","description":"Ping","parameters":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}`)}
 	} else {
 		provider = ai.NewOpenAIProvider(ai.OpenAIConfig{Model: "gpt-4o-mini", ProviderID: "openai", APIKey: "test-key", BaseURL: server.URL + test.Path, Compat: test.Compat, ExtraHeaders: test.ModelHeaders})
 	}
@@ -99,4 +103,13 @@ func probe(responses bool, test probeCase) error {
 		return fmt.Errorf("result=%+v", result)
 	}
 	return json.NewEncoder(os.Stdout).Encode(<-requests)
+}
+
+// toolFromJSON declares a tool as JSON text, the way an extension or an MCP server hands pig its schema: ai.ToolSchema keeps that member order, where a Go map carries none and is sent sorted. Pi's probe holds the same members in a literal.
+func toolFromJSON(text string) ai.ToolSchema {
+	var tool ai.ToolSchema
+	if err := json.Unmarshal([]byte(text), &tool); err != nil {
+		panic(err)
+	}
+	return tool
 }

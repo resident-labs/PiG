@@ -308,7 +308,7 @@ func TestWithClientIdentityMergesRequestIdentityOverTheWrapperIdentity(t *testin
 	wrapped := WithClientIdentity(capture, ClientIdentity{Attribution: &acmeAttribution, UserAgent: new(UserAgentShort)})
 	wrapped.StreamSimple(t.Context(), nil, Context{})
 	wrapped.CompleteSimple(t.Context(), nil, Context{}, StreamOptions{Identity: &ClientIdentity{AttributionNull: true}, SessionID: "kept"})
-	wrapped.FetchDeferred(t.Context(), nil, DeferredHandle{}, DeferredFetchOptions{StreamOptions: StreamOptions{Identity: &ClientIdentity{Version: new("2")}}})
+	wrapped.FetchDeferred(t.Context(), nil, DeferredHandle{}, DeferredFetchOptions{Identity: &ClientIdentity{Version: new("2")}})
 	if err := wrapped.CancelDeferred(t.Context(), nil, DeferredHandle{}); err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +352,7 @@ func TestWithClientIdentityKeepsTheOptionalSurfacesItsModelsHave(t *testing.T) {
 		t.Fatal("the wrapped catalog is gone")
 	}
 	view.Classify(t.Context(), nil, ClassifierContext{})
-	view.GenerateImages(t.Context(), nil, ImagesContext{}, ModelsImagesOptions{ImagesOptions: ImagesOptions{Identity: &ClientIdentity{Version: new("3")}}})
+	view.GenerateImages(t.Context(), nil, ImagesContext{}, ModelsImagesOptions{Identity: &ClientIdentity{Version: new("3")}})
 	if got, want := catalog.classifier[0].Identity, (&ClientIdentity{Attribution: &acmeAttribution}); !reflect.DeepEqual(got, want) {
 		t.Errorf("classifier identity = %#v, want %#v", got, want)
 	}
@@ -433,6 +433,10 @@ func TestModelsSendTheOpenCodeSessionHeaderToCustomProvidersPointingAtOpenCode(t
 func TestProviderIdentityUserAgents(t *testing.T) {
 	custom := &ClientIdentity{UserAgent: new(UserAgentCustom("acme/1.0"))}
 	for _, tc := range userAgentProviderCases(t) {
+		if !BuiltAPI(API(tc.name)) {
+			// A build with this API's pig_strip tag has no provider for the row.
+			continue
+		}
 		t.Run(tc.name, func(t *testing.T) {
 			var header http.Header
 			provider := tc.build(sseClient(&header, tc.sse))

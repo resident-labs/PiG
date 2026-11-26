@@ -4,6 +4,7 @@ package coding
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/MichaelKinsy/PiG/agent"
@@ -196,6 +197,32 @@ func (rt *Runtime) Diagnostics() []AgentSessionRuntimeDiagnostic {
 	return nil
 }
 
+// TakeUnreportedDiagnostics returns the current construction's diagnostics that were not reported yet, and marks them reported.
+//
+// The host calls it at startup and after each session replacement (/new, /resume, /fork, import), whose construction collects its diagnostics again. A diagnostic with the same type and message as one returned before is left out, so an unchanged settings warning is not repeated on every replacement. A construction that a replacement replaced before anyone took its diagnostics keeps them unreported for good: only the current construction's are taken.
+// upstream: agent-session-runtime.ts takeUnreportedDiagnostics (c47ad0432bb8)
+func (rt *Runtime) TakeUnreportedDiagnostics() []AgentSessionRuntimeDiagnostic {
+	current := rt.replacement.current.Load()
+	if current == nil {
+		return nil
+	}
+	rt.replacement.reportedMu.Lock()
+	defer rt.replacement.reportedMu.Unlock()
+	var unreported []AgentSessionRuntimeDiagnostic
+	for _, diagnostic := range current.Diagnostics {
+		key := diagnostic.Type + "\x00" + diagnostic.Message
+		if _, reported := rt.replacement.reportedDiagnosticKeys[key]; reported {
+			continue
+		}
+		if rt.replacement.reportedDiagnosticKeys == nil {
+			rt.replacement.reportedDiagnosticKeys = make(map[string]struct{})
+		}
+		rt.replacement.reportedDiagnosticKeys[key] = struct{}{}
+		unreported = append(unreported, diagnostic)
+	}
+	return unreported
+}
+
 // ModelFallbackMessage returns the model fallback message of the current construction; a replacement's own replaces it.
 // upstream: agent-session-runtime.ts get modelFallbackMessage, apply
 func (rt *Runtime) ModelFallbackMessage() string {
@@ -209,25 +236,38 @@ func (rt *Runtime) ModelFallbackMessage() string {
 // before the runner is invalidated.
 func (rt *Runtime) SetBeforeSessionInvalidate(fn func()) { rt.beforeSessionInvalidate = fn }
 
-// Close releases Runtime-level resources. Services supplied by the caller remain caller-owned and must be closed separately.
+// SettleCredentialWrites waits until the credential modifications of the current Services already in progress finish. An OAuth refresh may already have spent the single-use refresh token, so a process must not exit before the new one is saved. It fails only with ctx's cancellation cause.
+// upstream: packages/coding-agent/src/core/agent-session-runtime.ts:dispose (b2cb62923)
+func (rt *Runtime) SettleCredentialWrites(ctx context.Context) error {
+	services := rt.Services()
+	if services == nil {
+		return nil
+	}
+	return services.ModelRuntime().SettleCredentialWrites(ctx)
+}
+
+// Close releases Runtime-level resources. Services supplied by the caller remain caller-owned and must be closed separately. The Runtime a factory returned (the process's AgentSessionRuntime) then also waits for credential writes in progress, as Pi's dispose does: every mode exits through it, and the refresh it waits for is bounded by the OAuth refresh timeout and the auth lock wait, so it takes no timeout of its own.
 func (rt *Runtime) Close() error {
 	if current := rt.replacement.current.Load(); current != nil {
 		if !rt.replacement.closed.CompareAndSwap(false, true) {
 			return nil
 		}
 		rt.EmitQuitShutdown()
-		if rt.beforeSessionInvalidate != nil {
-			rt.beforeSessionInvalidate()
-		}
+		rt.runQuitInvalidate()
 		if runner := current.Session.currentRunner(); runner != nil {
 			runner.Invalidate("")
 		}
 		err := current.Session.Close()
+		// Pi's dispose waits for a started OAuth refresh to be saved, right after session.dispose and while the extensions are still running. PiG's own teardown below stops the extension processes and cancels the model tasks, which would cut an in-flight refresh request.
+		//portlint:allow ctxbackground Pi's dispose awaits settleCredentialWrites with no signal (agent-session-runtime.ts dispose); Close has no caller context
+		settleErr := rt.SettleCredentialWrites(context.Background())
+		// A settings write that a setter on another goroutine is performing finishes before the runtime is torn down.
+		icodingagent.FlushSettingsWrites()
 		current.retireResources("quit")
 		if rt.extCtx != nil && rt.extCtx.AbortFunc != nil {
 			rt.extCtx.AbortFunc()
 		}
-		return err
+		return errors.Join(err, settleErr)
 	}
 	if rt.extCtx != nil && rt.extCtx.AbortFunc != nil {
 		rt.extCtx.AbortFunc()
@@ -330,7 +370,6 @@ func (rt *Runtime) startSessionWithFactory(opts SessionStartOptions, create func
 		SessionDir:             opts.SessionDir,
 		SessionID:              opts.SessionID,
 		NoSession:              opts.NoSession,
-		Transport:              ai.Transport(rt.Services().Settings().Transport),
 		runnerShared:           true,
 		extensionHost:          rt.extensionHost,
 	})

@@ -223,7 +223,7 @@ func radiusModelEntry(model *ai.Model) ModelEntry {
 	capabilities := model.Capabilities
 	return ModelEntry{
 		Type:          model.Type,
-		CatalogRecord: ai.CatalogRecordOf(model),
+		CatalogRecord: ai.CatalogRecordRefOf(model),
 		ProviderID:    model.ProviderMeta.ProviderID, ModelID: model.ID, BaseURL: model.ProviderMeta.BaseURL, DisplayName: model.DisplayName,
 		API: string(ai.APIPiMessages), Reasoning: model.ProviderMeta.Reasoning,
 		ThinkingLevelMap: nilIfEmptyMap(model.ThinkingLevelMap), Input: nilIfEmptySlice(model.Input),
@@ -231,7 +231,7 @@ func radiusModelEntry(model *ai.Model) ModelEntry {
 		ContextWindow: capabilities.ContextWindow, MaxTokens: capabilities.MaxOutputTokens,
 		InputCost: capabilities.InputCostPer1M, OutputCost: capabilities.OutputCostPer1M, CacheReadCost: capabilities.CacheReadCostPer1M, CacheWriteCost: capabilities.CacheWriteCostPer1M,
 		CostTiers: capabilities.CostTiers, PromptCache: model.PromptCache,
-		SamplingParams: model.SamplingParams, SamplingParamsByThinkingLevel: model.SamplingParamsByThinkingLevel, Headers: model.ProviderMeta.Headers, ModelHeaders: maps.Clone(model.ProviderMeta.Headers),
+		SamplingParams: model.SamplingParams, SamplingParamsByThinkingLevel: model.SamplingParamsByThinkingLevel, SamplingParamsOrder: model.SamplingParamsOrder, SamplingParamsByThinkingLevelOrder: model.SamplingParamsByThinkingLevelOrder, Headers: model.ProviderMeta.Headers, ModelHeaders: maps.Clone(model.ProviderMeta.Headers),
 		Compat: mergeCompat((*providerCompat)(model.ProviderMeta.Compat), nil),
 	}
 }
@@ -292,24 +292,40 @@ func radiusCredentialKey(credential ai.Credential) string {
 	return credential.Key
 }
 
+// storedCredential reads providerID's stored credential for a synchronous lookup that has no operation to read in (Resolve, usingOAuth).
 func (r *ModelRegistry) storedCredential(providerID string) (ai.Credential, bool) {
+	return r.storedCredentialIn(context.Background(), providerID)
+}
+
+// storedCredentialIn is storedCredential with its read made in ctx's operation.
+func (r *ModelRegistry) storedCredentialIn(ctx context.Context, providerID string) (ai.Credential, bool) {
 	r.mu.RLock()
 	storage := r.credentialStore
 	r.mu.RUnlock()
 	if storage == nil {
 		return ai.Credential{}, false
 	}
-	credential, err := storage.Read(context.Background(), providerID)
+	credential, err := storage.Read(ctx, providerID)
 	if err != nil || credential == nil {
 		return ai.Credential{}, false
 	}
 	return *credential, true
 }
 
-// radiusHasAuth mirrors hasConfiguredAuth for a Radius provider: a stored
-// credential, configured API key, or RADIUS_API_KEY.
-func (r *ModelRegistry) radiusHasAuth(providerID string) bool {
-	if _, ok := r.storedCredential(providerID); ok {
+// radiusHasAuth mirrors hasConfiguredAuth for a Radius provider: a runtime
+// API key (model-runtime.ts RuntimeCredentials answers the credential read
+// with {type: "api_key", key}), a stored credential, configured API key, or
+// RADIUS_API_KEY.
+func (r *ModelRegistry) radiusHasAuth(ctx context.Context, providerID string) bool {
+	r.mu.RLock()
+	runtime := r.runtimeCredentials.Load()
+	r.mu.RUnlock()
+	if runtime != nil {
+		if key, ok := runtime.RuntimeAPIKey(providerID); ok && key != "" {
+			return true
+		}
+	}
+	if _, ok := r.storedCredentialIn(ctx, providerID); ok {
 		return true
 	}
 	if raw, env, ok := r.radiusConfiguredKey(providerID); ok {
@@ -319,8 +335,8 @@ func (r *ModelRegistry) radiusHasAuth(providerID string) bool {
 }
 
 // radiusEntries returns the effective models of every Radius provider,
-// limited to providers with configured auth when authenticated is set.
-func (r *ModelRegistry) radiusEntries(authenticated bool) []ModelEntry {
+// limited to the providers hasAuth accepts when it is set.
+func (r *ModelRegistry) radiusEntries(hasAuth func(providerID string) bool) []ModelEntry {
 	r.mu.RLock()
 	providers := make([]*ai.RadiusProvider, 0, len(r.radius))
 	for providerID := range r.radius {
@@ -331,7 +347,7 @@ func (r *ModelRegistry) radiusEntries(authenticated bool) []ModelEntry {
 	r.mu.RUnlock()
 	var entries []ModelEntry
 	for _, provider := range providers {
-		if authenticated && !r.radiusHasAuth(provider.ID()) {
+		if hasAuth != nil && !hasAuth(provider.ID()) {
 			continue
 		}
 		r.mu.RLock()
@@ -389,27 +405,21 @@ func (r *ModelRegistry) resolveRefreshCredential(ctx context.Context, provider *
 
 func (r *ModelRegistry) refreshRadiusOAuth(ctx context.Context, provider *ai.RadiusProvider) (*ai.Credential, error) {
 	r.mu.RLock()
-	storage := r.credentialStore
+	hasStore := r.credentialStore != nil
 	r.mu.RUnlock()
-	if storage == nil {
+	if !hasStore {
 		return nil, nil
 	}
-	post, err := storage.Modify(ctx, provider.ID(), func(current *ai.Credential) (*ai.Credential, error) {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if current == nil || current.Type != ai.CredentialOAuth || float64(time.Now().UnixMilli()) < current.ExpiresMillis() {
-			return nil, nil
-		}
+	// Pi refreshes Radius like every provider (Models.resolveRefreshCredential, then refreshStoredOAuthCredential): through the registry's credential overlay, whose pending modifications process exit waits for, with the caller's cancellation ending only the wait for the lock and the request bounded by the fifteen-second timeout alone.
+	oauth := &ai.OAuthAuth{Name: provider.OAuth().Name(), Refresh: func(ctx context.Context, current ai.Credential) (ai.Credential, error) {
 		next, err := provider.OAuth().RefreshTokenContext(ctx, current.OAuthCredentials())
 		if err != nil {
-			return nil, err
+			return ai.Credential{}, err
 		}
-		updated, err := ai.CredentialFromOAuth(next)
-		if err != nil {
-			return nil, err
-		}
-		return &updated, nil
+		return ai.CredentialFromOAuth(next)
+	}}
+	post, err := ai.RefreshStoredOAuth(ctx, registryCredentials{r}, provider.ID(), oauth, func(current ai.Credential) bool {
+		return float64(time.Now().UnixMilli()) >= current.ExpiresMillis()
 	})
 	if err != nil {
 		return nil, err

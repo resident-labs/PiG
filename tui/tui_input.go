@@ -162,8 +162,10 @@ func (t *tuiBase) SetTerminalColorSchemeNotifications(enabled bool) {
 	}
 	t.input.schemeNotifications = enabled
 	t.input.mu.Unlock()
-	if !t.stopped {
+	if !t.stopped.Load() {
+		t.outMu.Lock()
 		writeColorSchemeNotifications(t.out, enabled)
+		t.outMu.Unlock()
 	}
 }
 
@@ -172,6 +174,13 @@ func (t *tuiBase) colorSchemeNotificationsEnabled() bool {
 	t.input.mu.Lock()
 	defer t.input.mu.Unlock()
 	return t.input.schemeNotifications
+}
+
+// writeColorSchemeNotificationsOwned is writeColorSchemeNotifications for a caller that holds mu or nothing: it takes outMu for the write, as writeOwned does.
+func (t *tuiBase) writeColorSchemeNotificationsOwned(enabled bool) {
+	t.outMu.Lock()
+	defer t.outMu.Unlock()
+	writeColorSchemeNotifications(t.out, enabled)
 }
 
 func writeColorSchemeNotifications(out io.Writer, enabled bool) {

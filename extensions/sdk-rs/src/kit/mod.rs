@@ -84,12 +84,20 @@ node_from!(
 /// Upstream `Container`: its children one after another.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Container {
+    id: Option<String>,
     children: Vec<Node>,
 }
 
 impl Container {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The node's id: an a11y, focus or drawing record of a mounted view names
+    /// a node by it.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     /// Appends a child (builder form of [`Self::add_child`]).
@@ -108,6 +116,7 @@ impl Container {
 /// padding, on an optional background.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Box {
+    id: Option<String>,
     padding_x: u32,
     padding_y: u32,
     bg: Option<String>,
@@ -123,11 +132,19 @@ impl Default for Box {
 impl Box {
     pub fn new(padding_x: u32, padding_y: u32) -> Self {
         Self {
+            id: None,
             padding_x,
             padding_y,
             bg: None,
             children: Vec::new(),
         }
+    }
+
+    /// The node's id: an a11y, focus or drawing record of a mounted view names
+    /// a node by it.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     /// The background token (upstream `bgFn`, `theme.bg(token, ...)`).
@@ -151,6 +168,7 @@ impl Box {
 /// Upstream `Text(text = "", paddingX = 1, paddingY = 1, customBgFn?)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Text {
+    id: Option<String>,
     text: String,
     padding_x: u32,
     padding_y: u32,
@@ -160,11 +178,19 @@ pub struct Text {
 impl Text {
     pub fn new(text: impl Into<String>, padding_x: u32, padding_y: u32) -> Self {
         Self {
+            id: None,
             text: text.into(),
             padding_x,
             padding_y,
             bg: None,
         }
+    }
+
+    /// The node's id: an a11y, focus or drawing record of a mounted view names
+    /// a node by it.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     /// The background token (upstream `customBgFn`).
@@ -177,6 +203,7 @@ impl Text {
 /// Upstream `TruncatedText(text, paddingX = 0, paddingY = 0)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TruncatedText {
+    id: Option<String>,
     text: String,
     padding_x: u32,
     padding_y: u32,
@@ -185,10 +212,18 @@ pub struct TruncatedText {
 impl TruncatedText {
     pub fn new(text: impl Into<String>, padding_x: u32, padding_y: u32) -> Self {
         Self {
+            id: None,
             text: text.into(),
             padding_x,
             padding_y,
         }
+    }
+
+    /// The node's id: an a11y, focus or drawing record of a mounted view names
+    /// a node by it.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 }
 
@@ -210,6 +245,7 @@ pub struct TextStyle {
 /// options?)`, themed with coding-agent's `getMarkdownTheme()`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Markdown {
+    id: Option<String>,
     text: String,
     padding_x: u32,
     padding_y: u32,
@@ -220,12 +256,20 @@ pub struct Markdown {
 impl Markdown {
     pub fn new(text: impl Into<String>, padding_x: u32, padding_y: u32) -> Self {
         Self {
+            id: None,
             text: text.into(),
             padding_x,
             padding_y,
             default_text_style: None,
             render_latex: None,
         }
+    }
+
+    /// The node's id: an a11y, focus or drawing record of a mounted view names
+    /// a node by it.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     pub fn default_text_style(mut self, style: TextStyle) -> Self {
@@ -243,6 +287,7 @@ impl Markdown {
 /// Upstream `Spacer(lines = 1)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Spacer {
+    id: Option<String>,
     lines: u32,
 }
 
@@ -254,7 +299,14 @@ impl Default for Spacer {
 
 impl Spacer {
     pub fn new(lines: u32) -> Self {
-        Self { lines }
+        Self { id: None, lines }
+    }
+
+    /// The node's id: an a11y, focus or drawing record of a mounted view names
+    /// a node by it.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 }
 
@@ -262,6 +314,7 @@ impl Spacer {
 /// token (default `"border"`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DynamicBorder {
+    id: Option<String>,
     color: String,
 }
 
@@ -274,8 +327,16 @@ impl Default for DynamicBorder {
 impl DynamicBorder {
     pub fn new(color: impl Into<String>) -> Self {
         Self {
+            id: None,
             color: color.into(),
         }
+    }
+
+    /// The node's id: an a11y, focus or drawing record of a mounted view names
+    /// a node by it.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 }
 
@@ -467,9 +528,11 @@ impl ImageData {
 /// bytes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Image {
+    id: Option<String>,
     image: ImageData,
     max_width_cells: Option<u32>,
     max_height_cells: Option<u32>,
+    image_id: Option<u32>,
     filename: Option<String>,
     fallback_color: Option<String>,
 }
@@ -477,12 +540,21 @@ pub struct Image {
 impl Image {
     pub fn new(data: impl Into<Vec<u8>>, mime_type: impl Into<String>) -> Self {
         Self {
+            id: None,
             image: ImageData::new(data, mime_type),
             max_width_cells: None,
             max_height_cells: None,
+            image_id: None,
             filename: None,
             fallback_color: None,
         }
+    }
+
+    /// The node's id: an a11y, focus or drawing record of a mounted view names
+    /// a node by it.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     /// The image's ref: the lowercase hex SHA-256 of its bytes.
@@ -497,6 +569,13 @@ impl Image {
 
     pub fn max_height_cells(mut self, cells: u32) -> Self {
         self.max_height_cells = Some(cells);
+        self
+    }
+
+    /// The Kitty image id (upstream `ImageOptions.imageId`); unset, the host
+    /// allocates one as upstream does.
+    pub fn image_id(mut self, id: u32) -> Self {
+        self.image_id = Some(id);
         self
     }
 
@@ -526,6 +605,7 @@ pub struct LoaderIndicator {
 /// mounted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Loader {
+    id: Option<String>,
     message: String,
     spinner_color: Option<String>,
     message_color: Option<String>,
@@ -542,12 +622,20 @@ impl Default for Loader {
 impl Loader {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
+            id: None,
             message: message.into(),
             spinner_color: None,
             message_color: None,
             indicator: None,
             frame: None,
         }
+    }
+
+    /// The node's id: an a11y, focus or drawing record of a mounted view names
+    /// a node by it.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     /// The spinner's foreground token (upstream `spinnerColorFn`).
@@ -616,12 +704,20 @@ struct StackFields {
 /// Upstream `HStack(children?, options?)`: children side by side.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct HStack {
+    id: Option<String>,
     stack: StackFields,
 }
 
 impl HStack {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The node's id: an a11y, focus or drawing record of a mounted view names
+    /// a node by it.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     /// Appends a child with upstream's default entry options.
@@ -657,12 +753,20 @@ impl HStack {
 /// Upstream `VStack(children?, options?)`: children one under another.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct VStack {
+    id: Option<String>,
     stack: StackFields,
 }
 
 impl VStack {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The node's id: an a11y, focus or drawing record of a mounted view names
+    /// a node by it.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     /// Appends a child with upstream's default entry options.
@@ -700,6 +804,7 @@ impl VStack {
 /// sends them only while a frontend is attached.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Lines {
+    id: Option<String>,
     content: Vec<String>,
     image: Option<ImageData>,
     progress: Option<(f64, f64)>,
@@ -729,6 +834,13 @@ impl Lines {
             content,
             ..Self::default()
         }
+    }
+
+    /// The node's id: an a11y, focus or drawing record of a mounted view names
+    /// a node by it.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     /// Frontend-only: the rows depict this image (for example a half-block
@@ -768,6 +880,7 @@ impl Lines {
 /// user's Markdown on the user message background.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserMessage {
+    id: Option<String>,
     text: String,
     output_pad: u32,
 }
@@ -776,9 +889,17 @@ impl UserMessage {
     /// A user message with upstream's outputPad 1.
     pub fn new(text: impl Into<String>) -> Self {
         Self {
+            id: None,
             text: text.into(),
             output_pad: 1,
         }
+    }
+
+    /// The node's id: an a11y, focus or drawing record of a mounted view names
+    /// a node by it.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     /// Upstream `setOutputPad` (0 or 1, the values of Pi's outputPad setting).
@@ -1120,6 +1241,7 @@ impl BashExecution {
 /// lines in the diff colors, with a changed word inverted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diff {
+    id: Option<String>,
     diff: String,
     file_path: String,
     padding_x: u32,
@@ -1130,11 +1252,19 @@ impl Diff {
     /// A diff without padding.
     pub fn new(diff: impl Into<String>) -> Self {
         Self {
+            id: None,
             diff: diff.into(),
             file_path: String::new(),
             padding_x: 0,
             padding_y: 0,
         }
+    }
+
+    /// The node's id: an a11y, focus or drawing record of a mounted view names
+    /// a node by it.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     /// Upstream `filePath`.
@@ -1236,6 +1366,29 @@ impl Encoded {
             .any(|image| refs.contains(&image.reference))
     }
 
+    /// The view body with the data of every image it references (D614 mounts carry their images whole; no connection
+    /// state decides what the host already holds).
+    pub(crate) fn inline_wire(&self) -> Value {
+        let mut body = self.body.clone();
+        if !self.images.is_empty()
+            && let Value::Object(body) = &mut body
+        {
+            let images = self
+                .images
+                .iter()
+                .map(|image| {
+                    serde_json::json!({
+                        "ref": image.reference,
+                        "mimeType": image.mime_type,
+                        "data": digest::base64(&image.data),
+                    })
+                })
+                .collect();
+            body.insert("images".into(), Value::Array(images));
+        }
+        body
+    }
+
     pub(crate) fn refs(&self) -> Vec<String> {
         self.images
             .iter()
@@ -1312,6 +1465,25 @@ impl Encoder {
             Node::Widget(w) => w.kind(),
         };
         put(&mut map, "kind", kind);
+        // Every kind may carry an id; the kinds that need one write it with their fields.
+        let id = match node {
+            Node::Container(n) => &n.id,
+            Node::Box(n) => &n.id,
+            Node::Text(n) => &n.id,
+            Node::TruncatedText(n) => &n.id,
+            Node::Markdown(n) => &n.id,
+            Node::Spacer(n) => &n.id,
+            Node::DynamicBorder(n) => &n.id,
+            Node::Image(n) => &n.id,
+            Node::Loader(n) => &n.id,
+            Node::HStack(n) => &n.id,
+            Node::VStack(n) => &n.id,
+            Node::Lines(n) => &n.id,
+            Node::UserMessage(n) => &n.id,
+            Node::Diff(n) => &n.id,
+            _ => &None,
+        };
+        put_opt(&mut map, "id", id);
         match node {
             Node::Container(n) => {
                 if !n.children.is_empty() {
@@ -1429,6 +1601,7 @@ impl Encoder {
                 put(&mut map, "mimeType", n.image.mime_type.as_str());
                 put_opt(&mut map, "maxWidthCells", &n.max_width_cells);
                 put_opt(&mut map, "maxHeightCells", &n.max_height_cells);
+                put_opt(&mut map, "imageId", &n.image_id);
                 put_opt(&mut map, "filename", &n.filename);
                 put_opt(&mut map, "fallbackColor", &n.fallback_color);
                 self.add_image(&n.image);
@@ -1445,7 +1618,7 @@ impl Encoder {
                 }
                 put_opt(&mut map, "frame", &n.frame);
             }
-            Node::HStack(HStack { stack }) | Node::VStack(VStack { stack }) => {
+            Node::HStack(HStack { stack, .. }) | Node::VStack(VStack { stack, .. }) => {
                 if !stack.children.is_empty() {
                     let mut encoded = Vec::with_capacity(stack.children.len());
                     for (child, entry) in &stack.children {

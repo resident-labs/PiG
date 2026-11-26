@@ -28,11 +28,14 @@ import (
 // detection (or to capture if no ready pattern is set). This isolates
 // binary+runtime startup from shell init overhead since tmux exec's the
 // binary directly.
-type tmuxDriver struct{}
+type tmuxDriver struct {
+	// teardownClock paces the wait for the transcript reader when a run ends. The zero value is the wall clock; a test drives it.
+	teardownClock captureClock
+}
 
 func (tmuxDriver) Name() string { return "interactive-tmux" }
 
-func (tmuxDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scenario) (result Result) {
+func (d tmuxDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scenario) (result Result) {
 	t.Helper()
 	cfg := sc.Tmux
 
@@ -64,19 +67,23 @@ func (tmuxDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scen
 
 	session := fmt.Sprintf("parity-%s-%s-%s-%s", parityRunID(), sc.Name, bin.Label, uniqueID())
 	registerSession(session)
-	started := false
+	started, readerStarted := false, false
+	transcriptPath := filepath.Join(tc.tempRoot, "terminal-transcript.log")
 	defer func() {
 		// Cleanup must remain observable after the scenario context is cancelled.
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), processExitTimeout(t))
+		budget := processExitTimeout(t)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), budget)
 		defer cancel()
-		var owned map[int]bool
-		var err error
-		if started {
-			owned, err = tmuxSessionProcesses(cleanupCtx, session)
+		clock := d.teardownClock
+		if clock.now == nil {
+			clock = wallClock
 		}
-		killSession(session)
-		if started && err == nil {
-			err = awaitOwnedProcesses(cleanupCtx, owned)
+		err := tmuxTeardown{
+			session: session, transcriptPath: transcriptPath, scenario: sc.Name, side: bin.Label,
+			started: started, readerStarted: readerStarted, clock: clock, budget: budget,
+		}.end(cleanupCtx)
+		if errors.Is(err, errTranscriptReaderLive) {
+			tc.keep("the transcript reader may still be writing into it")
 		}
 		result.Err = errors.Join(result.Err, err)
 	}()
@@ -163,7 +170,7 @@ func (tmuxDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scen
 	// host HTTP_PROXY otherwise leaks into one binary.
 	envPrefix := tmuxEnvPrefix(os.Getenv("GOCOVERDIR"))
 	exitStatusPath := filepath.Join(tc.tempRoot, "process-exit-status")
-	cmdStr := envPrefix + strings.Join(quoted, " ") + "; exit_code=$?; printf '%s\\n' \"$exit_code\" > " + shellQuote(exitStatusPath+".tmp") + " && mv " + shellQuote(exitStatusPath+".tmp") + " " + shellQuote(exitStatusPath) + "; sleep 999"
+	cmdStr := envPrefix + preTuiLinesCommand(cfg.PreTuiLines) + strings.Join(quoted, " ") + "; exit_code=$?; printf '%s\\n' \"$exit_code\" > " + shellQuote(exitStatusPath+".tmp") + " && mv " + shellQuote(exitStatusPath+".tmp") + " " + shellQuote(exitStatusPath) + "; sleep 999"
 	// Working directory: prepend `cd <dir> && …` so the binary launches in
 	// the scenario cwd (resolved relative to the scenario source path) or
 	// the default cwd fixture. The directory is copied per binary under the
@@ -190,27 +197,10 @@ func (tmuxDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scen
 	}
 	cmdStr = "cd " + shellQuote(snap) + " && " + cmdStr
 
-	tmuxServerMu.Lock()
-	serverErr := ensureTmuxServer()
-	// The isolated server is shared by both binaries. Start each runtime clock
-	// only after that one-time setup so the first binary does not own it.
-	t0 := time.Now()
-	var createOutput []byte
-	var createErr error
-	if serverErr == nil {
-		//nolint:gosec // G204 (class a): program is literal tmux; cmdStr is a sh -c string that embeds bin.Path and scenario args, each shellQuote'd, and is the value of new-session.
-		createOutput, createErr = exec.CommandContext(ctx, "tmux", tmuxArgs(createTmuxSessionArgs(session, cmdStr, cfg)...)...).CombinedOutput()
-	}
-	tmuxServerMu.Unlock()
-	if serverErr != nil {
-		return Result{Err: serverErr}
-	}
-	if createErr != nil {
-		return Result{Err: fmt.Errorf("tmux new-session: %w: %s", createErr, strings.TrimSpace(string(createOutput)))}
-	}
-	started = true
-	transcriptPath := filepath.Join(tc.tempRoot, "terminal-transcript.log")
-	if err := attachTranscript(ctx, session, transcriptPath); err != nil {
+	t0, created, err := startTmuxSession(ctx, session, cmdStr, transcriptPath, cfg)
+	started = created
+	readerStarted = created && transcriptReaderAttached(session, err)
+	if err != nil {
 		return Result{Err: err}
 	}
 
@@ -222,11 +212,21 @@ func (tmuxDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scen
 
 	readyOK := true
 	var operationErr error
+	var frames FrameWatchResult
+	var finalFrame FinalFrameResult
+	var finalFrameSpecs []TmuxFinalFrame
 	if ready != "" {
 		timeout := time.Duration(cfg.ReadyTimeoutSeconds) * time.Second
-		readyOK = waitForPaneOrCapture(ctx, session, ready, cfg.CaptureStart, timeout)
+		// A capture_start that the launch shell itself prints (pre_tui_lines) is on screen before the TUI exists, so it cannot stand in for the ready pattern.
+		earlyCapture := cfg.CaptureStart
+		if cfg.PreTuiLines > 0 {
+			earlyCapture = ""
+		}
+		readyOK = waitForPaneOrCapture(ctx, session, ready, earlyCapture, timeout)
 		if !readyOK {
 			operationErr = fmt.Errorf("ready pattern %q not reached within %s", ready, timeout)
+			// A wait that timed out leaves the process in an unknown state. Every wait failure defers the probe, which runs after the final capture and before the session teardown deferred at the top; a run whose waits pass defers nothing.
+			defer hangProbe{session, transcriptPath, bin}.record(&result)
 		}
 	}
 	elapsed := time.Since(t0).Milliseconds()
@@ -256,35 +256,23 @@ func (tmuxDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scen
 	// Send any post-ready keys. Legacy scenarios use the top-level
 	// keys+settle fields; canonical staged scenarios use [[tmux.steps]].
 	if operationErr == nil && len(cfg.Steps) > 0 {
-		for _, step := range cfg.Steps {
-			timeout := stepWaitTimeout(step)
-			baseline := capturePaneHistory(ctx, session, transcriptPath)
-			if err := sendTmuxKeys(ctx, session, step.Keys); err != nil {
+		for index, step := range cfg.Steps {
+			watched, err := runTmuxStep(ctx, session, transcriptPath, bin.Label, step)
+			frames = frames.merge(watched)
+			if err != nil {
+				if errors.Is(err, errVisibleStateHeld) {
+					err = fmt.Errorf("[[tmux.steps]] step %d: %w", index+1, err)
+				}
 				operationErr = err
+				if errors.As(err, new(waitTimeoutError)) {
+					defer hangProbe{session, transcriptPath, bin}.record(&result)
+				}
 				break
 			}
-			if len(step.WaitContains) > 0 {
-				if !waitForPaneAllSince(ctx, session, transcriptPath, step.WaitContains, baseline, true, timeout) {
-					operationErr = fmt.Errorf("step output %q not reached within %s", step.WaitContains, timeout)
-					break
-				}
-			}
-			visible := step.visibleContains(bin.Label)
-			if len(visible) > 0 || len(step.WaitNotContains) > 0 {
-				if !waitForPaneState(ctx, session, visible, step.WaitNotContains, timeout) {
-					operationErr = fmt.Errorf("visible step state includes=%q excludes=%q not reached within %s", visible, step.WaitNotContains, timeout)
-					break
-				}
-			}
-			if step.WaitStableMilliseconds > 0 {
-				window := time.Duration(step.WaitStableMilliseconds) * time.Millisecond
-				if !waitForPaneQuiescent(ctx, func() string { return capturePaneVisible(ctx, session) }, window, tmuxQuiescencePoll, timeout) {
-					operationErr = fmt.Errorf("visible pane did not stay unchanged for %s within %s", window, timeout)
-					break
-				}
-			}
-			if step.SettleSeconds > 0 {
-				time.Sleep(time.Duration(step.SettleSeconds) * time.Second)
+			if step.FinalFrame != nil {
+				// The quiet window runs now; the transcript is read once the run is over and the pane's pipe is closed (see finishTranscript).
+				time.Sleep(finalFrameQuiet(*step.FinalFrame))
+				finalFrameSpecs = append(finalFrameSpecs, *step.FinalFrame)
 			}
 		}
 	} else if operationErr == nil {
@@ -321,12 +309,6 @@ func (tmuxDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scen
 			Err:       fmt.Errorf("capture-pane: %w (%s)", err, tmuxServerReport(ctx, session)),
 		}
 	}
-	// The waits read the transcript while the run is live; once the run is over the pane's pipe is closed and the reader's trailer must count every byte the file holds, so a reader that stopped copying fails the run instead of silently shortening what a wait saw.
-	if operationErr == nil {
-		if err := finishTranscript(ctx, session, transcriptPath, sc.Name, bin.Label, transcriptDoneTimeout); err != nil {
-			operationErr = err
-		}
-	}
 	pane, escaped, cropErr := cropCaptures(cfg, use, pane, escaped)
 	if !readyOK && paneMatchesCaptureSurface(pane, cfg) {
 		readyOK = true
@@ -334,6 +316,18 @@ func (tmuxDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scen
 	exitCode, exited, err := readProcessExitStatus(exitStatusPath)
 	if err != nil {
 		return Result{RuntimeMs: elapsed, ReadyOK: readyOK, Err: err}
+	}
+	var sequences []SequenceWindowResult
+	// A comparator reads the byte stream only from a transcript its reader has finished: the pipe is closed, and the reader's trailer counts the bytes the file must hold. A reader that did not finish is an error, never a short transcript read as "no frame".
+	if (len(finalFrameSpecs) > 0 || len(sc.Assert.TranscriptSequencesEqual) > 0) && operationErr == nil {
+		if err := finishTranscript(ctx, session, transcriptPath, sc.Name, bin.Label, transcriptDoneTimeout); err != nil {
+			operationErr = err
+		} else {
+			sequences = observeSequenceWindows(transcriptPath, sc.Assert.TranscriptSequencesEqual)
+			for _, spec := range finalFrameSpecs {
+				finalFrame = finalFrame.merge(observeFinalFrame(finalFrameSource(transcriptPath, spec, tc.expand), spec))
+			}
+		}
 	}
 	if exited && exitCode != 0 && operationErr == nil {
 		expected := sc.Assert.ExitCode
@@ -354,6 +348,9 @@ func (tmuxDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scen
 		RuntimeMs:       elapsed,
 		ReadyOK:         readyOK,
 		Err:             operationErr,
+		FrameWatch:      frames,
+		FinalFrame:      finalFrame,
+		Sequences:       sequences,
 	}
 	result = withFinalCaptures(result, sc.Name, bin.Label, cfg, use, pane, escaped, cropErr)
 	// Coverage-only: Go integration coverage flushes on a clean process exit, but
@@ -366,6 +363,94 @@ func (tmuxDriver) Run(ctx context.Context, t *testing.T, bin BinaryRef, sc *Scen
 		flushCoverageOnCleanExit(ctx, session, exitStatusPath)
 	}
 	return result
+}
+
+// startTmuxSession creates the detached session that runs command and attaches the transcript reader to its pane before command runs, so the transcript holds every byte the program writes, from its first. It returns the time taken just before the session was requested, and whether the session exists: the caller tears it down then, whatever err says.
+//
+// The pane's shell first waits on a tmux channel (tmuxGateHold). tmux runs new-session, pipe-pane and the signal that opens the channel, in that order, from one client invocation: a command list stops at the first command that fails, so the program is released only into an attached pipe, and no sleep or poll stands between the program and its pipe. The pane has its size and environment from new-session as before; the hold runs ahead of the command's own first line.
+func startTmuxSession(ctx context.Context, session, command, transcriptPath string, cfg TmuxDriverConfig) (t0 time.Time, created bool, err error) {
+	reader, err := transcriptReaderCommand(transcriptPath)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	gate := "pig-parity-gate-" + session
+	args := append(createTmuxSessionArgs(session, tmuxGateHold(gate, command), cfg),
+		";", "pipe-pane", "-o", "-t", session, reader,
+		";", "wait-for", "-S", gate)
+	tmuxServerMu.Lock()
+	serverErr := ensureTmuxServer()
+	// The isolated server is shared by both binaries. Start each runtime clock
+	// only after that one-time setup so the first binary does not own it.
+	t0 = time.Now()
+	var output []byte
+	var startErr error
+	if serverErr == nil {
+		//nolint:gosec // G204 (class a): program is literal tmux; command is a sh -c string that embeds bin.Path and scenario args, each shellQuote'd, and is the value of new-session; the pipe command is built by transcriptReaderCommand from the test binary's path and a path under the run's temp root.
+		output, startErr = exec.CommandContext(ctx, "tmux", tmuxArgs(args...)...).CombinedOutput()
+	}
+	tmuxServerMu.Unlock()
+	if serverErr != nil {
+		return t0, false, serverErr
+	}
+	if startErr != nil {
+		//nolint:gosec // G204 (class a): program is literal tmux; args are fixed has-session -t =<harness session>.
+		created = exec.CommandContext(ctx, "tmux", tmuxArgs("has-session", "-t", "="+session)...).Run() == nil
+		return t0, created, fmt.Errorf("tmux new-session with the transcript pipe: %w: %s", startErr, strings.TrimSpace(string(output)))
+	}
+	return t0, true, nil
+}
+
+// tmuxGateHold makes command wait until the channel is signalled (tmux wait-for -S). A signal that comes before the wait is kept, so the order of the two does not matter. A pane that cannot reach its server ends rather than run unrecorded.
+func tmuxGateHold(channel, command string) string {
+	return "tmux wait-for " + shellQuote(channel) + " || exit 1; " + command
+}
+
+// runTmuxStep sends one step's keys and waits for the state it names. When the step carries a frame_watch, the pane is sampled from before the
+// keys until the step ends, and what the watch saw is returned whether or not the step succeeded.
+// errVisibleStateHeld is runTmuxStep's refusal of a step that sends keys and whose only evidence of them is a visible state the pane already showed.
+var errVisibleStateHeld = errors.New("the visible step state already held before the step's keys were sent")
+
+func runTmuxStep(ctx context.Context, session, transcriptPath, label string, step TmuxStep) (watched FrameWatchResult, err error) {
+	timeout := stepWaitTimeout(step)
+	visible := step.visibleContains(label)
+	// A state the pane showed before the keys is no evidence that they took effect (wait_contains has the same rule: paneSatisfiesWait counts
+	// only what is new since the baseline). A step whose keys must change nothing says so with a stable window, a settle or a frame watch.
+	if step.visibleWaitIsOnlyEvidence(visible) && paneHoldsState(capturePaneVisible(ctx, session), visible, step.WaitNotContains) {
+		return watched, fmt.Errorf("%w: includes=%q excludes=%q keys=%q: the wait says nothing about these keys; wait for a state they produce, or add wait_stable_milliseconds when they must change nothing", errVisibleStateHeld, visible, step.WaitNotContains, step.Keys)
+	}
+	if step.FrameWatch != nil {
+		watch := startFrameWatch(ctx, session, *step.FrameWatch)
+		defer func() { watched = watch.finish() }()
+	}
+	baseline := capturePaneHistory(ctx, session, transcriptPath)
+	if err := sendTmuxKeys(ctx, session, step.Keys); err != nil {
+		return watched, err
+	}
+	if step.Signal != "" {
+		if err := signalTmuxProgram(ctx, session, step.Signal); err != nil {
+			return watched, err
+		}
+	}
+	if len(step.WaitContains) > 0 {
+		if !waitForPaneAllSince(ctx, session, transcriptPath, step.WaitContains, baseline, true, timeout) {
+			return watched, waitTimeoutError{fmt.Errorf("step output %q not reached within %s", step.WaitContains, timeout)}
+		}
+	}
+	if len(visible) > 0 || len(step.WaitNotContains) > 0 {
+		if !waitForPaneState(ctx, session, visible, step.WaitNotContains, timeout) {
+			return watched, waitTimeoutError{fmt.Errorf("visible step state includes=%q excludes=%q not reached within %s", visible, step.WaitNotContains, timeout)}
+		}
+	}
+	if step.WaitStableMilliseconds > 0 {
+		window := time.Duration(step.WaitStableMilliseconds) * time.Millisecond
+		if !waitForPaneQuiescent(ctx, func() string { return capturePaneVisible(ctx, session) }, window, tmuxQuiescencePoll, timeout) {
+			return watched, waitTimeoutError{fmt.Errorf("visible pane did not stay unchanged for %s within %s", window, timeout)}
+		}
+	}
+	if step.SettleSeconds > 0 {
+		time.Sleep(time.Duration(step.SettleSeconds) * time.Second)
+	}
+	return watched, nil
 }
 
 // flushCoverageOnCleanExit drives an interactive, coverage-instrumented pig to a
@@ -662,6 +747,19 @@ func paneContainsAll(pane string, patterns []string) bool {
 	return true
 }
 
+// paneHoldsState reports whether the pane shows every include and no exclude.
+func paneHoldsState(pane string, includes, excludes []string) bool {
+	if !paneContainsAll(pane, includes) {
+		return false
+	}
+	for _, pattern := range excludes {
+		if strings.Contains(pane, pattern) {
+			return false
+		}
+	}
+	return true
+}
+
 func waitForPaneState(ctx context.Context, session string, includes, excludes []string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -670,33 +768,12 @@ func waitForPaneState(ctx context.Context, session string, includes, excludes []
 		}
 		//nolint:gosec // G204 (class a): program is literal tmux; args are fixed capture-pane with a harness-generated session.
 		out, _ := exec.CommandContext(ctx, "tmux", tmuxArgs("capture-pane", "-t", session, "-p")...).Output()
-		pane := string(out)
-		matches := paneContainsAll(pane, includes)
-		for _, pattern := range excludes {
-			if strings.Contains(pane, pattern) {
-				matches = false
-				break
-			}
-		}
-		if matches {
+		if paneHoldsState(string(out), includes, excludes) {
 			return true
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	return false
-}
-
-// attachTranscript records the raw bytes the session's pane receives in the file at path, for the waits and comparators that read the byte stream rather than the screen.
-func attachTranscript(ctx context.Context, session, path string) error {
-	command, err := transcriptReaderCommand(path)
-	if err != nil {
-		return err
-	}
-	//nolint:gosec // G204 (class a): program is literal tmux; the pipe command is built by transcriptReaderCommand from the test binary's path and a path under the run's temp root.
-	if err := exec.CommandContext(ctx, "tmux", tmuxArgs("pipe-pane", "-o", "-t", session, command)...).Run(); err != nil {
-		return fmt.Errorf("tmux pipe-pane: %w", err)
-	}
-	return nil
 }
 
 // capturePaneHistory returns the pane's scrollback followed by the displayed text of the terminal transcript, so a wait matches displayed text only.
@@ -833,13 +910,22 @@ func capturePaneArgs(session string, escaped bool, cfg TmuxDriverConfig) []strin
 	return append(args, "-t", session, "-p")
 }
 
-// capturePanePair takes the final capture of the pane: the plain and the escaped screen, uncropped, of one still frame (see captureStablePair).
-func capturePanePair(ctx context.Context, session string, cfg TmuxDriverConfig, use captureUse) (string, string, error) {
-	read := func(escaped bool) (string, error) {
+// tmuxPaneReader reads the pane of session as the final capture does: plain or with escape sequences.
+func tmuxPaneReader(ctx context.Context, session string, cfg TmuxDriverConfig) paneReader {
+	return func(escaped bool) (string, error) {
 		//nolint:gosec // G204 (class a): program is literal tmux; args are fixed capture-pane (plain or escaped) with a harness-generated session.
 		out, err := exec.CommandContext(ctx, "tmux", tmuxArgs(capturePaneArgs(session, escaped, cfg)...)...).Output()
 		return string(out), err
 	}
+}
+
+// capturePanePair takes the final capture of the pane: the plain and the escaped screen, uncropped, of one still frame (see captureStablePair).
+func capturePanePair(ctx context.Context, session string, cfg TmuxDriverConfig, use captureUse) (string, string, error) {
+	return capturePairFrom(ctx, tmuxPaneReader(ctx, session, cfg), cfg, use)
+}
+
+// capturePairFrom is capturePanePair for a given reader of the pane.
+func capturePairFrom(ctx context.Context, read paneReader, cfg TmuxDriverConfig, use captureUse) (string, string, error) {
 	cropsCleanly := func(plain, escaped string) bool {
 		_, _, err := cropCaptures(cfg, use, plain, escaped)
 		return err == nil
@@ -1004,6 +1090,41 @@ func sendTmuxKeys(ctx context.Context, session string, keys []string) error {
 	return nil
 }
 
+// signalTmuxProgram sends the signal a step names ("TERM" or "HUP") to the program the pane's launch shell is running: the shell's only child, since the shell runs the program in the foreground and writes its exit status after it. A pane whose shell has no child (the program ended already) or several is an error, because the signal would not have reached what the scenario means.
+func signalTmuxProgram(ctx context.Context, session, name string) error {
+	sig := syscall.SIGTERM
+	if name == "HUP" {
+		sig = syscall.SIGHUP
+	}
+	//nolint:gosec // G204 (class a): program is literal tmux; args are fixed display-message -p -t <harness session>.
+	out, err := exec.CommandContext(ctx, "tmux", tmuxArgs("display-message", "-p", "-t", session, "#{pane_pid}")...).Output()
+	if err != nil {
+		return fmt.Errorf("pane pid of %s: %w", session, err)
+	}
+	shell, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return fmt.Errorf("pane pid of %s: %w", session, err)
+	}
+	//nolint:gosec // G204 (class a): program is literal pgrep; the argument is the integer pane pid.
+	children, _ := exec.CommandContext(ctx, "pgrep", "-P", strconv.Itoa(shell)).Output()
+	pids := strings.Fields(string(children))
+	if len(pids) != 1 {
+		return fmt.Errorf("signal %s: the pane's shell %d has %d child process(es), want the program alone", name, shell, len(pids))
+	}
+	pid, err := strconv.Atoi(pids[0])
+	if err != nil {
+		return fmt.Errorf("signal %s: child pid %q: %w", name, pids[0], err)
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("signal %s: %w", name, err)
+	}
+	if err := process.Signal(sig); err != nil {
+		return fmt.Errorf("signal %s to process %d: %w", name, pid, err)
+	}
+	return nil
+}
+
 func coalesceTmuxKeys(keys []string) []string {
 	coalesced := make([]string, 0, len(keys))
 	for index := 0; index < len(keys); {
@@ -1144,4 +1265,12 @@ func tmuxProcessRunning(pid int) bool {
 	}
 	err = process.Signal(syscall.Signal(0))
 	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// preTuiLinesCommand prints n numbered lines before the binary starts, as a package installer or a wrapper script would.
+func preTuiLinesCommand(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return "i=1; while [ $i -le " + strconv.Itoa(n) + " ]; do printf 'PRE-TUI-LINE-%d\\n' $i; i=$((i+1)); done; "
 }

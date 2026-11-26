@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -197,7 +198,7 @@ func TestExtensionDialogsShowAConfirmOpenedFromACustomComponentThenRestoreIt(t *
 	r := newCustomRig(t)
 	var confirmed <-chan dialogCall
 	var done func(any)
-	form := &formProbe{customProbe: customProbe{label: "custom form"}}
+	form := &formProbe{label: "custom form"}
 	form.onInput = func() {
 		result := make(chan dialogCall, 1)
 		confirmed = result
@@ -536,6 +537,48 @@ func TestReloadDisposesEveryExtensionDialog(t *testing.T) {
 	}
 }
 
+// countdownGoroutines counts the goroutines of the dialogs' countdowns (tui.CountdownTimer): the ones tui.NewCountdownTimer started. A stack carries the line of the function that created its goroutine from the go statement until the goroutine ends, whether the scheduler has run the goroutine yet or not; it names the countdown's own run function only once the goroutine has run. So the count holds a countdown as soon as its dialog is open, and a countdown that outlives its dialog whether it has started to run or not.
+func countdownGoroutines() int {
+	buf := make([]byte, 1<<20)
+	buf = buf[:runtime.Stack(buf, true)]
+	count := 0
+	for block := range strings.SplitSeq(string(buf), "\n\n") {
+		if strings.Contains(block, "\ncreated by github.com/MichaelKinsy/PiG/tui.NewCountdownTimer in goroutine ") {
+			count++
+		}
+	}
+	return count
+}
+
+// A selector and an input with a timeout each own a countdown, which the component's dispose stops (extension-selector.ts,
+// extension-input.ts: CountdownTimer). /reload disposes the open dialogs (handleReloadCommand's resetExtensionUI), so the countdown of
+// a dialog the reload removed ends with it: one that ran on would tick, and hold its dialog, until the timeout.
+func TestReloadEndsTheCountdownsOfTheOpenExtensionDialogs(t *testing.T) {
+	r := newCustomRig(t)
+	ctx, abort := context.WithCancel(t.Context())
+	defer abort()
+	before := countdownGoroutines()
+	timed := extension.ExtensionUIDialogOptions{Timeout: new(float64(600000))}
+	r.callDialog(t, func() (string, error) { return r.u.Select(ctx, "Timed select", []string{"one"}, timed) })
+	r.callDialog(t, func() (string, error) { return r.u.Input(ctx, "Timed input", "", timed) })
+	if got := countdownGoroutines(); got != before+2 {
+		t.Fatalf("%d countdown goroutines with a timed select and a timed input open, want %d", got, before+2)
+	}
+
+	if err := r.m.buildSlashContext(t.Context()).Reload(); err != nil {
+		t.Fatal(err)
+	}
+	requireEditorShown(t, r.m, "after /reload")
+	// Dispose closes the countdown's stop channel, and its goroutine ends on its own.
+	deadline := time.Now().Add(5 * time.Second)
+	for countdownGoroutines() != before {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d countdown goroutines after /reload disposed the dialogs, want %d", countdownGoroutines(), before)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // A subprocess component in the editor slot restores the editor text saved when it opened, as the in-process one does (restoreEditor
 // setText(savedText)).
 func TestRemoteEditorSlotComponentRestoresTheEditorText(t *testing.T) {
@@ -644,24 +687,94 @@ func TestExtensionDialogsReportBlockedStatusForAnInlineCustomComponentThatOptsIn
 	requireBlocked(t, terminal, "", "")
 }
 
-// An overlay is not part of the dialog stack, so the blocked option does not apply to it (Pi c1810bf7: "Overlays ignore the option").
-func TestExtensionCustomOverlayIgnoresTheBlockedOption(t *testing.T) {
+// customOverlayCall is one ui.custom overlay call of a test: its component, done callback and handle, once mounted.
+type customOverlayCall struct {
+	out       <-chan customOutcome
+	component *customProbe
+	done      func(any)
+	handle    *tui.OverlayHandle
+}
+
+func (r *customRig) startOverlay(t *testing.T, label string, blocked *extension.CustomBlocked) *customOverlayCall {
+	t.Helper()
+	call := &customOverlayCall{component: &customProbe{label: label}}
+	opened := len(r.m.extensionOverlays)
+	call.out = r.start(t.Context(), func(_ extension.TUI, _ *tui.Theme, _ extension.KeybindingsManager, d func(any)) (extension.DisposableComponent, error) {
+		call.done = d
+		return call.component, nil
+	}, &extension.CustomOptions{Overlay: true, Blocked: blocked, OnHandle: func(h *tui.OverlayHandle) { call.handle = h }})
+	r.pump(t, call.out, func() bool { return call.handle != nil && len(r.m.extensionOverlays) == opened+1 })
+	return call
+}
+
+func (r *customRig) endOverlay(t *testing.T, call *customOverlayCall, value string) {
+	t.Helper()
+	call.done(value)
+	if got := r.finish(t, call.out); got.err != nil || got.value != value {
+		t.Fatalf("the overlay = %v, %v; want %s", got.value, got.err, value)
+	}
+}
+
+// interactive-mode-extension-dialogs.test.ts "reports blocked status for each opted-in overlay until it is done, also while hidden" (#11816).
+func TestExtensionCustomOverlayReportsBlockedStatusUntilDoneAlsoWhileHidden(t *testing.T) {
 	r := newCustomRig(t)
 	terminal := recordProgramStatus(r.m, "")
-	component := &customProbe{label: "overlay"}
-	var done func(any)
-	out := r.start(t.Context(), func(_ extension.TUI, _ *tui.Theme, _ extension.KeybindingsManager, d func(any)) (extension.DisposableComponent, error) {
-		done = d
-		return component, nil
-	}, &extension.CustomOptions{Overlay: true, Blocked: &extension.CustomBlocked{Kind: tui.ProgramStatusKindQuestion, Message: "Pick"}})
-	r.pump(t, out, func() bool { return done != nil && r.m.tuiInst.HasOverlay() })
-	for _, report := range terminal.reports {
-		if report.State == tui.ProgramStateBlocked {
-			t.Fatalf("an overlay reported %+v, want no blocked status", report)
+	first := r.startOverlay(t, "first", &extension.CustomBlocked{Kind: tui.ProgramStatusKindQuestion, Message: "First?"})
+	requireBlocked(t, terminal, tui.ProgramStatusKindQuestion, "First?")
+	second := r.startOverlay(t, "second", &extension.CustomBlocked{Kind: tui.ProgramStatusKindQuestion, Message: "Second?"})
+	requireBlocked(t, terminal, tui.ProgramStatusKindQuestion, "Second?")
+
+	// An overlay that did not opt in reports nothing and changes nothing.
+	reports := len(terminal.reports)
+	loader := r.startOverlay(t, "loading", nil)
+	r.endOverlay(t, loader, "loaded")
+	if len(terminal.reports) != reports {
+		t.Fatalf("an overlay without blocked reported %+v", terminal.reports[reports:])
+	}
+
+	first.handle.SetHidden(true)
+	r.endOverlay(t, second, "two")
+	// The first overlay is hidden but still waiting for its answer.
+	requireBlocked(t, terminal, tui.ProgramStatusKindQuestion, "First?")
+	r.endOverlay(t, first, "one")
+	requireBlocked(t, terminal, "", "")
+}
+
+// interactive-mode-extension-dialogs.test.ts "clears overlay blocked status when the extension UI is reset" and interactive-mode-status.test.ts
+// "resetExtensionUI removes every extension overlay but keeps pi's own overlays" (#11816, #11853).
+func TestResetRemovesEveryExtensionOverlayButKeepsPisOwn(t *testing.T) {
+	r := newCustomRig(t)
+	terminal := recordProgramStatus(r.m, "")
+	internal := &customProbe{label: "INTERNAL"}
+	r.m.tuiInst.ShowOverlay(internal, tui.OverlaySpec{}.Options())
+	lower := r.startOverlay(t, "LOWER", nil)
+	hidden := r.startOverlay(t, "HIDDEN", &extension.CustomBlocked{Kind: tui.ProgramStatusKindQuestion, Message: "Question?"})
+	hidden.handle.SetHidden(true)
+	upper := r.startOverlay(t, "UPPER", nil)
+	requireBlocked(t, terminal, tui.ProgramStatusKindQuestion, "Question?")
+
+	r.m.removeExtensionOverlays()
+
+	if len(r.m.extensionOverlays) != 0 {
+		t.Fatalf("%d extension overlays are left open", len(r.m.extensionOverlays))
+	}
+	requireBlocked(t, terminal, "", "")
+	if got := r.m.tuiInst.ActiveOverlay(); got != tui.Component(internal) {
+		t.Fatalf("active overlay = %v, want pi's own overlay", got)
+	}
+	for _, call := range []*customOverlayCall{lower, hidden, upper} {
+		if got := call.component.disposed.Load(); got != 1 {
+			t.Fatalf("%s disposed %d times, want once", call.component.label, got)
 		}
 	}
-	go done("closed")
-	if got := r.finish(t, out); got.err != nil || got.value != "closed" {
-		t.Fatalf("the overlay = %v, %v; want closed", got.value, got.err)
+	// The calls stay pending, as for inline dialogs; a late done resolves them without hiding or disposing again.
+	for _, call := range []*customOverlayCall{lower, hidden, upper} {
+		r.endOverlay(t, call, "late")
+		if got := call.component.disposed.Load(); got != 1 {
+			t.Fatalf("%s disposed %d times after done, want once", call.component.label, got)
+		}
+	}
+	if got := r.m.tuiInst.ActiveOverlay(); got != tui.Component(internal) {
+		t.Fatalf("active overlay = %v, want pi's own overlay", got)
 	}
 }

@@ -298,10 +298,10 @@ func (s *Session) compactionHead() (ai.OrderedSections, []ai.ToolSchema, error) 
 }
 
 // appendCompaction records a compaction in manager with the head compactionHead gives.
-func (s *Session) appendCompaction(manager *icodingagent.Session, summary, firstKeptEntryID string, tokensBefore int, details any, fromHook bool, usage *ai.Usage) (string, error) {
+func (s *Session) appendCompaction(manager *icodingagent.Session, entry icodingagent.CompactionEntry) (string, error) {
 	head, tools, err := s.compactionHead()
 	if err != nil {
 		return "", err
 	}
-	return manager.AppendCompactionWithSections(summary, firstKeptEntryID, tokensBefore, details, fromHook, usage, head, tools)
+	return manager.AppendCompactionWithSections(entry, head, tools)
 }

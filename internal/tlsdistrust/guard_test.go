@@ -137,7 +137,7 @@ func TestEveryOutboundTLSClientIsBehindTheHook(t *testing.T) {
 		name := entry.Name()
 		if entry.IsDir() {
 			rel, _ := filepath.Rel(root, path)
-			if name == ".git" || name == "node_modules" || name == "testdata" || strings.HasPrefix(name, ".") && path != root {
+			if name == ".git" || name == "node_modules" || name == "testdata" || name == "tmp" || strings.HasPrefix(name, ".") && path != root {
 				return filepath.SkipDir
 			}
 			if _, skipped := skippedTrees[name]; skipped && (filepath.Dir(rel) == "." || name == "tlsdistrusttest") {
@@ -199,7 +199,7 @@ func TestNoProductionCodeImportsTheTestHelper(t *testing.T) {
 			return err
 		}
 		if entry.IsDir() {
-			if entry.Name() == ".git" || entry.Name() == "node_modules" || entry.Name() == "tlsdistrusttest" {
+			if entry.Name() == ".git" || entry.Name() == "node_modules" || entry.Name() == "tmp" || entry.Name() == "tlsdistrusttest" {
 				return filepath.SkipDir
 			}
 			return nil
@@ -230,7 +230,7 @@ func TestPigletModulesCarryAnIdenticalCopy(t *testing.T) {
 	}
 	for module, user := range map[string]string{
 		"standard": filepath.Join("piglets", "standard", "extensions", "bunruntime", "extension.go"),
-		"aot":      filepath.Join("piglets", "aot", "extensions", "aotruntime", "worker.go"),
+		"pig-bolt": filepath.Join("piglets", "pig-bolt", "extensions", "boltruntime", "worker.go"),
 	} {
 		root := filepath.Join("..", "..")
 		got, err := os.ReadFile(filepath.Join(root, "piglets", module, "internal", "tlsdistrust", "tlsdistrust.go"))

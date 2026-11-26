@@ -16,10 +16,12 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/data"
 	"github.com/MichaelKinsy/PiG/chord/next/state"
 	"github.com/MichaelKinsy/PiG/chord/next/store"
+	chordtelemetry "github.com/MichaelKinsy/PiG/chord/next/telemetry"
 	"github.com/MichaelKinsy/PiG/chord/sqlite/node"
+	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
-// Ports packages/chord/test/next/support.ts (the helpers the documents tests use).
+// Ports packages/chord/test/support.ts (the helpers the documents tests use).
 //
 // Shared test helpers of package documents. Pi's documents tests reach their objects through a `createHost` host
 // (`loaded`, `restartable`, `storeRestartable`, `host.get`), which lives in another package (D5). The Go counterpart
@@ -157,11 +159,12 @@ func (c *fakeClock) Advance(ms int64) {
 
 // object is a documents owner: the object's name, batch, context, store and live failures.
 type object struct {
-	t         *testing.T
+	t         testing.TB
 	label     string
 	loop      *loop
 	clock     *fakeClock
 	batch     *state.Batch
+	telemetry telemetry.TelemetryContext
 	scheduler *chord.DeliveryScheduler
 	ctx       context.Context
 	store     *store.ChordStore
@@ -170,6 +173,8 @@ type object struct {
 	mu        sync.Mutex
 	failures  []*data.ChordError
 	reports   []state.BatchError
+	// cancelled are the causes of the transactions reported `transaction_cancelled`.
+	cancelled []error
 	// onFail runs inside Fail (a host fails the live attempt, whose token it seals).
 	onFail func(err *data.ChordError)
 }
@@ -182,7 +187,7 @@ type objectOptions struct {
 }
 
 // newObject is an object with fresh documents; its store is options.store (nil: no store).
-func newObject(t *testing.T, options objectOptions) *object {
+func newObject(t testing.TB, options objectOptions) *object {
 	t.Helper()
 	l := &loop{scheduler: chord.NewDeliveryScheduler()}
 	o := &object{t: t, label: "app.owner(1)", loop: l, clock: newFakeClock(l), scheduler: l.scheduler, ctx: background, store: options.store, owner: "app.owner"}
@@ -207,8 +212,25 @@ func newObject(t *testing.T, options objectOptions) *object {
 func (o *object) Label() string            { return o.label }
 func (o *object) Batch() *state.Batch      { return o.batch }
 func (o *object) Context() context.Context { return o.ctx }
-func (o *object) Do(work func())           { o.loop.do(work) }
-func (o *object) Now() int64               { return o.clock.Now() }
+func (o *object) Telemetry() telemetry.TelemetryContext {
+	if o.telemetry != nil {
+		return o.telemetry
+	}
+	return telemetry.NoopTelemetryContext
+}
+func (o *object) Metrics() *chordtelemetry.Instruments {
+	if o.telemetry != nil {
+		return chordtelemetry.Metrics(o.telemetry.Metrics())
+	}
+	return chordtelemetry.Metrics(nil)
+}
+func (o *object) Do(work func())  { o.loop.do(work) }
+func (o *object) InSection() bool { return o.loop.holder.Load() == goroutineID() }
+func (o *object) Now() int64      { return o.clock.Now() }
+
+// Task runs fn on a goroutine of its own: the harness has no join, its tests wait for what the task does.
+func (o *object) Task(fn func()) { go fn() }
+
 func (o *object) AfterFunc(d time.Duration, job func()) func() {
 	return o.clock.AfterFunc(d, func() { job() })
 }
@@ -225,6 +247,21 @@ func (o *object) Fail(err *data.ChordError) {
 	if hook != nil {
 		hook(err)
 	}
+}
+
+// TransactionCancelled is the host's `transaction_cancelled` report of a transaction that did not commit while its
+// context was cancelled.
+func (o *object) TransactionCancelled(cause error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.cancelled = append(o.cancelled, cause)
+}
+
+// Cancelled is the causes reported `transaction_cancelled`.
+func (o *object) Cancelled() []error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]error{}, o.cancelled...)
 }
 
 // Failures is the live failures the documents reported.
@@ -345,7 +382,7 @@ func (o *object) End() {
 }
 
 // activated is an object whose first attempt ran factory and activated.
-func activated(t *testing.T, options objectOptions, factory func(a *attempt)) (*object, *attempt) {
+func activated(t testing.TB, options objectOptions, factory func(a *attempt)) (*object, *attempt) {
 	t.Helper()
 	o := newObject(t, options)
 	a := o.newAttempt()

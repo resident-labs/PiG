@@ -53,9 +53,16 @@ func newRadiusParts(options RadiusProviderOptions) *RadiusProvider {
 	}
 	gateway = NormalizeRadiusGatewayURL(gateway)
 	oauth := CreateRadiusOAuth(RadiusOAuthOptions{ID: id, Name: name, Gateway: gateway})
+	// The published catalog is bound to id on the first GetModels, not at registration: startup registers the provider without listing its models.
 	var baseline []*Model
-	if gateway == NormalizeRadiusGatewayURL(DefaultRadiusGateway) {
-		baseline = publishedRadiusModels(id)
+	var baselineOnce sync.Once
+	publishedBaseline := func() []*Model {
+		baselineOnce.Do(func() {
+			if gateway == NormalizeRadiusGatewayURL(DefaultRadiusGateway) {
+				baseline = publishedRadiusModels(id)
+			}
+		})
+		return baseline
 	}
 	var mu sync.RWMutex
 	// dynamic is the account's catalog; nil until one is known, and empty when the organization disabled every model.
@@ -85,7 +92,7 @@ func newRadiusParts(options RadiusProviderOptions) *RadiusProvider {
 		GetModels: func() ([]*Model, error) {
 			mu.RLock()
 			defer mu.RUnlock()
-			source := baseline
+			source := publishedBaseline()
 			if dynamic != nil {
 				source = dynamic
 			}
@@ -130,7 +137,7 @@ func newRadiusParts(options RadiusProviderOptions) *RadiusProvider {
 	return &RadiusProvider{provider: provider, gateway: gateway, oauth: oauth}
 }
 
-// publishedRadiusModels is RADIUS_MODELS (the generated radius shard) bound to id. cloneRadiusModel makes the one copy of each catalog entry.
+// publishedRadiusModels is RADIUS_MODELS (the generated radius shard) bound to id, as views of the catalog entries: radius.ts builds the baseline once and getModels returns it (radius.ts:28, 42). The views share the catalog's collections, so they stay inside the provider's closure and are only read by GetModels, which gives every caller its own deep copy (cloneRadiusModel).
 func publishedRadiusModels(id string) []*Model {
 	var models []*Model
 	for i := range GeneratedModels {
@@ -140,7 +147,7 @@ func publishedRadiusModels(id string) []*Model {
 		}
 		model := generated.catalogView()
 		model.ProviderMeta.ProviderID = id
-		models = append(models, cloneRadiusModel(model))
+		models = append(models, model)
 	}
 	return models
 }

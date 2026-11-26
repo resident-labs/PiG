@@ -13,6 +13,7 @@
 import * as crypto from "node:crypto";
 import { flushRawStdout, takeOverStdout, waitForRawStdoutBackpressure, writeRawStdout, } from "../../core/output-guard.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
+import { writeDiagnosticsToStderr } from "../diagnostics-stderr.js";
 import { theme } from "../interactive/theme/theme.js";
 import { toJsonEvent } from "../json-event.js";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.js";
@@ -39,10 +40,14 @@ export async function runRpcMode(runtimeHost) {
     };
     // Pending extension UI requests waiting for response
     const pendingExtensionRequests = new Map();
-    // Shutdown request flag
+    // Extension shutdown requests (ctx.shutdown()) wait until input is attached, no command is
+    // being handled, and the session is idle. See checkShutdownRequested().
     let shutdownRequested = false;
     let shuttingDown = false;
-    const signalCleanupHandlers = [];
+    let inputReady = false;
+    let activeCommands = 0;
+    // SIGTERM/SIGHUP received so far. Only a repeated signal forces exit during shutdown.
+    let signalCount = 0;
     /** Helper for dialog methods with signal/timeout support */
     function createDialogPromise(opts, defaultValue, request, parseResponse) {
         if (opts?.signal?.aborted)
@@ -224,9 +229,23 @@ export async function runRpcMode(runtimeHost) {
     });
     runtimeHost.setRebindSession(async () => {
         await rebindSession();
+        // stderr, never stdout: stdout carries the RPC protocol.
+        writeDiagnosticsToStderr(runtimeHost.takeUnreportedDiagnostics());
     });
     const rebindSession = async () => {
         session = runtimeHost.session;
+        // Subscribe before binding so events emitted by session_start handlers (e.g. appended entries) reach the client.
+        unsubscribe?.();
+        unsubscribeBackpressure?.();
+        unsubscribe = session.subscribe((event) => {
+            output(toJsonEvent(event));
+            if (event.type === "agent_settled") {
+                checkShutdownRequested();
+            }
+        });
+        unsubscribeBackpressure = session.agent.subscribe(async () => {
+            await waitForRawStdoutBackpressure();
+        });
         await session.bindExtensions({
             uiContext: createExtensionUIContext(),
             mode: "rpc",
@@ -255,35 +274,34 @@ export async function runRpcMode(runtimeHost) {
             },
             shutdownHandler: () => {
                 shutdownRequested = true;
+                // An idle session has no command response or agent_settled left to check the flag.
+                // Check on the next tick so the requesting handler finishes first.
+                setImmediate(checkShutdownRequested);
             },
             onError: (err) => {
                 output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
             },
         });
-        unsubscribe?.();
-        unsubscribeBackpressure?.();
-        unsubscribe = session.subscribe((event) => {
-            output(toJsonEvent(event));
-            if (event.type === "agent_settled") {
-                void checkShutdownRequested();
-            }
-        });
-        unsubscribeBackpressure = session.agent.subscribe(async () => {
-            await waitForRawStdoutBackpressure();
-        });
     };
     const registerSignalHandlers = () => {
-        const signals = ["SIGTERM"];
-        if (process.platform !== "win32") {
-            signals.push("SIGHUP");
-        }
+        // Pi 31b407dc63 (post-v1.5.2), backported by automation/gen/pi-post-release-backports.mjs.
+        const signals = ["SIGTERM", "SIGHUP"];
         for (const signal of signals) {
-            const handler = () => {
+            const exitCode = signal === "SIGHUP" ? 129 : 143;
+            // Handlers stay registered until exit: without one, a signal during shutdown would kill
+            // the process before dispose() finishes (for example a pending MCP token refresh).
+            process.on(signal, () => {
+                signalCount++;
                 killTrackedDetachedChildren();
-                void shutdown(signal === "SIGHUP" ? 129 : 143, signal);
-            };
-            process.on(signal, handler);
-            signalCleanupHandlers.push(() => process.off(signal, handler));
+                if (!shuttingDown) {
+                    void shutdown(exitCode, signal);
+                }
+                else if (signalCount > 1) {
+                    // Process managers often close stdin and send SIGTERM together, so one signal
+                    // during shutdown is not a request to skip cleanup; a repeated one is.
+                    process.exit(exitCode);
+                }
+            });
         }
     };
     await rebindSession();
@@ -299,6 +317,8 @@ export async function runRpcMode(runtimeHost) {
                 // Start prompt handling immediately, but emit the authoritative response only after
                 // prompt preflight succeeds. Queued and immediately handled prompts also count as success.
                 let preflightSucceeded = false;
+                // Extension commands run inside prompt(); defer shutdown requests until it settles.
+                activeCommands++;
                 void session
                     .prompt(command.message, {
                     images: command.images,
@@ -313,6 +333,10 @@ export async function runRpcMode(runtimeHost) {
                     if (!preflightSucceeded) {
                         output(error(id, "prompt", e.message));
                     }
+                })
+                    .finally(() => {
+                    activeCommands--;
+                    checkShutdownRequested();
                 });
                 return undefined;
             }
@@ -334,9 +358,6 @@ export async function runRpcMode(runtimeHost) {
             case "new_session": {
                 const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
                 const result = await runtimeHost.newSession(options);
-                if (!result.cancelled) {
-                    await rebindSession();
-                }
                 return success(id, "new_session", result);
             }
             // =================================================================
@@ -473,16 +494,10 @@ export async function runRpcMode(runtimeHost) {
             }
             case "switch_session": {
                 const result = await runtimeHost.switchSession(command.sessionPath);
-                if (!result.cancelled) {
-                    await rebindSession();
-                }
                 return success(id, "switch_session", result);
             }
             case "fork": {
                 const result = await runtimeHost.fork(command.entryId);
-                if (!result.cancelled) {
-                    await rebindSession();
-                }
                 return success(id, "fork", { text: result.selectedText, cancelled: result.cancelled });
             }
             case "clone": {
@@ -491,9 +506,6 @@ export async function runRpcMode(runtimeHost) {
                     return error(id, "clone", "Cannot clone session: no current entry selected");
                 }
                 const result = await runtimeHost.fork(leafId, { position: "at" });
-                if (!result.cancelled) {
-                    await rebindSession();
-                }
                 return success(id, "clone", { cancelled: result.cancelled });
             }
             case "get_fork_messages": {
@@ -571,19 +583,12 @@ export async function runRpcMode(runtimeHost) {
             }
         }
     };
-    /**
-     * Check if shutdown was requested and perform shutdown if so.
-     * Called after handling each command when waiting for the next command.
-     */
     let detachInput = () => { };
+    /** Dispose the runtime and exit. Runs once; later calls (stdin EOF after a signal) do nothing. */
     async function shutdown(exitCode = 0, signal) {
-        if (shuttingDown) {
-            process.exit(exitCode);
-        }
+        if (shuttingDown)
+            return;
         shuttingDown = true;
-        for (const cleanup of signalCleanupHandlers) {
-            cleanup();
-        }
         unsubscribe?.();
         unsubscribeBackpressure?.();
         await runtimeHost.dispose();
@@ -592,12 +597,21 @@ export async function runRpcMode(runtimeHost) {
         if (signal !== "SIGTERM") {
             await flushRawStdout();
         }
+        // Pi 31b407dc63 (post-v1.5.2), backported by automation/gen/pi-post-release-backports.mjs.
+        // dispose() only starts killing a running `bash` command, which on Windows loses the race with
+        // exit. After the last await, so it also catches a shell spawned after the abort.
+        killTrackedDetachedChildren();
         process.exit(exitCode);
     }
-    async function checkShutdownRequested() {
-        if (!shutdownRequested)
+    /**
+     * Shut down if an extension requested it and nothing still needs the process: input is attached,
+     * no command (including a prompt that has not settled) is being handled, and the session is idle.
+     * Each of those ending calls this again.
+     */
+    function checkShutdownRequested() {
+        if (!shutdownRequested || shuttingDown || !inputReady || activeCommands > 0 || !session.isIdle)
             return;
-        await shutdown();
+        void shutdown();
     }
     const handleInputLine = async (line) => {
         let parsed;
@@ -623,13 +637,20 @@ export async function runRpcMode(runtimeHost) {
             return;
         }
         const command = parsed;
+        activeCommands++;
         try {
-            const response = await handleCommand(command);
+            let response;
+            try {
+                response = await handleCommand(command);
+            }
+            finally {
+                activeCommands--;
+            }
             if (response) {
                 output(response);
                 await waitForRawStdoutBackpressure();
             }
-            await checkShutdownRequested();
+            checkShutdownRequested();
         }
         catch (commandError) {
             output(error(command.id, command.type, commandError instanceof Error ? commandError.message : String(commandError)));
@@ -649,6 +670,9 @@ export async function runRpcMode(runtimeHost) {
             process.stdin.off("end", onInputEnd);
         };
     })();
+    inputReady = true;
+    // Handle a shutdown requested during startup (e.g. from session_start).
+    checkShutdownRequested();
     // Keep process alive forever
     return new Promise(() => { });
 }

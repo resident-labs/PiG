@@ -120,7 +120,11 @@ pub fn agent_session_runtime_script(ctx: &Context, args: &Value) -> io::Result<V
                     custom_tools: vec![],
                 },
             )?;
-            let diagnostics = services.diagnostics.clone();
+            let mut diagnostics = services.diagnostics.clone();
+            diagnostics.push(json!({"type": "warning", "message": "runtime diagnostics: startup"}));
+            if calls.lock().unwrap().len() > 1 {
+                diagnostics.push(json!({"type": "error", "message": "runtime diagnostics: replaced"}));
+            }
             let fallback = session.model_fallback_message.clone();
             Ok(CreateAgentSessionRuntimeResult { session, services, diagnostics, model_fallback_message: fallback })
         })
@@ -221,6 +225,14 @@ pub fn agent_session_runtime_script(ctx: &Context, args: &Value) -> io::Result<V
             "servicesCwd": runtime.services().cwd, "servicesAgentDir": runtime.services().agent_dir == agent_dir, "calls": calls.lock().unwrap().len(),
         }),
     );
+    r.insert(
+        "takenAtStartup".into(),
+        json!(runtime.take_unreported_diagnostics()),
+    );
+    r.insert(
+        "takenAtStartupAgain".into(),
+        json!(runtime.take_unreported_diagnostics()),
+    );
     runtime.session().prompt("one")?;
     r.insert(
         "prompted".into(),
@@ -253,6 +265,14 @@ pub fn agent_session_runtime_script(ctx: &Context, args: &Value) -> io::Result<V
             "rebinds": rebinds.load(Ordering::SeqCst), "invalidations": invalidations.load(Ordering::SeqCst),
         }),
     );
+    r.insert(
+        "takenAfterNew".into(),
+        json!(runtime.take_unreported_diagnostics()),
+    );
+    r.insert(
+        "takenAfterNewAgain".into(),
+        json!(runtime.take_unreported_diagnostics()),
+    );
     runtime.session().prompt("two")?;
 
     // fork.
@@ -275,6 +295,10 @@ pub fn agent_session_runtime_script(ctx: &Context, args: &Value) -> io::Result<V
             "result": fork_view(&forked), "fresh": fresh, "parentIsNotSecond": text(&current()?.get_session_file()?) != second_file, "roles": roles()?, "kinds": kinds(&current()?)?,
             "calls": calls.lock().unwrap().len() as i64 - 2,
         }),
+    );
+    r.insert(
+        "takenAfterFork".into(),
+        json!(runtime.take_unreported_diagnostics()),
     );
     runtime.session().prompt("three")?;
     let forked_at = runtime.fork(
@@ -339,9 +363,41 @@ pub fn agent_session_runtime_script(ctx: &Context, args: &Value) -> io::Result<V
         }),
     );
 
+    // reload after bind_extensions() with no bindings (Pi e03dca7a3843): the old extensions get session_shutdown and the new ones session_start.
+    let logged_before_reload = std::fs::read_to_string(&log_file)?
+        .trim_end_matches('\n')
+        .split('\n')
+        .count();
+    runtime.session().reload()?;
+    let logged = std::fs::read_to_string(&log_file)?;
+    let reload_events: Vec<&str> = logged
+        .trim_end_matches('\n')
+        .split('\n')
+        .skip(logged_before_reload)
+        .collect();
+    r.insert("reload".into(), json!({"events": reload_events}));
+
     // A direct refresh of the live session (the runtime's own after a setup is the one the report shows); Pi's run reads nothing from it, so it adds nothing to the report.
     runtime.session().refresh_context()?;
-    runtime.dispose()?;
+    // dispose settles a run in flight before it emits session_shutdown; the model never ends this run, so only the abort can end it.
+    let observe_file = Path::new(cwd).join("observe-run");
+    std::fs::write(&observe_file, "")?;
+    let hung = runtime.session();
+    let disposed = std::thread::scope(|scope| -> io::Result<()> {
+        let running = scope.spawn(|| hung.prompt("hang-forever"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !std::fs::read_to_string(&log_file)?.contains("agent_start") {
+            if std::time::Instant::now() > deadline {
+                return Err(io::Error::other("the run never started"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let disposed = runtime.dispose();
+        let _ = running.join();
+        disposed
+    });
+    disposed?;
+    std::fs::remove_file(&observe_file)?;
     let reasons: Vec<String> = calls
         .lock()
         .unwrap()

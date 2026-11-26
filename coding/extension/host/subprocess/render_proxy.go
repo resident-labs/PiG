@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/extensions/sdk/frontend"
+	"github.com/MichaelKinsy/PiG/tui"
 	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
 
@@ -33,6 +35,13 @@ type renderProxyComponent struct {
 	invalidate func()
 	fallback   []string
 
+	// key is the host's name for the message or entry the component draws (renderKeys); "" when the renderer call is not for a displayed one.
+	key string
+	// takesMouse is the extension's report that the component it returned takes the mouse (RenderResult.Mouse).
+	takesMouse atomic.Bool
+	// regions are the rectangles of the Node component's MouseRegions (RenderResult.Regions), which HandleMouse hit-tests.
+	regions atomic.Pointer[[]RenderMouseRegion]
+
 	mu         sync.Mutex
 	lines      []string
 	linesWidth int // width the cached lines were rendered at
@@ -41,6 +50,16 @@ type renderProxyComponent struct {
 	generation uint64
 	requesting bool
 	retry      renderRetry
+	// rerender is whether the next request runs the renderer. Pi runs it when it builds the component (first draw, a new expansion or padding, an
+	// invalidation) and draws the component it returned on every other frame (a resize, a click), so only those three set it; an answer to a request
+	// that ran the renderer clears it.
+	rerender bool
+	// events are the mouse events the view took since the last request; the next request carries them, so the extension applies them before it draws.
+	events []ViewEventPayload
+	// answered is whether an answer of the extension has been applied: the lines, the regions and the view are then those of a component it drew.
+	answered bool
+	// early are the clicks made on the placeholder (holdEarlyClick), in the order they came, until the frame that paints the component gives them to it.
+	early []tui.TuiMouseEvent
 	// view is the view of the renderer's results (D107).
 	view rendererView
 }
@@ -65,6 +84,8 @@ func newRenderProxyComponent(
 		invalidate: invalidate,
 		fallback:   []string{fmt.Sprintf("[%s]", customType)},
 		options:    options,
+		key:        renderKeys.key(conn, options.Identity),
+		rerender:   true,
 	}
 }
 
@@ -93,7 +114,9 @@ func newEntryRenderProxyComponent(
 		inactivity: inactivity,
 		invalidate: invalidate,
 		fallback:   []string{fmt.Sprintf("[%s]", customType)},
-		options:    extension.MessageRenderOptions{Expanded: options.Expanded},
+		options:    extension.MessageRenderOptions{Expanded: options.Expanded, Identity: options.Identity},
+		key:        renderKeys.key(conn, options.Identity),
+		rerender:   true,
 	}
 }
 
@@ -115,6 +138,7 @@ func (c *renderProxyComponent) Render(width int) []string {
 	}
 	lines := c.lines
 	if len(lines) == 0 {
+		// pig divergence (D647): until the extension first answers, the message draws its placeholder [<customType>] where Pi draws the component, because the render loop never waits on extension IPC.
 		lines = c.fallback
 	} else {
 		// A response for an earlier width is never painted (whatever its rows)
@@ -125,22 +149,39 @@ func (c *renderProxyComponent) Render(width int) []string {
 		}
 	}
 	out := append([]string(nil), lines...)
+	var early []tui.TuiMouseEvent
+	if c.answered {
+		early, c.early = c.early, nil
+	}
 	c.mu.Unlock()
 
 	if start {
 		go c.requestLoop()
 	}
+	// The frame that paints the component gives it the clicks made on its placeholder, in the order they came (holdEarlyClick).
+	for _, click := range early {
+		c.HandleMouse(click)
+	}
 	return out
 }
 
-// IsDirty reports whether a response replaced the painted lines since the last NeedsRedraw, so a caching parent re-renders the proxy.
-func (c *renderProxyComponent) IsDirty() bool { return c.changed.Load() }
+// IsDirty reports whether a response replaced the painted lines since the last NeedsRedraw, or whether the painted view animates on its own (a loader), so a caching parent re-renders the proxy every frame while it does.
+func (c *renderProxyComponent) IsDirty() bool {
+	if c.changed.Load() {
+		return true
+	}
+	c.mu.Lock()
+	animates := c.linesWidth > 0 && c.view.animates()
+	c.mu.Unlock()
+	return animates
+}
 
 // NeedsRedraw consumes the flag IsDirty reads.
 func (c *renderProxyComponent) NeedsRedraw() bool { return c.changed.Swap(false) }
 
 func (c *renderProxyComponent) Invalidate() {
 	c.mu.Lock()
+	c.rerender = true
 	if c.width <= 0 || c.conn == nil {
 		c.mu.Unlock()
 		return
@@ -162,6 +203,7 @@ func (c *renderProxyComponent) SetExpanded(expanded bool) {
 		return
 	}
 	c.options.Expanded = expanded
+	c.rerender = true
 	if c.width <= 0 || c.conn == nil {
 		c.mu.Unlock()
 		return
@@ -183,6 +225,7 @@ func (c *renderProxyComponent) SetOutputPad(padding int) {
 		return
 	}
 	c.options.OutputPad = padding
+	c.rerender = true
 	if c.width <= 0 || c.conn == nil {
 		c.mu.Unlock()
 		return
@@ -202,19 +245,29 @@ func (c *renderProxyComponent) requestLoop() {
 		generation := c.generation
 		width := c.width
 		options := c.options
+		rerender := c.rerender
+		events := c.events
+		c.events = nil
 		c.mu.Unlock()
 
-		lines, ok, stall := c.request(width, options)
+		lines, ok, stall := c.request(width, options, rerender, events)
 
 		c.mu.Lock()
 		current := generation == c.generation
 		if current && ok {
+			// The answer ran the renderer when it was asked to, and the next frame draws the component it returned.
+			c.rerender = false
 			c.lines = append([]string(nil), lines...)
 			c.linesWidth = width
 			c.changed.Store(true)
+			c.answered = true
 		}
 		if current {
 			c.requesting = false
+			if !c.answered {
+				// No answer was applied and none is asked for: no component was drawn, so the clicks made on the placeholder have nothing to reach.
+				c.early = nil
+			}
 			var epoch uint64
 			var backoff time.Duration
 			var settled <-chan struct{}
@@ -253,17 +306,27 @@ func (c *renderProxyComponent) retryDue(epoch uint64) {
 
 // request runs one render in the extension. stall is set when the renderer
 // inactivity boundary abandoned the request.
-func (c *renderProxyComponent) request(width int, options extension.MessageRenderOptions) (lines []string, ok bool, stall *HandlerStalledError) {
+func (c *renderProxyComponent) request(width int, options extension.MessageRenderOptions, rerender bool, events []ViewEventPayload) (lines []string, ok bool, stall *HandlerStalledError) {
 	ctx := context.Background()
 	var wireOptions any = options
 	if c.method == "render_entry" {
 		wireOptions = extension.EntryRenderOptions{Expanded: options.Expanded}
 	}
-	args, err := json.Marshal(map[string]any{
+	fields := map[string]any{
 		c.payloadKey: c.payload,
 		"options":    wireOptions,
 		"width":      width,
-	})
+	}
+	if c.key != "" {
+		fields["key"] = c.key
+	}
+	if rerender {
+		fields["rerender"] = true
+	}
+	if len(events) > 0 {
+		fields["events"] = events
+	}
+	args, err := json.Marshal(fields)
 	if err != nil {
 		return nil, false, nil
 	}
@@ -285,8 +348,96 @@ func (c *renderProxyComponent) request(width int, options extension.MessageRende
 	if err := json.Unmarshal(resp.Response.Result, &result); err != nil {
 		return nil, false, nil
 	}
-	lines, ok = c.view.apply(c.conn, c.invalidate, result, width)
+	c.takesMouse.Store(result.Mouse)
+	c.regions.Store(&result.Regions)
+	lines, ok = c.view.apply(c.conn, c.invalidate, c.key, c.enqueueEvent, result, width)
 	return lines, ok, nil
+}
+
+// enqueueEvent queues a mouse event for the extension and asks for the request that carries it. It performs no IPC and takes no view lock, so a view
+// delivers its events from the TUI loop.
+func (c *renderProxyComponent) enqueueEvent(ev ViewEventPayload) {
+	c.mu.Lock()
+	c.events = append(c.events, ev)
+	if c.width <= 0 || c.conn == nil {
+		c.mu.Unlock()
+		return
+	}
+	c.generation++
+	start := !c.requesting
+	c.requesting = true
+	c.mu.Unlock()
+	if start {
+		//portlint:allow golifetime requestLoop ends when its answer is current: it clears c.requesting under c.mu, and only the component's next frame starts another; one loop per component
+		go c.requestLoop()
+	}
+}
+
+// HandleMouse gives a fullscreen mouse event to the component the extension drew, as Pi's Container gives it to the component the renderer returned
+// (a MouseRegion in the posthorse and built-in cards). Nothing runs in the extension while the terminal waits: a kit view's mouse regions answer
+// from their description, and the extension hears of the events they took in the next request, which draws the card again. A component the extension
+// keeps (Node's) takes the click only, answered as handled at once; its press, drag, wheel and move stay with the host's selection and scrolling,
+// which Pi's component would have left unhandled in the same places. A click made on the placeholder waits for the frame that paints the component
+// (holdEarlyClick).
+func (c *renderProxyComponent) HandleMouse(event tui.TuiMouseEvent) *tui.TuiMouseDispatchResult {
+	if c.key == "" || c.conn == nil {
+		return nil
+	}
+	if event.Type == tui.MouseClick && c.holdEarlyClick(event) {
+		return nil
+	}
+	result := c.view.handleMouse(*remoteMouse(event))
+	if !result.Handled && !result.Capture && !result.Focus {
+		if event.Type != tui.MouseClick {
+			return nil
+		}
+		var regions []RenderMouseRegion
+		if p := c.regions.Load(); p != nil {
+			regions = *p
+		}
+		if len(regions) > 0 {
+			// The component's MouseRegions answer where Pi's hit test finds them; a click outside them is left unhandled, as in Pi.
+			if !slices.ContainsFunc(regions, func(r RenderMouseRegion) bool {
+				return event.X >= r.X && event.X < r.X+r.Width && event.Y >= r.Y && event.Y < r.Y+r.Height
+			}) {
+				return nil
+			}
+		} else if !c.takesMouse.Load() {
+			// pig divergence (D277): a component that handles the mouse itself answers for itself, which the host cannot ask before it answers the terminal, so it gets the clicks inside it and no other event.
+			return nil
+		}
+		c.enqueueEvent(ViewEventPayload{Key: c.key, Type: ViewEventMouse, Mouse: remoteMouse(event)})
+		result = extension.ViewMouseResult{Handled: true}
+	}
+	dispatched := &tui.TuiMouseDispatchResult{
+		Handled: true, Capture: result.Capture, Focus: result.Focus, Render: result.Render,
+		Target: tui.TuiMouseDispatchTarget{
+			Component: c, OriginX: event.ScreenX - event.X, OriginY: event.ScreenY - event.Y,
+			Width: event.Width, Height: event.Height,
+		},
+	}
+	if result.Focus {
+		dispatched.FocusTarget = c
+	}
+	return dispatched
+}
+
+// holdEarlyClick keeps a click made on the proxy's placeholder and reports whether it kept it. Pi's renderer returns the component inside the render
+// that builds the message, so a card on Pi's screen has its mouse regions from its first frame. A proxy paints a placeholder from its first request
+// until the frame that follows the first applied answer, and knows no region of the component in that time. The click waits, and Render gives it to
+// the component in that frame, on the TUI loop, where HandleMouse runs too: every such click is delivered once, in the order the clicks came, and a
+// click made while others wait is kept behind them. The caller answers a kept click unhandled, as a click outside every region is answered. The
+// clicks die with the proxy: one that is not drawn again gives none to a component. A request that ends with no answer applied (it failed, or the
+// renderer inactivity boundary abandoned it) drops them, so the list lives no longer than that boundary or the next frame.
+func (c *renderProxyComponent) holdEarlyClick(event tui.TuiMouseEvent) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.early) == 0 && (c.answered || !c.requesting) {
+		return false
+	}
+	// pig divergence (D647): a click on the placeholder row is kept for the frame that paints the component, where Pi's component has its regions from its first frame.
+	c.early = append(c.early, event)
+	return true
 }
 
 // FrontendView reports the structure of the renderer's result to a D91

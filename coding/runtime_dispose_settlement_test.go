@@ -30,7 +30,7 @@ func (tool disposeWaitTool) Execute(ctx context.Context, _ string, _ json.RawMes
 	return agent.AgentToolResult{}, errors.New("Operation aborted")
 }
 
-// pi: test/suite/regressions/9124-runtime-dispose-tool-settlement.test.ts (Pi main 7a53c310a, #9126; D247). Closing the runtime
+// pi: test/suite/regressions/9124-runtime-dispose-tool-settlement.test.ts (Pi main 7a53c310a, #9126). Closing the runtime
 // during a tool settles the interrupted turn before the session is disconnected, and session_shutdown reaches extensions after it.
 func TestRuntimeCloseDuringToolSettlesTheInterruptedTurnBeforeShutdown(t *testing.T) {
 	tool := disposeWaitTool{started: make(chan struct{})}
@@ -71,6 +71,41 @@ func TestRuntimeCloseDuringToolSettlesTheInterruptedTurnBeforeShutdown(t *testin
 	if got := rolesOf(); !slices.Equal(got, want) {
 		t.Fatalf("messages after Close = %v, want %v", got, want)
 	}
+	// The persisted entries carry the same turn, and the third message is the aborted tool's error result (Pi asserts both on sessionManager.getEntries()).
+	var persisted []map[string]any
+	for _, entry := range h.session.Entries() {
+		raw, err := json.Marshal(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields struct {
+			Type    string         `json:"type"`
+			Message map[string]any `json:"message"`
+		}
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			t.Fatal(err)
+		}
+		if fields.Type == "message" && fields.Message["role"] != "system" {
+			persisted = append(persisted, fields.Message)
+		}
+	}
+	var persistedRoles []string
+	for _, message := range persisted {
+		role, _ := message["role"].(string)
+		persistedRoles = append(persistedRoles, role)
+	}
+	if !slices.Equal(persistedRoles, want) {
+		t.Fatalf("persisted message entries after Close = %v, want %v", persistedRoles, want)
+	}
+	result := persisted[2]
+	content, _ := result["content"].([]any)
+	var block map[string]any
+	if len(content) == 1 {
+		block, _ = content[0].(map[string]any)
+	}
+	if result["isError"] != true || block == nil || block["type"] != "text" || block["text"] != "Operation aborted" {
+		t.Fatalf("persisted tool result = %v, want an error result with the single text block %q", result, "Operation aborted")
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	if !slices.Equal(rolesAtShutdown, want) {
@@ -79,9 +114,10 @@ func TestRuntimeCloseDuringToolSettlesTheInterruptedTurnBeforeShutdown(t *testin
 	<-prompt
 }
 
-// pi: print-mode.ts:57-60 and agent-session-runtime.ts dispose (Pi 1.5.0, the pin): a termination signal's disposal emits session_shutdown at once and does
-// not abort the run in flight. Print mode's signal hook holds the Agent at its next event (HoldAgentEvents) before it kills the tool, as Pi's one
-// event loop stands still while the handlers run, so a run that the emit aborted could not settle and the emit would wait for it for ever.
+// pig behaviour of the print-mode signal hook (print-mode.ts:55-68 runs runtimeHost.dispose() on SIGTERM and SIGHUP): the hook's disposal emits session_shutdown
+// through EmitQuitShutdownContext at once and does not abort the run in flight. The hook holds the Agent at its next event (HoldAgentEvents) before it kills the tool, as Pi's one
+// event loop stands still while the handlers run, so a run that the emit aborted could not settle and the emit would wait for it for ever. This pins what pig's hook does; the dispose of
+// the pinned Pi awaits session.abort() before it emits (agent-session-runtime.ts:415-424), which is what Runtime.EmitQuitShutdown does for the quit of the interactive mode.
 func TestEmitQuitShutdownContextDoesNotAbortTheRunASignalHolds(t *testing.T) {
 	tool := disposeWaitTool{started: make(chan struct{})}
 	var h *recoveryHarness
@@ -130,7 +166,7 @@ func TestEmitQuitShutdownContextDoesNotAbortTheRunASignalHolds(t *testing.T) {
 		t.Fatal("EmitQuitShutdownContext waited for the run that the signal's hold keeps from settling")
 	}
 	if h.session.AgentRunAbortRequested() {
-		t.Error("EmitQuitShutdownContext aborted the run; Pi 1.5.0's dispose emits session_shutdown without an abort")
+		t.Error("EmitQuitShutdownContext aborted the run; the signal hook's disposal emits session_shutdown without an abort")
 	}
 	mu.Lock()
 	gotShutdowns, gotRoles := shutdowns, slices.Clone(rolesAtShutdown)

@@ -7,7 +7,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/delta"
 )
 
-// Ports packages/chord/src/next/contracts/params.ts (the policy for params fields and the closed object schema checked
+// Ports packages/chord/src/contracts/params.ts (the policy for params fields and the closed object schema checked
 // on every get). The type-level ParamSchema (required, no default), Params and RequiredFields types are designed out:
 // Params is a slice of properties (see schema.go) and the policy is the runtime check below, which refuses an optional
 // field and, through the normal form's keywords, a defaulted one.
@@ -54,11 +54,18 @@ func ReadParams(declared []Property, path string) (*ParamsData, error) {
 	return &ParamsData{Fields: fields, Schema: Schema{Node: schema}, Normal: normal}, nil
 }
 
+// special is what JoinKey escapes in a part: its separator and the escape itself.
+const special = `\|`
+
 // JoinKey joins key parts with `|`, each escaped (`\` and `|`), so two different part lists never join to one key.
 func JoinKey(parts []string) string {
 	escaped := make([]string, len(parts))
 	for i, part := range parts {
-		escaped[i] = strings.ReplaceAll(strings.ReplaceAll(part, `\`, `\\`), "|", `\|`)
+		// Most parts have nothing to escape: no copy for them.
+		if strings.ContainsAny(part, special) {
+			part = strings.ReplaceAll(strings.ReplaceAll(part, `\`, `\\`), "|", `\|`)
+		}
+		escaped[i] = part
 	}
 	return strings.Join(escaped, "|")
 }

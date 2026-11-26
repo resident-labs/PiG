@@ -101,7 +101,7 @@ func (s *Session) TransferModel(ctx context.Context, target *ai.Model, options M
 	}
 	settings := compaction.CompactionSettings{Enabled: true, ReserveTokens: configured.ReserveTokens, KeepRecentTokens: configured.KeepRecentTokens, TriggerTokens: options.CompactionTriggerTokens}
 	contextTokens := func() int {
-		return compaction.EstimateProjectedContextTokens(s.inner.BuildSessionProjectionView(), s.currentBranch()).Tokens
+		return compaction.EstimateProjectedContextTokens(s.inner.Load().BuildSessionProjectionView(), s.currentBranch()).Tokens
 	}
 	// A virtual model's limits are checked when a request is routed, against the model it reaches.
 	exceeds := func(limits compaction.CompactionSettings) bool {
@@ -223,8 +223,9 @@ func (s *Session) summarizeTransfer(ctx context.Context, prep compaction.Compact
 // appendTransferBoundary compacts without a model. The summary tells the new model where the session file is, and the
 // tail kept is what the cut point keeps within limit. Older entries stay in the file.
 func (s *Session) appendTransferBoundary(reason string, settings compaction.CompactionSettings, limit int) error {
+	in := s.inner.Load()
 	branch := s.currentBranch()
-	projection := s.inner.BuildSessionProjectionView()
+	projection := in.BuildSessionProjectionView()
 	before := compaction.EstimateProjectedContextTokens(projection, branch).Tokens
 	prep := compaction.PrepareCompaction(branch, settings)
 	var readFiles, modifiedFiles []string
@@ -238,7 +239,7 @@ func (s *Session) appendTransferBoundary(reason string, settings compaction.Comp
 	if runes := []rune(reason); len(runes) > 300 {
 		reason = string(runes[:300])
 	}
-	summary := transferBoundary(s.inner.Path(), reason, previous) + compaction.FormatFileOperations(readFiles, modifiedFiles)
+	summary := transferBoundary(in.Path(), reason, previous) + compaction.FormatFileOperations(readFiles, modifiedFiles)
 
 	// One oversized tool result can pass the limit alone, and a cut cannot split it. Keep no tail then.
 	firstKept := ""
@@ -259,13 +260,13 @@ func (s *Session) appendTransferBoundary(reason string, settings compaction.Comp
 	details := compaction.CompactionDetails{ReadFiles: readFiles, ModifiedFiles: modifiedFiles}
 
 	s.emitCompactionEvent(agent.CompactionStartEvent{Reason: "threshold"})
-	entryID, err := s.appendCompaction(s.inner, summary, firstKept, before, details, false, nil)
+	entryID, err := s.appendCompaction(in, icodingagent.CompactionEntry{Summary: summary, FirstKeptEntryID: firstKept, TokensBefore: before, Details: details})
 	if err != nil {
 		s.emitOrderedEventSync(agent.CompactionEndEvent{Reason: "threshold", ErrorMessage: err.Error()})
 		return err
 	}
 	s.refreshContext()
-	if entry, ok := s.inner.GetEntry(entryID); ok {
+	if entry, ok := in.GetEntry(entryID); ok {
 		s.emitSessionCompact(s.backgroundContext(), entry, false, "threshold", false)
 	}
 	s.emitCompactionEvent(agent.CompactionEndEvent{

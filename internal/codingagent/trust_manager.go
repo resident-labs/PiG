@@ -19,12 +19,14 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/MichaelKinsy/PiG/internal/atomicfile"
 	"github.com/MichaelKinsy/PiG/internal/jsonparse"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/nodeerrno"
 	"github.com/MichaelKinsy/PiG/internal/nodefs"
 	"github.com/MichaelKinsy/PiG/internal/orderedjson"
 	"github.com/MichaelKinsy/PiG/internal/resolvepath"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 	"github.com/MichaelKinsy/PiG/internal/text"
 )
 
@@ -251,9 +253,9 @@ func (s *ProjectTrustStore) read() (map[string]*bool, error) {
 func (s *ProjectTrustStore) write(data map[string]*bool) error {
 	// writeTrustFile (trust-manager.ts:126-135) sorts the keys with Array.prototype.sort, which compares UTF-16 code units, and writes JSON.stringify(sorted, null, 2): no HTML escaping, array-index keys first.
 	sorted := orderedjson.New()
-	for _, key := range slices.SortedFunc(maps.Keys(data), func(a, b string) int {
-		return slices.Compare(jsstring.ToUTF16(a), jsstring.ToUTF16(b))
-	}) {
+	keys := slices.Collect(maps.Keys(data))
+	sortx.Func(keys, func(a, b string) int { return slices.Compare(jsstring.ToUTF16(a), jsstring.ToUTF16(b)) })
+	for _, key := range keys {
 		value := json.RawMessage("null")
 		if data[key] != nil {
 			value = json.RawMessage(strconv.FormatBool(*data[key]))
@@ -268,8 +270,9 @@ func (s *ProjectTrustStore) write(data map[string]*bool) error {
 	if err := nodeerrno.MkdirAll(filepath.Dir(s.trustPath), 0o755); err != nil {
 		return err
 	}
+	// pig divergence (D651): replaced through a private temporary file and a rename, in place where that is refused; Pi writes the file in place.
 	// upstream: coding-agent/src/core/trust-manager.ts:142 writeFileSync(path, ..., "utf-8"): no mode, so a new file is 0666 with the umask taken out.
-	if err := os.WriteFile(s.trustPath, append(encoded, '\n'), 0o666); err != nil {
+	if err := atomicfile.WriteFile(s.trustPath, append(encoded, '\n'), 0o666); err != nil {
 		return nodeerrno.FromPathError(err)
 	}
 	return nil

@@ -98,7 +98,7 @@ const misspelledCredentialsFlag = "credentails" //nolint:misspell // the typo is
 
 func TestCredentialPrintReportsUnknownAuthOptionsLikePackageCommands(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := runAuthCommandWith([]string{"auth", "check", "--provider", "openai-codex", "--" + misspelledCredentialsFlag}, authRunEnv{stdout: &stdout, stderr: &stderr, agentDir: t.TempDir()})
+	code := runAuthCommandWith([]string{"auth", "check", "--provider", "openai-codex", "--" + misspelledCredentialsFlag}, authRunEnv{ctx: t.Context(), stdout: &stdout, stderr: &stderr, agentDir: t.TempDir()})
 	if !strings.Contains(stderr.String(), `Unknown option --`+misspelledCredentialsFlag+` for "auth check".`) {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
@@ -173,7 +173,7 @@ func TestParseAuthCommandMinExpiryUnits(t *testing.T) {
 		t.Fatalf("--json on print-api-key = %v", err)
 	}
 	if _, err := ParseAuthCommand([]string{"auth"}); err == nil ||
-		err.Error() != `Unknown auth command "". Use "pig auth print-api-key", "pig auth print-bearer-token", or "pig auth check".` {
+		err.Error() != `Unknown auth command "". Use "pig auth login", "pig auth logout", "pig auth print-api-key", "pig auth print-bearer-token", or "pig auth check".` {
 		t.Fatalf("bare auth parse = %v", err)
 	}
 }
@@ -213,7 +213,7 @@ func writeAuthJSON(t *testing.T, agentDir string, content map[string]ai.Credenti
 func runAuthForTest(t *testing.T, agentDir string, args ...string) (int, string, string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code := runAuthCommandWith(append([]string{"auth"}, args...), authRunEnv{stdout: &stdout, stderr: &stderr, agentDir: agentDir})
+	code := runAuthCommandWith(append([]string{"auth"}, args...), authRunEnv{ctx: t.Context(), stdout: &stdout, stderr: &stderr, agentDir: agentDir})
 	return code, stdout.String(), stderr.String()
 }
 
@@ -292,7 +292,7 @@ func TestAuthCommandExitCodesAndErrors(t *testing.T) {
 		stdout, stderr string
 	}{
 		{"help", []string{}, 0, authCommandHelp + "\n", ""},
-		{"unknown subcommand", []string{"nope"}, 1, "", `Error: Unknown auth command "nope". Use "pig auth print-api-key", "pig auth print-bearer-token", or "pig auth check".` + "\n"},
+		{"unknown subcommand", []string{"nope"}, 1, "", `Error: Unknown auth command "nope". Use "pig auth login", "pig auth logout", "pig auth print-api-key", "pig auth print-bearer-token", or "pig auth check".` + "\n"},
 		{"check without target", []string{"check"}, 2, "", "Error: Auth checks require --provider <provider> or --model <model>\n"},
 		{"print without target", []string{"print-api-key"}, 1, "", "Error: Credential printing requires --provider <provider> or --model <model>\n"},
 		{"check with message", []string{"check", "--provider", "openai", "hello"}, 2, "", "Error: Auth commands only accept --provider and --model\n"},
@@ -314,7 +314,7 @@ func TestAuthCommandExitCodesAndErrors(t *testing.T) {
 			}
 		})
 	}
-	if code := runAuthCommandWith([]string{"login"}, authRunEnv{agentDir: agentDir}); code != -1 {
+	if code := runAuthCommandWith([]string{"login"}, authRunEnv{ctx: t.Context(), agentDir: agentDir}); code != -1 {
 		t.Fatalf("non-auth command = %d, want -1", code)
 	}
 }

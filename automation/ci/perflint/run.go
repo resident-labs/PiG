@@ -9,6 +9,7 @@ import (
 	"go/types"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 
@@ -42,7 +43,7 @@ func isJSONPkg(p string) bool {
 
 // hotPackage reports whether rel is in a package where env, stat and loop-format sites count.
 func hotPackage(rel string) bool {
-	for _, prefix := range []string{"agent/", "ai/", "coding/", "extensions/sdk/", "internal/codingagent/"} {
+	for _, prefix := range []string{"agent/", "ai/", "coding/", "extensions/sdk/", "internal/codingagent/", "internal/noderealpath/"} {
 		if strings.HasPrefix(rel, prefix) {
 			return true
 		}
@@ -86,6 +87,7 @@ type scanner struct {
 	pkg     *packages.Package
 	rel     string
 	hot     bool
+	linked  bool         // the package is linked into cmd/pig (sort-instance)
 	allowed map[int]bool // lines covered by //perf:ok <reason>
 	counts  map[string]*finding
 }
@@ -108,6 +110,12 @@ func (s *scanner) add(owner, pattern, detail string, pos token.Pos) {
 
 // callee returns the package path and name of the function or method a call invokes.
 func (s *scanner) callee(call *ast.CallExpr) (string, string) {
+	p, name, _ := s.calleeInfo(call)
+	return p, name
+}
+
+// calleeInfo returns the package path, name, and whether the callee is a method (has a receiver).
+func (s *scanner) calleeInfo(call *ast.CallExpr) (string, string, bool) {
 	var id *ast.Ident
 	switch fun := call.Fun.(type) {
 	case *ast.SelectorExpr:
@@ -123,13 +131,19 @@ func (s *scanner) callee(call *ast.CallExpr) (string, string) {
 		}
 	}
 	if id == nil {
-		return "", ""
+		return "", "", false
 	}
 	obj := s.pkg.TypesInfo.Uses[id]
 	if obj == nil || obj.Pkg() == nil {
-		return "", ""
+		return "", "", false
 	}
-	return obj.Pkg().Path(), obj.Name()
+	isMethod := false
+	if fn, ok := obj.(*types.Func); ok {
+		if sig, ok := fn.Type().(*types.Signature); ok && sig.Recv() != nil {
+			isMethod = true
+		}
+	}
+	return obj.Pkg().Path(), obj.Name(), isMethod
 }
 
 func isMarshal(path, name string) bool {
@@ -243,7 +257,7 @@ func (s *scanner) scanFunc(fn *ast.FuncDecl) {
 				}
 			}
 		case *ast.CallExpr:
-			p, name := s.callee(n)
+			p, name, isMethod := s.calleeInfo(n)
 			if nestedMarshal && (isMarshal(p, name) || name == "MarshalJSON") && len(n.Args) <= 1 {
 				onReceiver := false
 				if len(n.Args) == 1 {
@@ -264,7 +278,7 @@ func (s *scanner) scanFunc(fn *ast.FuncDecl) {
 			if s.isPoolPut(n) && growable(info.TypeOf(n.Args[0]), 0) {
 				puts = append(puts, n)
 			}
-			if s.hot && !fnHot && loopDepth > 0 && timerCall(p, name) {
+			if s.hot && !fnHot && loopDepth > 0 && !isMethod && timerCall(p, name) {
 				s.add(owner, "timer-per-call", p+"."+name, n.Pos())
 			}
 			switch {
@@ -283,6 +297,8 @@ func (s *scanner) scanFunc(fn *ast.FuncDecl) {
 				s.add(owner, "compile-in-func", "regexp."+name, n.Pos())
 			case (p == "text/template" || p == "html/template") && name == "Parse" && fn.Name.Name != "init":
 				s.add(owner, "compile-in-func", "template.Parse", n.Pos())
+			case s.linked && p == "slices" && sortInstance(name):
+				s.add(owner, "sort-instance", "slices."+name, n.Pos())
 			case p == "slices" && name == "Clone" && len(n.Args) == 1 && isMessageSlice(info.TypeOf(n.Args[0])):
 				s.add(owner, "history-clone", "slices.Clone", n.Pos())
 			case p == "":
@@ -394,9 +410,36 @@ func allowedLines(pkg *packages.Package, file *ast.File) map[int]bool {
 	return out
 }
 
+// linkedPackages returns the import paths cmd/pig links, or nil when pkgs hold no cmd/pig (then every package counts as linked, as in the sample module).
+func linkedPackages(pkgs []*packages.Package) map[string]bool {
+	var entry *packages.Package
+	for _, pkg := range pkgs {
+		if strings.HasSuffix(pkg.PkgPath, "/cmd/pig") {
+			entry = pkg
+		}
+	}
+	if entry == nil {
+		return nil
+	}
+	linked := map[string]bool{}
+	var walk func(p *packages.Package)
+	walk = func(p *packages.Package) {
+		if linked[p.PkgPath] {
+			return
+		}
+		linked[p.PkgPath] = true
+		for _, dep := range p.Imports {
+			walk(dep)
+		}
+	}
+	walk(entry)
+	return linked
+}
+
 // scan returns the findings in the non-test code of pkgs, with file names relative to root.
 func scan(root string, pkgs []*packages.Package) []finding {
 	counts := map[string]*finding{}
+	linked := linkedPackages(pkgs)
 	for _, pkg := range pkgs {
 		for _, file := range pkg.Syntax {
 			name := pkg.Fset.Position(file.Pos()).Filename
@@ -411,13 +454,20 @@ func scan(root string, pkgs []*packages.Package) []finding {
 			if isToolingPath(rel) && !strings.HasPrefix(rel, "testdata/") {
 				continue
 			}
-			s := &scanner{pkg: pkg, rel: rel, hot: hotPackage(rel), allowed: allowedLines(pkg, file), counts: counts}
+			s := &scanner{pkg: pkg, rel: rel, hot: hotPackage(rel), linked: linked == nil || linked[pkg.PkgPath], allowed: allowedLines(pkg, file), counts: counts}
 			if sampleHot {
 				s.hot = true
 			}
 			for _, decl := range file.Decls {
-				if fn, ok := decl.(*ast.FuncDecl); ok && fn.Body != nil {
-					s.scanFunc(fn)
+				switch d := decl.(type) {
+				case *ast.FuncDecl:
+					if d.Body != nil {
+						s.scanFunc(d)
+					}
+				case *ast.GenDecl:
+					if d.Tok == token.VAR {
+						s.scanPackageVars(d)
+					}
 				}
 			}
 		}
@@ -434,9 +484,94 @@ func scan(root string, pkgs []*packages.Package) []finding {
 // sampleHot makes every package hot; the tests set it for their sample module.
 var sampleHot bool
 
-func load(root string, patterns []string) ([]*packages.Package, error) {
+// sortInstance reports whether name is a function of package slices that compiles a copy of the sort for the element shape of its caller: the two sorts in place, and the two that collect a sequence and sort it (slices.SortedFunc is slices.Collect and slices.SortFunc).
+func sortInstance(name string) bool {
+	switch name {
+	case "SortFunc", "SortStableFunc", "SortedFunc", "SortedStableFunc":
+		return true
+	}
+	return false
+}
+
+// scanPackageVars finds sort-instance sites in package-level var initializers (a call or func literal there runs at init and is linked like a function body).
+func (s *scanner) scanPackageVars(d *ast.GenDecl) {
+	if !s.linked {
+		return
+	}
+	for _, spec := range d.Specs {
+		vs, ok := spec.(*ast.ValueSpec)
+		if !ok {
+			continue
+		}
+		owner := "var " + vs.Names[0].Name
+		for _, v := range vs.Values {
+			ast.Inspect(v, func(n ast.Node) bool {
+				if call, ok := n.(*ast.CallExpr); ok {
+					if p, name := s.callee(call); p == "slices" && sortInstance(name) {
+						s.add(owner, "sort-instance", "slices."+name, call.Pos())
+					}
+				}
+				return true
+			})
+		}
+	}
+}
+
+// releaseGOOS are the operating systems the release binaries are built for.
+var releaseGOOS = []string{"linux", "darwin", "windows"}
+
+// findAll scans the host build in full, then loads the other release GOOS and adds the sort-instance sites only they link (a package or file linked on one OS must be covered), deduplicating by file and line.
+func findAll(root string, patterns []string) ([]finding, error) {
+	pkgs, err := load(root, patterns, nil)
+	if err != nil {
+		return nil, err
+	}
+	found := scan(root, pkgs)
+	for _, goos := range releaseGOOS {
+		if goos == runtime.GOOS {
+			continue
+		}
+		other, err := load(root, patterns, []string{"GOOS=" + goos, "CGO_ENABLED=0"})
+		if err != nil {
+			return nil, err
+		}
+		for _, f := range scan(root, other) {
+			if f.Pattern != "sort-instance" {
+				continue
+			}
+			i := slices.IndexFunc(found, func(g finding) bool { return g.key() == f.key() })
+			if i < 0 {
+				found = append(found, f)
+				continue
+			}
+			g := &found[i]
+			for _, l := range slices.Compact(slices.Clone(f.Lines)) {
+				for extra := countOf(f.Lines, l) - countOf(g.Lines, l); extra > 0; extra-- {
+					g.Lines = append(g.Lines, l)
+					g.Count++
+				}
+			}
+			slices.Sort(g.Lines)
+		}
+	}
+	slices.SortFunc(found, func(a, b finding) int { return strings.Compare(a.key(), b.key()) })
+	return found, nil
+}
+
+func countOf(lines []int, l int) int {
+	n := 0
+	for _, m := range lines {
+		if m == l {
+			n++
+		}
+	}
+	return n
+}
+
+func load(root string, patterns []string, env []string) ([]*packages.Package, error) {
 	cfg := &packages.Config{
 		Dir:  root,
+		Env:  append(os.Environ(), env...),
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
 	}
 	pkgs, err := packages.Load(cfg, patterns...)
@@ -462,7 +597,7 @@ func entry(f finding) string {
 // needsClass is true for the patterns whose baseline entries must say how hot the site is.
 func needsClass(pattern string) bool {
 	switch pattern {
-	case "json-roundtrip", "history-clone", "chan-hop", "decode-own-encode", "nested-marshal", "open-per-call", "pool-uncapped", "timer-per-call":
+	case "json-roundtrip", "history-clone", "chan-hop", "decode-own-encode", "nested-marshal", "open-per-call", "pool-uncapped", "timer-per-call", "sort-instance":
 		return true
 	}
 	return false
@@ -499,16 +634,27 @@ func compare(found []finding, baseline []finding) (grew, stale []string) {
 	return grew, stale
 }
 
+// loadBaseline reads the baseline at path. A missing file is an empty baseline: every finding is then new and fails.
+func loadBaseline(path string) (baselineFile, error) {
+	var baseline baselineFile
+	if _, err := toml.DecodeFile(path, &baseline); err != nil && !os.IsNotExist(err) {
+		return baselineFile{}, fmt.Errorf("read baseline %s: %w", path, err)
+	}
+	return baseline, nil
+}
+
 func run(root, baselinePath string, patterns []string, report, printBaseline bool) int {
-	pkgs, err := load(root, patterns)
+	found, err := findAll(root, patterns)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "perf-lint:", err)
 		return 2
 	}
-	found := scan(root, pkgs)
 	if printBaseline {
-		var previous baselineFile
-		_, _ = toml.DecodeFile(baselinePath, &previous)
+		previous, err := loadBaseline(baselinePath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "perf-lint:", err)
+			return 2
+		}
 		classes := map[string]string{}
 		for _, b := range previous.Hit {
 			classes[b.key()] = b.Class
@@ -537,8 +683,8 @@ func run(root, baselinePath string, patterns []string, report, printBaseline boo
 		}
 		return 0
 	}
-	var baseline baselineFile
-	if _, err := toml.DecodeFile(baselinePath, &baseline); err != nil && !os.IsNotExist(err) {
+	baseline, err := loadBaseline(baselinePath)
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "perf-lint:", err)
 		return 2
 	}

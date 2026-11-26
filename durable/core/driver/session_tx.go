@@ -188,6 +188,10 @@ func (p *txProxy) ScanTasks(query durable.TaskQuery, limit int, cursor durable.C
 	return decodePage[durable.TaskRecord[durable.JsonValue, durable.JsonValue, durable.JsonValue]](p.op("scanTasks", map[string]any{"query": wireTaskQuery(query), "limit": limit, "cursor": cursor}))
 }
 
+func (p *txProxy) Submission(id durable.SubmissionId) (*durable.SubmissionRecord, error) {
+	return decodeOptional[durable.SubmissionRecord](p.op("submission", map[string]any{"id": id}))
+}
+
 func (p *txProxy) SubmissionByRequest(conversationId durable.ConversationId, requestId string) (*durable.SubmissionRecord, error) {
 	return decodeOptional[durable.SubmissionRecord](p.op("submissionByRequest", map[string]any{"conversationId": conversationId, "requestId": requestId}))
 }
@@ -247,7 +251,7 @@ func (p *txProxy) CreateTaskErased(task durable.AnyTask, input durable.JsonValue
 	if options.ConversationId != nil {
 		wire["conversationId"] = *options.ConversationId
 	}
-	body := map[string]any{"task": def.Name, "version": def.Version, "input": input, "options": wire}
+	body := map[string]any{"task": def.Name, "version": corePinVersion(def), "input": input, "options": wire}
 	// The host computes initial(input) for a task whose definition it holds (PROTOCOL.md, createTask). The built-in tasks
 	// are core code: the core builds their first checkpoint.
 	if !builtinTask(def.Name) {
@@ -262,7 +266,15 @@ func (p *txProxy) CreateTaskErased(task durable.AnyTask, input durable.JsonValue
 }
 
 func (p *txProxy) CreateSubmission(create durable.SubmissionCreate) (durable.SubmissionRecord, error) {
+	if create.Notify != nil {
+		return durable.SubmissionRecord{}, notInPin("SubmissionCreate.Notify")
+	}
 	return decode[durable.SubmissionRecord](p.op("createSubmission", map[string]any{"create": create}))
+}
+
+// SignalErased is `signal`: the core has no signal rows (CONTRACT.md section 8), so it delivers nothing.
+func (p *txProxy) SignalErased(durable.TaskId, durable.AnySignalSource, string, durable.JsonValue) (durable.SignalResult, error) {
+	return "", notInPin("Tx.SignalErased")
 }
 
 func (p *txProxy) SettleSubmission(id durable.SubmissionId, settlement durable.SubmissionSettlement) error {

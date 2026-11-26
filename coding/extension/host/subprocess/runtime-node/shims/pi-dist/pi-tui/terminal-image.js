@@ -2,6 +2,7 @@ import { execSync } from "node:child_process";
 import { homedir } from "node:os";
 import { isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
+import { visibleWidth } from "../../pi-tui-utils-lazy.mjs";
 let cachedCapabilities = null;
 let capabilityOverrides = {};
 // Default cell dimensions - updated by TUI when terminal responds to query
@@ -82,7 +83,10 @@ function detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink) {
     if (process.env.WT_SESSION) {
         return { images: null, trueColor: true, hyperlinks: true };
     }
-    if (termProgram === "alacritty" || termProgram === "vscode" || termProgram === "zed") {
+    // Alacritty does not set TERM_PROGRAM. It sets TERM=alacritty when its terminfo entry is
+    // installed (otherwise xterm-256color) and ALACRITTY_WINDOW_ID on Unix and macOS.
+    const isAlacritty = termProgram === "alacritty" || term.startsWith("alacritty") || process.env.ALACRITTY_WINDOW_ID;
+    if (isAlacritty || termProgram === "vscode" || termProgram === "zed") {
         return { images: null, trueColor: true, hyperlinks: true };
     }
     if (terminalEmulator === "jetbrains-jediterm") {
@@ -159,6 +163,42 @@ export function isImageLine(line) {
     }
     // Slow path: sequence elsewhere (multi-row images have cursor-up prefix)
     return line.includes(KITTY_PREFIX) || line.includes(ITERM2_PREFIX);
+}
+/**
+ * Return the cells an image line draws over. Kitty places the image at the line and extends it
+ * downward; iTerm2 lines move the cursor up before drawing, so the image ends at the line.
+ */
+export function getImageLineExtent(line) {
+    const kittyStart = line.indexOf(KITTY_PREFIX);
+    if (kittyStart !== -1) {
+        const controls = /\x1b_G([^;]*);/.exec(line)?.[1] ?? "";
+        const columnValue = /(?:^|,)c=(\d+)(?:,|$)/.exec(controls)?.[1];
+        const columns = columnValue === undefined
+            ? getRegisteredKittyImageMetadataFromControls(controls)?.columns
+            : Number.parseInt(columnValue, 10);
+        const startCol = visibleWidth(line.slice(0, kittyStart));
+        const rows = getKittyImagePlacementRows(line) ?? 1;
+        return { firstRow: 0, lastRow: rows - 1, startCol, endCol: startCol + (columns ?? Infinity) };
+    }
+    const iterm2Start = line.indexOf(ITERM2_PREFIX);
+    if (iterm2Start === -1)
+        return undefined;
+    const before = line.slice(0, iterm2Start);
+    const moveUp = /\x1b\[(\d+)A$/.exec(before);
+    // Only a plain cell count is a known width; `auto`, pixel and percent widths depend on the image.
+    const columnValue = /[;=]width=(\d+)[;:]/.exec(line.slice(iterm2Start))?.[1];
+    // visibleWidth counts the cursor-up sequence as text, so measure only what precedes it.
+    const startCol = visibleWidth(moveUp ? before.slice(0, moveUp.index) : before);
+    return {
+        firstRow: moveUp ? -Number.parseInt(moveUp[1], 10) : 0,
+        lastRow: 0,
+        startCol,
+        endCol: startCol + (columnValue === undefined ? Infinity : Number.parseInt(columnValue, 10)),
+    };
+}
+/** Remove Kitty and iTerm2 image sequences, including iTerm2's cursor-up prefix, keeping the text. */
+export function stripImageSequences(line) {
+    return line.replace(/\x1b_G[^\x1b]*\x1b\\/g, "").replace(/(?:\x1b\[\d+A)?\x1b\]1337;File=[^\x07]*\x07/g, "");
 }
 /**
  * Generate a random image ID for Kitty graphics protocol.

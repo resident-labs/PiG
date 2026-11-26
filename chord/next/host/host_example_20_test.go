@@ -1,6 +1,6 @@
 package host
 
-// pi: packages/chord/test/next/examples/20-tables.ts
+// pi: packages/chord/test/examples/20-tables.ts
 
 import (
 	"context"
@@ -15,9 +15,9 @@ import (
 
 // --- 20-tables.ts --------------------------------------------------------------------------------------------------
 
-// Ports packages/chord/test/next/examples/20-tables.ts: the factory declares its table with `self.table(Edits)`
+// Ports packages/chord/test/examples/20-tables.ts: the factory declares its table with `self.table(Edits)`
 // (20-tables.ts:45, StoreSelf.Table) and the app closes the store it opened with `store.close(context)`
-// (packages/chord/test/next/examples/20-tables.ts:101, through the store.Store interface OpenStore returned).
+// (packages/chord/test/examples/20-tables.ts:101, through the store.Store interface OpenStore returned).
 func TestExample20Tables(t *testing.T) {
 	// Flat columns, defaults, a key of non-opt str or int columns, and indexes, which end with the key.
 	edits, err := store.DefineTable("edits", store.TableOptions{
@@ -44,8 +44,8 @@ func TestExample20Tables(t *testing.T) {
 		return h.Serve(history, func(_ *delta.JsonObject, self Self) (contracts.Implementation, error) {
 			table := self.(StoreSelf).Table(edits)
 			// A query of the table: a condition and an order (the key is the tie-break); immutable, built once.
-			open := store.NewQuery(edits).Where(func(row store.ColumnRefs) store.Condition { return store.Eq(row["done"], false) }).
-				OrderBy(func(row store.ColumnRefs) *store.ColumnRef { return row["at"] }, "desc")
+			open := store.NewQuery(edits).Where(func(row, _ store.ColumnRefs) store.Condition { return store.Eq(row["done"], false) }).
+				OrderBy(func(row, _ store.ColumnRefs) *store.ColumnRef { return row["at"] }, "desc")
 			return exImpl(nil, map[string]contracts.MethodFunction{
 				"record": exMethod(func(args *delta.JsonObject, ctx context.Context) (delta.JsonValue, error) {
 					// Writes are staged synchronously (a bad row fails here) and commit together in one step.
@@ -95,7 +95,7 @@ func TestExample20Tables(t *testing.T) {
 					return result, nil
 				}),
 				"finished": exMethod(func(_ *delta.JsonObject, ctx context.Context) (delta.JsonValue, error) {
-					count, err := table.Count(ctx, store.NewQuery(edits).Where(func(row store.ColumnRefs) store.Condition { return store.Eq(row["done"], true) }))
+					count, err := table.Count(ctx, store.NewQuery(edits).Where(func(row, _ store.ColumnRefs) store.Condition { return store.Eq(row["done"], true) }))
 					return float64(count), err
 				}),
 			}), nil

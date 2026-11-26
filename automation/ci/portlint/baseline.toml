@@ -19,18 +19,6 @@ snippet = "go func() {"
 
 [[hit]]
 check = "asyncorder"
-file = "coding/cli/rpc_mode_runtime.go"
-func = "rpcHost.bind"
-snippet = "go func() {"
-
-[[hit]]
-check = "asyncorder"
-file = "coding/session.go"
-func = "NewSession"
-snippet = "go sess.forwardAgentEvents()"
-
-[[hit]]
-check = "asyncorder"
 file = "mcp/client.go"
 func = "Client.startRequest"
 snippet = "go func() {"
@@ -147,13 +135,13 @@ snippet = "return AssistantImages{API: model.API, Provider: model.Provider, Mode
 check = "clock"
 file = "ai/models_provider.go"
 func = "CreateProvider"
-snippet = "_, err = refresh.Publish(ModelsPublication{Persist: &ModelsStoreEntry{Models: models, CheckedAt: new(float64(time.Now().UnixMilli()))}, Update: func() { mu.Lock(); dynamic = models; mu.Unlock() }})"
+snippet = "_, err = refresh.Publish(ModelsPublication{Persist: &ModelsStoreEntry{Models: models, CheckedAt: new(float64(time.Now().UnixMilli()))}, Update: func() { setDynamicModels(models) }})"
 
 [[hit]]
 check = "clock"
 file = "ai/models_runtime_stream.go"
 func = "pushModelsSetupError"
-snippet = "message := &AssistantMessage{API: model.ProviderMeta.API, Provider: modelProviderID(model), Model: model.ID, Content: []AssistantContentBlock{}, StopReason: StopReasonError, ErrorMessage: err.Error(), ErrorBeforeTimestamp: true, Timestamp: time.Now().UnixMilli()}"
+snippet = "message := &AssistantMessage{API: model.ProviderMeta.API, Provider: modelProviderID(model), Model: model.ID, Content: []AssistantContentBlock{}, StopReason: reason, ErrorMessage: err.Error(), ErrorBeforeTimestamp: true, Timestamp: time.Now().UnixMilli()}"
 
 [[hit]]
 check = "clock"
@@ -296,12 +284,6 @@ snippet = "_ = TouchUsage(finalDir, time.Now())"
 [[hit]]
 check = "clock"
 file = "coding/extension/host/runtimecell/cellcache.go"
-func = "ReusePublishedArtifact"
-snippet = "_ = TouchUsage(finalDir, time.Now())"
-
-[[hit]]
-check = "clock"
-file = "coding/extension/host/runtimecell/cellcache.go"
 func = "publishArtifact"
 snippet = "_ = TouchUsage(finalDir, time.Now())"
 count = 2
@@ -387,7 +369,7 @@ snippet = "}, CrashLogPath(m.opts.AgentDir), time.Now())"
 [[hit]]
 check = "clock"
 file = "internal/codingagent/interactive_events.go"
-func = "InteractiveMode.handleAgentEvent"
+func = "InteractiveMode.applyAgentEvent"
 snippet = "m.toolStarts[e.ToolCallID] = time.Now()"
 count = 2
 
@@ -425,14 +407,8 @@ snippet = "m.statusLastFrame = time.Now()"
 [[hit]]
 check = "clock"
 file = "internal/codingagent/interactive_transcript.go"
-func = "InteractiveMode.steerMessageWithImages"
-snippet = "Timestamp: time.Now().UnixMilli(),"
-
-[[hit]]
-check = "clock"
-file = "internal/codingagent/interactive_transcript.go"
-func = "InteractiveMode.followUpMessageWithImages"
-snippet = "Timestamp: time.Now().UnixMilli(),"
+func = "InteractiveMode.queuedUserMessage"
+snippet = "return agent.AgentMessage{User: &agent.UserMessage{Role: agent.RoleUser, Content: promptContent(text, images), Timestamp: time.Now().UnixMilli()}}"
 
 [[hit]]
 check = "clock"
@@ -478,12 +454,6 @@ snippet = "creds.Expires = time.Now().Add(time.Hour).UnixMilli()"
 
 [[hit]]
 check = "clock"
-file = "internal/codingagent/radius_login_selector.go"
-func = "newRadiusLoginMenu"
-snippet = "menu := &radiusLoginMenu{ExtensionSelectorComponent: selector, label: label, text: text, start: time.Now(), now: time.Now, stop: make(chan struct{})}"
-
-[[hit]]
-check = "clock"
 file = "internal/codingagent/radius_models.go"
 func = "ModelRegistry.resolveRefreshCredential"
 snippet = "if float64(time.Now().UnixMilli()) < stored.ExpiresMillis() {"
@@ -492,19 +462,13 @@ snippet = "if float64(time.Now().UnixMilli()) < stored.ExpiresMillis() {"
 check = "clock"
 file = "internal/codingagent/radius_models.go"
 func = "ModelRegistry.refreshRadiusOAuth"
-snippet = "if current == nil || current.Type != ai.CredentialOAuth || float64(time.Now().UnixMilli()) < current.ExpiresMillis() {"
+snippet = "return float64(time.Now().UnixMilli()) >= current.ExpiresMillis()"
 
 [[hit]]
 check = "clock"
 file = "internal/codingagent/remote_catalog_provider.go"
 func = "refreshRemoteCatalog"
 snippet = "now := func() float64 { return float64(time.Now().UnixMilli()) }"
-
-[[hit]]
-check = "clock"
-file = "internal/codingagent/session.go"
-func = "Session.appendCompaction"
-snippet = "now := time.Now().UTC()"
 
 [[hit]]
 check = "clock"
@@ -719,7 +683,7 @@ snippet = "close(entry.released)"
 [[hit]]
 check = "doubleclose"
 file = "coding/cli/rpc_shutdown.go"
-func = "watchForcedTermination"
+func = "watchRepeatedTermination"
 snippet = "defer close(w.done)"
 
 [[hit]]
@@ -867,30 +831,6 @@ check = "emptydrop"
 file = "agent/proxy.go"
 func = "(decl)"
 snippet = "Headers                       map[string]string                `json:\"headers,omitempty\"`"
-
-[[hit]]
-check = "emptydrop"
-file = "ai/anthropic.go"
-func = "(decl)"
-snippet = "Betas      []string          `json:\"betas,omitempty\" requestsplice:\"read\"`"
-
-[[hit]]
-check = "emptydrop"
-file = "ai/anthropic.go"
-func = "(decl)"
-snippet = "System     []anthSystemBlock `json:\"system,omitempty\"`"
-
-[[hit]]
-check = "emptydrop"
-file = "ai/anthropic.go"
-func = "(decl)"
-snippet = "Tools      []anthTool        `json:\"tools,omitempty\"`"
-
-[[hit]]
-check = "emptydrop"
-file = "ai/anthropic.go"
-func = "(decl)"
-snippet = "Fallbacks   []anthFallback `json:\"fallbacks,omitempty\"`"
 
 [[hit]]
 check = "emptydrop"
@@ -1046,7 +986,7 @@ snippet = "ChatTemplateArgs            map[string]any `json:\"chatTemplateArgs,o
 check = "emptydrop"
 file = "ai/openai.go"
 func = "(decl)"
-snippet = "AllowedFallbackModels          []AnthropicAllowedFallbackModel `json:\"allowedFallbackModels,omitempty\"`"
+snippet = "AllowedFallbackModels  []AnthropicAllowedFallbackModel `json:\"allowedFallbackModels,omitempty\"`"
 
 [[hit]]
 check = "emptydrop"
@@ -1722,18 +1662,6 @@ snippet = "Model []ai.Message  `json:\"model,omitempty\"`"
 check = "emptydrop"
 file = "durable/types.go"
 func = "(decl)"
-snippet = "On         []TaskId        `json:\"on,omitempty\"`"
-
-[[hit]]
-check = "emptydrop"
-file = "durable/types.go"
-func = "(decl)"
-snippet = "Memos map[string]JsonValue `json:\"memos,omitempty\"`"
-
-[[hit]]
-check = "emptydrop"
-file = "durable/types.go"
-func = "(decl)"
 snippet = "Ops     []Op                `json:\"ops,omitempty\"`"
 
 [[hit]]
@@ -1996,12 +1924,6 @@ snippet = "go q.drain()"
 
 [[hit]]
 check = "golifetime"
-file = "coding/extension/host/inproc/mcp_servers.go"
-func = "Runner.onMcpServersChange"
-snippet = "go r.drainMcpServersChanges()"
-
-[[hit]]
-check = "golifetime"
 file = "coding/extension/host/inproc/ui_prompt.go"
 func = "Runner.enqueueUIPromptLocked"
 snippet = "go r.drainUIPromptEvents()"
@@ -2017,12 +1939,6 @@ check = "golifetime"
 file = "coding/extension/host/subprocess/host_calls.go"
 func = "callLanes.pushCall"
 snippet = "go l.drain(lane, current)"
-
-[[hit]]
-check = "golifetime"
-file = "coding/extension/host/subprocess/push_proxy.go"
-func = "PushProxy.Render"
-snippet = "go p.onWidthChange(width)"
 
 [[hit]]
 check = "golifetime"
@@ -2164,34 +2080,9 @@ snippet = "go ct.run()"
 
 [[hit]]
 check = "golifetime"
-file = "tui/editor.go"
-func = "Editor.kickFileAutocomplete"
-snippet = "go work()"
-
-[[hit]]
-check = "golifetime"
 file = "tui/theme_watcher.go"
 func = "StartThemeWatcher"
 snippet = "go w.run()"
-
-[[hit]]
-check = "golifetime"
-file = "tui/tui.go"
-func = "TuiMainScreen.doRender"
-snippet = "go t.onWidthChange(width)"
-
-[[hit]]
-check = "golifetime"
-file = "tui/tui.go"
-func = "TuiMainScreen.doRender"
-snippet = "go t.onHeightChange(height)"
-count = 2
-
-[[hit]]
-check = "golifetime"
-file = "tui/tui_alt_screen.go"
-func = "TuiAltScreen.doRender"
-snippet = "go t.notifyGeometryChanges()"
 
 [[hit]]
 check = "gorecover"
@@ -2497,12 +2388,6 @@ snippet = "_ = enc.Encode(b.Arguments)"
 [[hit]]
 check = "mapkeyorder"
 file = "agent/messages.go"
-func = "customMessageContent"
-snippet = "raw, err := json.Marshal(map[string]any{\"role\": RoleUser, \"content\": content})"
-
-[[hit]]
-check = "mapkeyorder"
-file = "agent/messages.go"
 func = "customMessageText"
 snippet = "b, _ := json.Marshal(m)"
 
@@ -2511,12 +2396,6 @@ check = "mapkeyorder"
 file = "ai/classifier_wire.go"
 func = "ClassifierContext.MarshalJSON"
 snippet = "stateJSON, err := json.Marshal(state)"
-
-[[hit]]
-check = "mapkeyorder"
-file = "ai/constrained_sampling.go"
-func = "makeStrictJSONSchemaWithOrder"
-snippet = "body, err := json.Marshal(parameters)"
 
 [[hit]]
 check = "mapkeyorder"
@@ -2642,7 +2521,7 @@ snippet = "args, err := json.Marshal(map[string]any{\"kind\": kind, \"api\": api
 check = "mapkeyorder"
 file = "coding/extension/host/subprocess/render_proxy.go"
 func = "renderProxyComponent.request"
-snippet = "args, err := json.Marshal(map[string]any{"
+snippet = "args, err := json.Marshal(fields)"
 
 [[hit]]
 check = "mapkeyorder"
@@ -2815,24 +2694,6 @@ snippet = "result, _ := json.Marshal(map[string]any{\"commands\": commands})"
 [[hit]]
 check = "mapkeyorder"
 file = "coding/extension/host/subprocess/ui_bridge.go"
-func = "UIBridge.handleSetModel"
-snippet = "result, _ := json.Marshal(map[string]any{\"success\": false, \"error\": \"not ready\"})"
-
-[[hit]]
-check = "mapkeyorder"
-file = "coding/extension/host/subprocess/ui_bridge.go"
-func = "UIBridge.handleSetModel"
-snippet = "result, _ := json.Marshal(map[string]any{\"success\": false, \"error\": err.Error()})"
-
-[[hit]]
-check = "mapkeyorder"
-file = "coding/extension/host/subprocess/ui_bridge.go"
-func = "UIBridge.handleSetModel"
-snippet = "result, _ := json.Marshal(map[string]any{\"success\": ok})"
-
-[[hit]]
-check = "mapkeyorder"
-file = "coding/extension/host/subprocess/ui_bridge.go"
 func = "UIBridge.handleGetThinkingLevel"
 snippet = "result, _ := json.Marshal(map[string]any{\"level\": \"\"})"
 
@@ -2935,27 +2796,9 @@ snippet = "return json.Marshal(map[string]int{\"top\": m.Top, \"right\": m.Right
 
 [[hit]]
 check = "mapkeyorder"
-file = "coding/session_extension_hooks.go"
-func = "Session.toolCallHook"
-snippet = "beforeValues, _ := json.Marshal(input)"
-
-[[hit]]
-check = "mapkeyorder"
-file = "coding/session_extension_hooks.go"
-func = "Session.toolCallHook"
-snippet = "if afterValues, err := json.Marshal(input); err == nil && (!bytes.Equal(beforeValues, afterValues) || (wireInput != nil && string(*wireInput) != before)) {"
-
-[[hit]]
-check = "mapkeyorder"
 file = "durable/durabletest/storage_conformance.go"
 func = "CreateStorageConformance"
 snippet = "encoded := must(json.Marshal(*first.Next))"
-
-[[hit]]
-check = "mapkeyorder"
-file = "internal/codingagent/compaction/compaction.go"
-func = "customMessageToLlm"
-snippet = "raw, err := json.Marshal(map[string]any{\"role\": agent.RoleUser, \"content\": custom[\"content\"]})"
 
 [[hit]]
 check = "mapkeyorder"
@@ -2986,12 +2829,6 @@ check = "mapkeyorder"
 file = "internal/codingagent/interactive_extensions.go"
 func = "subprocessStreamOptions"
 snippet = "data, err := json.Marshal(object)"
-
-[[hit]]
-check = "mapkeyorder"
-file = "internal/codingagent/interactive_radius_mcp.go"
-func = "radiusMcpServerConfig"
-snippet = "auth, err := json.Marshal(map[string]string{\"provider\": providerID})"
 
 [[hit]]
 check = "mapkeyorder"
@@ -3115,12 +2952,6 @@ snippet = "content, _ := json.Marshal(parts)"
 
 [[hit]]
 check = "nilslicenull"
-file = "ai/openai_responses.go"
-func = "openAIResponsesProvider.Stream"
-snippet = "inputJSON, marshalErr := json.Marshal(msgs)"
-
-[[hit]]
-check = "nilslicenull"
 file = "coding/extension/host/subprocess/packed_node.go"
 func = "buildNodePackedCell"
 snippet = "data, err := json.Marshal(manifest)"
@@ -3166,12 +2997,6 @@ check = "numbers"
 file = "ai/faux.go"
 func = "FauxProviderHandle.estimateUsage"
 snippet = "usage.CacheRead = (common + 3) / 4"
-
-[[hit]]
-check = "numbers"
-file = "ai/google.go"
-func = "getGeminiMajorVersion"
-snippet = "n, err := strconv.ParseFloat(m[1], 64)"
 
 [[hit]]
 check = "numbers"
@@ -3307,18 +3132,6 @@ snippet = "port := int(*aux.CallbackPort)"
 
 [[hit]]
 check = "numbers"
-file = "coding/extension/mcp_servers.go"
-func = "validateOAuth"
-snippet = "if err := json.Unmarshal(v, &n); err != nil || len(v) == 0 || v[0] == '\"' || n != float64(int(n)) || n < 1 || n > 65535 {"
-
-[[hit]]
-check = "numbers"
-file = "coding/extension/mcp_servers.go"
-func = "validateOAuth"
-snippet = "port, hasPort = int(n), true"
-
-[[hit]]
-check = "numbers"
 file = "coding/mcpext/cli.go"
 func = "mcpCLI.login"
 snippet = "delay := time.Duration(timeoutMs * float64(time.Millisecond))"
@@ -3337,27 +3150,9 @@ snippet = "perServer = min(maxServerDescriptionChars, (MaxServersSectionChars-si
 
 [[hit]]
 check = "numbers"
-file = "coding/mcpext/oauth.go"
-func = "newCallbackSettings"
-snippet = "p, _ := strconv.Atoi(u.Port)"
-
-[[hit]]
-check = "numbers"
-file = "coding/mcpext/oauth.go"
-func = "SignInMcpServer"
-snippet = "if p, err := strconv.Atoi(u.Port); err == nil && p != 0 {"
-
-[[hit]]
-check = "numbers"
 file = "coding/mcpext/runtime.go"
 func = "Connection.Timeout"
 snippet = "return time.Duration(seconds * float64(time.Second))"
-
-[[hit]]
-check = "numbers"
-file = "coding/mcpext/tools.go"
-func = "LimitMcpContent"
-snippet = "tokens := (truncation.TotalBytes + 3) / 4"
 
 [[hit]]
 check = "numbers"
@@ -3739,12 +3534,6 @@ snippet = "return int(jsnumber.Round(color[0]))<<16 | int(jsnumber.Round(color[1
 
 [[hit]]
 check = "numbers"
-file = "internal/codingagent/radius_login_selector.go"
-func = "radiusShimmer"
-snippet = "band := int(math.Floor(position / radiusCharsPerColor))"
-
-[[hit]]
-check = "numbers"
 file = "internal/codingagent/session_file.go"
 func = "truthySessionLine"
 snippet = "number, err := strconv.ParseFloat(string(line), 64)"
@@ -3973,12 +3762,6 @@ snippet = "grow = int(math.Floor(float64(max(0, natural[i]-minWidths[i])) / floa
 
 [[hit]]
 check = "numbers"
-file = "tui/markdown_list.go"
-func = "parseMarkdownList"
-snippet = "list.start, _ = strconv.Atoi(marker[:len(marker)-1])"
-
-[[hit]]
-check = "numbers"
 file = "tui/system_theme.go"
 func = "hexOfRgb"
 snippet = "digits := strconv.FormatInt(int64(jsnumber.Round(channel)), 16)"
@@ -4072,12 +3855,6 @@ check = "pathseparators"
 file = "coding/extension/host/runtimecell/hash_go_module.go"
 func = "hashGoModuleDir"
 snippet = "case goSourceExtensions[path.Ext(name)]:"
-
-[[hit]]
-check = "pathseparators"
-file = "coding/extension/host/runtimecell/hash_go_module.go"
-func = "hashGoModuleDir"
-snippet = "if err := add(path.Join(dir, name)); err != nil {"
 
 [[hit]]
 check = "pathseparators"
@@ -4812,12 +4589,6 @@ snippet = "return encoded[0:8] + \"-\" + encoded[8:12] + \"-\" + encoded[12:16] 
 
 [[hit]]
 check = "utf16units"
-file = "codemode/declarations.go"
-func = "resolveRef"
-snippet = "for segment := range strings.SplitSeq(ref[2:], \"/\") {"
-
-[[hit]]
-check = "utf16units"
 file = "codemode/source.go"
 func = "ParseCodemodeSource"
 snippet = "options, err := parseOptions(jsstring.Trim(trimmed[len(CodemodeOptionsPrefix):]))"
@@ -4851,24 +4622,6 @@ check = "utf16units"
 file = "coding/mcpext/runtime.go"
 func = "expandHome"
 snippet = "return filepath.Join(home, value[2:])"
-
-[[hit]]
-check = "utf16units"
-file = "coding/mcpext/tools.go"
-func = "CreateMcpToolName"
-snippet = "if len(name) <= maxToolNameLength && (isTaken == nil || !isTaken(name)) {"
-
-[[hit]]
-check = "utf16units"
-file = "coding/mcpext/tools.go"
-func = "CreateMcpToolName"
-snippet = "hash := hex.EncodeToString(digest[:])[:8]"
-
-[[hit]]
-check = "utf16units"
-file = "coding/mcpext/tools.go"
-func = "CreateMcpToolName"
-snippet = "return name[:min(len(name), maxToolNameLength-len(hash)-1)] + \"_\" + hash"
 
 [[hit]]
 check = "utf16units"
@@ -4935,13 +4688,13 @@ count = 2
 [[hit]]
 check = "utf16units"
 file = "internal/codingagent/mermaid_transform.go"
-func = "transformMermaidBlocks"
+func = "transformMermaidBlocksCounted"
 snippet = "out.WriteString(markdown[offset:fence.start])"
 
 [[hit]]
 check = "utf16units"
 file = "internal/codingagent/mermaid_transform.go"
-func = "transformMermaidBlocks"
+func = "transformMermaidBlocksCounted"
 snippet = "out.WriteString(markdown[offset:])"
 
 [[hit]]
@@ -5108,12 +4861,6 @@ snippet = "text = text[2:]"
 
 [[hit]]
 check = "utf16units"
-file = "tui/markdown.go"
-func = "parseMarkdownFenceOpen"
-snippet = "if len(line)-len(trimmed) > 3 || len(trimmed) < 3 || trimmed[0] != '`' && trimmed[0] != '~' {"
-
-[[hit]]
-check = "utf16units"
 file = "tui/system_theme.go"
 func = "hexOfRgb"
 snippet = "if len(digits) < 2 {"
@@ -5140,7 +4887,7 @@ snippet = "return a.load(context.Background())"
 check = "ctxbackground"
 file = "ai/auth.go"
 func = "AuthStorage.credential"
-snippet = "creds, err := a.readLatest(context.Background())"
+snippet = "return a.credentialIn(context.Background(), provider)"
 
 [[hit]]
 check = "ctxbackground"
@@ -5303,30 +5050,6 @@ check = "ctxbackground"
 file = "ai/radius.go"
 func = "newRadiusParts"
 snippet = "ctx = context.Background()"
-
-[[hit]]
-check = "ctxbackground"
-file = "coding/cli/auth_commands.go"
-func = "runLoginCommand"
-snippet = "_, err = store.Modify(context.Background(), provider.ID(), func(*ai.Credential) (*ai.Credential, error) { return &credential, nil })"
-
-[[hit]]
-check = "ctxbackground"
-file = "coding/cli/auth_commands.go"
-func = "runLoginCommand"
-snippet = "if err := store.Delete(context.Background(), providerID); err != nil {"
-
-[[hit]]
-check = "ctxbackground"
-file = "coding/cli/auth_contributions.go"
-func = "discoverAuthContributionsFor"
-snippet = "ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)"
-
-[[hit]]
-check = "ctxbackground"
-file = "coding/cli/auth_run.go"
-func = "runParsedAuthCommand"
-snippet = "ctx, cancel := context.WithTimeout(context.Background(), credentialPrintTimeout)"
 
 [[hit]]
 check = "ctxbackground"
@@ -5538,12 +5261,6 @@ check = "ctxbackground"
 file = "coding/extension/factoryload/api.go"
 func = "api.RegisterNativeProvider"
 snippet = "if err := a.runtime.RegisterNativeProvider(context.Background(), provider, a.ext.Path); err != nil {"
-
-[[hit]]
-check = "ctxbackground"
-file = "coding/extension/host/cellpack/node_cell.go"
-func = "extractNodeCell"
-snippet = "_, err := runtimecell.PublishArtifact(context.Background(), entryDir, nodeArchiveMarker, digest, nodeLanguage, func(scratch string) (string, error) {"
 
 [[hit]]
 check = "ctxbackground"
@@ -5877,12 +5594,6 @@ snippet = "if apiKey, err = resolveAPIKey(context.Background()); err != nil {"
 
 [[hit]]
 check = "ctxbackground"
-file = "coding/model_runtime_typed.go"
-func = "ModelRuntime.failedStream"
-snippet = "runtime.fail(context.Background(), outer, model, err)"
-
-[[hit]]
-check = "ctxbackground"
 file = "coding/piglet/pull_cli.go"
 func = "cmdPull"
 snippet = "result, err := pigletrelease.Pull(context.Background(), ref, pigletrelease.Options{"
@@ -6087,48 +5798,6 @@ snippet = "id, err := durable.Commit(context.Background(), kernel, func(tx durab
 
 [[hit]]
 check = "ctxbackground"
-file = "chord/sqlite/node/node.go"
-func = "NewDatabaseSync"
-snippet = "conn, err := db.Conn(context.Background())"
-
-[[hit]]
-check = "ctxbackground"
-file = "chord/sqlite/node/node.go"
-func = "NewDatabaseSync"
-snippet = "context.Background(), fmt.Sprintf(\"PRAGMA busy_timeout = %d\", max(options.TimeoutMs, 0)),"
-
-[[hit]]
-check = "ctxbackground"
-file = "chord/sqlite/node/node.go"
-func = "DatabaseSync.Exec"
-snippet = "_, err = conn.ExecContext(context.Background(), sqlText)"
-
-[[hit]]
-check = "ctxbackground"
-file = "chord/sqlite/node/node.go"
-func = "DatabaseSync.Prepare"
-snippet = "statement, err := conn.PrepareContext(context.Background(), sqlText)"
-
-[[hit]]
-check = "ctxbackground"
-file = "chord/sqlite/node/node.go"
-func = "StatementSync.Run"
-snippet = "_, err := statement.statement.ExecContext(context.Background(), params...)"
-
-[[hit]]
-check = "ctxbackground"
-file = "chord/sqlite/node/node.go"
-func = "StatementSync.EachText"
-snippet = "rows, err := statement.statement.QueryContext(context.Background(), params...)"
-
-[[hit]]
-check = "ctxbackground"
-file = "chord/sqlite/node/node.go"
-func = "StatementSync.query"
-snippet = "rows, err := statement.statement.QueryContext(context.Background(), params...)"
-
-[[hit]]
-check = "ctxbackground"
 file = "env/connection.go"
 func = "NewConnection"
 snippet = "lifetime, cancel := context.WithCancel(context.Background())"
@@ -6189,6 +5858,12 @@ snippet = "return context.Background()"
 
 [[hit]]
 check = "ctxbackground"
+file = "internal/codingagent/bug_report.go"
+func = "ModelRegistry.BugReportProviderInfo"
+snippet = "UsingOAuth:            r.hasStoredOAuth(context.Background(), providerID),"
+
+[[hit]]
+check = "ctxbackground"
 file = "internal/codingagent/cache_warmer.go"
 func = "NewCacheWarmer"
 snippet = "lifetime, dispose := context.WithCancel(context.Background())"
@@ -6196,7 +5871,7 @@ snippet = "lifetime, dispose := context.WithCancel(context.Background())"
 [[hit]]
 check = "ctxbackground"
 file = "internal/codingagent/cache_warmer.go"
-func = "CacheWarmer.Start"
+func = "CacheWarmer.StartCapturing"
 snippet = "ctx, cancel := context.WithCancel(context.Background())"
 
 [[hit]]
@@ -6251,7 +5926,7 @@ snippet = "_, _ = runner.Emit(context.Background(), extension.AgentStartEvent{"
 check = "ctxbackground"
 file = "internal/codingagent/event_bridge.go"
 func = "emitAgentEnd"
-snippet = "_, _ = runner.Emit(context.Background(), extension.AgentEndEvent{"
+snippet = "_, _ = runner.Emit(withEventSequences(context.Background(), sequence, sequences), extension.AgentEndEvent{"
 
 [[hit]]
 check = "ctxbackground"
@@ -6269,7 +5944,7 @@ snippet = "_, _ = runner.Emit(context.Background(), extension.TurnStartEvent{"
 check = "ctxbackground"
 file = "internal/codingagent/event_bridge.go"
 func = "emitTurnEnd"
-snippet = "_, _ = runner.Emit(context.Background(), extension.TurnEndEvent{"
+snippet = "_, _ = runner.Emit(withEventSequences(context.Background(), sequence, sequences), extension.TurnEndEvent{"
 
 [[hit]]
 check = "ctxbackground"
@@ -6357,8 +6032,8 @@ snippet = "return m.extensionNavigateTreeContext(context.Background(), targetID,
 
 [[hit]]
 check = "ctxbackground"
-file = "internal/codingagent/interactive_input.go"
-func = "InteractiveMode.syncExtensionSlashCommands"
+file = "internal/codingagent/interactive_turn.go"
+func = "InteractiveMode.startExtensionCommand"
 snippet = "baseCtx = context.Background()"
 
 [[hit]]
@@ -6417,6 +6092,12 @@ snippet = "runCtx, abort := context.WithCancelCause(context.Background())"
 
 [[hit]]
 check = "ctxbackground"
+file = "internal/codingagent/model_availability.go"
+func = "availabilityPassContext"
+snippet = "return ai.WithFileReadSnapshot(context.Background())"
+
+[[hit]]
+check = "ctxbackground"
 file = "internal/codingagent/model_refresh_background.go"
 func = "ModelRegistry.uncoverRegistrationRefresh"
 snippet = "r.StartRegistrationRefresh(context.Background())"
@@ -6431,7 +6112,7 @@ snippet = "r.StartRegistrationRefresh(context.Background())"
 check = "ctxbackground"
 file = "internal/codingagent/model_registry.go"
 func = "ModelRegistry.providerEnv"
-snippet = "env, err := ai.CredentialStoreProviderEnv(context.Background(), r.credentialStore, providerID)"
+snippet = "return r.providerEnvIn(context.Background(), providerID)"
 
 [[hit]]
 check = "ctxbackground"
@@ -6454,8 +6135,8 @@ snippet = "r.RefreshCatalogs(context.Background(), CatalogRefreshOptions{})"
 [[hit]]
 check = "ctxbackground"
 file = "internal/codingagent/model_registry.go"
-func = "ModelRegistry.accountModelFilter"
-snippet = "credential, found, err := ai.ReadRawCredential(context.Background(), store, providerID)"
+func = "ModelRegistry.HasConfiguredAuth"
+snippet = "return r.hasConfiguredAuth(context.Background(), providerID)"
 
 [[hit]]
 check = "ctxbackground"
@@ -6466,26 +6147,8 @@ snippet = "fallback = ai.CredentialStoreAuthStatus(context.Background(), r.crede
 [[hit]]
 check = "ctxbackground"
 file = "internal/codingagent/model_registry.go"
-func = "ModelRegistry.hasStoredOAuth"
-snippet = "cred, err := r.credentialStore.Read(context.Background(), providerID)"
-
-[[hit]]
-check = "ctxbackground"
-file = "internal/codingagent/model_registry.go"
 func = "ModelRegistry.hasStoredCredential"
 snippet = "_, ok, _ := ai.ReadRawCredential(context.Background(), r.credentialStore, providerID)"
-
-[[hit]]
-check = "ctxbackground"
-file = "internal/codingagent/model_registry.go"
-func = "ModelRegistry.checkProviderAuth"
-snippet = "check, err := ai.CheckProviderAuth(context.Background(), providerID, auth, store, ai.DefaultProviderAuthContext())"
-
-[[hit]]
-check = "ctxbackground"
-file = "internal/codingagent/model_registry.go"
-func = "ModelRegistry.storedCredentialLocked"
-snippet = "credential, err := r.credentialStore.Read(context.Background(), providerID)"
 
 [[hit]]
 check = "ctxbackground"
@@ -6533,7 +6196,7 @@ snippet = "controller.disposeError = controller.options.RunOnMain(context.Backgr
 check = "ctxbackground"
 file = "internal/codingagent/radius_models.go"
 func = "ModelRegistry.storedCredential"
-snippet = "credential, err := storage.Read(context.Background(), providerID)"
+snippet = "return r.storedCredentialIn(context.Background(), providerID)"
 
 [[hit]]
 check = "ctxbackground"
@@ -6759,18 +6422,6 @@ snippet = "ctx, cancel := context.WithTimeout(context.Background(), tmuxProbeTim
 
 [[hit]]
 check = "jsonclone"
-file = "agent/messages.go"
-func = "customMessageContent"
-snippet = "if json.Unmarshal(raw, &decoded) != nil || decoded.User == nil {"
-
-[[hit]]
-check = "jsonclone"
-file = "ai/constrained_sampling.go"
-func = "makeStrictJSONSchemaWithOrder"
-snippet = "if err := json.Unmarshal(body, &cloned); err != nil {"
-
-[[hit]]
-check = "jsonclone"
 file = "ai/credential_json.go"
 func = "unmarshalCredentialFields"
 snippet = "return expires, expiry, json.Unmarshal(encoded, target)"
@@ -6786,12 +6437,6 @@ check = "jsonclone"
 file = "ai/credential_json.go"
 func = "OAuthCredentials.marshalFields"
 snippet = "if err := json.Unmarshal(data, &known); err != nil {"
-
-[[hit]]
-check = "jsonclone"
-file = "ai/google.go"
-func = "marshalGeminiParameters"
-snippet = "if err := json.Unmarshal(encoded, &params); err != nil {"
 
 [[hit]]
 check = "jsonclone"
@@ -6903,21 +6548,9 @@ snippet = "if raw, err := json.Marshal(entry); err != nil || json.Unmarshal(raw,
 
 [[hit]]
 check = "jsonclone"
-file = "coding/session_extension_hooks.go"
-func = "sameContextMessages"
-snippet = "if json.Unmarshal(left, &leftValue) != nil || json.Unmarshal(right, &rightValue) != nil || !reflect.DeepEqual(leftValue, rightValue) {"
-
-[[hit]]
-check = "jsonclone"
 file = "coding/session_extension_replacement.go"
 func = "Session.beforeExtensionReplacement"
 snippet = "if err := json.Unmarshal(encoded, &value); err != nil {"
-
-[[hit]]
-check = "jsonclone"
-file = "coding/session_run_state.go"
-func = "extensionUserMessageContent"
-snippet = "if err := json.Unmarshal(encoded, &wire); err != nil {"
 
 [[hit]]
 check = "jsonclone"
@@ -6972,12 +6605,6 @@ check = "jsonclone"
 file = "internal/codingagent/bug_report.go"
 func = "RedactBugReportJSON"
 snippet = "decoder := json.NewDecoder(bytes.NewReader(data))"
-
-[[hit]]
-check = "jsonclone"
-file = "internal/codingagent/compaction/compaction.go"
-func = "customMessageToLlm"
-snippet = "if json.Unmarshal(raw, &decoded) != nil || decoded.User == nil {"
 
 [[hit]]
 check = "jsonclone"
@@ -7059,12 +6686,6 @@ snippet = "if err := json.Unmarshal(encoded, &result); err != nil {"
 
 [[hit]]
 check = "jsonclone"
-file = "internal/codingagent/tool_builtin_renderers.go"
-func = "readTruncation"
-snippet = "if json.Unmarshal(encoded, &truncation) != nil {"
-
-[[hit]]
-check = "jsonclone"
 file = "internal/codingagent/tool_codemode_renderer.go"
 func = "codemodeRenderResult"
 snippet = "_ = json.Unmarshal(raw, &details)"
@@ -7080,12 +6701,6 @@ check = "jsonclone"
 file = "internal/codingagent/tool_render_list.go"
 func = "listDetailsFrom"
 snippet = "if data, err := json.Marshal(d); err == nil && json.Unmarshal(data, &wire) == nil {"
-
-[[hit]]
-check = "jsonclone"
-file = "internal/codingagent/tool_result_content.go"
-func = "toolResultBlockFields"
-snippet = "if err := json.Unmarshal(raw, &fields); err != nil {"
 
 [[hit]]
 check = "jsonclone"
@@ -7180,13 +6795,13 @@ snippet = "if err := json.Unmarshal(encoded, &wire); err != nil {"
 [[hit]]
 check = "hotpathjson"
 file = "coding/extension/host/subprocess/host.go"
-func = "Host.pushStateTo"
+func = "Host.pushState"
 snippet = "leanBody, err := json.Marshal(stateUpdateBody{State: &lean})"
 
 [[hit]]
 check = "hotpathjson"
 file = "coding/extension/host/subprocess/host.go"
-func = "Host.pushStateTo"
+func = "Host.pushState"
 snippet = "if out, err = json.Marshal(stateUpdateBody{State: &partial}); err != nil {"
 
 [[hit]]

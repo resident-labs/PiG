@@ -11,13 +11,13 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/sqlite/node"
 )
 
-// Ports packages/chord/test/next/store/applier.test.ts
+// Ports packages/chord/test/store/applier.test.ts
 //
 // Tests of the applier (slice 6a §13): recorded writes applied as recorded, checked against the store's own records:
 // table names and columns by the name rules, indexes, rows against their recorded columns (NULL cells, defaults kept
 // as stored, booleans, json(...) cells as JSON text) and documents with their ids kept.
 //
-// pi: packages/chord/src/next/store/applier.ts
+// pi: packages/chord/src/store/applier.ts
 
 const applierTable = "app.store:edits"
 
@@ -109,6 +109,67 @@ func TestApplier(t *testing.T) {
 					})}
 				},
 				"a json(...) column has a version and a fingerprint",
+			},
+			{
+				"two host columns",
+				func() []StoreWrite {
+					return []StoreWrite{applierTableWrite(func(write *TableDefinitionWrite) {
+						write.Columns = ColumnRecords{
+							{Name: "id", Record: ColumnRecord{Type: ColStr}},
+							{Name: "a", Record: ColumnRecord{Type: ColStr, Host: new("session")}},
+							{Name: "b", Record: ColumnRecord{Type: ColStr, Host: new("user")}},
+						}
+					})}
+				},
+				"more than one host column",
+			},
+			{
+				"a host column that is opt",
+				func() []StoreWrite {
+					return []StoreWrite{applierTableWrite(func(write *TableDefinitionWrite) {
+						write.Columns = ColumnRecords{
+							{Name: "id", Record: ColumnRecord{Type: ColStr}},
+							{Name: "a", Record: ColumnRecord{Type: ColStr, Host: new("session"), Optional: true}},
+						}
+					})}
+				},
+				"a host column is a non-opt str column without a default",
+			},
+			{
+				"a host column of an int type",
+				func() []StoreWrite {
+					return []StoreWrite{applierTableWrite(func(write *TableDefinitionWrite) {
+						write.Columns = ColumnRecords{
+							{Name: "id", Record: ColumnRecord{Type: ColStr}},
+							{Name: "a", Record: ColumnRecord{Type: ColInt, Host: new("session")}},
+						}
+					})}
+				},
+				"a host column is a non-opt str column without a default",
+			},
+			{
+				"a host kind that is no name",
+				func() []StoreWrite {
+					return []StoreWrite{applierTableWrite(func(write *TableDefinitionWrite) {
+						write.Columns = ColumnRecords{
+							{Name: "id", Record: ColumnRecord{Type: ColStr}},
+							{Name: "a", Record: ColumnRecord{Type: ColStr, Host: new("Session")}},
+						}
+					})}
+				},
+				"expected lowercase",
+			},
+			{
+				"a host kind that is empty",
+				func() []StoreWrite {
+					return []StoreWrite{applierTableWrite(func(write *TableDefinitionWrite) {
+						write.Columns = ColumnRecords{
+							{Name: "id", Record: ColumnRecord{Type: ColStr}},
+							{Name: "a", Record: ColumnRecord{Type: ColStr, Host: new("")}},
+						}
+					})}
+				},
+				"host kind",
 			},
 			{
 				"a default of another type",

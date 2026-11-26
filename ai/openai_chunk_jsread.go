@@ -21,6 +21,10 @@ import (
 // notIterableToolCalls is the TypeError V8 throws for `for (const toolCall of choice.delta.tool_calls)` when the value is not iterable (:640-641).
 const notIterableToolCalls = "choice.delta.tool_calls is not iterable"
 
+// nullChoiceFinishReason is the TypeError V8 throws in openai 7.59.0 normalizeChatCompletionChunk
+// (lib/chat-completions/streaming.mjs:9) when chunk.choices holds a null element: `choice.finish_reason ?? null`.
+const nullChoiceFinishReason = "Cannot read properties of null (reading 'finish_reason')"
+
 func jsTruthy(value any) bool {
 	switch value := value.(type) {
 	case nil:
@@ -106,6 +110,15 @@ func normalizeOpenAIChunkMembers(chunk map[string]any, read *openAIChunkRead) bo
 	if !isArray || len(choices) == 0 {
 		delete(chunk, "choices")
 		return true
+	}
+	// openai 7.59.0 normalizeChatCompletionChunk maps every element of chunk.choices and reads
+	// choice.finish_reason without a null check, throwing before Pi sees the chunk.
+	for _, element := range choices {
+		if element == nil {
+			read.thrown = nullChoiceFinishReason
+			chunk["choices"] = []any{}
+			return true
+		}
 	}
 	choice, isObject := choices[0].(map[string]any)
 	if !isObject {
@@ -199,12 +212,18 @@ func normalizeOpenAIUsageMember(owner map[string]any) bool {
 		}
 		readCached = true
 	}
+	// `completion_tokens_details?.reasoning_tokens || rawUsage.reasoning_tokens || 0` reads the top-level count only when the nested one is falsy.
 	completion, _ := usageObject["completion_tokens_details"].(map[string]any)
-	if completion == nil {
+	switch {
+	case completion == nil:
 		delete(usageObject, "completion_tokens_details")
+	case !numberOrFalsy(completion, "reasoning_tokens"):
+		return false
+	case jsTruthy(completion["reasoning_tokens"]):
+		delete(usageObject, "reasoning_tokens")
 		return true
 	}
-	return numberOrFalsy(completion, "reasoning_tokens")
+	return numberOrFalsy(usageObject, "reasoning_tokens")
 }
 
 // jsIntegerNumber is Number(value) as a JSON number when it is an integer a Go int holds exactly.

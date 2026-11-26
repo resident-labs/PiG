@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -65,9 +67,11 @@ type AssistantMessage struct {
 	// ErrorMessage holds the error string when StopReason == "error".
 	ErrorMessage string `json:"errorMessage,omitempty"`
 	// ErrorBeforeTimestamp records that the message was built with errorMessage before timestamp; see ai.AssistantMessage.ErrorBeforeTimestamp.
-	ErrorBeforeTimestamp bool   `json:"-"`
-	RawStopReason        string `json:"rawStopReason,omitempty"`
-	EndTurn              *bool  `json:"endTurn,omitempty"`
+	ErrorBeforeTimestamp bool `json:"-"`
+	// FailureResponse holds non-serialized HTTP status/headers/stream state for custom retry policies; see ai.AssistantMessage.FailureResponse.
+	FailureResponse *ai.FailureResponse `json:"-"`
+	RawStopReason   string              `json:"rawStopReason,omitempty"`
+	EndTurn         *bool               `json:"endTurn,omitempty"`
 	// DurationMs is the milliseconds from the start of the request to the final message, measured with a monotonic clock by the AssistantMessageEventStream. Nil for legacy messages and for deferred results fetched later.
 	// upstream: ai/src/types.ts:582 AssistantMessage.durationMs
 	DurationMs *int64 `json:"durationMs,omitempty"`
@@ -150,6 +154,69 @@ type AgentMessage struct {
 
 	// source is the object a System or Custom message was decoded from, when its JSON.stringify text differs from the text the fields encode to. Custom encodes its current members in the order of the decoded object.
 	source *messageSource
+	// origin is the Identity of the message an EventView was copied from; nil for any other message.
+	origin any
+}
+
+// Identity names the message m stands for, so the transcript's message, the message_end event's and the session entry's, which share one object, and the EventView copied from it all give one key. It is nil for a message with no content to name. Pi hands one object to all of them; a key is what lets a listener of this process tell its payload copies apart from messages that merely look alike.
+func (m AgentMessage) Identity() any {
+	if m.origin != nil {
+		return m.origin
+	}
+	switch {
+	case m.System != nil:
+		return m.System
+	case m.User != nil:
+		return m.User
+	case m.Assistant != nil:
+		return m.Assistant
+	case m.ToolResult != nil:
+		return m.ToolResult
+	case m.Custom != nil:
+		return reflect.ValueOf(m.Custom).UnsafePointer()
+	}
+	return nil
+}
+
+// Original is the message m's EventView was copied from, as a message of its own shape over the object the transcript and the saved entry hold, and reports whether m is such a view whose original is reachable. A system, user, assistant or tool result message has one; a custom message's view does not (its original is a map Identity only names).
+func (m AgentMessage) Original() (AgentMessage, bool) {
+	switch origin := m.origin.(type) {
+	case *ai.SystemMessage:
+		return AgentMessage{System: origin}, true
+	case *UserMessage:
+		return AgentMessage{User: origin}, true
+	case *AssistantMessage:
+		return AgentMessage{Assistant: origin}, true
+	case *ToolResultMessage:
+		return AgentMessage{ToolResult: origin}, true
+	}
+	return AgentMessage{}, false
+}
+
+// EventView returns m as the consumer of an event holds it: a copy with m's Identity whose members a later in-place replacement of m (ReplaceMessageInPlace) does not change. Original returns m. A session that publishes events to consumers reading on their own goroutines gives them the view, so they read the message as it was when the event was published, as Pi's listeners do, though a later handler replaces it; message_start carries the view of the message it announces, so a message_end replacement does not reach it.
+//
+// A system, user, assistant or tool result message is copied as a struct, and a custom message's member map and member-order record are copied. What the members refer to (content blocks, usage, the values of a custom message's members) is shared with m: a replacement overwrites the members of a message or the entries of its map and never writes into the values they held. A write into those values by other code is not covered.
+func (m AgentMessage) EventView() AgentMessage {
+	out := m
+	out.origin = m.Identity()
+	switch {
+	case m.System != nil:
+		out.System = new(*m.System)
+	case m.User != nil:
+		out.User = new(*m.User)
+	case m.Assistant != nil:
+		out.Assistant = new(*m.Assistant)
+	case m.ToolResult != nil:
+		out.ToolResult = new(*m.ToolResult)
+	case m.Custom != nil:
+		out.Custom = maps.Clone(m.Custom)
+		if m.source != nil {
+			// The member-order record is shared by the copies of one message, so a replacement's adoption would reach this view; it keeps its own, as Clone does.
+			record := *m.source
+			out.source = &record
+		}
+	}
+	return out
 }
 
 // messageSource is the JSON.stringify text of the object a message was decoded from.
@@ -594,9 +661,11 @@ type CompactionStartEvent struct {
 // CompactionEndEvent fires when compaction completes, aborts, or errors.
 // Mirrors upstream compaction_end event (agent-session.ts).
 type CompactionEndEvent struct {
-	Reason               string
-	Aborted              bool
-	WillRetry            bool
+	Reason    string
+	Aborted   bool
+	WillRetry bool
+	// HasResult is upstream's `event.result` being present: a completed compaction, whatever its summary holds.
+	HasResult            bool
 	Summary              string
 	FirstKeptEntryID     string
 	TokensBefore         int
@@ -966,6 +1035,10 @@ func NewAgent(opts AgentOptions) (*Agent, error) {
 	}
 	if opts.ThinkingLevel == "" {
 		opts.ThinkingLevel = ai.ThinkingOff
+	}
+	// agent.ts:259: `runtimeOptions.transport ?? "auto"`. The Agent never forwards an unset transport.
+	if opts.Transport == "" {
+		opts.Transport = ai.TransportAuto
 	}
 	sm := opts.SteeringMode
 	if sm == "" {
@@ -2122,7 +2195,11 @@ func (h *loopHost) consumeStream(ctx context.Context, stream *ai.AssistantMessag
 	}
 
 	final, resultErr := stream.ResultContext(ctx)
-	if ctx.Err() != nil || resultErr != nil {
+	// upstream: packages/agent/src/agent-loop.ts:470-478 takes the result of a stream that ended without a terminal event (`await result()` after the loop), whatever its signal says: an author that ended its stream with a result when it saw the abort gave the turn's message. A stream that has no result ends as aborted below.
+	if settled, ok := stream.SettledResult(); ok {
+		final, resultErr = settled, nil
+	}
+	if resultErr != nil {
 		if pending {
 			message = shallowAssistantMessageFrom(&unobserved)
 		}
@@ -2303,6 +2380,7 @@ func assistantMessageWith(message *ai.AssistantMessage, content []ai.AssistantCo
 		StopReason:            message.StopReason,
 		ErrorMessage:          message.ErrorMessage,
 		ErrorBeforeTimestamp:  message.ErrorBeforeTimestamp,
+		FailureResponse:       message.FailureResponse,
 		RawStopReason:         message.RawStopReason,
 		EndTurn:               message.EndTurn,
 		DurationMs:            message.DurationMs,

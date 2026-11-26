@@ -102,7 +102,10 @@ impl Host {
                 terminal_input: None,
                 stream: None,
                 stream_error: None,
+                args_error: None,
+                deep_args: false,
                 tool_call_index: None,
+                signal_aborted: false,
                 args_raw: None,
                 method: method.into(),
                 tool: (!tool.is_empty()).then(|| tool.into()),
@@ -125,6 +128,7 @@ impl Host {
             msg_type: "notify".into(),
             notify: Some(NotifyMsg {
                 custom_input: None,
+                args_error: None,
                 method: "width_change".into(),
                 args: Some(json!({"width": width})),
             }),

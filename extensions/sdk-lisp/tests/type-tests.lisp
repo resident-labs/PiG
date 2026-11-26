@@ -64,6 +64,39 @@
     (check (not (pig:retryable-assistant-error-p (message "429 {\"error\":{\"code\":1308,\"message\":\"Usage limit reached\"}}"))))
     (check (pig:retryable-assistant-error-p (message "429 {\"error\":{\"code\":\"13081\",\"message\":\"Too many requests\"}}")))))
 
+;; Pi 9b88b94e2 packages/ai/test/retry.test.ts:106 (#12064): a gateway ends the stream with an Anthropic-style api_error event reading "Connection closed.".
+(deftest connection-closed-is-retryable
+  (flet ((message (text) (pig:from-json (format nil "{\"role\":\"assistant\",\"stopReason\":\"error\",\"errorMessage\":~A}" (pig:to-json text)))))
+    (check (pig:retryable-assistant-error-p (message "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Connection closed.\"}}")))
+    (check (pig:retryable-assistant-error-p (message "Connection closed by proxy server before the response completed")))
+    (check (not (pig:retryable-assistant-error-p (message "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Connection closed. insufficient_quota\"}}"))))
+    (check (not (pig:retryable-assistant-error-p (message "The connection was closed by the user"))))))
+
+;; Pi 4699b5b26 packages/ai/test/retry.test.ts:65,77 (#12128): a provider error that reports only a Node socket error code is retried; a code inside a longer identifier is not.
+(deftest node-socket-error-codes-are-retryable
+  (flet ((message (text) (pig:from-json (format nil "{\"role\":\"assistant\",\"stopReason\":\"error\",\"errorMessage\":~A}" (pig:to-json text)))))
+    (check (pig:retryable-assistant-error-p (message "read ECONNRESET")))
+    (check (pig:retryable-assistant-error-p (message "connect ETIMEDOUT 140.82.113.3:443")))
+    (check (pig:retryable-assistant-error-p (message "write EPIPE")))
+    (check (pig:retryable-assistant-error-p (message "connect ECONNREFUSED 127.0.0.1:443")))
+    (check (pig:retryable-assistant-error-p (message "ECONNABORTED")))
+    (check (pig:retryable-assistant-error-p (message "Connection reset by peer")))
+    (check (not (pig:retryable-assistant-error-p (message "Invalid value EXECONNRESET"))))
+    (check (not (pig:retryable-assistant-error-p (message "Unknown field ETIMEDOUTX"))))
+    (check (not (pig:retryable-assistant-error-p (message "Invalid key ERR_EPIPE_ID"))))))
+
+;; Pi bb1a2b3542b5 packages/ai/test/retry.test.ts (#12124): the Codex WebSocket lifetime limit, as text or as the error code, is retried; a generic connection limit is not.
+(deftest codex-websocket-connection-limit-is-retryable
+  (flet ((message (text) (pig:from-json (format nil "{\"role\":\"assistant\",\"stopReason\":\"error\",\"errorMessage\":~A}" (pig:to-json text)))))
+    (check (pig:retryable-assistant-error-p (message "Codex error: Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.")))
+    (check (pig:retryable-assistant-error-p (message "Codex error: websocket_connection_limit_reached")))
+    (check (pig:retryable-assistant-error-p (message "WEBSOCKET CONNECTION LIMIT REACHED")))
+    (check (pig:retryable-assistant-error-p (message "websocket-connection-limit-reached")))
+    (check (not (pig:retryable-assistant-error-p (message "connection limit reached"))))
+    (check (not (pig:retryable-assistant-error-p (message "websocket connection limit"))))
+    (check (not (pig:retryable-assistant-error-p (message "connection limit reached on the websocket"))))
+    (check (not (pig:retryable-assistant-error-p (message "websocket connection limit reached: insufficient_quota"))))))
+
 (deftest the-default-retry-delay-cap-is-pis
   (check-equal 60000 pig:+default-max-agent-retry-delay-ms+))
 
@@ -418,3 +451,81 @@ encoder writes something that reads back as the same schema."
     (pig:tool ext "t" "d" (pig:type-object (pig:obj) (pig:obj "x-extra" (pig:type-refine (pig:type-string) (lambda (v) v))))
               (lambda (ctx args) (declare (ignore ctx args)) "ok"))
     (check (= 1 (length (pig::extension-tools ext))))))
+
+;;; ---------------------------------------------------------------- Value.Check / Value.Errors: the refinement loop
+
+(defun tt-scripted-send (replies requests)
+  "A send function that answers with REPLIES in order and records each request as JSON text in the cell REQUESTS."
+  (lambda (request)
+    (push (pig:to-json request) (car requests))
+    (when (null replies) (error "the loop asked once more than the script answers"))
+    (pop replies)))
+
+(defun tt-refine-call (id message value) (pig:obj "call" (pig:obj "token" "tok" "id" id "message" message "value" value)))
+
+(deftest the-value-loop-runs-each-refinement-once-in-order
+  (let* ((log '())
+         (schema (pig:type-refine (pig:type-string)
+                                  (lambda (v) (push (list :check v) log) (> (length v) 3))
+                                  (lambda (v) (push (list :error v) log) (concatenate 'string "short: " v))))
+         (requests (list '())))
+    (let ((result (pig::te-value-run "Value.Errors" schema "ab"
+                                     (tt-scripted-send (list (tt-refine-call 0 :false "ab") (tt-refine-call 0 t "ab") (pig:obj "value" (vector)))
+                                                       requests))))
+      (check-equal (vector) result)
+      (check-equal '((:check "ab") (:error "ab")) (reverse log))
+      (let ((sent (reverse (car requests))))
+        (check-equal 3 (length sent))
+        (check (search "\"member\":\"Value.Errors\"" (first sent)))
+        (check (search "\"ab\"" (first sent)))
+        (check-equal "{\"member\":\"Value.Answer\",\"args\":[\"tok\",false]}" (second sent))
+        (check-equal "{\"member\":\"Value.Answer\",\"args\":[\"tok\",\"short: ab\"]}" (third sent))))))
+
+(deftest the-value-loop-truthiness-and-default-message
+  (let* ((schema (pig:type-refine (pig:type-string) (lambda (v) (declare (ignore v)) :null)))
+         (requests (list '())))
+    (pig::te-value-run "Value.Errors" schema "x"
+                       (tt-scripted-send (list (tt-refine-call 0 :false "x") (tt-refine-call 0 t "x") (pig:obj "value" (vector))) requests))
+    (check-equal '("{\"member\":\"Value.Answer\",\"args\":[\"tok\",false]}" "{\"member\":\"Value.Answer\",\"args\":[\"tok\",\"Refine Error\"]}")
+                 (cdr (reverse (car requests))))))
+
+(deftest a-refinement-condition-cancels-and-aborts-the-value-loop
+  (let* ((runs 0)
+         (schema (pig:type-refine (pig:type-string) (lambda (v) (declare (ignore v)) (incf runs) (error "kaboom"))))
+         (requests (list '()))
+         (message (handler-case (progn (pig::te-value-run "Value.Check" schema "x"
+                                                          (tt-scripted-send (list (tt-refine-call 0 :false "x") (pig:obj "value" :false)) requests))
+                                       nil)
+                    (error (e) (princ-to-string e)))))
+    (check-equal "kaboom" message)
+    (check-equal 1 runs)
+    (check-equal 2 (length (car requests)))
+    (check-equal "{\"member\":\"Value.Cancel\",\"args\":[\"tok\"]}" (first (car requests)))))
+
+(deftest an-error-reply-fails-the-value-call-without-a-cancel
+  (let* ((requests (list '()))
+         (message (handler-case (pig::te-value-run "Value.Check" (pig:type-string) "x"
+                                                   (tt-scripted-send (list (pig:obj "error" (pig:obj "name" "Error" "message" "no such member"))) requests))
+                    (pig:type-schema-error (e) (pig:type-schema-error-message e)))))
+    (check-equal "no such member" message)
+    (check-equal 1 (length (car requests)))))
+
+(deftest value-check-asks-the-host-with-the-schema-value-and-answers
+  (let ((ext (pig:make-extension "value-probe")) (answer :unset) (ran nil))
+    (with-host (host ext)
+      (tt-wait-running)
+      (let* ((schema (pig:type-refine (pig:type-integer) (lambda (v) (setf ran v) t)))
+             (thread (sb-thread:make-thread (lambda () (setf answer (pig:value-check schema 4))))))
+        (let* ((call (hread-type host "call")) (request (pig:jget (pig:jget call "call") "args")))
+          (check-equal "Value.Check" (pig:jget request "member"))
+          (check-equal 2 (length (pig:jget request "args")))
+          (check-equal "4" (pig:to-json (aref (pig:jget request "args") 1)))
+          (hsend host "type" "call_result" "id" (pig:jget call "id")
+                      "call_result" (pig:obj "result" (pig:obj "call" (pig:obj "token" "t1" "id" 0 "message" :false "value" 4)))))
+        (let* ((call (hread-type host "call")) (request (pig:jget (pig:jget call "call") "args")))
+          (check-equal "Value.Answer" (pig:jget request "member"))
+          (check-equal "[\"t1\",true]" (pig:to-json (pig:jget request "args")))
+          (tt-engine-reply host (pig:jget call "id") t))
+        (sb-thread:join-thread thread)
+        (check-equal 4 ran)
+        (check-equal t answer)))))

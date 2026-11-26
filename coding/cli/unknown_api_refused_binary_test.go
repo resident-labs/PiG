@@ -97,8 +97,8 @@ func unknownAPIModels(baseURL, api string) string {
 }
 
 // A model whose api names no registered API implementation is refused when its first request starts, with Pi's text, exit status and
-// stop reason, and nothing is sent to its endpoint (provider-composer.ts:603-604).
-// PiG 0.3.0 through 0.7.0 sent the conversation to the endpoint as an OpenAI chat-completions request.
+// stop reason, and nothing is sent to its endpoint (provider-composer.ts:605-606). Pi 1.5.2 run on the same files: xd6702
+// ~/lanes/UnknownApiName.out/p1.log. PiG 0.3.0 through 0.7.0 sent the conversation to the endpoint as an OpenAI chat-completions request.
 func TestUnknownAPINamePrintSendsNothingAndReportsPiText(t *testing.T) {
 	if testing.Short() {
 		t.Skip("starts the pig binary")

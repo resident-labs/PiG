@@ -16,6 +16,7 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/piglogin"
 	"github.com/MichaelKinsy/PiG/internal/coding/pigversion"
 	"github.com/MichaelKinsy/PiG/internal/configroot"
+	"github.com/MichaelKinsy/PiG/internal/pigstrip"
 	"github.com/MichaelKinsy/PiG/tui"
 	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
@@ -217,7 +218,13 @@ const compactHints = "escape interrupt · ctrl+c/ctrl+d clear/exit · / commands
 
 const pressLine = "Press ctrl+o to show full startup help and loaded resources."
 
-const onboardingLine = "PiG can explain its own features and look up its docs. Ask it how to use or extend PiG."
+// onboardingLine is the self-help line of the built-in header; a build that strips docs has no docs to look up (startup_header.go).
+func onboardingLine() string {
+	if pigstrip.Has(pigstrip.ListFeatures, pigstrip.Docs) {
+		return "PiG can explain its own features. Ask it how to use or extend PiG."
+	}
+	return "PiG can explain its own features and look up its docs. Ask it how to use or extend PiG."
+}
 
 // D2: the pig head takes Pi's logo slot. Its first line carries the version and its other lines the header's next lines,
 // each wrapped in the cells right of the head, as Pi's logo carries the version and the first hint line; the lines after the
@@ -230,8 +237,8 @@ func TestBuiltInHeaderDrawsThePigHeadInPisLogoSlot(t *testing.T) {
 		expanded bool
 		want     []string
 	}{
-		{false, []string{"v" + pigversion.Version, compactHints, pressLine, "", onboardingLine, "", ""}},
-		{true, append(append([]string{"v" + pigversion.Version}, expandedHints...), "", onboardingLine)},
+		{false, []string{"v" + pigversion.Version, compactHints, pressLine, "", onboardingLine(), "", ""}},
+		{true, append(append([]string{"v" + pigversion.Version}, expandedHints...), "", onboardingLine())},
 	} {
 		m.setAllToolsExpanded(tc.expanded)
 		raw, lines := headerLines(m, 120)
@@ -330,7 +337,7 @@ func TestBuiltInHeaderAt80Columns(t *testing.T) {
 	}
 	if len(lines) != piglogin.HeadRows || beside[0] != "v"+pigversion.Version ||
 		strings.Join(beside[1:3], " ") != compactHints || beside[3] != pressLine || beside[4] != "" ||
-		strings.Join(beside[5:], " ") != onboardingLine {
+		strings.Join(beside[5:], " ") != onboardingLine() {
 		t.Fatalf("80-column header = %q", lines)
 	}
 }
@@ -675,20 +682,24 @@ var expandedHints = []string{
 }
 
 func init() {
-	// Pi's Windows defaults differ: ctrl+z is unbound, cycle-back is alt+p, follow-up is ctrl+q, dequeue is alt+q, paste is alt+v.
+	// Pi's Windows defaults differ: ctrl+z is unbound on native Windows only (WSL keeps it), cycle-back is alt+p, follow-up is ctrl+q, dequeue is alt+q, paste is alt+v
+	// and ctrl+v. They apply wherever Windows keybindings do, native Windows and WSL, which tui.HostKeybindingPlatform decides.
 	if runtime.GOOS == "darwin" {
 		for i, hint := range expandedHints {
 			expandedHints[i] = strings.NewReplacer("alt+enter", "option+enter", "alt+up", "option+up").Replace(hint)
 		}
 		return
 	}
-	if runtime.GOOS != "windows" {
+	platform := tui.HostKeybindingPlatform()
+	if !platform.UsesWindowsKeybindings() {
 		return
 	}
 	for i, hint := range expandedHints {
 		switch hint {
 		case "ctrl+z to suspend":
-			expandedHints[i] = " to suspend"
+			if platform == tui.KeybindingPlatformWin32 {
+				expandedHints[i] = " to suspend"
+			}
 		case "ctrl+p/shift+ctrl+p to cycle models":
 			expandedHints[i] = "ctrl+p/alt+p to cycle models"
 		case "alt+enter to queue follow-up":
@@ -696,7 +707,7 @@ func init() {
 		case "alt+up to edit all queued messages":
 			expandedHints[i] = "alt+q to edit all queued messages"
 		case "ctrl+v to paste files on macOS, images, or text":
-			expandedHints[i] = "alt+v to paste files on macOS, images, or text"
+			expandedHints[i] = "alt+v/ctrl+v to paste files on macOS, images, or text"
 		}
 	}
 }

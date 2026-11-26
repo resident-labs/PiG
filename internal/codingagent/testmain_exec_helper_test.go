@@ -109,6 +109,9 @@ func TestMain(m *testing.M) {
 		fmt.Println(strings.Join(os.Args[1:], " "))
 		os.Exit(0)
 	}
+	if os.Getenv(raceExitStampEnv) == "1" {
+		os.Exit(runRaceExitStamp())
+	}
 	if os.Getenv(externalEditorScenarioEnv) == "1" {
 		os.Exit(runExternalEditorScenario(os.Args[1:]))
 	}
@@ -125,7 +128,27 @@ func TestMain(m *testing.M) {
 	getNativeClipboard = func() *tui.NativeClipboard { return nil }
 	// The queued-message hint and the Up key depend on TERM_PROGRAM and TERM (D228); a test that needs a terminal sets them.
 	_ = os.Unsetenv("TERM_PROGRAM")
-	code := testenv.RunScoped(m, "pig-ca-")
+	if err := exitRaceChildrenAtOnce(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	testRoot, err := testenv.MkdirShortTemp("pig-ca-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "create scoped test temp directory:", err)
+		os.Exit(2)
+	}
+	if err := testenv.ScopeTempDir(testRoot); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		_ = os.RemoveAll(testRoot)
+		os.Exit(2)
+	}
+	code := m.Run()
+	if err := os.RemoveAll(testRoot); err != nil {
+		fmt.Fprintln(os.Stderr, "remove scoped test temp directory:", err)
+		if code == 0 {
+			code = 2
+		}
+	}
 	if code == 0 {
 		// A test binary that passed must not end with goroutines blocked forever on primitives nothing can reach.
 		leaked, text, err := testenv.LeakedGoroutines()

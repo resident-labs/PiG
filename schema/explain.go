@@ -6,6 +6,7 @@ package schema
 
 import (
 	"math"
+	"math/big"
 	"slices"
 	"strconv"
 	"strings"
@@ -124,8 +125,8 @@ func (e *explainer) walk(node any, base string, v any, path string, out *[]Valid
 	if bs, ok := v.([]byte); ok && typeIs("bytes") {
 		e.walkBytes(o, bs, pushHere)
 	}
-	if n, ok := asNumber(v); ok {
-		e.walkNumber(o, n, pushHere)
+	if _, isNumber := asNumber(v); isNumber || isBigInt(v) {
+		e.walkNumber(o, v, pushHere)
 	}
 	if vo, ok := asObject(v); ok {
 		e.walkObject(o, b, vo, path, out, push, pushHere)
@@ -262,34 +263,63 @@ func (e *explainer) walkBytes(node jsonObject, v []byte, push func(keyword, mess
 	}
 }
 
-func (e *explainer) walkNumber(node jsonObject, v float64, push func(keyword, message string)) {
-	if min, ok := node.numberMember("minimum"); ok && v < min {
-		push("minimum", "expected >= "+numberString(min))
+// walkNumber is the number keywords, for numbers and bigints alike: bounds of either kind compare with values of either kind.
+func (e *explainer) walkNumber(node jsonObject, v any, push func(keyword, message string)) {
+	if min, ok := node.boundMember("minimum"); ok && isBelow(v, min) {
+		push("minimum", "expected >= "+boundString(min))
 	}
-	if max, ok := node.numberMember("maximum"); ok && v > max {
-		push("maximum", "expected <= "+numberString(max))
+	if max, ok := node.boundMember("maximum"); ok && isBelow(max, v) {
+		push("maximum", "expected <= "+boundString(max))
 	}
-	if min, ok := node.numberMember("exclusiveMinimum"); ok && v <= min {
-		push("exclusiveMinimum", "expected > "+numberString(min))
+	if min, ok := node.boundMember("exclusiveMinimum"); ok && isBelowOrEqual(v, min) {
+		push("exclusiveMinimum", "expected > "+boundString(min))
 	}
-	if max, ok := node.numberMember("exclusiveMaximum"); ok && v >= max {
-		push("exclusiveMaximum", "expected < "+numberString(max))
+	if max, ok := node.boundMember("exclusiveMaximum"); ok && isBelowOrEqual(max, v) {
+		push("exclusiveMaximum", "expected < "+boundString(max))
 	}
-	if d, ok := node.numberMember("multipleOf"); ok && !isMultiple(v, d) {
-		push("multipleOf", "expected a multiple of "+numberString(d))
+	if d, ok := node.boundMember("multipleOf"); ok && !isMultipleOf(v, d) {
+		push("multipleOf", "expected a multiple of "+boundString(d))
 	}
+}
+
+// isBelow is `a < b`, false when either is NaN.
+func isBelow(a, b any) bool {
+	order, ok := compareNumeric(a, b)
+	return ok && order < 0
+}
+
+// isBelowOrEqual is `a <= b`, false when either is NaN.
+func isBelowOrEqual(a, b any) bool {
+	order, ok := compareNumeric(a, b)
+	return ok && order <= 0
+}
+
+// boundString is String(bound): a number as JavaScript writes it, a bigint in decimal.
+func boundString(bound any) string {
+	if i, ok := bound.(*big.Int); ok {
+		return i.String()
+	}
+	n, _ := asNumber(bound)
+	return numberString(n)
 }
 
 func (e *explainer) walkObject(node jsonObject, b string, v jsonObject, path string, out *[]ValidationError, push pusher, pushHere func(keyword, message string)) {
 	properties, _ := node.objectMember("properties")
 	required, _ := node.arrayMember("required")
 	for _, k := range required {
-		if name, ok := k.(string); ok && !v.has(name) {
+		name, ok := k.(string)
+		if !ok {
+			continue
+		}
+		// Present and holding undefined: missing unless its schema takes undefined (see declaredObject).
+		x, present := v.get(name)
+		accepted := present && isUndefined(x) && properties.has(name) && e.ok(properties.value(name), b, Undefined)
+		if !present || (isUndefined(x) && !accepted) {
 			push("required", "missing", pointer(path, name))
 		}
 	}
 	for _, k := range properties.keys() {
-		if x, ok := v.get(k); ok {
+		if x, ok := v.get(k); ok && !isUndefined(x) {
 			e.walk(properties.value(k), b, x, pointer(path, k), out)
 		}
 	}
@@ -486,7 +516,8 @@ func (e *explainer) declaredKeys(s any, b string, v jsonObject) int {
 	node := s
 	if o, ok := isSchemaObject(s); ok {
 		if ref, ok := o.stringMember("$ref"); ok {
-			node = e.c.r.resolve(ref, b).node
+			// the branch's own base, as its `$id` sets it (Pi main 2bd2c2d0a).
+			node = e.c.r.resolve(ref, e.c.r.baseFor(o, b)).node
 		}
 	}
 	o, ok := isSchemaObject(node)
@@ -513,7 +544,8 @@ func (e *explainer) tagOf(branches []any, b string) (string, []any, bool) {
 		resolvedBranches[i] = s
 		if o, ok := isSchemaObject(s); ok {
 			if ref, ok := o.stringMember("$ref"); ok {
-				resolvedBranches[i] = e.c.r.resolve(ref, b).node
+				// the branch's own base, as its `$id` sets it (Pi main 2bd2c2d0a).
+				resolvedBranches[i] = e.c.r.resolve(ref, e.c.r.baseFor(o, b)).node
 			}
 		}
 	}
@@ -556,7 +588,8 @@ func (e *explainer) walkUnevaluated(node jsonObject, b string, v any, path strin
 	if !ok {
 		rest = &Object{}
 		for _, k := range node.keys() {
-			if k != "unevaluatedProperties" && k != "unevaluatedItems" {
+			// b already applies the node's `$id`; the copy must not apply it again (Pi main 2bd2c2d0a).
+			if k != "unevaluatedProperties" && k != "unevaluatedItems" && k != "$id" {
 				rest.Set(k, node.value(k))
 			}
 		}
@@ -607,6 +640,10 @@ func typeName(v any) string {
 		if isInteger(n) {
 			return "integer"
 		}
+		// NaN and Infinity are named as String(v) names them (Pi main 55a5c6914).
+		if !isFinite(n) {
+			return jsnumberName(n)
+		}
 		return "number"
 	}
 	switch v.(type) {
@@ -614,6 +651,8 @@ func typeName(v any) string {
 		return "array"
 	case []byte:
 		return "bytes"
+	case *big.Int:
+		return "bigint"
 	case string:
 		return "string"
 	case bool:
@@ -623,4 +662,15 @@ func typeName(v any) string {
 		return "object"
 	}
 	return "undefined"
+}
+
+// jsnumberName is String(n) for a NaN or an infinity.
+func jsnumberName(n float64) string {
+	switch {
+	case math.IsNaN(n):
+		return "NaN"
+	case n > 0:
+		return "Infinity"
+	}
+	return "-Infinity"
 }

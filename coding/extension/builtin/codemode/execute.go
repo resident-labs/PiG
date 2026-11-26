@@ -276,7 +276,7 @@ func truncateText(text string, maxChars int) string {
 	if jsstring.Length(text) <= maxChars {
 		return text
 	}
-	return jsstring.Slice(text, 0, maxChars-3) + "..."
+	return jsstring.SliceHead(text, maxChars-3) + "..."
 }
 
 func previewArgs(args json.RawMessage) string {
@@ -669,11 +669,8 @@ func truncateOutput(items []ai.ToolResultMessageContent, maxTokens int64) ([]ai.
 	headChars := budget / 2
 	tailChars := budget - headChars
 	removed := len(units) - headChars - tailChars
-	head := decodeUnits(units[:headChars])
-	tail := ""
-	if tailChars > 0 {
-		tail = decodeUnits(units[len(units)-tailChars:])
-	}
+	head := decodeUnits(jsstring.HeadUnits(units, headChars))
+	tail := decodeUnits(jsstring.TailUnits(units, tailChars))
 	text := fmt.Sprintf("Warning: truncated output (original token count: %d)\nTotal output lines: %d\n\n%s…%d tokens truncated…%s",
 		ceilDiv(len(units), charsPerToken), strings.Count(combined, "\n")+1, head, ceilDiv(removed, charsPerToken), tail)
 	path, err := spillOutput(combined)
@@ -769,11 +766,7 @@ func Execute(ctx context.Context, toolCallID string, params json.RawMessage, onU
 	}
 	samples := make(map[string]string, len(callable))
 	for _, tool := range callable {
-		sample, err := sandbox.RenderToolSample(toDeclaration(tool, guidelines[tool.Name]), sandbox.ToolRenderOptions{})
-		if err != nil {
-			return agent.AgentToolResult{}, err
-		}
-		samples[tool.Name] = sample
+		samples[tool.Name] = sandbox.RenderToolSample(toDeclaration(tool, guidelines[tool.Name]), sandbox.ToolRenderOptions{})
 	}
 	sandboxTools := make([]sandbox.Tool, len(callable))
 	for i, tool := range callable {
@@ -810,6 +803,7 @@ func Execute(ctx context.Context, toolCallID string, params json.RawMessage, onU
 		TimeoutMs:        math.Max(1, math.Round(deadline-waitedMs)),
 		MemoryLimitBytes: memoryLimitBytes,
 		CacheDir:         options.CacheDir,
+		Interpreter:      options.Interpreter, // pig additive (D263)
 		AcquireWorker:    reservation.acquireWorker,
 	})
 	if err != nil {

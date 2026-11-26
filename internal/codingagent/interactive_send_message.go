@@ -21,10 +21,12 @@ func (m *InteractiveMode) sendExtensionMessage(msg extension.CustomMessageRef, o
 	agentMsg := agent.AgentMessage{Custom: map[string]any{
 		"role":       agent.RoleCustom,
 		"customType": msg.CustomType,
-		"content":    msg.Content,
-		"display":    msg.Display,
+		"content":    msg.ContentMember(),
 		"timestamp":  time.Now().UnixMilli(), //portlint:allow clock agent-session.ts:2331 sendCustomMessage stamps `timestamp: Date.now()`; the package's clock seams belong to the logo animations
 	}}
+	if display := msg.DisplayMember(); display != nil {
+		agentMsg.Custom["display"] = display
+	}
 	if msg.Details != nil {
 		agentMsg.Custom["details"] = msg.Details
 	}
@@ -73,14 +75,14 @@ func (m *InteractiveMode) sendExtensionMessage(msg extension.CustomMessageRef, o
 
 // appendCustomMessageNow persists a custom message and renders it, starting no run (upstream _appendCustomMessage).
 func (m *InteractiveMode) appendCustomMessageNow(msg extension.CustomMessageRef) error {
-	entry, err := m.currentSession().customMessageEntry(msg.CustomType, msg.Content, msg.Display, msg.Details, true)
+	entry, err := m.currentSession().customMessageEntry(CustomMessageEntry{CustomType: msg.CustomType, Content: msg.ContentMember(), Display: msg.Display, DisplayAbsent: msg.DisplayAbsent, DisplayNull: msg.DisplayNull, Details: msg.Details}, true)
 	if err != nil {
 		return err
 	}
 	// The agent renders a message it takes at its message_start (interactive_events.go); only a message that is persisted here without a run is rendered now.
 	if msg.Display {
 		m.runOnMain(m.runCtx, func() {
-			m.appendCustomMessage(entry)
+			m.appendCustomMessage(entry, messageMeta{})
 			m.tuiInst.Render()
 		})
 	}
@@ -94,10 +96,6 @@ func (m *InteractiveMode) startCustomTurn(agentMsg agent.AgentMessage, followUp 
 		// Starting a turn mutates TUI and session state, so it runs on the owner loop. It re-checks there: a turn may have begun since.
 		_ = m.postToMain(m.runCtx, func() {
 			if m.agent == nil {
-				return
-			}
-			// The action was released before a quit key set requestExit: the quit settles the interrupted run on the owner loop (settleRunAtQuit) and would wait for a turn started here (D247).
-			if m.requestExit.Load() {
 				return
 			}
 			if m.enqueueIfTurnActive(func() {

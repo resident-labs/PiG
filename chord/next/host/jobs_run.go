@@ -9,7 +9,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/documents"
 )
 
-// Ports packages/chord/src/next/jobs/run.ts
+// Ports packages/chord/src/jobs/run.ts
 //
 // One run of a job (§15, slice 6b §4.1): its record (id, version, key, args, phase, restarts, finish failures, abort
 // mark, outcome), its current invocation (the fence of its seal token, its abort signal, the end an abort joins: one
@@ -96,6 +96,8 @@ type jobRun struct {
 	blocked  *BlockedReason
 	// trace is the start's trace carrier, when the adapter propagates (stored, slice 9 uses it).
 	trace map[string]string
+	// traceOrder is trace's keys in the order they were stored (Pi's insertion order); empty: sorted.
+	traceOrder []string
 	// outcome is what it ended with, once recorded (finishing and blocked).
 	outcome *AnyOutcome
 	// entry is its entry in `running`, while its record exists; replaced when its record or state document changes.
@@ -286,18 +288,16 @@ func (set *waiters) wait(ctx context.Context) (AnyOutcome, error) {
 		return immediate.outcome, immediate.err
 	}
 	parking.Park(ctx)
+	if settled, err := parking.Recv(ctx, each.settled); err == nil {
+		return settled.outcome, settled.err
+	}
+	set.loop.Run(func() { delete(set.waiting, each) })
 	select {
 	case settled := <-each.settled:
 		return settled.outcome, settled.err
-	case <-ctx.Done():
-		set.loop.Run(func() { delete(set.waiting, each) })
-		select {
-		case settled := <-each.settled:
-			return settled.outcome, settled.err
-		default:
-		}
-		return AnyOutcome{}, context.Cause(ctx)
+	default:
 	}
+	return AnyOutcome{}, context.Cause(ctx)
 }
 
 // join is one wait for an invocation to be over.
@@ -350,16 +350,14 @@ func (set *joins) wait(ctx context.Context) error {
 		return nil
 	}
 	parking.Park(ctx)
+	if _, err := parking.Recv(ctx, each.over); err == nil {
+		return nil
+	}
+	set.loop.Run(func() { delete(set.waiting, each) })
 	select {
 	case <-each.over:
 		return nil
-	case <-ctx.Done():
-		set.loop.Run(func() { delete(set.waiting, each) })
-		select {
-		case <-each.over:
-			return nil
-		default:
-		}
-		return context.Cause(ctx)
+	default:
 	}
+	return context.Cause(ctx)
 }

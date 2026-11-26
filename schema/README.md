@@ -6,7 +6,7 @@ JSON Schema builders and validation without code generation, a Go port of Pi's `
 - Builders return plain JSON Schema objects.
 - Errors are JSON Pointer paths. A missing or unknown field is reported at the field. The errors, their order and their messages equal Pi's (`TestErrorsMatchPi`).
 - A schema is read, never modified.
-- `Check` is the fast path: a boolean, no allocation for a schema without `pattern` or `format`. `Errors` explains a failure and returns nothing for a valid value. It is built on the first failure and kept.
+- `Check` is the fast path: a boolean, no allocation for a schema without `pattern` or `format`. `Errors` explains a failure and returns nothing for a valid value. It is built on the first failure and kept. `Validate` combines the two without changing the value: `ParseResult{OK: true, Value: value}` or `ParseResult{Errors: ...}`; every validator has it, with or without coercion.
 - Format checks are an optional import (`schema/formats`; every format 2020-12 defines, plus `url` and `json-pointer-uri-fragment`, which TypeBox and ajv-formats also check); without them `format` is an annotation, as 2020-12 specifies.
 - `CompileCoercing` adds `Coerce` and `Parse` for loosely typed input such as a model's tool call arguments: the results equal Pi's (`TestCoerceMatchesPi`, Pi's `coerce.test.ts` and TypeBox `Value.Convert` cases), copy-on-write, and no allocation for a value that needs no change.
 
@@ -38,11 +38,11 @@ JSON data is `nil`, `bool`, `float64` (every Go numeric kind reads as a number),
 
 `*Object` keeps JavaScript's property order, so builders and `Errors` order fields as Pi does. A Go map has no order; its keys are read in own-key order (array-index keys ascending, then the rest ascending).
 
-Strings are UTF-8; a lone UTF-16 surrogate is held as WTF-8, as `internal/jsstring` holds it, and counts as one code point, matches `.` in a pattern and is escaped as `\\uD800` in messages, as in JavaScript. A Go value has no `undefined`: an absent member is absent.
+Strings are UTF-8; a lone UTF-16 surrogate is held as WTF-8, as `internal/jsstring` holds it, and counts as one code point, matches `.` in a pattern and is escaped as `\\uD800` in messages, as in JavaScript. Two values never pass through JSON: a bigint is a `*big.Int` (TypeBox's `Type.BigInt`, `{"type":"bigint"}`) and `undefined` is `schema.Undefined` (`{"type":"undefined"}`). The number keywords apply to numbers and bigints alike, with bounds of either kind (`*big.Int` bounds exact), and a `multipleOf` with a bigint on either side is exact integer arithmetic (a bigint is no multiple of 0 or of a fraction). An optional property holding `Undefined` counts as absent; a required one is present, and its schema decides whether `undefined` is a value of it (`{"type":"undefined"}`, a union with it, `{}`), as in Pi main af79b0c3d. A `number` is finite: `NaN` and the infinities, which only a value built in code can be, are not numbers, with or without bounds, and an explanation names them `NaN`, `Infinity` or `-Infinity`.
 
 ### Builders
 
-`Str`, `Num`, `Int`, `Bool`, `Nul`, `Unknown`, `Lit`, `OneOf`, `Obj` (with `Prop`, `Opt`, `Open`), `Arr`, `Tuple`, `Map`, `Union`, `Nullable` and `Bytes` return the same JSON Schema as Pi's builders, member order included. Options are applied in call order, as the members of the options object Pi's builders spread are, so `Str(Description("d"), MinLength(1))` and `Str(MinLength(1), Description("d"))` write their members in that order. Each builder takes the options that fit its type, and a misplaced option does not compile (`Str(MinItems(1))`, `Num(Open())`):
+`Str`, `Num`, `Int`, `BigInt`, `Bool`, `Nul`, `Unknown`, `Lit`, `OneOf`, `Obj` (with `Prop`, `Opt`, `Open`), `Arr`, `Tuple`, `Map`, `Union`, `Nullable`, `Bytes`, `Recursive` and `Unsafe` (the schema it is given, or `{}`: nothing checks the type the caller has in mind) return the same JSON Schema as Pi's builders, member order included. Options are applied in call order, as the members of the options object Pi's builders spread are, so `Str(Description("d"), MinLength(1))` and `Str(MinLength(1), Description("d"))` write their members in that order. Each builder takes the options that fit its type, and a misplaced option does not compile (`Str(MinItems(1))`, `Num(Open())`):
 
 | option | builders |
 |---|---|
@@ -50,12 +50,15 @@ Strings are UTF-8; a lone UTF-16 surrogate is held as WTF-8, as `internal/jsstri
 | `MinLength`, `MaxLength` | `Str`, `Bytes` |
 | `Pattern`, `Format` | `Str` |
 | `Minimum`, `Maximum`, `ExclusiveMinimum`, `ExclusiveMaximum`, `MultipleOf` | `Num`, `Int` |
+| `BigMinimum`, `BigMaximum`, `BigExclusiveMinimum`, `BigExclusiveMaximum`, `BigMultipleOf` (a `*big.Int`) | `BigInt` |
 | `MinItems`, `MaxItems`, `UniqueItems` | `Arr` |
 | `Open` | `Obj` |
 
 A `Default` is an annotation; validation never inserts it. `Obj` takes its properties as a `Properties` slice in declaration order; its `properties` and `required` follow JavaScript's own-key order (array-index names first), as Pi's `obj()` reads `Object.entries`.
 
-The static types of Pi's builders (`Static<S>`) are TypeScript compile-time types and have no Go form.
+`Recursive(id, func(self Schema) Schema)` builds a schema that contains itself (a tree): `self` is `{"$ref": id}`, the result is the built schema with `$id` set to `id`, which must be unique among the recursive schemas within one schema. `Equal(a, b)` is JSON equality as `const`, `enum` and `uniqueItems` compare.
+
+The static types of Pi's builders (`Static<S>`), and the TypeBox `Enum`, `Tuple`, `BigInt` and `Undefined` static types are TypeScript compile-time types and have no Go form.
 
 ### Coercion
 
@@ -85,6 +88,8 @@ Three passes run in order:
    - `integer`: as `number`, then truncated (`"3.5"` and `3.5` become 3).
    - `boolean`: `"true"`/`"false"` (any case), `"1"`/`"0"`, 1/0, `null` to `false`.
    - `null`: `"null"`, `"undefined"`, `""`, `"0"`, 0 and `false`.
+   - `bigint` (a `*big.Int`): `true` and `false` to 1 and 0, numbers truncated, `null` to 0, strings in the forms `"12n"`, `"12.5"` (truncated) and `"12"`, and `"true"` and `"false"` (any case).
+   - `undefined` (`schema.Undefined`): `null`, 0, `false`, `"undefined"`, `"null"`, `""` and `"0"`. The member stays, holding `Undefined`; a required `{"type":"undefined"}` property then passes, and the JSON text of the arguments leaves it out, while an optional one is dropped by pass 1 as any optional null is.
    - `array`: a single value becomes a one-item array, then each item converts; a tuple (`prefixItems` or an `items` array) converts its items and never wraps.
    - `object`: each property converts by `properties`, `patternProperties` or `additionalProperties`.
 3. **Primitive coercion by type**, as Ajv's `coerceTypes`, for what pass 2 leaves (type arrays such as `["integer", "null"]`): numbers from numeric strings and booleans, booleans from `"true"`/`"false"` and 1/0, strings from numbers and booleans, `null` from `""`, 0 and `false`, and `null` to `""`, 0 or `false`. A value that already has one of a type array's types stays.
@@ -93,7 +98,7 @@ Where passes 2 and 3 disagree, pass 2 wins: `null` for a required string becomes
 
 Pass 1 drops optional nulls inside the values of `properties`, `patternProperties` and `additionalProperties` alike; a pattern or additional key itself is never dropped. Items past a draft-7 `items` array (`additionalItems`) are not coerced by any pass.
 
-What a string reads as is JavaScript's: a number is what `+value` gives (`" 1 "`, `"0x1F"`, `"1e3"` and `"\u00a01"` are numbers; `"1_000"` and `"Infinity"` are not), a trim removes JavaScript whitespace, and "any case" is `toLowerCase`. A Go value has no `undefined` and no bigint, so the conversions of those have no Go form; the string forms `"12n"` and `"12.5"` still read as a safe integer for a number, as in Pi.
+What a string reads as is JavaScript's: a number is what `+value` gives (`" 1 "`, `"0x1F"`, `"1e3"` and `"\u00a01"` are numbers; `"1_000"` and `"Infinity"` are not), a trim removes JavaScript whitespace, and "any case" is `toLowerCase`. The string forms `"12n"` and `"12.5"` read as a safe integer for a number, as in Pi, and a bigint and `Undefined` read as in Pi's `tryString`, `tryNumber`, `tryBoolean` and `tryNull` (a bigint within the safe integers is a number; a bigint 0 or 1 is a boolean, 0 is null).
 
 ### Concurrency
 

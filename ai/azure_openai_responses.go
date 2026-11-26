@@ -5,7 +5,6 @@ package ai
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"os"
 	"strings"
 )
@@ -22,6 +21,9 @@ type AzureOpenAIResponsesConfig struct {
 	SamplingParams map[string]any
 	// SamplingParamsByThinkingLevel overrides SamplingParams for the effective thinking level.
 	SamplingParamsByThinkingLevel SamplingParamsByThinkingLevel
+	// SamplingParamsOrder and SamplingParamsByThinkingLevelOrder are Model.SamplingParamsOrder and Model.SamplingParamsByThinkingLevelOrder.
+	SamplingParamsOrder                []string
+	SamplingParamsByThinkingLevelOrder map[ModelThinkingLevel][]string
 	// ThinkingLevelMap overrides catalog effort values when non-nil.
 	ThinkingLevelMap ThinkingLevelMap
 	// Env is the provider's environment; request env entries outrank it. The Azure endpoint options (azureBaseUrl, azureResourceName, azureApiVersion, azureDeploymentName) are per-request StreamOptions fields.
@@ -39,23 +41,25 @@ func NewAzureOpenAIResponsesProvider(cfg AzureOpenAIResponsesConfig) Provider {
 		providerID = string(APIAzureOpenAIResponses)
 	}
 	baseCfg := OpenAIResponsesConfig{
-		api:                           APIAzureOpenAIResponses,
-		StrictModeDefault:             true, // upstream azure-openai-responses.ts: supportsStrictMode ?? true
-		SkipServiceTierPricing:        true,
-		APIKey:                        cfg.APIKey,
-		APIKeyHeader:                  "api-key",
-		APIKeyPrefix:                  "",
-		Model:                         cfg.Model,
-		azure:                         &azureResponsesEndpoint{env: cfg.Env, modelBaseURL: cfg.BaseURL},
-		ProviderID:                    providerID,
-		ExtraHeaders:                  cfg.ExtraHeaders,
-		SamplingParams:                cfg.SamplingParams,
-		SamplingParamsByThinkingLevel: cfg.SamplingParamsByThinkingLevel,
-		ModelMetadata:                 cfg.ModelMetadata,
-		ThinkingLevelMap:              cfg.ThinkingLevelMap,
-		Compat:                        cfg.Compat,
-		IsReasoning:                   cfg.IsReasoning,
-		BaseURLIsEndpoint:             true,
+		api:                                APIAzureOpenAIResponses,
+		StrictModeDefault:                  true, // upstream azure-openai-responses.ts: supportsStrictMode ?? true
+		SkipServiceTierPricing:             true,
+		APIKey:                             cfg.APIKey,
+		APIKeyHeader:                       "api-key",
+		APIKeyPrefix:                       "",
+		Model:                              cfg.Model,
+		azure:                              &azureResponsesEndpoint{env: cfg.Env, modelBaseURL: cfg.BaseURL},
+		ProviderID:                         providerID,
+		ExtraHeaders:                       cfg.ExtraHeaders,
+		SamplingParams:                     cfg.SamplingParams,
+		SamplingParamsByThinkingLevel:      cfg.SamplingParamsByThinkingLevel,
+		SamplingParamsOrder:                cfg.SamplingParamsOrder,
+		SamplingParamsByThinkingLevelOrder: cfg.SamplingParamsByThinkingLevelOrder,
+		ModelMetadata:                      cfg.ModelMetadata,
+		ThinkingLevelMap:                   cfg.ThinkingLevelMap,
+		Compat:                             cfg.Compat,
+		IsReasoning:                        cfg.IsReasoning,
+		BaseURLIsEndpoint:                  true,
 		GetAPIKey: func(context.Context) (string, error) {
 			apiKey := firstNonEmptyString(cfg.APIKey, os.Getenv("AZURE_OPENAI_API_KEY"))
 			if apiKey == "" {
@@ -75,6 +79,15 @@ type azureResponsesEndpoint struct {
 	modelBaseURL string
 }
 
+// azureResponsesRequestURL builds the Azure OpenAI Responses request URL the way pinned openai 7.59.0
+// AzureOpenAI does (azure.mjs:41 sets defaultQuery['api-version'] = apiVersion; client.mjs:502-554 buildURL
+// strips search/hash from baseURL before appending '/responses', merges baseQuery under pathQuery/defaultQuery,
+// and preserves repeated baseParams).
+// /responses is not in azure.mjs's _deployments_endpoints, so buildRequest does not rewrite its path.
+func azureResponsesRequestURL(config AzureConfig) (string, error) {
+	return openaiBuildURLWithDefaultQuery(config.BaseURL, "/responses", sdkQueryParam{name: "api-version", value: config.APIVersion})
+}
+
 // resolve returns the provider for one request: the same configuration with the deployment name as the wire model and the resolved endpoint.
 func (e *azureResponsesEndpoint) resolve(p *openAIResponsesProvider, opts StreamOptions) *openAIResponsesProvider {
 	options := opts
@@ -86,7 +99,7 @@ func (e *azureResponsesEndpoint) resolve(p *openAIResponsesProvider, opts Stream
 		if err != nil {
 			return "", err
 		}
-		return strings.TrimRight(config.BaseURL, "/") + "/responses?api-version=" + url.QueryEscape(config.APIVersion), nil
+		return azureResponsesRequestURL(config)
 	}
 	resolved.cfg.azure = nil
 	return &resolved

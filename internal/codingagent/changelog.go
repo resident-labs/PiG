@@ -1,7 +1,8 @@
 package codingagent
 
 import (
-	"math"
+	"bufio"
+	"io"
 	"slices"
 	"strconv"
 	"strings"
@@ -38,8 +39,8 @@ var versionHeaderRE = lazyregexp.New(`##[\t\n\v\f\r \x{a0}\x{1680}\x{2000}-\x{20
 // ParseChangelog walks the markdown content of a CHANGELOG.md and
 // returns one ChangelogEntry per `## [x.y.z]`-style header. Order is
 // the order found in the file (typical convention: newest first).
-// Malformed entries are silently skipped: matches upstream behavior
-// (errors only logged via console.error).
+// Malformed entries are silently skipped. A changelog that cannot be read
+// gives no entries and prints nothing (parseChangelogFile; Pi ac78a6068b38).
 func ParseChangelog(content string) []ChangelogEntry {
 	if content == "" {
 		return nil
@@ -128,60 +129,92 @@ func changelogMarkdown(entries []ChangelogEntry) string {
 	return strings.Join(parts, "\n\n")
 }
 
-// GetNewEntries returns the entries whose version is newer than sinceVersion. The last-seen version is read as upstream's
-// `lastVersion.split(".").map(Number)` does: each of the first three dot-separated parts is a JavaScript Number, and a part
-// that is missing or not a number counts as 0 (utils/changelog.ts getNewEntries).
-func GetNewEntries(entries []ChangelogEntry, sinceVersion string) []ChangelogEntry {
-	parts := strings.Split(sinceVersion, ".")
-	part := func(i int) float64 {
-		if i >= len(parts) {
-			return 0
-		}
-		if number := jsStringToNumber(parts[i]); number != 0 && !math.IsNaN(number) {
-			return number
-		}
-		return 0
+// lastSeenVersionRE reads the leading major.minor.patch of a recorded version.
+var lastSeenVersionRE = lazyregexp.New(`^v?([0-9]+)\.([0-9]+)\.([0-9]+)`)
+
+// GetNewEntries returns the entries whose version is newer than sinceVersion, and false when sinceVersion has no major.minor.patch
+// to compare against. Only the leading major.minor.patch is read, like the changelog headings, so a prerelease or build suffix such as
+// 0.1.5-20261020.7 counts as 0.1.5 and its notes are not shown again on every launch.
+func GetNewEntries(entries []ChangelogEntry, sinceVersion string) ([]ChangelogEntry, bool) {
+	last, ok := parseLastSeenVersion(sinceVersion)
+	if !ok {
+		return nil, false
 	}
-	last := [3]float64{part(0), part(1), part(2)}
 	var newer []ChangelogEntry
 	for _, e := range entries {
-		for i, value := range [3]float64{float64(e.Major), float64(e.Minor), float64(e.Patch)} {
-			if value == last[i] {
-				continue
-			}
-			if value > last[i] {
-				newer = append(newer, e)
-			}
-			break
+		if e.newerThan(last) {
+			newer = append(newer, e)
 		}
 	}
-	return newer
+	return newer, true
 }
 
-var jsDecimalLiteral = lazyregexp.New(`^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$`)
-
-// jsStringToNumber is Number(text) for a string: surrounding JavaScript whitespace is ignored, the empty string is 0, Infinity, decimal and
-// 0x/0o/0b literals convert and anything else is NaN.
-func jsStringToNumber(text string) float64 {
-	text = jsstring.Trim(text)
-	switch {
-	case text == "":
-		return 0
-	case text == "Infinity" || text == "+Infinity":
-		return math.Inf(1)
-	case text == "-Infinity":
-		return math.Inf(-1)
-	case jsDecimalLiteral.MatchString(text):
-		number, _ := strconv.ParseFloat(text, 64)
-		return number
+// parseLastSeenVersion reads the leading major.minor.patch of a recorded version, and reports false when it has none.
+func parseLastSeenVersion(sinceVersion string) ([3]float64, bool) {
+	parts := lastSeenVersionRE.FindStringSubmatch(jsstring.Trim(sinceVersion))
+	if parts == nil {
+		return [3]float64{}, false
 	}
-	if len(text) > 2 && text[0] == '0' {
-		base := map[byte]int{'x': 16, 'X': 16, 'o': 8, 'O': 8, 'b': 2, 'B': 2}[text[1]]
-		if base != 0 {
-			if number, err := strconv.ParseUint(text[2:], base, 64); err == nil && !strings.HasPrefix(text[2:], "+") {
-				return float64(number)
+	var last [3]float64
+	for i := range last {
+		last[i], _ = strconv.ParseFloat(parts[i+1], 64)
+	}
+	return last, true
+}
+
+// newerThan reports whether the entry's version is greater than last, component by component.
+func (e ChangelogEntry) newerThan(last [3]float64) bool {
+	for i, value := range [3]float64{float64(e.Major), float64(e.Minor), float64(e.Patch)} {
+		if value == last[i] {
+			continue
+		}
+		return value > last[i]
+	}
+	return false
+}
+
+// parseChangelogNewerThan returns the entries ParseChangelog would find in the changelog r reads that are newer than last, reading only as far as
+// they extend. A changelog lists its releases newest first (TestBundledChangelogIsNewestFirst holds the bundled one to it), so the first release
+// that is not newer ends the read: the startup What's New of a build that is not an update, or whose recorded version is ahead of it, decodes a few
+// kilobytes of the embedded changelog instead of inflating all of it. read reports the reader's failure, which an embedded changelog cannot have.
+func parseChangelogNewerThan(r io.Reader, last [3]float64) (newer []ChangelogEntry, err error) {
+	br := bufio.NewReader(r)
+	var current *ChangelogEntry
+	var body strings.Builder
+	// finish closes the entry under construction. An entry's content runs from its heading line to the newline before the next "## " line,
+	// which the trim removes with the rest.
+	finish := func() {
+		if current != nil {
+			current.Content = jsstring.Trim(body.String())
+			newer = append(newer, *current)
+			current = nil
+		}
+		body.Reset()
+	}
+	for {
+		line, readErr := br.ReadString('\n')
+		if strings.HasPrefix(line, "## ") {
+			finish()
+			if match := versionHeaderRE.FindStringSubmatch(strings.TrimSuffix(line, "\n")); match != nil {
+				major, _ := strconv.Atoi(match[1])
+				minor, _ := strconv.Atoi(match[2])
+				patch, _ := strconv.Atoi(match[3])
+				entry := ChangelogEntry{Major: major, Minor: minor, Patch: patch}
+				if !entry.newerThan(last) {
+					return newer, nil
+				}
+				current = &entry
 			}
 		}
+		if current != nil {
+			body.WriteString(line)
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				finish()
+				return newer, nil
+			}
+			return newer, readErr
+		}
 	}
-	return math.NaN()
 }

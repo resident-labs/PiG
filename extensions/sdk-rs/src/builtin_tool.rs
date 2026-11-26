@@ -62,12 +62,18 @@ pub struct ModelImageResizeOptions {
     pub jpeg_quality: Option<u32>,
 }
 
+/// The stream `ReadOperations::create_read_stream` opens: the bytes of a file, read in chunks.
+pub type ReadStream = Box<dyn io::Read + Send>;
+
 /// Pi's `ReadOperations`: pluggable file reading. `detect_image_mime_type` returns a MIME type or `None` and is optional (without it every file is read as text).
+/// `create_read_stream` is Pi's `createReadStream` and is optional: the read tool then reads a text file through the stream, keeping only the lines it shows in
+/// memory, where `read_file` loads the whole file. The host reads the stream in chunks of at most 64 KB and drops it when the read ends or is aborted.
 #[derive(Clone)]
 pub struct ReadOperations {
     pub read_file: PathOperation<Vec<u8>>,
     pub access: PathOperation<()>,
     pub detect_image_mime_type: Option<PathOperation<Option<String>>>,
+    pub create_read_stream: Option<PathOperation<ReadStream>>,
 }
 
 /// Pi's `ReadToolOptions`. `auto_resize_images` `None` is Pi's default, true.
@@ -106,8 +112,8 @@ pub struct EditToolOptions {
     pub operations: Option<EditOperations>,
 }
 
-/// Pi's `GrepOperations`. `is_directory` fails when the path does not exist; `read_file` is optional and, without it, matched files are streamed from the local
-/// file system.
+/// Pi's `GrepOperations`. `is_directory` fails when the path does not exist. `read_file` is Pi's deprecated `readFile`: accepted and ignored. Grep takes its
+/// context lines from ripgrep, so the host never calls it and it is not sent to the host.
 #[derive(Clone)]
 pub struct GrepOperations {
     pub is_directory: PathOperation<bool>,
@@ -294,9 +300,72 @@ fn read_spec(cwd: &str, options: Option<ReadToolOptions>) -> Spec {
                 path_callback(detect, |mime| mime.map_or(Value::Null, Value::String)),
             );
         }
+        if let Some(create) = ops.create_read_stream.clone() {
+            names.push("createReadStream");
+            read_stream_callbacks(&mut spec, create);
+        }
         spec.operations(&names);
     }
     spec
+}
+
+/// The most a `operations.readStream` call returns: the 64 KB chunks `fs.createReadStream` yields.
+const READ_STREAM_CHUNK: usize = 64 * 1024;
+
+/// The callbacks of `create_read_stream`: the host opens a stream, reads it a chunk per call (an empty answer is the end) and closes it.
+fn read_stream_callbacks(spec: &mut Spec, create: PathOperation<ReadStream>) {
+    type Streams = Mutex<HashMap<String, ReadStream>>;
+    let streams: Arc<Streams> = Arc::new(Mutex::new(HashMap::new()));
+    let last = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let take = |streams: &Streams, args: &Value| -> Result<(String, ReadStream), String> {
+        let id = text_of(args, "stream").to_string();
+        let stream = streams
+            .lock()
+            .map_err(|_| "read streams are poisoned".to_string())?
+            .remove(&id);
+        stream
+            .map(|stream| (id.clone(), stream))
+            .ok_or_else(|| format!("read stream {id} is not open"))
+    };
+    let opened = Arc::clone(&streams);
+    spec.callback("operations.createReadStream", move |args| {
+        let stream = create(text_of(args, "path"))?;
+        let id = (last.fetch_add(1, Ordering::SeqCst) + 1).to_string();
+        opened
+            .lock()
+            .map_err(|_| "read streams are poisoned".to_string())?
+            .insert(id.clone(), stream);
+        Ok(Value::String(id))
+    });
+    let reading = Arc::clone(&streams);
+    spec.callback("operations.readStream", move |args| {
+        // The stream leaves the table while it reads, so a slow read holds no lock; the host reads one chunk at a time.
+        let (id, mut stream) = take(&reading, args)?;
+        let mut chunk = vec![0u8; READ_STREAM_CHUNK];
+        let read = loop {
+            match io::Read::read(&mut stream, &mut chunk) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                other => break other,
+            }
+        };
+        reading
+            .lock()
+            .map_err(|_| "read streams are poisoned".to_string())?
+            .insert(id, stream);
+        let count = read.map_err(|error| error.to_string())?;
+        Ok(Value::String(base64(&chunk[..count])))
+    });
+    let closing = Arc::clone(&streams);
+    spec.callback("operations.closeStream", move |args| {
+        let id = text_of(args, "stream");
+        let removed = closing
+            .lock()
+            .map_err(|_| "read streams are poisoned".to_string())?
+            .remove(id);
+        removed
+            .map(|_| Value::Null)
+            .ok_or_else(|| format!("read stream {id} is not open"))
+    });
 }
 
 fn write_spec(cwd: &str, options: Option<WriteToolOptions>) -> Spec {
@@ -342,15 +411,7 @@ fn grep_spec(cwd: &str, options: Option<GrepToolOptions>) -> Spec {
             "operations.isDirectory",
             path_callback(ops.is_directory.clone(), Value::Bool),
         );
-        let mut names = vec!["isDirectory"];
-        if let Some(read_file) = ops.read_file.clone() {
-            names.push("readFile");
-            spec.callback(
-                "operations.readFile",
-                path_callback(read_file, Value::String),
-            );
-        }
-        spec.operations(&names);
+        spec.operations(&["isDirectory"]);
     }
     spec
 }
@@ -769,10 +830,9 @@ fn execute(
         let callback = callback.clone();
         std::thread::spawn(move || {
             for (update, answer) in receiver {
-                let failure =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(update)))
-                        .err()
-                        .map(|payload| crate::context::panic_message(payload.as_ref()));
+                let failure = crate::diagnostic::recover(|| callback(update))
+                    .err()
+                    .map(|payload| crate::context::panic_message(payload.as_ref()));
                 let _ = answer.send(failure);
             }
         })
@@ -898,6 +958,12 @@ fn run_call(
     }
     let reply = reply?;
     if let Some(error) = reply.error {
+        if let Some(shell_exit) = error.shell_exit {
+            return Err(io::Error::other(HostShellTimeout {
+                message: host_error_message(error),
+                shell_exit,
+            }));
+        }
         return Err(io::Error::other(host_error_message(error)));
     }
     reply.result.ok_or_else(|| {
@@ -907,6 +973,21 @@ fn run_call(
         )
     })
 }
+
+/// The host's error reply of a local command that timed out after its shell had exited (Pi's `ShellTimeoutError` with a `shellExit`).
+#[derive(Debug)]
+struct HostShellTimeout {
+    message: String,
+    shell_exit: crate::protocol::ShellExit,
+}
+
+impl std::fmt::Display for HostShellTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HostShellTimeout {}
 
 /// Runs one function of a call's options for the host's `builtin_tool_callback`. An `Err` is the callback's throw.
 pub(crate) fn dispatch_callback(args: &Value) -> Result<Value, String> {
@@ -920,7 +1001,7 @@ pub(crate) fn dispatch_callback(args: &Value) -> Result<Value, String> {
     });
     let function = function.ok_or_else(|| format!("no built-in tool callback {member}"))?;
     let arguments = args.get("args").cloned().unwrap_or(Value::Null);
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| function(&arguments)))
+    crate::diagnostic::recover(|| function(&arguments))
         .map_err(|payload| crate::context::panic_message(payload.as_ref()))?
 }
 
@@ -942,7 +1023,8 @@ pub struct LocalBashOperationsOptions {
 fn local_exec(shell: &'static str, shell_path: Option<String>) -> BashOperations {
     BashOperations {
         exec: Arc::new(move |command, cwd, options| {
-            let conn = host_helpers::running_connection().map_err(|error| error.to_string())?;
+            let conn = host_helpers::running_connection()
+                .map_err(|error| crate::BashExecError::from(error.to_string()))?;
             let execute_id = format!("x{}", conn.execute_seq.fetch_add(1, Ordering::Relaxed));
             // A throw in onData (a panic) ends the command with it, as Pi's would reject the exec.
             let failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -955,12 +1037,11 @@ fn local_exec(shell: &'static str, shell_path: Option<String>) -> BashOperations
                         if let Some(message) = locked(&sink_failure).clone() {
                             return Err(message);
                         }
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_data(data)))
-                            .map_err(|payload| {
-                                let message = crate::context::panic_message(payload.as_ref());
-                                *locked(&sink_failure) = Some(message.clone());
-                                message
-                            })
+                        crate::diagnostic::recover(|| on_data(data)).map_err(|payload| {
+                            let message = crate::context::panic_message(payload.as_ref());
+                            *locked(&sink_failure) = Some(message.clone());
+                            message
+                        })
                     }),
                 );
             });
@@ -989,9 +1070,24 @@ fn local_exec(shell: &'static str, shell_path: Option<String>) -> BashOperations
             );
             registry(|registry| registry.exec_data.remove(&execute_id));
             if let Some(message) = locked(&failure).clone() {
-                return Err(message);
+                return Err(message.into());
             }
-            let reply = outcome.map_err(|error| error.to_string())?;
+            let reply = match outcome {
+                Ok(reply) => reply,
+                Err(error) => {
+                    let shell_exit = error
+                        .get_ref()
+                        .and_then(|inner| inner.downcast_ref::<HostShellTimeout>())
+                        .map(|timeout| timeout.shell_exit);
+                    let message = error.to_string();
+                    return Err(match shell_exit {
+                        Some(shell_exit) => {
+                            crate::BashExecError::shell_timeout(message, shell_exit)
+                        }
+                        None => message.into(),
+                    });
+                }
+            };
             Ok(reply.get("exitCode").and_then(Value::as_i64))
         }),
     }
@@ -1150,8 +1246,85 @@ pub fn create_read_only_tools(
 mod tests {
     use super::*;
 
+    // The shell's exit is a private field of the error: it survives a move, a clone and a thread hop, and a message alone (from a String, a &str, or the error's
+    // own text) does not carry it.
+    #[test]
+    fn the_shell_exit_belongs_to_the_error_and_not_to_its_message() {
+        let exit = crate::protocol::ShellExit {
+            exit_code: 7,
+            after_seconds: 0.5,
+        };
+        let error = crate::BashExecError::shell_timeout("timeout:2".to_string(), exit);
+        let moved = std::thread::spawn(move || error.clone()).join().unwrap();
+        assert_eq!(moved.clone().into_parts().1, Some(exit));
+        assert_eq!(
+            crate::BashExecError::from(moved.to_string()).into_parts().1,
+            None
+        );
+        assert_eq!(
+            crate::BashExecError::from(moved.message()).into_parts().1,
+            None
+        );
+    }
+
     // The behavior of the tools is the shared conformance row TestConformance_BuiltinToolDelegationAcrossSDKs; these cases pin what the SDK does before and after
     // the host call: which options cross the wire, which functions stay, and the tool-result shape of a host result.
+
+    // A stream the extension opens is read a chunk per call, ends with an empty chunk, and is dropped by closeStream.
+    #[test]
+    fn a_read_stream_is_read_in_chunks_until_an_empty_one_and_closed() {
+        let spec = read_spec(
+            "/c",
+            Some(ReadToolOptions {
+                operations: Some(ReadOperations {
+                    read_file: Arc::new(|_| Err("readFile must not be used".into())),
+                    access: Arc::new(|_| Ok(())),
+                    detect_image_mime_type: None,
+                    create_read_stream: Some(Arc::new(|path| {
+                        let bytes = vec![b'x'; READ_STREAM_CHUNK + 3];
+                        if path == "/missing" {
+                            return Err("ENOENT".into());
+                        }
+                        Ok(Box::new(io::Cursor::new(bytes)) as ReadStream)
+                    })),
+                }),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            Value::Object(spec.options.clone()),
+            json!({"operations": ["readFile", "access", "createReadStream"]})
+        );
+        let call = |member: &str, args: Value| spec.callbacks[member](&args);
+        assert_eq!(
+            call("operations.createReadStream", json!({"path": "/missing"})).unwrap_err(),
+            "ENOENT"
+        );
+        let id = call("operations.createReadStream", json!({"path": "/f"})).unwrap();
+        let stream = json!({"stream": id});
+        let chunk = |value: Value| base64_decode(value.as_str().unwrap()).unwrap().len();
+        assert_eq!(
+            chunk(call("operations.readStream", stream.clone()).unwrap()),
+            READ_STREAM_CHUNK
+        );
+        assert_eq!(
+            chunk(call("operations.readStream", stream.clone()).unwrap()),
+            3
+        );
+        assert_eq!(
+            call("operations.readStream", stream.clone()).unwrap(),
+            json!("")
+        );
+        assert_eq!(
+            call("operations.closeStream", stream.clone()).unwrap(),
+            Value::Null
+        );
+        assert!(
+            call("operations.readStream", stream)
+                .unwrap_err()
+                .contains("is not open")
+        );
+    }
 
     #[test]
     fn serializable_options_cross_and_functions_stay() {
@@ -1167,6 +1340,7 @@ mod tests {
                     read_file: Arc::new(|path| Ok(format!("bytes of {path}").into_bytes())),
                     access: Arc::new(|path| Err(format!("denied: {path}"))),
                     detect_image_mime_type: None,
+                    create_read_stream: None,
                 }),
             }),
         );
@@ -1203,25 +1377,18 @@ mod tests {
     }
 
     #[test]
-    fn optional_members_are_announced_only_when_given() {
-        let grep = |read_file: Option<PathOperation<String>>| {
-            grep_spec(
-                "/c",
-                Some(GrepToolOptions {
-                    operations: Some(GrepOperations {
-                        is_directory: Arc::new(|_| Ok(true)),
-                        read_file,
-                    }),
+    fn grep_announces_only_is_directory() {
+        let spec = grep_spec(
+            "/c",
+            Some(GrepToolOptions {
+                operations: Some(GrepOperations {
+                    is_directory: Arc::new(|_| Ok(true)),
+                    read_file: Some(Arc::new(|_| panic!("read_file is never called"))),
                 }),
-            )
-            .options["operations"]
-                .clone()
-        };
-        assert_eq!(grep(None), json!(["isDirectory"]));
-        assert_eq!(
-            grep(Some(Arc::new(|_| Ok(String::new())))),
-            json!(["isDirectory", "readFile"])
+            }),
         );
+        assert_eq!(spec.options["operations"], json!(["isDirectory"]));
+        assert!(!spec.callbacks.contains_key("operations.readFile"));
     }
 
     #[test]

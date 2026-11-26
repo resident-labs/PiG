@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"iter"
 	"maps"
+	"math"
 	"reflect"
 	"slices"
 	"strconv"
@@ -66,10 +67,13 @@ func (linesComponent) Invalidate()                 {}
 // renderers keep. The shell ticker and the edit preview update it off the UI
 // loop, so it has its own lock.
 type builtInRenderState struct {
-	mu        sync.Mutex
-	lifetime  context.Context
-	closed    bool
-	tasks     sync.WaitGroup
+	mu       sync.Mutex
+	lifetime context.Context
+	closed   bool
+	tasks    sync.WaitGroup
+	// spawn, when set, starts a task the card does not join itself: an interactive session runs its cards' workers in its own
+	// background group, which its end cancels and joins. Unset, a task runs in tasks, which the card's Dispose joins.
+	spawn     func(task func())
 	startedAt time.Time
 	endedAt   time.Time
 	stopTick  chan struct{}
@@ -82,6 +86,20 @@ type builtInRenderState struct {
 	writeHighlight *writeHighlightCache
 	// writePlain is the write card's lines for a path without a language, extended as its content streams in.
 	writePlain writePlainLines
+	// writeWarmed is the length of the content last handed to the whole-file highlight warm-up (warmWholeHighlight), writeWarmOff
+	// that the file's language cannot resume or a warm-up failed, so no warm-up is worth its cost, writeWarmRunning that the
+	// card's warm-up worker is alive, writeWarmNext and writeWarmLang the newest content waiting for it, and writeWarmFailure the panic of a warm-up that the next frame raises.
+	// writeWarmHeld and writeWarmHeldLang are the text, and its language, that the last warm-up left the units for the next one of
+	// (empty when it left none), and writeWarmDone that the call is complete: both end the card's hold on them (releaseWarmUnits). All are guarded by mu.
+	writeWarmed       int
+	writeWarmOff      bool
+	writeWarmRunning  bool
+	writeWarmDone     bool
+	writeWarmNext     string
+	writeWarmLang     string
+	writeWarmHeld     string
+	writeWarmHeldLang string
+	writeWarmFailure  any
 	// highlighter is the row's highlighting of a complete write call's file, or of a codemode call's script (upstream
 	// WriteCallRenderComponent.highlighter and CodemodeRenderState.scriptHighlighter). A complete write call redraws on
 	// every update and expand toggle with the same file, and a codemode call on every progress update and timer tick with
@@ -98,6 +116,15 @@ type builtInRenderState struct {
 	// editCall reports that the built-in edit renderCall drew this card, so
 	// its box holds the preview (upstream state.callComponent).
 	editCall bool
+}
+
+// goTask runs task on a goroutine the card's owner joins. state.mu is held, so a card that ended starts no more.
+func (state *builtInRenderState) goTask(task func()) {
+	if state.spawn != nil {
+		state.spawn(task)
+		return
+	}
+	state.tasks.Go(task)
 }
 
 func builtInState(context extension.ToolRenderContext) *builtInRenderState {
@@ -129,7 +156,7 @@ func builtInToolRenderers(name string) (extension.ToolRenderCallFunc, extension.
 	case "find":
 		return headerRenderCall(func(args json.RawMessage, _ string) string { return tui.FormatFindHeader(args) }), listRenderResult("find")
 	case "ls":
-		return headerRenderCall(tui.FormatLsHeader), listRenderResult("ls")
+		return lsRenderCall, listRenderResult("ls")
 	}
 	return nil, nil
 }
@@ -137,6 +164,21 @@ func builtInToolRenderers(name string) (extension.ToolRenderCallFunc, extension.
 func headerRenderCall(header func(json.RawMessage, string) string) extension.ToolRenderCallFunc {
 	return func(args json.RawMessage, _ extension.Theme, context extension.ToolRenderContext) extension.Component {
 		return tui.NewPaddedText(header(args, context.Cwd), 0, 0, nil)
+	}
+}
+
+// lsRenderCall is upstream ls.ts renderCall. Its path goes through renderToolPath, which throws for a path whose hyperlink cannot be named.
+func lsRenderCall(args json.RawMessage, _ extension.Theme, context extension.ToolRenderContext) extension.Component {
+	rawPath, _ := stringArg(args, "path")
+	panicOnUnlinkablePath(rawPath, context.Cwd)
+	return tui.NewPaddedText(tui.FormatLsHeader(args, context.Cwd), 0, 0, nil)
+}
+
+// panicOnUnlinkablePath is renderToolPath's throw (render-utils.ts linkPath): the call renderer throws for a path whose file URL cannot be named, and
+// tool-execution.ts updateDisplay draws the call fallback instead, as runToolRenderer does when it recovers this panic.
+func panicOnUnlinkablePath(rawPath, cwd string) {
+	if err := tui.ToolPathLinkError(rawPath, cwd); err != nil {
+		panic(err)
 	}
 }
 
@@ -158,7 +200,7 @@ type retainedToolResult struct {
 // structured content is the one the tool derives from its content, else the result.
 func retainToolResult(tool string, result agent.AgentToolResult) any {
 	if len(result.StructuredContent) > 0 {
-		if rebuilt, ok := tools.RebuildStructuredContent(tool, result.Content); ok && bytes.Equal(rebuilt, result.StructuredContent) {
+		if tools.StructuredContentMatches(tool, result.Content, result.StructuredContent) {
 			result.StructuredContent = nil
 			return retainedToolResult{result: result, tool: tool}
 		}
@@ -181,6 +223,19 @@ func toolResultOf(result any) (agent.AgentToolResult, bool) {
 		}
 	}
 	return agent.AgentToolResult{}, false
+}
+
+// readRenderResultCode identifies the built-in read renderer among the result renderers a card can hold.
+var readRenderResultCode = reflect.ValueOf(readRenderResult).Pointer()
+
+// toolResultForRenderer is toolResultOf for the result renderer render, which receives it. The built-in read renderer reads no structured
+// content, so it gets a retained read result as it is held, without the structured content toolResultOf derives from the file text again
+// for each draw. Every other renderer, an extension's included, receives the structured content the tool returned.
+func toolResultForRenderer(result any, render extension.ToolRenderResultFunc) (agent.AgentToolResult, bool) {
+	if held, ok := result.(retainedToolResult); ok && render != nil && reflect.ValueOf(render).Pointer() == readRenderResultCode {
+		return held.result, true
+	}
+	return toolResultOf(result)
 }
 
 // decodeRenderArgs reads the arguments a tool card holds once, so a renderer that needs several of them does not decode the whole object for each.
@@ -214,6 +269,44 @@ var fieldsRenderCall = reflect.ValueOf(extension.ToolRenderCallFunc(writeRenderC
 // encode them as text for each frame.
 func readsCallFields(render extension.ToolRenderCallFunc) bool {
 	return render != nil && reflect.ValueOf(render).Pointer() == fieldsRenderCall
+}
+
+// callShowsNoChange is, for a built-in renderCall that can tell without drawing, the question whether a call with these arguments would draw the lines its last call drew; nil for every other renderer, an extension's included.
+func callShowsNoChange(render extension.ToolRenderCallFunc) func(fields map[string]any, context extension.ToolRenderContext) bool {
+	if readsCallFields(render) {
+		return writeCallShowsNoChange
+	}
+	return nil
+}
+
+// writeCallShowsNoChange reports whether writeRenderCall, called now with these arguments, would set the text its last call set: the card is collapsed, the content still streams and extends a line the last call already counted, without a new line, so the line count of the hint is the same, the path is the one the last call drew, so the header is, and the lines drawn are the first ten of a leading block that the last call left highlighted for this epoch and that no longer grows (writePartialFullHighlightLines). It answers from the state the last call left and changes none of it but the highlight warm-up, which it hands the content as a frame would. Any doubt is false.
+// pig additive (D625): Pi asks no card whether an update changed it.
+func writeCallShowsNoChange(fields map[string]any, context extension.ToolRenderContext) bool {
+	if context.Expanded || context.ArgsComplete {
+		return false
+	}
+	states, _ := context.State.(map[string]any)
+	state, _ := states[builtInRenderStateKey].(*builtInRenderState)
+	rawPath, _ := stringField(fields, "file_path", "path")
+	content, ok := stringField(fields, "content")
+	if state == nil || !ok || rawPath == "" {
+		return false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	cache := state.writeHighlight
+	if cache == nil || state.writeWarmFailure != nil || cache.rawPath != rawPath || cache.lang != tui.LanguageFromPath(rawPath) || !strings.HasPrefix(content, cache.rawContent) {
+		return false
+	}
+	if len(cache.normalizedLines)-1 < writePartialFullHighlightLines || !cache.prefixFresh || cache.prefixEpoch != tui.CurrentHighlightEpoch() {
+		return false
+	}
+	// The hint counts the lines up to the last one that is not empty (lineCount): the count moves when a line begins, with the first character after a new line, and not again until the next new line.
+	if cache.normalizedLines[len(cache.normalizedLines)-1] == "" || strings.Contains(content[len(cache.rawContent):], "\n") {
+		return false
+	}
+	state.warmWholeHighlight(content, cache.lang)
+	return true
 }
 
 // pathRenderArgs is the part of decoded arguments that holds the file path a header names, as JSON for tui.FormatEditHeader, which reads no other argument.
@@ -409,6 +502,8 @@ func readRenderCall(args json.RawMessage, _ extension.Theme, context extension.T
 			return tui.NewPaddedText(header, 0, 0, nil)
 		}
 	}
+	rawPath, _ := stringArg(args, "file_path", "path")
+	panicOnUnlinkablePath(rawPath, context.Cwd)
 	return tui.NewPaddedText(tui.FormatReadHeader(args, context.Cwd), 0, 0, nil)
 }
 
@@ -417,11 +512,15 @@ func readRenderCall(args json.RawMessage, _ extension.Theme, context extension.T
 // file's language, the first ten lines while collapsed, and the truncation
 // warning.
 func readRenderResult(result extension.AgentToolResult, options extension.ToolRenderResultOptions, _ extension.Theme, context extension.ToolRenderContext) extension.Component {
-	if !options.Expanded && !context.IsError {
-		return tui.NewPaddedText("", 0, 0, nil)
-	}
 	theme := tui.ActiveTheme()
 	value := renderResultValue(result)
+	imageWarning := ""
+	if unsupportedBy := readImageUnsupportedByModel(value.Details); unsupportedBy != "" {
+		imageWarning = "\n" + themeFg(theme.Warning, "["+unsupportedBy+" does not support images; it saw a placeholder instead]")
+	}
+	if !options.Expanded && !context.IsError {
+		return tui.NewPaddedText(imageWarning, 0, 0, nil)
+	}
 	rawPath, _ := stringArg(context.Args, "file_path", "path")
 	output := toolResultTextOutput(value, context.ShowImages)
 	lang := ""
@@ -451,52 +550,144 @@ func readRenderResult(result extension.AgentToolResult, options extension.ToolRe
 	if remaining := len(lines) - len(display); remaining > 0 {
 		text += moreLinesHint("\n... (" + strconv.Itoa(remaining) + " more lines,")
 	}
-	if truncation := readTruncation(value.Details); truncation != nil && truncation.Truncated {
-		maxBytes := truncation.MaxBytes
-		if maxBytes == 0 {
-			maxBytes = tools.DefaultMaxBytesUpstream
-		}
-		maxLines := truncation.MaxLines
-		if maxLines == 0 {
-			maxLines = tools.DefaultMaxLinesUpstream
-		}
+	if truncation := readTruncation(value.Details); truncation != nil && truncation.truncated {
 		var warning string
 		switch {
-		case truncation.FirstLineExceedsLimit:
-			warning = "[First line exceeds " + tools.FormatSize(maxBytes) + " limit]"
-		case truncation.TruncatedBy == "lines":
-			warning = "[Truncated: showing " + strconv.Itoa(truncation.OutputLines) + " of " + strconv.Itoa(truncation.TotalLines) + " lines (" + strconv.Itoa(maxLines) + " line limit)]"
+		case truncation.firstLineExceedsLimit:
+			warning = "[First line exceeds " + tools.FormatSize(truncation.maxBytes) + " limit]"
+		case truncation.truncatedBy == "lines":
+			warning = "[Truncated: showing " + truncation.outputLines + " of " + truncation.totalLines + " lines (" + truncation.maxLines + " line limit)]"
 		default:
-			warning = "[Truncated: " + strconv.Itoa(truncation.OutputLines) + " lines shown (" + tools.FormatSize(maxBytes) + " limit)]"
+			warning = "[Truncated: " + truncation.outputLines + " lines shown (" + tools.FormatSize(truncation.maxBytes) + " limit)]"
 		}
 		text += "\n" + themeFg(theme.Warning, warning)
 	}
-	return tui.NewPaddedText(text, 0, 0, nil)
+	return tui.NewPaddedText(text+imageWarning, 0, 0, nil)
 }
 
-func readTruncation(details any) *tools.TruncationResult {
+// readImageUnsupportedByModel is `${details.imageUnsupportedByModel}` of a read result when the member is truthy, as read.ts
+// formatReadResult reads it, else "": the tool's own details, or the JSON a stored result carries.
+func readImageUnsupportedByModel(details any) string {
 	switch value := detailsObject(details).(type) {
 	case *tools.ReadDetails:
-		if value != nil {
-			return value.Truncation
+		if value == nil || value.ImageUnsupportedByModel == nil {
+			return ""
 		}
-		return nil
+		return *value.ImageUnsupportedByModel
 	case map[string]any:
-		raw, ok := value["truncation"]
-		if !ok || raw == nil {
+		if truthyValue(value["imageUnsupportedByModel"]) {
+			return jsTemplateText(value, "imageUnsupportedByModel")
+		}
+	}
+	return ""
+}
+
+// truncationView is details.truncation as read.ts formatReadResult reads it. The counts are the text `${value}` makes of the member, so one a
+// result does not carry reads "undefined"; the limits are `value ?? default`, so a limit of 0 is kept.
+type truncationView struct {
+	truncated, firstLineExceedsLimit bool
+	truncatedBy                      string
+	outputLines, totalLines          string
+	maxLines                         string
+	maxBytes                         int
+}
+
+// readTruncation reads details.truncation of a read result: the tool's own details, or the JSON a stored result carries.
+func readTruncation(details any) *truncationView {
+	switch value := detailsObject(details).(type) {
+	case *tools.ReadDetails:
+		if value == nil || value.Truncation == nil {
 			return nil
 		}
-		encoded, err := json.Marshal(raw)
-		if err != nil {
+		return typedTruncationView(value.Truncation)
+	case map[string]any:
+		raw, ok := detailsObject(value["truncation"]).(map[string]any)
+		if !ok {
 			return nil
 		}
-		var truncation tools.TruncationResult
-		if json.Unmarshal(encoded, &truncation) != nil {
-			return nil
+		view := &truncationView{
+			truncated:             truthyValue(raw["truncated"]),
+			firstLineExceedsLimit: truthyValue(raw["firstLineExceedsLimit"]),
+			outputLines:           jsTemplateText(raw, "outputLines"),
+			totalLines:            jsTemplateText(raw, "totalLines"),
+			maxLines:              strconv.Itoa(tools.DefaultMaxLinesUpstream),
+			maxBytes:              tools.DefaultMaxBytesUpstream,
 		}
-		return &truncation
+		view.truncatedBy, _ = raw["truncatedBy"].(string)
+		if limit, ok := numberValue(raw["maxLines"]); ok {
+			view.maxLines = tui.JSNumberString(limit)
+		}
+		if limit, ok := numberValue(raw["maxBytes"]); ok && limit >= math.MinInt && limit < -math.MinInt {
+			//portlint:allow numbers the guard above admits only values within int range (NaN fails both comparisons), so the conversion is defined; maxBytes is the whole byte count the read tool wrote
+			view.maxBytes = int(limit)
+		}
+		return view
 	}
 	return nil
+}
+
+// typedTruncationView is the view of a truncation the read tool produced: every member is set, and an unset limit is the default.
+func typedTruncationView(truncation *tools.TruncationResult) *truncationView {
+	view := &truncationView{
+		truncated:             truncation.Truncated,
+		firstLineExceedsLimit: truncation.FirstLineExceedsLimit,
+		truncatedBy:           truncation.TruncatedBy,
+		outputLines:           strconv.Itoa(truncation.OutputLines),
+		totalLines:            strconv.Itoa(truncation.TotalLines),
+		maxLines:              strconv.Itoa(truncation.MaxLines),
+		maxBytes:              truncation.MaxBytes,
+	}
+	if truncation.MaxLines == 0 {
+		view.maxLines = strconv.Itoa(tools.DefaultMaxLinesUpstream)
+	}
+	if truncation.MaxBytes == 0 {
+		view.maxBytes = tools.DefaultMaxBytesUpstream
+	}
+	return view
+}
+
+// truthyValue is JavaScript's truthiness of a decoded JSON value.
+func truthyValue(value any) bool {
+	switch value := value.(type) {
+	case nil:
+		return false
+	case bool:
+		return value
+	case string:
+		return value != ""
+	}
+	if number, ok := numberValue(value); ok {
+		return number != 0 && !math.IsNaN(number)
+	}
+	return true
+}
+
+// numberValue is a decoded JSON number or a Go integer a tool stored in its details, as the float64 JavaScript holds.
+func numberValue(value any) (float64, bool) {
+	switch value := value.(type) {
+	case float64:
+		return value, true
+	case int:
+		return float64(value), true
+	case int64:
+		return float64(value), true
+	case json.Number:
+		number, err := value.Float64()
+		return number, err == nil
+	}
+	return 0, false
+}
+
+// jsTemplateText is `${object[key]}`: "undefined" for a member the object lacks.
+func jsTemplateText(object map[string]any, key string) string {
+	value, present := object[key]
+	if !present {
+		return "undefined"
+	}
+	if number, ok := numberValue(value); ok {
+		return tui.JSNumberString(number)
+	}
+	return tui.JSTemplateString(value)
 }
 
 // listRenderResult is upstream grep.ts, find.ts and ls.ts renderResult.
@@ -522,8 +713,9 @@ func listRenderResult(name string) extension.ToolRenderResultFunc {
 func writeRenderCall(args json.RawMessage, _ extension.Theme, context extension.ToolRenderContext) extension.Component {
 	theme := tui.ActiveTheme()
 	fields := callFields(args, context)
-	text := tui.FormatWriteHeaderArgs(writeHeaderFields(fields), context.Cwd)
 	rawPath, _ := stringField(fields, "file_path", "path")
+	panicOnUnlinkablePath(rawPath, context.Cwd)
+	text := tui.FormatWriteHeaderArgs(writeHeaderFields(fields), context.Cwd)
 	content, ok := stringField(fields, "content")
 	lang := ""
 	if rawPath != "" {
@@ -536,8 +728,14 @@ func writeRenderCall(args json.RawMessage, _ extension.Theme, context extension.
 	// fileContent !== null && !context.argsComplete ? updateWriteHighlightCacheIncremental : undefined).
 	if ok && !context.ArgsComplete {
 		state.writeHighlight = updateWriteHighlightCacheIncremental(state.writeHighlight, rawPath, content)
+		if lang != "" {
+			state.warmWholeHighlight(content, lang)
+		}
 	} else {
 		state.writeHighlight = nil
+		// A complete call draws its file from the highlighter once: a warm-up that has not started is dropped.
+		state.writeWarmNext = ""
+		state.writeWarmDone = state.writeWarmDone || context.ArgsComplete
 	}
 	cache := state.writeHighlight
 	var plain writePlainLines
@@ -592,6 +790,9 @@ func writeRenderCall(args json.RawMessage, _ extension.Theme, context extension.
 			text += moreLinesHint("\n... (" + strconv.Itoa(remaining) + " more lines, " + strconv.Itoa(total) + " total,")
 		}
 	}
+	// The frame that completed the call drew the highlighter's lines of the whole file from the state the last warm-up left, and took
+	// its units; a warm-up still running at that draw releases its own when it ends (runWriteWarmUps).
+	state.releaseWarmUnitsOfAFinishedCall()
 	// The row's Text is reused, and keeps its wrapped lines when a redraw sets the text it showed (upstream
 	// WriteCallRenderComponent extends Text).
 	component := reusableText(context.LastComponent)
@@ -802,6 +1003,8 @@ func editRenderCall(args json.RawMessage, _ extension.Theme, context extension.T
 	}
 	headerArgs := input.header
 	state.mu.Unlock()
+	editPath, _ := stringArg(headerArgs, "file_path", "path")
+	panicOnUnlinkablePath(editPath, context.Cwd)
 	header := tui.FormatEditHeader(headerArgs, context.Cwd)
 	// The box is built once per preview, settled state and theme, and its rows are kept per width: the card draws on
 	// every frame it is dirty, and drawing the diff again each time cost a pass over all of it.

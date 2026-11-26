@@ -37,7 +37,7 @@ func TestEmptyMessagesUpstream(t *testing.T) {
 		{"huggingface", "moonshotai/Kimi-K2.5"}, {"together", "moonshotai/Kimi-K3"}, {"baseten", "zai-org/GLM-5.2"}, {"zai", "glm-5.2"},
 		{"mistral", "devstral-medium-latest"}, {"minimax", "MiniMax-M2.7"}, {"xiaomi", "mimo-v2.6-pro"}, {"xiaomi-token-plan-cn", "mimo-v2.6-pro"},
 		{"xiaomi-token-plan-ams", "mimo-v2.6-pro"}, {"xiaomi-token-plan-sgp", "mimo-v2.6-pro"}, {"qwen-token-plan", "qwen3.7-max"},
-		{"qwen-token-plan-individual", "qwen3.8-max"}, {"qwen-token-plan-cn", "qwen3.7-max"}, {"kimi-coding", "kimi-for-coding"},
+		{"qwen-token-plan-individual", "qwen3.8-max"}, {"qwen-token-plan-individual-cn", "qwen3.8-max"}, {"qwen-token-plan-cn", "qwen3.7-max"}, {"kimi-coding", "kimi-for-coding"},
 		{"vercel-ai-gateway", "google/gemini-2.5-flash"}, {"amazon-bedrock", "global.anthropic.claude-sonnet-4-5-20250929-v1:0"},
 		{"anthropic", "claude-haiku-4-5"}, {"github-copilot", "claude-haiku-4.5"}, {"github-copilot", "claude-sonnet-4.6"}, {"openai-codex", "gpt-6.1-sol"},
 	}
@@ -46,6 +46,10 @@ func TestEmptyMessagesUpstream(t *testing.T) {
 		t.Fatalf("upstream denominator has %d cases for %d four-case model groups", len(cases), len(models))
 	}
 	for index, tc := range cases {
+		if spec := models[index/4]; !ai.BuiltCatalogModel(spec.provider + "/" + spec.model) {
+			// A build with this API's pig_strip tag has no provider for the row.
+			continue
+		}
 		t.Run(tc.ID, func(t *testing.T) {
 			t.Logf(".upstream/current/packages/ai/test/empty.test.ts:%d", tc.Line)
 			spec := models[index/4]

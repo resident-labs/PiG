@@ -9,7 +9,7 @@
 
 (defstruct (core-state (:conc-name cs-) (:constructor make-core-state ()))
   (lock (sb-thread:make-mutex :name "pig core state"))
-  (model "") (model-provider "") (session-name "") (session-file "") (settings nil) (source-info nil)
+  (model "") (model-provider "") (model-info nil) (model-known nil) (replica-session-id "") (replica-session-known nil) (session-name "") (session-file "") (settings nil) (source-info nil)
   (nested (make-hash-table :test 'equal)) (execute-seq 0) (exec-seq 0)
   ;; the session log mirror
   (session-id "") (entries (make-array 0 :adjustable t :fill-pointer t)) (index (make-hash-table :test 'equal)) (leaf-id "")
@@ -57,11 +57,13 @@
       (sb-thread:with-mutex ((cs-lock cs))
         (when (nth-value 1 (gethash "model" state))
           (multiple-value-bind (id provider) (core-model-identity (jget state "model"))
-            (setf (cs-model cs) id (cs-model-provider cs) provider)))
+            (setf (cs-model cs) id (cs-model-provider cs) provider
+                  (cs-model-info cs) (jget state "model") (cs-model-known cs) t)))
         (let ((session (jget state "session")))
           (when (hash-table-p session)
+            (let ((id (jget session "sessionId"))) (setf (cs-replica-session-id cs) (if (stringp id) id "") (cs-replica-session-known cs) t))
             (let ((name (jget session "sessionName"))) (setf (cs-session-name cs) (if (stringp name) name "")))
-            (let ((file (jget session "sessionFile"))) (when (and (stringp file) (plusp (length file))) (setf (cs-session-file cs) file)))
+            (let ((file (jget session "sessionFile"))) (setf (cs-session-file cs) (if (stringp file) file "")))
             (cs-apply-session cs session)))
         (let ((settings (jget state "settings"))) (when (hash-table-p settings) (setf (cs-settings cs) settings)))))))
 
@@ -80,6 +82,50 @@
   (assert-active ctx)
   (with-core-state (cs ctx) (cs-model cs)))
 
+;;; The model object, session id, name and file of the latest snapshot answer these reads without a host call. A context made before
+;;; the first snapshot, and a withSession context (this process replicates only the requesting Session), ask the host.
+
+(defun ctx-get-model-info (ctx)
+  "The active model's info object (a fresh copy per call), or NIL while the session has no model."
+  (if (ctx-replacement ctx)
+      (host-model-info ctx)
+      (progn
+        (assert-active ctx)
+        (multiple-value-bind (known info) (with-core-state (cs ctx) (values (cs-model-known cs) (cs-model-info cs)))
+          (if known (model-info-result (clone-stream-value info)) (host-model-info ctx))))))
+
+(defun replicated-session-member (ctx reader)
+  "(values value known): READER, (lambda (core-state)), of the replicated session members of an ordinary context; known is NIL for a replacement context and before the first session snapshot."
+  (cond ((ctx-replacement ctx) (values nil nil))
+        (t (assert-active ctx)
+           (with-core-state (cs ctx) (if (cs-replica-session-known cs) (values (funcall reader cs) t) (values nil nil))))))
+
+(defun non-empty-or-nil (text) (and (plusp (length text)) text))
+
+(defun ctx-get-session-id (ctx)
+  (multiple-value-bind (id known) (replicated-session-member ctx #'cs-replica-session-id)
+    (if known id (host-session-id ctx))))
+
+(defun ctx-get-session-name (ctx)
+  "The session's name, or NIL while it has none."
+  (multiple-value-bind (name known) (replicated-session-member ctx #'cs-session-name)
+    (if known (non-empty-or-nil name) (optional-string-field ctx "getSessionName" "name"))))
+
+(defun ctx-get-session-file (ctx)
+  "The session file's path, or NIL for an in-memory session."
+  (multiple-value-bind (file known) (replicated-session-member ctx #'cs-session-file)
+    (if known (non-empty-or-nil file) (optional-string-field ctx "getSessionFile" "sessionFile"))))
+
+(defun replicated-manager-member (manager reader method &optional (transform #'identity))
+  "The replicated session member READER names for the context's own Session, through TRANSFORM; a setup manager reads the Session being created, so it asks the host."
+  (multiple-value-bind (value known)
+      (if (session-manager-replicated manager) (replicated-session-member (session-manager-ctx manager) reader) (values nil nil))
+    (if known (funcall transform value) (session-read manager method))))
+
+(defun session-get-session-id (manager) (replicated-manager-member manager #'cs-replica-session-id "getSessionId"))
+(defun session-get-session-name (manager) (replicated-manager-member manager #'cs-session-name "getSessionName" #'non-empty-or-nil))
+(defun session-get-session-file (manager) (replicated-manager-member manager #'cs-session-file "getSessionFile" #'non-empty-or-nil))
+
 (defun ctx-model-provider (ctx)
   "The active model's provider id (Pi's ctx.model.provider), \"\" while the session has no model."
   (assert-active ctx)
@@ -96,15 +142,13 @@
   (assert-active ctx)
   (with-core-state (cs ctx) (cs-session-name cs)))
 
-(defun ctx-get-session-name (ctx) (optional-string-field ctx "getSessionName" "name"))
-(defun ctx-get-session-file (ctx) (optional-string-field ctx "getSessionFile" "sessionFile"))
-
 (defun ctx-extension-source-info (ctx)
   "The provenance the host stamped on this extension (path, source, scope, origin, baseDir, and changelogPath when the package has a changelog), as the host sent it, or NIL."
   (with-core-state (cs ctx) (and (cs-source-info cs) (clone-stream-value (cs-source-info cs)))))
 
 (defun ctx-get-settings (ctx)
-  "A copy of the effective settings the host sent. Signals until it has sent them."
+  "A copy of the effective settings the host sent. Signals until it has sent them, and after the session was replaced or reloaded."
+  (assert-call-active ctx)
   (let ((settings (with-core-state (cs ctx) (cs-settings cs))))
     (unless settings (error "settings are not available: the host has not sent them"))
     (clone-stream-value settings)))
@@ -154,17 +198,30 @@
            (char/= (char key 0) #\0) (<= (parse-integer key) 4294967294))))
 
 (defun core-js-ordered (value)
-  "VALUE with every object's members in the order JavaScript's Object.keys gives: array-index keys ascending, then the others in insertion order."
-  (cond ((hash-table-p value)
-         (let ((keys '()) (copy (make-hash-table :test 'equal)))
-           (maphash (lambda (k v) (declare (ignore v)) (push k keys)) value)
-           (setf keys (nreverse keys))
-           (let ((indexes (sort (remove-if-not #'core-array-index-p keys) #'< :key #'parse-integer)))
-             (dolist (k (append indexes (remove-if #'core-array-index-p keys)))
-               (setf (gethash k copy) (core-js-ordered (gethash k value)))))
-           copy))
-        ((and (vectorp value) (not (stringp value))) (map 'simple-vector #'core-js-ordered value))
-        (t value)))
+  "VALUE with every object's members in the order JavaScript's Object.keys gives: array-index keys ascending, then the others in insertion order.
+The containers are walked with a stack of the function's own: a value nested thousands of levels deep (the host sends up to 10000) does not depend on the thread's control stack."
+  (flet ((shell (v)
+           (cond ((hash-table-p v) (make-hash-table :test 'equal))
+                 ((and (vectorp v) (not (stringp v))) (make-array (length v)))
+                 (t v))))
+    (declare (inline shell))
+    (let* ((root (shell value)) (stack (if (eq root value) '() (list (cons value root)))))
+      (loop while stack
+            do (destructuring-bind (source . target) (pop stack)
+                 (if (hash-table-p source)
+                     (let ((keys '()))
+                       (maphash (lambda (k v) (declare (ignore v)) (push k keys)) source)
+                       (setf keys (nreverse keys))
+                       (let ((indexes (sort (remove-if-not #'core-array-index-p keys) #'< :key #'parse-integer)))
+                         (dolist (k (append indexes (remove-if #'core-array-index-p keys)))
+                           (let* ((v (gethash k source)) (child (shell v)))
+                             (setf (gethash k target) child)
+                             (unless (eq child v) (push (cons v child) stack))))))
+                     (dotimes (i (length source))
+                       (let* ((v (aref source i)) (child (shell v)))
+                         (setf (svref target i) child)
+                         (unless (eq child v) (push (cons v child) stack)))))))
+      root)))
 
 (defun ctx-tool-call-index (ctx)
   "The running tool call's position among the tool calls of the assistant message that issued it, or NIL (outside a tool handler,
@@ -182,11 +239,14 @@ and for a call no assistant message issued, such as a nested ctx-execute-tool ca
 ;;; ---------------------------------------------------------------- background work owned by the connection
 
 (defun core-spawn (ext name function)
-  "Run FUNCTION on a thread the connection owns: shutdown waits for it."
+  "Run FUNCTION on a thread the connection owns: shutdown waits for it. A condition FUNCTION leaves unhandled (a failing callback of its own) is reported
+on stderr: no thread but the one that signals it can handle it, and one that ends a thread ends the whole process, which a packed cell shares."
   (sb-thread:with-mutex ((extension-state-lock ext))
     (let ((thread (sb-thread:make-thread
                    (lambda ()
-                     (unwind-protect (funcall function)
+                     (unwind-protect (handler-case (funcall function)
+                                       (serious-condition (c)
+                                         (format *error-output* "~A: ~A failed: ~A~%" (extension-name ext) name (condition-message c))))
                        (sb-thread:with-mutex ((extension-state-lock ext))
                          (setf (extension-request-threads ext) (remove sb-thread:*current-thread* (extension-request-threads ext))))))
                    :name name)))

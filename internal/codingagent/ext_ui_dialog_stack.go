@@ -4,6 +4,7 @@ package codingagent
 
 import (
 	"context"
+	"fmt"
 	"slices"
 
 	"github.com/MichaelKinsy/PiG/coding/extension"
@@ -38,7 +39,7 @@ type awaitedDialog struct {
 // ok is false when the dialog was dismissed (Esc, or a timeout) or the TUI is unavailable. A Session replacement or /reload
 // disposes the dialog too (resetExtensionUI); Pi leaves the awaiting promise pending then and its continuation never runs,
 // but the owner loop cannot park for good in a nested loop that ignores submissions, so the wait ends as a dismissal.
-func awaitOwnerDialog[T any](m *InteractiveMode, ctx context.Context, ask func(context.Context, *ExtUIContext) (T, error)) (T, bool) {
+func awaitOwnerDialog[T any](m *InteractiveMode, ctx context.Context, commit func(choice string), ask func(context.Context, *ExtUIContext) (T, error)) (T, bool) {
 	var value T
 	dialogCtx, dismiss := context.WithCancel(ctx)
 	defer dismiss()
@@ -52,30 +53,30 @@ func awaitOwnerDialog[T any](m *InteractiveMode, ctx context.Context, ask func(c
 		stop := context.AfterFunc(workCtx, dismiss)
 		defer stop()
 		var err error
-		value, err = ask(dialogCtx, &ExtUIContext{m: m})
+		value, err = ask(dialogCtx, &ExtUIContext{m: m, commit: commit})
 		return err
 	})
 	return value, err == nil
 }
 
-// askSelector is `await showExtensionSelector(title, options)`: the chosen option, or ok false when the selector was dismissed.
-func (m *InteractiveMode) askSelector(ctx context.Context, title string, options []string) (string, bool) {
-	return awaitOwnerDialog(m, ctx, func(ctx context.Context, ui *ExtUIContext) (string, error) {
+// askSelectorCommit is `await showExtensionSelector(title, options)`: the chosen option, or ok false when the selector was dismissed. commit runs as the selector resolves with a choice (ExtUIContext.commit).
+func (m *InteractiveMode) askSelectorCommit(ctx context.Context, title string, options []string, commit func(choice string)) (string, bool) {
+	return awaitOwnerDialog(m, ctx, commit, func(ctx context.Context, ui *ExtUIContext) (string, error) {
 		return ui.Select(ctx, title, options, extension.ExtensionUIDialogOptions{})
 	})
 }
 
 // askConfirm is `await showExtensionConfirm(title, message)`: whether Yes was chosen. Dismissing it answers No.
 func (m *InteractiveMode) askConfirm(ctx context.Context, title, message string) bool {
-	confirmed, ok := awaitOwnerDialog(m, ctx, func(ctx context.Context, ui *ExtUIContext) (bool, error) {
+	confirmed, ok := awaitOwnerDialog(m, ctx, nil, func(ctx context.Context, ui *ExtUIContext) (bool, error) {
 		return ui.Confirm(ctx, title, message, extension.ExtensionUIDialogOptions{})
 	})
 	return ok && confirmed
 }
 
-// askEditor is `await showExtensionEditor(title, prefill)`: the text, or ok false when the editor was dismissed.
-func (m *InteractiveMode) askEditor(ctx context.Context, title, prefill string) (string, bool) {
-	return awaitOwnerDialog(m, ctx, func(ctx context.Context, ui *ExtUIContext) (string, error) {
+// askEditorCommit is `await showExtensionEditor(title, prefill)`: the text, or ok false when the editor was dismissed. commit runs as the editor resolves with text.
+func (m *InteractiveMode) askEditorCommit(ctx context.Context, title, prefill string, commit func(choice string)) (string, bool) {
+	return awaitOwnerDialog(m, ctx, commit, func(ctx context.Context, ui *ExtUIContext) (string, error) {
 		return ui.Editor(ctx, title, prefill)
 	})
 }
@@ -154,4 +155,42 @@ func (m *InteractiveMode) resetExtensionDialogs() {
 		wait.dismiss()
 	}
 	m.showTopExtensionDialog()
+}
+
+// extensionOverlay is an open extension overlay (ui.custom with overlay: true) and the function that removes it.
+type extensionOverlay struct {
+	handle *tui.OverlayHandle
+	remove func()
+}
+
+// nextBlockingOverlaySource numbers the program status source of a blocking overlay, so closing one keeps the others.
+// upstream: interactive-mode.ts nextBlockingOverlayId
+func (m *InteractiveMode) nextBlockingOverlaySource() string {
+	source := fmt.Sprintf("extension-overlay:%d", m.nextBlockingOverlayID)
+	m.nextBlockingOverlayID++
+	return source
+}
+
+// addExtensionOverlay records an open extension overlay, in opening order. upstream: interactive-mode.ts extensionOverlays
+func (m *InteractiveMode) addExtensionOverlay(handle *tui.OverlayHandle, remove func()) {
+	m.extensionOverlays = append(m.extensionOverlays, &extensionOverlay{handle: handle, remove: remove})
+}
+
+// deleteExtensionOverlay forgets the overlay and reports whether it was open.
+func (m *InteractiveMode) deleteExtensionOverlay(handle *tui.OverlayHandle) bool {
+	index := slices.IndexFunc(m.extensionOverlays, func(overlay *extensionOverlay) bool { return overlay.handle == handle })
+	if index < 0 {
+		return false
+	}
+	m.extensionOverlays = slices.Delete(m.extensionOverlays, index, index+1)
+	return true
+}
+
+// removeExtensionOverlays removes every extension overlay, hidden ones included, newest first, the way done does, and leaves pi's own overlays open.
+// Reload and session switches replace every extension without calling done(); the promises stay pending, as for inline dialogs.
+// upstream: interactive-mode.ts resetExtensionUI
+func (m *InteractiveMode) removeExtensionOverlays() {
+	for _, overlay := range slices.Backward(slices.Clone(m.extensionOverlays)) {
+		overlay.remove()
+	}
 }

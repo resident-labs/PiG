@@ -13,7 +13,7 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
-// Ports packages/chord/src/next/store/applier.ts
+// Ports packages/chord/src/store/applier.ts
 //
 // The applier (slice 6a §13, slice 6b §1.6): recorded writes applied as they were recorded, inside a backend
 // transaction, checked against the store's own records (a trust boundary: archives, a replica's batches). One code
@@ -484,6 +484,15 @@ func checkTable(write *TableDefinitionWrite, what string) error {
 		}
 	}
 	folded := map[string]bool{}
+	hosts := 0
+	for _, entry := range write.Columns {
+		if entry.Record.Host != nil {
+			hosts++
+		}
+	}
+	if hosts > 1 {
+		return invalidArgs("%s: more than one host column", what)
+	}
 	for _, entry := range write.Columns {
 		where := fmt.Sprintf("%s: column %s", what, jsString(entry.Name))
 		lower := strings.ToLower(entry.Name)
@@ -502,6 +511,15 @@ func checkTable(write *TableDefinitionWrite, what string) error {
 }
 
 func checkColumn(column ColumnRecord, what string) error {
+	if column.Host != nil {
+		if column.Type != ColStr || column.Optional || column.Default != nil {
+			return invalidArgs("%s: a host column is a non-opt str column without a default", what)
+		}
+		// CheckName fails with a plain error.
+		if err := contracts.CheckName(*column.Host, what+": host kind"); err != nil {
+			return invalidArgs("%s", err.Error())
+		}
+	}
 	json := column.Type == ColJson
 	if json != (column.Version != nil) || json != (column.Fingerprint != "") {
 		return invalidArgs("%s: a json(...) column has a version and a fingerprint, no other column has", what)

@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"sync/atomic"
 	"testing"
+
+	"github.com/MichaelKinsy/PiG/ai"
 )
 
 func TestBeforeRequestHoldsFirstRequestAndReadsQueuedSteer(t *testing.T) {
@@ -44,6 +46,28 @@ func TestBeforeRequestHoldsFirstRequestAndReadsQueuedSteer(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("queued steer not read")
+	}
+}
+
+func TestNoBeforeRequestDoesNotPollSteeringBeforeNextTurnPreparation(t *testing.T) {
+	provider := &scriptedProvider{respond: toolCallsThenText(toolCall("t1", "echo", ai.JsonObject{"value": "x"}))}
+	config := standaloneConfig(provider)
+	polls := 0
+	config.GetSteeringMessages = func() []AgentMessage {
+		polls++
+		return nil
+	}
+	config.PrepareNextTurn = func(context.Context, PrepareNextTurnContext) (*AgentLoopTurnUpdate, error) {
+		if polls != 2 {
+			t.Errorf("steering polled %d times before preparation, want the initial and post-turn polls only", polls)
+		}
+		return nil, nil
+	}
+	if _, err := RunAgentLoop(t.Context(), []AgentMessage{userMessage("start")}, AgentContext{Tools: []AgentTool{valueEchoTool(ToolModeParallel, nil)}}, config, func(AgentEvent) error { return nil }, providerStream); err != nil {
+		t.Fatal(err)
+	}
+	if provider.calls() != 2 || polls != 4 {
+		t.Fatalf("requests=%d, polls=%d; want 2 requests and 4 polls", provider.calls(), polls)
 	}
 }
 

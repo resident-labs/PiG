@@ -1,6 +1,6 @@
 package host
 
-// pi: packages/chord/test/next/examples/32-startup.ts
+// pi: packages/chord/test/examples/32-startup.ts
 
 import (
 	"context"
@@ -38,13 +38,13 @@ func TestExample32Startup(t *testing.T) {
 	var workersMu sync.Mutex
 	workerLoaded := make(chan struct{})
 	var workerLoadedOnce sync.Once
-	// loadGate holds every worker's `load` until the test has read the server's Bootstrap loading. In Pi the read after
-	// `await server.load(...)` and the worker's progress (the route's resolve, the memory link's deliveries, the worker's
-	// load) are all microtasks of one event loop, in an order that leaves Bootstrap loading at the read. Here the worker
-	// runs on its own goroutines, so a caller starved between `Load` returning and the read let the worker finish first
-	// (Agent live, then Bootstrap), and the gate is the order Pi's loop gives.
-	loadGate := make(chan struct{})
-	openLoadGate := sync.OnceFunc(func() { close(loadGate) })
+	// W6: the worker connects first, then loads. Pi's load of the worker takes more microtask turns than the check that
+	// Bootstrap is `loading` after the server's load, which a goroutine loading at once does not (a delayed test goroutine finds
+	// Bootstrap bound already): the worker loads when the check is done.
+	workerLoadGate := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseWorker := func() { releaseOnce.Do(func() { close(workerLoadGate) }) }
+	defer releaseWorker()
 	startWorker := func(id string) started {
 		up, down := link.MemoryLinkPair()
 		address := Session.Address(jsonObject("id", id))
@@ -59,11 +59,7 @@ func TestExample32Startup(t *testing.T) {
 			}, ServeOptions{})
 		})
 		go func() {
-			select {
-			case <-loadGate:
-			case <-t.Context().Done():
-				return
-			}
+			<-workerLoadGate
 			_, _ = worker.Load([]HostFacet{{Name: "@example/agents", Facet: agents}}, background)
 			workerLoadedOnce.Do(func() { close(workerLoaded) })
 		}()
@@ -119,7 +115,7 @@ func TestExample32Startup(t *testing.T) {
 	if got := exStateNow(t, exHold(t, server, bootstrap, jsonObject())); got != "loading" {
 		t.Fatalf("server loaded; Bootstrap is %s, want loading", got)
 	}
-	openLoadGate()
+	releaseWorker()
 	// 2. The worker's hold for Catalog bound on the published server; Agent went live, then Bootstrap.
 	reference := exGet(t, server, bootstrap, jsonObject())
 	exEqual(t, "Bootstrap sees models through the worker", exValue(t, reference, "agents"), float64(3))

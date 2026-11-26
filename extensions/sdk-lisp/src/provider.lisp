@@ -19,8 +19,8 @@
 (defstruct models-publication "PERSIST is :OMITTED when the publication has no persist member." (persist :omitted) update)
 (defstruct refresh-models-context publish credential stored allow-network force signal base-url)
 (defstruct provider
-  "A Pi Provider. Its functions take what Python's do: STREAM and STREAM-SIMPLE (model context options) return a model-event-stream."
-  id name auth get-models stream stream-simple base-url headers filter-models get-all-models filter-all-models
+  "A Pi Provider. REFRESH-MODELS-AUTH is Pi's refreshModelsAuth: NIL or \"credential\" (the default), or \"configured\": the network phase of a catalog refresh then runs without the credential and without an OAuth refresh first. Its functions take what Python's do: STREAM and STREAM-SIMPLE (model context options) return a model-event-stream."
+  id name auth get-models stream stream-simple base-url headers refresh-models-auth filter-models get-all-models filter-all-models
   refresh-models fetch-deferred cancel-deferred generate-images classify
   (handle nil))
 
@@ -97,6 +97,7 @@
          (api-key (prov-api-key provider)) (oauth (prov-oauth provider)))
     (when (provider-base-url provider) (setf (gethash "baseUrl" decl) (provider-base-url provider)))
     (when (provider-headers provider) (setf (gethash "headers" decl) (provider-headers provider)))
+    (when (provider-refresh-models-auth provider) (setf (gethash "refreshModelsAuth" decl) (provider-refresh-models-auth provider)))
     (when api-key (setf (gethash "apiKey" auth) (obj "name" (api-key-auth-name api-key))))
     (when oauth
       (let ((entry (obj "name" (oauth-auth-name oauth))) (subscription (oauth-auth-is-subscription oauth)))
@@ -145,6 +146,13 @@
                        (error "provider ~A implementation for ~A must be callable" kind api)))
                    implementations)
           (setf (gethash kind operations) (prov-copy-table implementations)))))
+    ;; ProviderConfig.refreshModels (types.ts:1930) is held as the one entry of the "refreshModels" kind, under the empty API: it has no API of its own.
+    (let ((refresh (gethash "refreshModels" config)))
+      (remhash "refreshModels" config)
+      (when (and refresh (not (functionp refresh))) (error "refreshModels must be callable"))
+      (when refresh
+        (let ((table (make-hash-table :test 'equal)))
+          (setf (gethash "" table) refresh (gethash "refreshModels" operations) table))))
     (ensure-jsonable config (format nil "provider config for ~A" name))
     (when callback (setf (gethash name (ps-streams ps)) callback))
     ;; A re-registration replaces only the kinds it defines, as registerProvider merges defined values.
@@ -154,6 +162,7 @@
       (when (zerop (hash-table-count kept)) (remhash name (ps-operations ps))))
     (let ((decl (obj "name" name "config" config)))
       (when callback (setf (gethash "stream_simple" decl) t))
+      (when (gethash "refreshModels" operations) (setf (gethash "refresh_models" decl) t))
       (flet ((apis (kind) (sort (loop for api being the hash-keys of (or (gethash kind operations) (obj)) collect api) #'string<)))
         (when (plusp (length (apis "images"))) (setf (gethash "image_apis" decl) (prov-vec (apis "images"))))
         (when (plusp (length (apis "classifiers"))) (setf (gethash "classifier_apis" decl) (prov-vec (apis "classifiers")))))
@@ -296,6 +305,28 @@ extension drops the functions it held for it."
   (let ((ps (prov-of ext)))
     (with-prov (ps) (setf (ps-stopped ps) t) (dolist (stream (ps-forwarding ps)) (model-stream-wake stream)))))
 
+(defun prov-refresh-context (ps params callback signal)
+  "The refresh-models-context of a refresh request: PUBLISH sends the publication's persistence and the token of its update to the host as a publish callback of the request, and the host runs the update here by token (the update provider_sync request) while it applies the publication."
+  (make-refresh-models-context
+   :publish (lambda (publication)
+              (let* ((token (prov-uuid))
+                     (update (models-publication-update publication))
+                     (value (if (eq (models-publication-persist publication) :omitted)
+                                (obj)
+                                (obj "persist" (models-publication-persist publication))))
+                     (wire (obj "publication" value)))
+                (when update
+                  (with-prov (ps) (setf (gethash token (ps-updates ps)) update))
+                  (setf (gethash "token" wire) token))
+                (unwind-protect (funcall callback "publish" wire)
+                  (with-prov (ps) (remhash token (ps-updates ps))))))
+   :credential (let ((c (jget params "credential"))) (and (hash-table-p c) c))
+   :stored (let ((c (jget params "stored"))) (and (hash-table-p c) c))
+   :allow-network (eq (jget params "allowNetwork") t)
+   :force (let ((f (jget params "force"))) (cond ((eq f t) t) ((eq f :false) :false)))
+   :signal signal
+   :base-url (let ((b (jget params "baseUrl"))) (and (stringp b) b))))
+
 (defun prov-dispatch (ext ctx req)
   (let* ((ps (prov-of ext)) (args (prov-object (jget req "args"))) (method (jget args "method"))
          (params (prov-object (jget args "params"))) (key (jget req "tool")))
@@ -333,25 +364,7 @@ extension drops the functions it held for it."
           ((equal method "auth.oauth.refresh") (funcall fn (jget params "credential") signal))
           ((equal method "auth.oauth.toAuth") (funcall fn (jget params "credential")))
           ((equal method "refreshModels")
-           (funcall fn (make-refresh-models-context
-                        :publish (lambda (publication)
-                                   (let* ((token (prov-uuid))
-                                          (update (models-publication-update publication))
-                                          (value (if (eq (models-publication-persist publication) :omitted)
-                                                     (obj)
-                                                     (obj "persist" (models-publication-persist publication))))
-                                          (wire (obj "publication" value)))
-                                     (when update
-                                       (with-prov (ps) (setf (gethash token (ps-updates ps)) update))
-                                       (setf (gethash "token" wire) token))
-                                     (unwind-protect (funcall callback "publish" wire)
-                                       (with-prov (ps) (remhash token (ps-updates ps))))))
-                        :credential (let ((c (jget params "credential"))) (and (hash-table-p c) c))
-                        :stored (let ((c (jget params "stored"))) (and (hash-table-p c) c))
-                        :allow-network (eq (jget params "allowNetwork") t)
-                        :force (let ((f (jget params "force"))) (cond ((eq f t) t) ((eq f :false) :false)))
-                        :signal signal
-                        :base-url (let ((b (jget params "baseUrl"))) (and (stringp b) b)))))
+           (funcall fn (prov-refresh-context ps params callback signal)))
           ((member method '("generateImages" "classify") :test #'equal)
            (funcall fn (jget params "model") (jget params "context")
                     (make-provider-operation-options :values (prov-object (jget params "options")) :signal signal)))
@@ -382,32 +395,52 @@ extension drops the functions it held for it."
 (def-notify "provider_release" (ext args)
   (prov-forget-native ext (jget args "key")))
 
+(defun prov-refresh-config (ps ctx provider args)
+  "types.ts:1930: run the refreshModels of provider config PROVIDER with the refresh context ARGS carries; the models it returns (NIL for none) are the answer."
+  (let ((refresh (with-prov (ps) (let ((kinds (gethash provider (ps-operations ps)))) (and kinds (gethash "" (or (gethash "refreshModels" kinds) (obj))))))))
+    (unless refresh (error "Provider ~A has no refreshModels" provider))
+    (let ((models (funcall refresh (prov-refresh-context
+                                    ps (prov-object (jget args "context"))
+                                    (lambda (m p) (call-result ctx "provider.callback" (obj "provider" provider "method" m "params" p)))
+                                    (ctx-cancel ctx)))))
+      (if models (prov-vec models) :null))))
+
 (def-request "provider_operation" (ext ctx req)
   (let* ((ps (prov-of ext)) (args (prov-object (jget req "args"))) (provider (jget req "tool" "")) (kind (jget args "kind"))
          (api (jget args "api")))
-    (unless (member kind '("images" "classifiers") :test #'equal) (error "Unknown provider operation ~S" kind))
-    (let ((implementation (with-prov (ps) (let ((kinds (gethash provider (ps-operations ps))))
-                                            (and kinds (gethash api (or (gethash kind kinds) (obj))))))))
-      (unless implementation
-        (error "Provider ~A has no ~A implementation for ~A" provider (if (equal kind "images") "image" "classifier") (to-json api)))
-      (funcall implementation (prov-object (jget args "model")) (prov-object (jget args "context"))
-               (make-provider-operation-options :values (prov-object (jget args "options")) :signal (ctx-cancel ctx))))))
+    (cond
+      ((equal kind "refreshModels") (prov-refresh-config ps ctx provider args))
+      ((not (member kind '("images" "classifiers") :test #'equal)) (error "Unknown provider operation ~S" kind))
+      (t
+       (let ((implementation (with-prov (ps) (let ((kinds (gethash provider (ps-operations ps))))
+                                               (and kinds (gethash api (or (gethash kind kinds) (obj))))))))
+         (unless implementation
+           (error "Provider ~A has no ~A implementation for ~A" provider (if (equal kind "images") "image" "classifier") (to-json api)))
+         (funcall implementation (prov-object (jget args "model")) (prov-object (jget args "context"))
+                  (make-provider-operation-options :values (prov-object (jget args "options")) :signal (ctx-cancel ctx))))))))
 
 (def-request "provider_stream_simple" (ext ctx req)
   (let* ((ps (prov-of ext)) (args (prov-object (jget req "args")))
-         (callback (with-prov (ps) (gethash (jget req "tool" "") (ps-streams ps)))) (signal (ctx-cancel ctx)))
+         (callback (with-prov (ps) (gethash (jget req "tool" "") (ps-streams ps)))) (request (ctx-request ctx)))
     (unless callback (error "unknown provider stream ~S" (jget req "tool")))
-    (let* ((stream (funcall callback ctx (jget args "model") (jget args "context") (jget args "options")))
-           (unsubscribe (abort-signal-subscribe signal (lambda () (model-stream-end stream nil)))))
-      (unwind-protect
-           (progn
-             (loop (multiple-value-bind (event more) (model-stream-next stream :wire t)
-                     (unless more (return))
-                     (when (abort-signal-set-p signal) (error "provider stream aborted"))
-                     (notify-host ext "provider_stream_event" (obj "request_id" (ctx-request-id ctx) "result" event))))
-             (when (abort-signal-set-p signal) (error "provider stream aborted"))
-             (model-stream-wire-result stream))
-        (funcall unsubscribe)))))
+    ;; An ordinary cancel ends the request: handle-cancel marks it cancelled and calls its on-end, which ends the author's stream, so the loop stops and the answer is the
+    ;; abort. A signal-only cancel, the abort of a turn, sets the signal the author holds and nothing else: Pi's consumer has no check of the signal
+    ;; (packages/agent/src/agent-loop.ts:424-478), so what the author's stream gives after it is forwarded and its result is the answer.
+    (let ((stream (funcall callback ctx (jget args "model") (jget args "context") (jget args "options"))))
+      (flet ((ended-p () (sb-thread:with-mutex ((extension-state-lock ext)) (eq (request-state request) :cancelled))))
+        (when (sb-thread:with-mutex ((extension-state-lock ext))
+                (setf (request-on-end request) (lambda () (model-stream-end stream nil)))
+                (eq (request-state request) :cancelled))
+          (model-stream-end stream nil))
+        (unwind-protect
+             (progn
+               (loop (multiple-value-bind (event more) (model-stream-next stream :wire t)
+                       (unless more (return))
+                       (when (ended-p) (error "provider stream aborted"))
+                       (notify-host ext "provider_stream_event" (obj "request_id" (ctx-request-id ctx) "result" event))))
+               (when (ended-p) (error "provider stream aborted"))
+               (model-stream-wire-result stream))
+          (sb-thread:with-mutex ((extension-state-lock ext)) (setf (request-on-end request) nil)))))))
 
 ;;; ---------------------------------------------------------------- Providers other extensions registered
 
@@ -473,7 +506,7 @@ and SIGNAL, once set, cancels the call (the cancel is sent after the call, so th
   (let ((thread (sb-thread:make-thread
                  (lambda ()
                    (unwind-protect (handler-case (funcall function)
-                                     (error (e) (format *error-output* "~A: ~A failed: ~A~%" (extension-name ext) name e)))
+                                     (error (e) (diagnose "~A: ~A failed: ~A~%" (extension-name ext) name e)))
                      (sb-thread:with-mutex ((extension-state-lock ext))
                        (setf (extension-request-threads ext) (remove sb-thread:*current-thread* (extension-request-threads ext))))))
                  :name name)))
@@ -556,7 +589,7 @@ and SIGNAL, once set, cancels the call (the cancel is sent after the call, so th
                        :auth (prov-remote-auth ext handle decl methods)
                        :get-models (lambda () (invoke "getModels"))
                        :stream (streaming "stream") :stream-simple (streaming "streamSimple")
-                       :base-url (jget decl "baseUrl") :headers (jget decl "headers"))))
+                       :base-url (jget decl "baseUrl") :headers (jget decl "headers") :refresh-models-auth (jget decl "refreshModelsAuth"))))
         (when (member "generateImages" methods :test #'equal) (setf (provider-generate-images provider) (operation "generateImages")))
         (when (member "classify" methods :test #'equal) (setf (provider-classify provider) (operation "classify")))
         (when (member "getAllModels" methods :test #'equal) (setf (provider-get-all-models provider) (lambda () (invoke "getAllModels"))))

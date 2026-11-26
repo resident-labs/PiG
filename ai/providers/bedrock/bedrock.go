@@ -38,9 +38,14 @@ import (
 
 	awsconfig "github.com/MichaelKinsy/PiG/third_party/awssdk/config"
 	"github.com/MichaelKinsy/PiG/third_party/awssdk/credentials"
+	"github.com/MichaelKinsy/PiG/third_party/awssdk/credentials/logincreds"
+	"github.com/MichaelKinsy/PiG/third_party/awssdk/credentials/ssocreds"
 	"github.com/MichaelKinsy/PiG/third_party/awssdk/credentials/stscreds"
 	"github.com/MichaelKinsy/PiG/third_party/awssdk/service/bedrockruntime"
 	btypes "github.com/MichaelKinsy/PiG/third_party/awssdk/service/bedrockruntime/types"
+	"github.com/MichaelKinsy/PiG/third_party/awssdk/service/signin"
+	"github.com/MichaelKinsy/PiG/third_party/awssdk/service/sso"
+	"github.com/MichaelKinsy/PiG/third_party/awssdk/service/ssooidc"
 	"github.com/MichaelKinsy/PiG/third_party/awssdk/service/sts"
 )
 
@@ -208,7 +213,10 @@ func (p *BedrockProvider) Stream(ctx context.Context, transcript ai.TranscriptCo
 		checkBedrockRequest(ctx, input)
 		return input, hasPreferredStrictTools, nil
 	}
-	input, hasPreferredStrictTools, err := buildInput(false)
+	// upstream: bedrock-converse-stream.ts:stream (let disablePreferredStrictTools = hasExceededStrictToolLimits(options.sessionId)): a session whose
+	// strict tools were rejected sends its preferred tools non-strict from the first request, so that request reports no preferred strict tools
+	// and the fallback below, which runs at most once, is not taken again.
+	input, hasPreferredStrictTools, err := buildInput(ai.HasExceededStrictToolLimits(opts.SessionID))
 	if err != nil {
 		return nil, err
 	}
@@ -219,6 +227,7 @@ func (p *BedrockProvider) Stream(ctx context.Context, transcript ai.TranscriptCo
 	// Pi returns the event stream before the request settles: the async body of `stream` starts at its first await (bedrock-converse-stream.ts:129-330).
 	requestContext, abort := context.WithCancel(ctx)
 	builder.SetAbort(abort)
+	//portlint:allow asyncorder Pi's stream() starts a detached async IIFE and returns the stream (bedrock-converse-stream.ts:151, :403); the stream owns this goroutine, which sends the request and runs the body pipeline as a turn of the stream's continuation executor (ResponseTurn in streamResponse), the ordering point with the consumer; TestBedrockObservationMatchesPi holds each record's epoch and tick to Pi's
 	go builder.RunResponse(func() error {
 		p.streamResponse(ctx, requestContext, converse, input, hasPreferredStrictTools, buildInput, opts, modelMeta, builder)
 		return nil
@@ -288,6 +297,7 @@ func (p *BedrockProvider) streamResponse(ctx, requestContext context.Context, co
 		}
 		tap.close()
 		disablePreferredStrictTools = true
+		ai.MarkStrictToolLimitsExceeded(opts.SessionID)
 		ai.AppendAssistantMessageDiagnostic(builder.Partial(), ai.AssistantMessageDiagnostic{
 			Type:      "bedrock_strict_tools_fallback",
 			Timestamp: time.Now().UnixMilli(), //portlint:allow clock Pi stamps the fallback diagnostic with Date.now() (bedrock-converse-stream.ts:321)
@@ -341,10 +351,10 @@ func bedrockClientOptions(cfg aws.Config, httpClient bedrockruntime.HTTPClient) 
 
 // loadBedrockConfig preserves explicit/scoped profile ownership, ambient key precedence, and ARN region precedence. A configured region or ambient profile unpins standard AWS endpoints; caller-supplied custom endpoints remain fixed.
 //
-// The proxy follows bedrock-converse-stream.ts: resolveHttpProxyUrlForTarget(model.baseUrl) is resolved once, and only the runtime client's
-// requestHandler carries it. The credential clients keep the SDK's own handlers, which use no proxy: IMDS and the container provider call node:http
-// directly, and the SSO client takes only the logger from its parent. The STS client inherits the parent's requestHandler only when that handler
-// is not HTTP/2, which is when the proxy was found, so STS uses the runtime client's proxy and nothing else.
+// The proxy follows packages/ai/src/api/bedrock-converse-stream.ts:242-253 (Pi commit be269f57b1b707399edd86f5f718d1a907ffea8b / #12365):
+// resolveHttpProxyUrlForTarget(model.baseUrl) is resolved once and given to the runtime client and the default credential chain's clientConfig.
+// That proxies the runtime client, STS (AssumeRole and AssumeRoleWithWebIdentity), SSO (GetRoleCredentials), SSO OIDC (CreateToken), and login_session Signin refresh (CreateOAuth2Token, @aws-sdk/credential-provider-login 3.972.90 dist-cjs/index.js:60-77);
+// IMDS, the container provider, credential_process, bearer tokens, AWS_BEDROCK_SKIP_AUTH, and static/env keys do not use the proxy.
 func loadBedrockConfig(ctx context.Context, baseURL, modelID string, options ai.StreamOptions) (aws.Config, *awshttp.BuildableClient, error) {
 	env := options.Env
 	proxyURL, proxyErr := ai.ResolveHTTPProxyURLForTarget(baseURL, env)
@@ -362,6 +372,21 @@ func loadBedrockConfig(ctx context.Context, baseURL, modelID string, options ai.
 				if client, ok := o.Client.(*sts.Client); ok {
 					o.Client = bedrockProxiedSTS{client: client, httpClient: runtimeHTTPClient}
 				}
+			}),
+			awsconfig.WithSSOProviderOptions(func(o *ssocreds.Options) {
+				if client, ok := o.Client.(*sso.Client); ok {
+					o.Client = bedrockProxiedSSO{client: client, httpClient: runtimeHTTPClient}
+				}
+			}),
+			awsconfig.WithSSOTokenProviderOptions(func(o *ssocreds.SSOTokenProviderOptions) {
+				o.ClientOptions = append(o.ClientOptions, func(opt *ssooidc.Options) {
+					opt.HTTPClient = runtimeHTTPClient
+				})
+			}),
+			awsconfig.WithLoginCredentialOptions(func(o *logincreds.Options) {
+				o.ClientOptions = append(o.ClientOptions, func(opt *signin.Options) {
+					opt.HTTPClient = runtimeHTTPClient
+				})
 			}),
 		)
 	}
@@ -439,6 +464,16 @@ func (c bedrockProxiedSTS) AssumeRole(ctx context.Context, input *sts.AssumeRole
 
 func (c bedrockProxiedSTS) AssumeRoleWithWebIdentity(ctx context.Context, input *sts.AssumeRoleWithWebIdentityInput, optFns ...func(*sts.Options)) (*sts.AssumeRoleWithWebIdentityOutput, error) {
 	return c.client.AssumeRoleWithWebIdentity(ctx, input, append(optFns, c.useHTTPClient)...)
+}
+
+// bedrockProxiedSSO sends SSO GetRoleCredentials calls through the runtime client's proxy.
+type bedrockProxiedSSO struct {
+	client     *sso.Client
+	httpClient sso.HTTPClient
+}
+
+func (c bedrockProxiedSSO) GetRoleCredentials(ctx context.Context, input *sso.GetRoleCredentialsInput, optFns ...func(*sso.Options)) (*sso.GetRoleCredentialsOutput, error) {
+	return c.client.GetRoleCredentials(ctx, input, append(optFns, func(options *sso.Options) { options.HTTPClient = c.httpClient })...)
 }
 
 // bedrockARNRegionRE extracts the region embedded in an inference-profile ARN
@@ -1541,7 +1576,10 @@ func appendBedrockFailureDiagnostic(message *ai.AssistantMessage, err error, fal
 
 func failBedrockResponse(ctx context.Context, builder *ai.AssistantStreamBuilder, err error, requestID string, streaming bool) {
 	if ctx.Err() != nil {
-		builder.Fail(ai.StopReasonAborted, errors.New("Request aborted"))
+		// @smithy/node-http-handler 4.12.1 (and @smithy/core retry race.js) wrap an aborted AbortSignal's
+		// default DOMException("This operation was aborted", code 20) as AbortError("Request aborted", { cause: reason }),
+		// which Pi v1.6.0 error-body.ts:53-77 withCauseDetail formats as "Request aborted: This operation was aborted (20)".
+		builder.Fail(ai.StopReasonAborted, errors.New("Request aborted: This operation was aborted (20)"))
 		return
 	}
 	appendBedrockFailureDiagnostic(builder.Partial(), err, requestID)
@@ -1619,7 +1657,7 @@ func mapBedrockTransportError(ctx context.Context, err error, message string) er
 // bedrockSendError is the error Pi's AWS SDK client rejects with when the request could not be sent. Its Node handlers report a
 // failed connect or lookup with Node's own error, not a fetch rejection. Through NodeHttpHandler (an HTTP proxy for the endpoint,
 // or AWS_BEDROCK_FORCE_HTTP1=1; bedrock-converse-stream.ts:220-232) that is the net error itself, "connect ECONNREFUSED …", which
-// retry.ts does not retry. The default NodeHttp2Handler cancels the pending stream with it as the cause, which retry.ts retries.
+// retry.ts retries by its code since Pi 4699b5b26 (#12128). The default NodeHttp2Handler cancels the pending stream with it as the cause, which retry.ts retries.
 func bedrockSendError(ctx context.Context, err error, baseURL string, env ai.ProviderEnv) error {
 	if ctx.Err() != nil || !ai.IsGoTransportError(err) {
 		return err

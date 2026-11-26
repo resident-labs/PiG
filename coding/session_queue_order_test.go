@@ -105,8 +105,8 @@ func TestSessionQueueRemovalPrecedesExtensionMessageStart(t *testing.T) {
 	}
 }
 
-// upstream: packages/coding-agent/src/core/agent-session.ts:896-909 — the truthy contentText guard deliberately retains an empty queued string in pending metadata.
-func TestSessionEmptyQueuedTextRetainsUpstreamPendingState(t *testing.T) {
+// Pi 1.5.0 (agent-session.ts:896-909) guarded the queue match with a truthy contentText and retained an empty queued string in pending metadata; Pi main a63c4ec5c (#8612, in the pin) removes it at delivery.
+func TestSessionEmptyQueuedTextLeavesPendingStateAtDelivery(t *testing.T) {
 	h := newRecoveryHarness(t, harnessOptions{emptySessionManager: true}, fauxReply("done", ai.StopReasonStop, 0))
 	if _, err := h.session.Steer(t.Context(), "", nil, nil); err != nil {
 		t.Fatal(err)
@@ -114,8 +114,8 @@ func TestSessionEmptyQueuedTextRetainsUpstreamPendingState(t *testing.T) {
 	if _, err := h.session.Send(t.Context(), "start"); err != nil {
 		t.Fatal(err)
 	}
-	if pending := h.session.PendingMessageCount(); pending != 1 {
-		t.Fatalf("empty pending count=%d want1", pending)
+	if pending := h.session.PendingMessageCount(); pending != 0 {
+		t.Fatalf("empty pending count=%d want 0", pending)
 	}
 	found := false
 	for _, message := range h.session.Messages() {
@@ -130,5 +130,36 @@ func TestSessionEmptyQueuedTextRetainsUpstreamPendingState(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("empty queued message was lost")
+	}
+}
+
+// Delivering an empty queued message removes its entry and publishes the queue it leaves (Pi main a63c4ec5c, #8612; Pi 1.5.0 emitted nothing).
+// RPC mode forwards session events, so the RPC stream carries these records; '20-rpc-runtime-boundary-values' and '35-rpc-queue-prompt-await'
+// compare them against the pin's Pi.
+func TestSessionEmptyQueuedMessagesPublishTheQueueTheyLeaveAtDelivery(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{emptySessionManager: true}, fauxReply("done", ai.StopReasonStop, 0))
+	var updates []agent.QueueUpdateEvent
+	h.session.Subscribe(func(event agent.AgentEvent) {
+		if update, ok := event.(agent.QueueUpdateEvent); ok {
+			updates = append(updates, update)
+		}
+	})
+	if _, err := h.session.Steer(t.Context(), "", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.session.FollowUp(t.Context(), "", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.session.Send(t.Context(), "start"); err != nil {
+		t.Fatal(err)
+	}
+	want := []agent.QueueUpdateEvent{
+		{Steering: []string{""}, FollowUp: []string{}},
+		{Steering: []string{""}, FollowUp: []string{""}},
+		{Steering: []string{}, FollowUp: []string{""}},
+		{Steering: []string{}, FollowUp: []string{}},
+	}
+	if !reflect.DeepEqual(updates, want) {
+		t.Fatalf("queue updates=%#v want %#v", updates, want)
 	}
 }

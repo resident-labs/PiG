@@ -103,6 +103,34 @@ def test_every_kind_encodes_its_upstream_fields() -> None:
     assert encoded.images == []
 
 
+def test_structural_kinds_carry_an_id() -> None:
+    """Every node kind can carry an id: an a11y, focus or drawing record of a mounted view names a node by it."""
+    tree = kit.Container(
+        [
+            kit.Box(children=[kit.Text("t", id="id-text")], id="id-box"),
+            kit.TruncatedText("t", id="id-truncated-text"),
+            kit.Markdown("m", id="id-markdown"),
+            kit.Spacer(id="id-spacer"),
+            kit.DynamicBorder(id="id-dynamic-border"),
+            kit.Image(b"png", "image/png", id="id-image"),
+            kit.Loader(id="id-loader"),
+            kit.HStack(id="id-hstack"),
+            kit.VStack(id="id-vstack"),
+            kit.Lines(["row"], id="id-lines"),
+            kit.UserMessage("u", id="id-user-message"),
+            kit.Diff("d", id="id-diff"),
+        ],
+        id="id-container",
+    )
+
+    def ids(node: dict[str, Any]) -> list[tuple[str, Any]]:
+        return [(node["kind"], node.get("id"))] + [pair for child in node.get("children", []) for pair in ids(child)]
+
+    got = ids(kit.View(tree)._encode(False).body["root"])
+    assert len(got) == 14
+    assert [node_id for _, node_id in got] == [f"id-{kind}" for kind, _ in got]
+
+
 def test_defaults_match_upstream_constructors() -> None:
     body = kit.View(kit.Container([kit.Box(), kit.Spacer(), kit.DynamicBorder(), kit.Loader(), kit.Text()]))._encode(False).body
     assert body["root"]["children"] == [
@@ -145,6 +173,45 @@ def test_scroll_view_encodes_its_child_and_options() -> None:
         "scrollbarThumbColor": "accent",
         "scrollbarHideDelayMs": 0,
         "scrollTop": 4,
+    }
+
+
+def test_grid_holds_exactly_the_members_set() -> None:
+    """The grid node (D614): ``columns`` is always sent, and an optional member left unset is absent, not null, zero or empty."""
+    grid = kit.Grid(
+        "month",
+        7,
+        [
+            kit.GridCell(label="30", dim=True),
+            kit.GridCell(value="d1", label="1", chips=[kit.GridChip("standup", "#3366cc"), kit.GridChip("lunch")], more=2),
+            kit.GridCell(value="d2", label="2", mark="current", color="accent"),
+            kit.GridCell(value="d3"),
+            kit.GridCell(),
+        ],
+        head=["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"],
+        chip_rows=2,
+        selected="d2",
+    )
+    assert kit._Encoder(False).node(kit.Container([grid, kit.Grid("bare", 1, [])]), 0) == {
+        "kind": "container",
+        "children": [
+            {
+                "kind": "grid",
+                "id": "month",
+                "columns": 7,
+                "chipRows": 2,
+                "head": ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"],
+                "cells": [
+                    {"label": "30", "dim": True},
+                    {"value": "d1", "label": "1", "chips": [{"text": "standup", "color": "#3366cc"}, {"text": "lunch"}], "more": 2},
+                    {"value": "d2", "label": "2", "mark": "current", "color": "accent"},
+                    {"value": "d3"},
+                    {},
+                ],
+                "selected": "d2",
+            },
+            {"kind": "grid", "id": "bare", "columns": 1},
+        ],
     }
 
 
@@ -211,11 +278,11 @@ def test_conversation_kinds_encode_as_the_go_sdk() -> None:
 
 
 def test_image_ref_is_the_sha256_of_its_bytes() -> None:
-    image = kit.Image(b"png-bytes", "image/png", max_width_cells=20, max_height_cells=10, filename="cover.png", fallback_color="dim")
+    image = kit.Image(b"png-bytes", "image/png", max_width_cells=20, max_height_cells=10, image_id=4242, filename="cover.png", fallback_color="dim")
     assert image.ref == _sha(b"png-bytes")
     encoded = kit.View(image)._encode(False)
     assert encoded.body["root"] == {"kind": "image", "ref": _sha(b"png-bytes"), "mimeType": "image/png", "maxWidthCells": 20,
-                                    "maxHeightCells": 10, "filename": "cover.png", "fallbackColor": "dim"}
+                                    "maxHeightCells": 10, "imageId": 4242, "filename": "cover.png", "fallbackColor": "dim"}
     assert encoded.refs() == [_sha(b"png-bytes")]
 
 

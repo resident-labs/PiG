@@ -12,7 +12,7 @@ import (
 // model's api is looked up in the API registry (ai.GetAPIProvider, compat.ts getApiProvider: a Map, so any unregistered name misses) when the
 // request starts, after the request's credential is resolved (model-runtime.ts prepareRequest runs before provider.stream), and an
 // unregistered api is refused before anything is built for the model's endpoint.
-// upstream: provider-composer.ts:603-607
+// upstream: provider-composer.ts:605-609
 type apiRegistryProvider struct {
 	id     string
 	api    ai.API

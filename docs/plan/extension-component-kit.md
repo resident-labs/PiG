@@ -331,9 +331,27 @@ draw again after press, click, drag and wheel, as Pi's default `render`
 does, but not after move or release. The host answers the terminal
 synchronously, so a component that takes the mouse counts as handled for
 every event in its bounds, and text selection does not start over it.
-Widgets, header/footer and renderer views take no mouse, as they take no keys;
+Widgets, header/footer and tool-renderer views take no mouse, as they take no keys;
 Node's widget, header/footer and tool-renderer components get none yet,
 although Pi routes it to them (a recorded gap).
+
+**Message and entry renderers take the mouse (D276, D277).** Pi's custom
+message and entry components are mounted in the transcript and their
+`MouseRegion` closures run in-process (`custom-message.ts`, `mouse-region.ts`).
+The host's proxy for a renderer routes the fullscreen event as Pi's Container
+does. A kit view's mouse regions answer from their description and
+the host reports each event the handler ran for in the next `render_message` or
+`render_entry` request (`events`), which the extension applies before it draws:
+one request carries the click and returns the card drawn again, and the click
+itself waits for nothing. The request names the message with `key` (one per
+transcript component, stable across the renderer's rebuilds; the extension keeps
+its state under it and drops it on `render_release`) and says whether the host
+built the component (`rerender`). The Node runtime keeps the first decoded
+message object and the component its renderer last returned per key, so Pi's
+`WeakMap` keyed by message and a `MouseRegion` work unchanged; its components
+take the click only where their `MouseRegion`s are: the runtime finds the regions' rectangles with Pi's own dispatch and the host hit-tests them, so a click on a card's padding falls through to selection as in Pi (a hand-written `handleMouse` is the residue, D277). Cost: a click does no IPC and no transcript
+replay on the loop; it marks the dispatch path dirty (`Container.handleMouse`) so
+the cached rows above the handler are drawn again, and one request follows.
 
 ### 4.4 Events back to the extension (async contract)
 
@@ -364,7 +382,11 @@ PiG keeps the ordering and moves the callback across the process:
 
 Loader animation is host-owned for authoritative views, like D94's working
 indicator. The host advances the frame every `intervalMs` while the surface
-is mounted, and stops when the surface closes or the frame drops the loader.
+is drawn: a tick asks for a repaint, and the next tick is armed only when the
+surface was drawn since. The animation stops when the surface closes, when
+the frame drops the loader, and when nothing draws the surface any more (the
+view of a renderer goes with its transcript component, which a rebuilt
+transcript drops without a call), and it starts again with the next draw.
 
 ## 5. Host rendering and validation
 
@@ -556,7 +578,7 @@ signature is unchanged. A line-returning author keeps today's wire exactly.
   `Markdown`, `Spacer`, `SelectList`, `SettingsList`, `Image`, `HStack`,
   `VStack`, coding-agent `DynamicBorder`), or `Loader.prototype.render` for
   `loader`. A subclass that overrides `render`, and any other component, is
-  a `lines` range. Its rows come from the parent's `mouseLayout` (Container,
+  a `lines` range. Its rows come from the parent's `childLines` (Container,
   Box) or from rendering it again only when no layout exists.
 - A style closure maps to a token only when its output on a probe string
   equals `theme.fg(token, probe)`/`theme.bg(token, probe)` of the current

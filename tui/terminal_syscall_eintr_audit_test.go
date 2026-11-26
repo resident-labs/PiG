@@ -18,7 +18,7 @@ import (
 // kernel, which are the ones job control and signals interrupt, go through the retrying helpers or retry in place.
 //
 //   - x/term's MakeRaw, Restore and SetState issue the termios setting ioctls (TCSETS, TIOCSETA), which wait for output to drain and stop a
-//     background group with SIGTTOU. Only the seam variables in terminal.go may name them; everything else calls makeRaw and restoreCooked.
+//     background group with SIGTTOU. Only the seam variables in terminal.go may name them; everything else calls MakeRaw and RestoreCooked.
 //   - x/sys/unix's Poll, Select, Read and Ioctl* calls, and calls through those seams, must sit in a loop that goes round again on EINTR; a
 //     function that only names EINTR, or returns on it, does not count.
 //
@@ -53,6 +53,9 @@ func auditEINTRTree(root string, excluded map[string]string) (findings []string,
 			switch entry.Name() {
 			case ".git", "node_modules", ".upstream", "vendor", "testdata":
 				return filepath.SkipDir
+			case "tmp":
+				// Scratch that git ignores (`tmp/` in .gitignore), not the repository's code.
+				return filepath.SkipDir
 			}
 			return nil
 		}
@@ -85,6 +88,8 @@ func auditEINTRTree(root string, excluded map[string]string) (findings []string,
 func TestEINTRAuditCoversTheWholeRepository(t *testing.T) {
 	const unguarded = "package p\nimport (\n\t\"os\"\n\t\"golang.org/x/sys/unix\"\n)\nfunc f() (int, error) {\n\tfds := []unix.PollFd{{Fd: int32(os.Stdin.Fd()), Events: unix.POLLIN}}\n\treturn unix.Poll(fds, -1)\n}\n"
 	const guarded = "package p\nimport (\n\t\"os\"\n\t\"golang.org/x/sys/unix\"\n)\nfunc isEINTR(error) bool { return false }\nfunc f() (int, error) {\n\tfds := []unix.PollFd{{Fd: int32(os.Stdin.Fd()), Events: unix.POLLIN}}\n\tfor {\n\t\tn, err := unix.Poll(fds, -1)\n\t\tif isEINTR(err) {\n\t\t\tcontinue\n\t\t}\n\t\treturn n, err\n\t}\n}\n"
+	const termiosUnguarded = "package p\nimport \"golang.org/x/sys/unix\"\nfunc f(fd int) (*unix.Termios, error) {\n\treturn unix.IoctlGetTermios(fd, unix.TCGETS)\n}\n"
+	const termiosGuarded = "package p\nimport (\n\t\"errors\"\n\t\"golang.org/x/sys/unix\"\n)\nfunc f(fd int) (*unix.Termios, error) {\n\tfor {\n\t\ttermios, err := unix.IoctlGetTermios(fd, unix.TCGETS)\n\t\tif errors.Is(err, unix.EINTR) {\n\t\t\tcontinue\n\t\t}\n\t\treturn termios, err\n\t}\n}\n"
 	const unrelated = "package p\nimport \"golang.org/x/sys/unix\"\nfunc f() (int, error) { return unix.Poll(nil, 0) }\n"
 	for _, tc := range []struct {
 		name, path, source string
@@ -93,6 +98,8 @@ func TestEINTRAuditCoversTheWholeRepository(t *testing.T) {
 	}{
 		{"mutant: unguarded Poll on stdin far from the old directories", "extensions/host/deep/poll.go", unguarded, nil, 1, 1},
 		{"the same call with a retry", "extensions/host/deep/poll.go", guarded, nil, 1, 0},
+		{"mutant: a termios ioctl on a descriptor argument without the retry", "chord/nextnode/tui/raw.go", termiosUnguarded, nil, 1, 1},
+		{"the same termios ioctl with the retry", "chord/nextnode/tui/raw.go", termiosGuarded, nil, 1, 0},
 		{"a file that names no stream or descriptor", "extensions/host/deep/poll.go", unrelated, nil, 0, 0},
 		{"mutant excluded by a stated path", "env/daemon/pty_unix.go", unguarded, map[string]string{"env/daemon/pty_unix.go": "a pty PiG owns"}, 0, 0},
 	} {
@@ -124,8 +131,9 @@ var eintrAuditExcluded = map[string]string{
 	"env/daemon/pty_linux.go":                    "ioctls (TIOCGPTN, TIOCSPTLCK) on a pty master the environment daemon allocated for its own child, not the user's terminal",
 }
 
-// touchesUserTerminal reports whether file imports x/term or x/sys/unix and names a standard stream, a tty path or an Fd call: the files whose
-// syscalls can reach the user's terminal. A file that imports neither cannot issue the audited calls, and one that never names a stream or a
+// touchesUserTerminal reports whether file imports x/term or x/sys/unix and names a standard stream, a tty path, an Fd call or a termios ioctl
+// (it sets a terminal's mode whatever descriptor it is given, as chord's raw mode takes an fd argument): the files whose syscalls can reach
+// the user's terminal. A file that imports neither cannot issue the audited calls, and one that never names a stream or a
 // descriptor is working on something else (sockets, pipes it opened itself).
 func touchesUserTerminal(file *ast.File) bool {
 	imports := false
@@ -145,7 +153,7 @@ func touchesUserTerminal(file *ast.File) bool {
 			if x, ok := n.X.(*ast.Ident); ok && x.Name == "os" && (n.Sel.Name == "Stdin" || n.Sel.Name == "Stdout" || n.Sel.Name == "Stderr") {
 				touches = true
 			}
-			if n.Sel.Name == "Fd" {
+			if n.Sel.Name == "Fd" || n.Sel.Name == "IoctlGetTermios" || n.Sel.Name == "IoctlSetTermios" {
 				touches = true
 			}
 		case *ast.BasicLit:
@@ -230,7 +238,7 @@ func auditEINTR(fset *token.FileSet, path string, file *ast.File) []string {
 				switch selector.Sel.Name {
 				case "MakeRaw", "Restore", "SetState":
 					if !allowedSeam {
-						report(selector.Pos(), "term."+selector.Sel.Name+" without the EINTR retry (use makeRaw and restoreCooked)")
+						report(selector.Pos(), "term."+selector.Sel.Name+" without the EINTR retry (use tui.MakeRaw and tui.RestoreCooked)")
 					}
 				}
 			case "golang.org/x/sys/unix":

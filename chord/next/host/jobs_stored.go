@@ -6,9 +6,10 @@ import (
 
 	"github.com/MichaelKinsy/PiG/chord/delta"
 	"github.com/MichaelKinsy/PiG/chord/next/link"
+	chordtelemetry "github.com/MichaelKinsy/PiG/chord/next/telemetry"
 )
 
-// Ports packages/chord/src/next/jobs/stored.ts
+// Ports packages/chord/src/jobs/stored.ts
 //
 // A persisted run's record (slice 6b §4.1, D5): the document each unsettled run of a persisted job keeps in its
 // object's store (namespace `chord.jobs`, kind the job name, key the run id), and the conversion of an outcome to and
@@ -35,11 +36,13 @@ type storedOutcome struct {
 
 // StoredRun is the record document of one unsettled persisted run.
 type StoredRun struct {
-	Version        int
-	Fingerprint    string
-	Args           delta.JsonValue
-	Key            *string
-	Trace          map[string]string
+	Version     int
+	Fingerprint string
+	Args        delta.JsonValue
+	Key         *string
+	Trace       map[string]string
+	// TraceOrder is its carrier's keys in the order the stored document had them (Pi's insertion order).
+	TraceOrder     []string
 	Phase          Phase
 	Restarts       int
 	FinishFailures int
@@ -102,8 +105,9 @@ func storedRun(run *jobRun, fields storedFields) *delta.JsonObject {
 	}
 	if run.trace != nil {
 		trace := delta.NewJsonObject(len(run.trace))
-		for key, value := range run.trace {
-			trace.Set(key, value)
+		// Its keys in the order the carrier came with (insertion order), else sorted: a map has none.
+		for _, key := range chordtelemetry.CarrierKeys(run.trace, run.traceOrder) {
+			trace.Set(key, run.trace[key])
 		}
 		record.Set("trace", trace)
 	}
@@ -178,6 +182,7 @@ func recordOf(value *delta.JsonObject) (StoredRun, error) {
 		record.Trace = make(map[string]string, trace.Len())
 		for key, entry := range trace.All() {
 			record.Trace[key], _ = entry.(string)
+			record.TraceOrder = append(record.TraceOrder, key)
 		}
 	}
 	phase, _ := value.Value("phase").(string)

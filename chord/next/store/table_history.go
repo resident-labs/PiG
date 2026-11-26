@@ -6,7 +6,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/delta"
 )
 
-// Ports packages/chord/src/next/store/table-history.ts
+// Ports packages/chord/src/store/table-history.ts
 //
 // A table's history (slice 6a §9; decision "Second spec review: the majority"): the versions from a base
 // `DefineTable` through each `EvolveTable`, the migration each version recorded, and what an activation does with the
@@ -163,7 +163,7 @@ func PlanTable(definition *TableDefinition, recorded *TableRecord, what string) 
 	if version > definition.Version {
 		return TablePlan{}, fmt.Errorf("%s: the store has version %d, newer than the code's %d", what, version, definition.Version)
 	}
-	versions := historyOf(definition)
+	versions := HistoryOf(definition)
 	var at *TableDefinition
 	for _, each := range versions {
 		if each.Version == version {
@@ -200,8 +200,8 @@ func PlanTable(definition *TableDefinition, recorded *TableRecord, what string) 
 	return TablePlan{Kind: PlanMigrate, Versions: later, First: FirstBegin}, nil
 }
 
-// historyOf is every version of definition's history, the base first.
-func historyOf(definition *TableDefinition) []*TableDefinition {
+// HistoryOf is the versions of definition's history, oldest (its base) first.
+func HistoryOf(definition *TableDefinition) []*TableDefinition {
 	var versions []*TableDefinition
 	for at := definition; at != nil; {
 		versions = append([]*TableDefinition{at}, versions...)

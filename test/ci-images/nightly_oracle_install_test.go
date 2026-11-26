@@ -23,7 +23,7 @@ func TestNightlyPreparesTheOracleLikeCI(t *testing.T) {
 		t.Fatalf("ci.yml's linux job does not run %q, the step the nightly jobs share", shared)
 	}
 	nightly := readWorkflow(t, "nightly.yml")
-	for _, name := range []string{"race", "allocations"} {
+	for _, name := range []string{"race", "allocations", "strip-matrix"} {
 		job, ok := nightly.Jobs[name]
 		if !ok {
 			t.Fatalf("nightly.yml has no %s job", name)
@@ -62,7 +62,7 @@ func TestNightlyRaceJobInstallsThePinnedSBCL(t *testing.T) {
 				}
 			}
 		}
-		if strings.HasPrefix(step.Uses, "actions/cache@") && step.With["path"] == "~/.cache/pig-sbcl" {
+		if (strings.HasPrefix(step.Uses, "actions/cache@") || strings.HasPrefix(step.Uses, "actions/cache/restore@")) && step.With["path"] == "~/.cache/pig-sbcl" {
 			caches = true
 		}
 	}

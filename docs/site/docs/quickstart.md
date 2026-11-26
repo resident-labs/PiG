@@ -1,6 +1,6 @@
 # Quickstart
 
-PiG is under active development. Install it on macOS or Linux with `curl -fsSL https://pi-in-go.dev/install.sh | sh`, on any supported platform with `npm install -g @pi-in-go/pig` or `go install github.com/MichaelKinsy/PiG/cmd/pig@latest`, or download an archive from [GitHub Releases](https://github.com/MichaelKinsy/PiG/releases). Windows support is a preview. To build from source instead, follow the steps below. Pi 1.5.0 documents its own install routes in [Pi's quickstart](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/quickstart.md).
+PiG is under active development. Install it on macOS or Linux with `curl -fsSL https://pi-in-go.dev/install.sh | sh`, on any supported platform with `npm install -g @pi-in-go/pig` or `go install github.com/MichaelKinsy/PiG/cmd/pig@latest`, or download an archive from [GitHub Releases](https://github.com/MichaelKinsy/PiG/releases). Windows support is a preview. To build from source instead, follow the steps below. Pi 1.6.0 documents its own install routes in [Pi's quickstart](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/quickstart.md).
 
 If you have not used a terminal before, start with [Your first ten minutes](/docs/latest/first-run). It explains each step.
 
@@ -15,6 +15,8 @@ pig --version
 
 When `~/.local/bin` is not on `PATH`, the script prints the `export PATH=...` line to run. [Install troubleshooting](/docs/latest/install-troubleshooting) lists the script's options, for example `PIG_VERSION` to install a given release.
 
+PiG doesn't run on iPhone, iPad, or iSH. Use `ssh` to connect to a computer that has PiG installed, then run `pig` there.
+
 ## Requirements
 
 You need these tools only to build PiG from source. Build the `pig` executable with Go 1.27.4. Go 1.27 release binaries for macOS require macOS 13 or later.
@@ -22,8 +24,8 @@ You need these tools only to build PiG from source. Build the `pig` executable w
 The complete verification suite also uses:
 
 - Git;
-- Node.js 24.22.1 and npm 12.1.0;
-- Python 3.12;
+- Node.js 24.22.2 and npm 12.2.1;
+- Python 3.12, and CPython 3.11 for `make test-sdk-py-311`, which `make check` runs (`PIG_SDK_PY_311` names the interpreter; the default is `python3.11`);
 - Rust 1.97.1;
 - tmux on Unix.
 
@@ -67,7 +69,7 @@ with `npm uninstall -g @pi-in-go/pig`.
 
 ## Install with Go
 
-Go 1.26 or newer installs the command without cloning the repository. Go downloads PiG's source and its dependencies and compiles them on your computer, which can take several minutes the first time:
+Go 1.27 or newer installs the command without cloning the repository (an older Go, 1.21 or newer, downloads the toolchain `go.mod` names unless `GOTOOLCHAIN=local`). Go downloads PiG's source and its dependencies and compiles them on your computer, which can take several minutes the first time:
 
 ```bash
 go install github.com/MichaelKinsy/PiG/cmd/pig@latest
@@ -128,7 +130,7 @@ A source build is at `bin/pig` in the PiG checkout. Run it by its full path, for
 
 PiG stores user state below `~/.pig`. Use `PIG_HOME` only when you need an isolated configuration root.
 
-On an interactive start in the default agent directory that holds no `settings.json` yet, which includes every fresh `PIG_HOME`, PiG shows a first-time setup screen: theme, sprite and usage-analytics choices. `Esc` skips it and saves nothing. A custom agent directory (`PIG_CODING_AGENT_DIR`) and print, JSON and RPC modes skip it (`coding/cli/extensions.go:93-95`). Pi 1.5 shows its screen (theme and usage-analytics choices) only when all of these hold (`startup-ui.ts` `shouldRunFirstTimeSetup`): the binary is Pi's own distribution (package `@earendil-works/pi-coding-agent`, app `pi`, config directory `.pi`), `PI_EXPERIMENTAL=1` is set, `PI_CODING_AGENT_DIR` is not set, and `~/.pi/agent/settings.json` does not exist yet. This is divergence D88. Change the theme later with `/settings` and the pig with `/sprite`. [Your first ten minutes](/docs/latest/first-run) shows the screen.
+On an interactive start in the default agent directory that holds no `settings.json` yet, which includes every fresh `PIG_HOME`, PiG shows a first-time setup screen: theme, sprite and usage-analytics choices. `Esc` skips it and saves nothing. A custom agent directory (`PIG_CODING_AGENT_DIR`) and print, JSON and RPC modes skip it (`coding/cli/extensions.go:93-95`). Pi 1.6.0 shows its screen (theme and usage-analytics choices) only when all of these hold (`startup-ui.ts` `shouldRunFirstTimeSetup`): the binary is Pi's own distribution (package `@earendil-works/pi-coding-agent`, app `pi`, config directory `.pi`), `PI_EXPERIMENTAL=1` is set, `PI_CODING_AGENT_DIR` is not set, and `~/.pi/agent/settings.json` does not exist yet. This is divergence D88. Change the theme later with `/settings` and the pig with `/sprite`. [Your first ten minutes](/docs/latest/first-run) shows the screen.
 
 ## Authenticate a provider
 

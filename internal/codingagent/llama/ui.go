@@ -14,6 +14,7 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/jsnumber"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 	"github.com/MichaelKinsy/PiG/tui"
 	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
@@ -214,9 +215,11 @@ type HuggingFaceSearch struct {
 	allResults      []HuggingFaceModel
 	filteredResults []HuggingFaceModel
 	selectedIndex   int
-	query           string
-	status          string
-	debounce        debounceTimer
+	// selectionTouched is whether the user moved the selection since the query last changed.
+	selectionTouched bool
+	query            string
+	status           string
+	debounce         debounceTimer
 	// afterFunc starts the debounce timer: time.AfterFunc, or a manual clock in tests that compare against Pi on a virtual clock.
 	afterFunc     func(d time.Duration, f func()) debounceTimer
 	cancelRequest context.CancelFunc
@@ -286,7 +289,7 @@ func (s *HuggingFaceSearch) updateResults() {
 	s.requestRender()
 }
 
-func (s *HuggingFaceSearch) filterResults() {
+func (s *HuggingFaceSearch) filterResults(preferredID string) {
 	if s.query != "" {
 		matches := map[string]bool{}
 		for _, model := range tui.FuzzyFilter(s.allResults, s.query, func(model HuggingFaceModel) string { return model.ID }) {
@@ -301,7 +304,15 @@ func (s *HuggingFaceSearch) filterResults() {
 	} else {
 		s.filteredResults = s.allResults
 	}
-	s.selectedIndex = min(s.selectedIndex, max(0, len(s.filteredResults)-1))
+	preferredIndex := -1
+	if preferredID != "" {
+		preferredIndex = slices.IndexFunc(s.filteredResults, func(model HuggingFaceModel) bool { return model.ID == preferredID })
+	}
+	if preferredIndex >= 0 {
+		s.selectedIndex = preferredIndex
+	} else {
+		s.selectedIndex = min(s.selectedIndex, max(0, len(s.filteredResults)-1))
+	}
 	s.updateResults()
 }
 
@@ -320,7 +331,7 @@ func (s *HuggingFaceSearch) scheduleSearch() {
 	s.stopPending()
 	if jsLength(s.query) < 2 {
 		s.status = "Type at least 2 characters"
-		s.filterResults()
+		s.filterResults("")
 		return
 	}
 	if cached, ok := s.cache[strings.ToLower(s.query)]; ok {
@@ -329,11 +340,11 @@ func (s *HuggingFaceSearch) scheduleSearch() {
 		if len(cached) == 0 {
 			s.status = "No GGUF models found"
 		}
-		s.filterResults()
+		s.filterResults("")
 		return
 	}
 	s.status = searchingStatus
-	s.filterResults()
+	s.filterResults("")
 	if s.closed {
 		// Keys that reach a closed search still edit the input and the list, as upstream's do, but start no search: SearchModels has stopped waiting for the pending ones, and a timer added now would outlive it.
 		return
@@ -374,8 +385,13 @@ func (s *HuggingFaceSearch) runSearch(query string) {
 	if err != nil {
 		s.allResults = nil
 		s.status = err.Error()
-		s.filterResults()
+		s.filterResults("")
 		return
+	}
+	// Pi df0d88aac: keep the row the user browsed to while the search was in flight; otherwise the best match shows.
+	selectedID := ""
+	if s.selectionTouched && s.selectedIndex < len(s.filteredResults) {
+		selectedID = s.filteredResults[s.selectedIndex].ID
 	}
 	s.allResults = results
 	s.selectedIndex = 0
@@ -383,7 +399,7 @@ func (s *HuggingFaceSearch) runSearch(query string) {
 	if len(results) == 0 {
 		s.status = "No GGUF models found"
 	}
-	s.filterResults()
+	s.filterResults(selectedID)
 }
 
 func (s *HuggingFaceSearch) close(model string, ok bool) {
@@ -403,16 +419,19 @@ func (s *HuggingFaceSearch) HandleInput(data string) {
 	case keys.Matches(data, tui.KBSelectUp):
 		if len(s.filteredResults) > 0 {
 			s.selectedIndex = (s.selectedIndex - 1 + len(s.filteredResults)) % len(s.filteredResults)
+			s.selectionTouched = true
 			s.updateResults()
 		}
 	case keys.Matches(data, tui.KBSelectDown):
 		if len(s.filteredResults) > 0 {
 			s.selectedIndex = (s.selectedIndex + 1) % len(s.filteredResults)
+			s.selectionTouched = true
 			s.updateResults()
 		}
 	case keys.Matches(data, tui.KBSelectPageUp) || keys.Matches(data, tui.KBSelectPageDown):
 		if len(s.filteredResults) > 0 {
 			s.selectedIndex, _ = tui.GetSelectPageIndex(keys, data, s.selectedIndex, len(s.filteredResults), searchMaxVisible)
+			s.selectionTouched = true
 			s.updateResults()
 		}
 	case keys.Matches(data, tui.KBSelectConfirm):
@@ -434,6 +453,7 @@ func (s *HuggingFaceSearch) HandleInput(data string) {
 			return
 		}
 		s.query = query
+		s.selectionTouched = false
 		s.scheduleSearch()
 	}
 }
@@ -500,7 +520,7 @@ func (v *LlamaView) showList(list *tui.FilterableList, title string, before []tu
 // ShowModels mirrors LlamaView.showModels.
 func (v *LlamaView) ShowModels(serverURL string, models []LlamaModelInfo) LlamaManagerAction {
 	sorted := slices.Clone(models)
-	slices.SortStableFunc(sorted, func(left, right LlamaModelInfo) int {
+	sortx.Stable(sorted, func(left, right LlamaModelInfo) int {
 		leftLoaded := left.Status.Value == LlamaModelStatusLoaded
 		rightLoaded := right.Status.Value == LlamaModelStatusLoaded
 		if leftLoaded != rightLoaded {
@@ -711,8 +731,8 @@ func RunWithProgress[T any](ui LlamaUi, options RunWithProgressOptions[T]) (valu
 	runCtx, abort := context.WithCancelCause(context.Background())
 	defer abort(nil)
 	var stateMu sync.Mutex
-	state := ProgressState{Title: options.Title, Model: options.Model}
-	state.Message = options.InitialMessage
+	state := ProgressState{Title: options.Title, Model: options.Model,
+		Message: options.InitialMessage}
 	showProgress := func() <-chan struct{} {
 		stateMu.Lock()
 		defer stateMu.Unlock()

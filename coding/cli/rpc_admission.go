@@ -78,7 +78,7 @@ type rpcAdmission struct {
 	// shared, when set, is the task group every Session's admission of one RPC process uses, so a replacement does not fork the set of tasks that shutdown joins.
 	shared *rpcTaskGroup
 	runs   *sync.WaitGroup
-	// shutdown counts the commands in flight for an extension's ctx.shutdown() request (D231); nil counts nothing.
+	// shutdown counts the commands in flight for an extension's ctx.shutdown() request; nil counts nothing.
 	shutdown *rpcShutdownGate
 	// commandsInFlight, when set, counts the extension commands whose prompt response is not yet written.
 	commandsInFlight *atomic.Int32
@@ -102,7 +102,6 @@ func (a *rpcAdmission) taskGroup() *rpcTaskGroup {
 // commandTurn opens a Turns command for work that runs outside the executor. Pi runs the command's microtasks to the response without a timer callback between, so the extension runtimes hold theirs until the work's result settled and the loop drained what it queued: settled is called from the task that settles the result, and ends the command once that drain is over. abandoned ends it at once.
 func (a *rpcAdmission) commandTurn() (settled, abandoned func()) {
 	finish := a.turns.Command()
-	// pig divergence (D231): follows Pi main 1708b4788 ahead of the v1.5.0 pin.
 	a.shutdown.Begin()
 	return func() {
 		idle := a.turn.Idle()
@@ -187,8 +186,7 @@ func rpcAwaitHandler[T any](a *rpcAdmission, work func(context.Context) (T, erro
 	entered := make(chan struct{})
 	ctx := invocation.WithSuspensionAcknowledgment(a.ctx, func() { close(entered) })
 	p := &rpcPromise[T]{turn: a.turn}
-	// pig divergence (D231): follows Pi main 1708b4788 ahead of the v1.5.0 pin.
-	// The handler is a command in flight until its continuation was queued; the shutdown check runs as a macrotask, after that continuation (D231).
+	// The handler is a command in flight until its continuation was queued; the shutdown check runs as a macrotask, after that continuation.
 	a.shutdown.Begin()
 	if !a.tasks.Go(func() {
 		defer invocation.Acknowledge(ctx)
@@ -309,10 +307,27 @@ type rpcCommandFlight struct {
 	runs     *rpcCommandRuns
 	running  bool
 	answered bool
+	// resumed is the work a call the handler awaited left for the handler's settlement (invocation.Resumption): a reload's hold on stdin.
+	resumed []func()
 }
 
-func (f *rpcCommandFlight) Resumed()   { f.runs.set(f, true, nil) }
-func (f *rpcCommandFlight) Suspended() { f.runs.set(f, false, nil) }
+func (f *rpcCommandFlight) Resumed() { f.runs.set(f, true, nil) }
+func (f *rpcCommandFlight) Suspended() {
+	f.runs.set(f, false, nil)
+	f.runs.settle(f)
+}
+
+// AfterResumption keeps fn until the handler, resumed by the answer of a call it awaited, awaits again or its response is written; the response of a command that has answered is written, so fn runs at once.
+func (f *rpcCommandFlight) AfterResumption(fn func()) {
+	f.runs.mu.Lock()
+	if f.answered {
+		f.runs.mu.Unlock()
+		fn()
+		return
+	}
+	f.resumed = append(f.resumed, fn)
+	f.runs.mu.Unlock()
+}
 
 // rpcCommandRuns holds the start of a run an extension command sent while a command's handler runs. Pi runs a command's handler
 // on its one event loop: pi.sendMessage and pi.sendUserMessage return inside the handler, which goes on until it awaits or
@@ -344,6 +359,17 @@ func (r *rpcCommandRuns) set(f *rpcCommandFlight, running bool, a *rpcAdmission)
 	r.releaseLocked(a)
 }
 
+// settle runs the work left for the settlement of f's handler.
+func (r *rpcCommandRuns) settle(f *rpcCommandFlight) {
+	r.mu.Lock()
+	resumed := f.resumed
+	f.resumed = nil
+	r.mu.Unlock()
+	for _, fn := range resumed {
+		fn()
+	}
+}
+
 // answered retires f once its response is written.
 func (r *rpcCommandRuns) answered(f *rpcCommandFlight, a *rpcAdmission) {
 	r.mu.Lock()
@@ -352,13 +378,18 @@ func (r *rpcCommandRuns) answered(f *rpcCommandFlight, a *rpcAdmission) {
 		return
 	}
 	f.answered = true
-	if !f.running {
+	resumed := f.resumed
+	f.resumed = nil
+	if f.running {
+		f.running = false
+		r.running--
+		r.releaseLocked(a)
+	} else {
 		r.mu.Unlock()
-		return
 	}
-	f.running = false
-	r.running--
-	r.releaseLocked(a)
+	for _, fn := range resumed {
+		fn()
+	}
 }
 
 // releaseLocked unlocks r and runs the held starts once no handler runs, in the order they were held. With a nil admission (a
@@ -444,12 +475,16 @@ func (a *rpcAdmission) promptInput(id rpcRequestID, cmd RPCPromptCommand) {
 		fail(fmt.Errorf("Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry."))
 		return
 	}
+	// upstream: agent-session.ts prompt() awaits _preparePrompt (Pi main, #9154), an async function: a rejection it throws reaches prompt()'s
+	// catch one microtask later than a throw inside prompt() itself did, and so does the start of _startRun after it returns the trigger.
+	// "handled" and "queued" call preflightResult inside _preparePrompt and add no hop.
+	failPrepared := func(err error) { a.turn.Microtask(func() { fail(err) }) }
 	a.input(cmd.Message, rpcImages(cmd.Images), cmd.StreamingBehavior).then(func(input rpcInputResult, err error) {
 		if a.ctx.Err() != nil {
 			return
 		}
 		if err != nil {
-			fail(err)
+			failPrepared(err)
 			return
 		}
 		if input.handled {
@@ -459,7 +494,7 @@ func (a *rpcAdmission) promptInput(id rpcRequestID, cmd RPCPromptCommand) {
 		text := a.catalog.expandPrompt(input.text)
 		if a.session.IsStreaming() {
 			if cmd.StreamingBehavior == "" {
-				fail(fmt.Errorf("Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."))
+				failPrepared(fmt.Errorf("Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."))
 				return
 			}
 			if cmd.StreamingBehavior == "followUp" {
@@ -468,46 +503,57 @@ func (a *rpcAdmission) promptInput(id rpcRequestID, cmd RPCPromptCommand) {
 				a.session.QueueSteer(text, input.images)
 			}
 			if err := a.session.FlushEvents(a.ctx); err != nil {
-				fail(err)
+				failPrepared(err)
 				return
 			}
 			a.turn.Microtask(func() { a.write(rpcDispositionSuccess(id, "prompt", coding.DispositionQueued)) })
 			return
 		}
 		if err := a.validateModel(); err != nil {
-			fail(err)
+			failPrepared(err)
 			return
 		}
-		// upstream: agent-session.ts:2133 prompt() awaits _startRun, which marks the Session busy before its compaction check and
-		// before_agent_start (:1832-1837), so input that arrives meanwhile queues into this run or is rejected.
-		start, err := a.session.BeginRunStart()
-		if err != nil {
-			fail(err)
-			return
-		}
-		failStarted := func(err error) {
-			start.Abandon()
-			fail(err)
-		}
-		prepare := func() {
-			a.beforeAgentStart(id, start, coding.BuildUserContent(text, input.images), len(input.images) > 0, failStarted)
-		}
-		if slices.ContainsFunc(a.session.Messages(), func(m agent.AgentMessage) bool { return m.Assistant != nil }) {
-			checked := a.promptCompactionCheck()
-			checked.then(func(_ struct{}, err error) {
-				switch {
-				case err != nil && !a.session.AgentRunAbortRequested():
-					failStarted(err)
-				case a.ctx.Err() == nil:
-					prepare()
-				default:
-					start.Abandon()
-				}
-			})
-		} else {
-			prepare()
-		}
+		a.turn.Microtask(func() { a.startPrompt(id, text, input, fail) })
 	})
+}
+
+// startPrompt is prompt() after _preparePrompt returned its trigger: _startRun marks the Session busy and prepares the run.
+func (a *rpcAdmission) startPrompt(id rpcRequestID, text string, input rpcInputResult, fail func(error)) {
+	if a.ctx.Err() != nil {
+		return
+	}
+	// upstream: agent-session.ts:2195 prompt() awaits _startRun, which marks the Session busy before its compaction check and
+	// before_agent_start (:1944-1948), so input that arrives meanwhile queues into this run or is rejected.
+	// pig divergence (D629): a second prompt of the same input chunk passed promptInput's isStreaming check before the first reached this
+	// point, as Pi's passes _preparePrompt's; BeginRunStart rejects it with the "already processing" error. Pi's _startRun has no such
+	// check: it answers "started", the prompt is never run, its error is dropped and an agent_settled is emitted for it.
+	start, err := a.session.BeginRunStart()
+	if err != nil {
+		fail(err)
+		return
+	}
+	failStarted := func(err error) {
+		start.Abandon()
+		fail(err)
+	}
+	prepare := func() {
+		a.beforeAgentStart(id, start, coding.BuildUserContent(text, input.images), len(input.images) > 0, failStarted)
+	}
+	if slices.ContainsFunc(a.session.Messages(), func(m agent.AgentMessage) bool { return m.Assistant != nil }) {
+		checked := a.promptCompactionCheck()
+		checked.then(func(_ struct{}, err error) {
+			switch {
+			case err != nil && !a.session.AgentRunAbortRequested():
+				failStarted(err)
+			case a.ctx.Err() == nil:
+				prepare()
+			default:
+				start.Abandon()
+			}
+		})
+	} else {
+		prepare()
+	}
 }
 
 // promptCompactionCheck is prompt()'s compaction check. Pi's check resumes without I/O unless it compacts, so only a due compaction leaves the loop, and the
@@ -617,8 +663,7 @@ func (a *rpcAdmission) startPreparedPrompt(id rpcRequestID, start *coding.RunSta
 				}
 				hasStartHandler := a.runner != nil && a.runner.HasHandlers("agent_start")
 				rpcAwaitWork(a, hasStartHandler, start).then(func(_ struct{}, _ error) {
-					// pig divergence (D231): follows Pi main 1708b4788 ahead of the v1.5.0 pin.
-					// The prompt command is in flight until the run settles (rpc-mode.ts activeCommands, D231).
+					// The prompt command is in flight until the run settles (rpc-mode.ts activeCommands).
 					a.shutdown.Begin()
 					a.runs.Go(func() { defer a.shutdown.End(); stackprime.Prime(); _, _ = run.Run() })
 				})

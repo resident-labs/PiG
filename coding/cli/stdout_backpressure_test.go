@@ -230,7 +230,7 @@ func TestRPCUsageProbeFailsWhenTheCLIWritesNoFrame(t *testing.T) {
 	}
 	dir := t.TempDir()
 	cli := filepath.Join(dir, "cli.js")
-	if err := os.WriteFile(cli, []byte("require('node:fs').closeSync(0)\nprocess.stdout.write('up\\n', () => process.exit(0))\n"), 0o600); err != nil {
+	if err := os.WriteFile(cli, []byte("require('node:fs').closeSync(0)\nconsole.log('up')\nsetTimeout(() => process.exit(0), 300)\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	out := filepath.Join(dir, "rpc-usage.json")

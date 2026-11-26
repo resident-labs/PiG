@@ -2,7 +2,7 @@
 
 [Command line](/docs/latest/cli) lists every verb and option. This page runs the common ones and shows what they print. Each block is a command, its output and its exit status (`exit N` after the output; 0 means success). The outputs were captured from one PiG binary under a scratch home directory, so paths read `/home/you/...` here and your own paths differ. Commands that need a network or a model say so.
 
-Version: `0.5.0+1.2.0` in the captures below. Yours prints your own release.
+Version: `0.5.0` in the captures below. Yours prints your own release.
 
 ## Is it installed, and what is it?
 
@@ -11,10 +11,10 @@ pig --version
 ```
 
 ```text
-0.5.0+1.2.0
+1.2.0
 ```
 
-The number is `<PiG version>+<Pi version it follows>`. Pi prints only its own version, so this is a difference (D63). `pig version` is the detailed form:
+The number is the Pi version PiG follows, what `pi --version` prints, so a launcher that checks Pi's version reads it. `pig version` names the PiG release too:
 
 ```bash
 pig version
@@ -174,7 +174,7 @@ No packages installed.
 ```
 
 ```text
-Pig status: healthy
+PiG status: healthy
   paths: home=/home/you/.pig agent=/home/you/.pig/agent project=/home/you/project/.pig
   packages: 0 (user=0 project=0)
   resources: 0 (enabled=0 disabled=0)
@@ -246,7 +246,7 @@ User packages:
 `pig status` now reports a problem if two resources collide. Here the package's `commit` skill and a `commit` skill in `~/.pig/agent/skills` have the same name. The status turns `invalid`, names both files and exits 1 (exit 1):
 
 ```text
-Pig status: invalid
+PiG status: invalid
   paths: home=/home/you/.pig agent=/home/you/.pig/agent project=/home/you/project/.pig
   packages: 1 (user=1 project=0)
   resources: 3 (enabled=3 disabled=0)
@@ -443,9 +443,9 @@ pig docs show onboarding
 The first lines of the page:
 
 ```text
-# Get started with Pig
+# Get started with PiG
 
-Stock Pig includes the reference documentation required to configure models,
+Stock PiG includes the reference documentation required to configure models,
 author extensions, use Packages, and compose Piglets. ...
 ```
 

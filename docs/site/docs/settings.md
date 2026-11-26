@@ -1,6 +1,6 @@
 # Settings
 
-PiG reads settings from `~/.pig/agent/settings.json`. The file is optional. Every key is optional, and a key you leave out keeps its default. PiG uses the settings keys of Pi 1.5.0 ([Pi's settings reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/settings.md)) and adds the PiG-only keys marked below.
+PiG reads settings from `~/.pig/agent/settings.json`. The file is optional. Every key is optional, and a key you leave out keeps its default. PiG uses the settings keys of Pi 1.6.0 ([Pi's settings reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/settings.md)) and adds the PiG-only keys marked below.
 
 Set `PIG_HOME` to move the whole configuration root. Set `PIG_CODING_AGENT_DIR` to move only this directory.
 
@@ -13,15 +13,15 @@ Set `PIG_HOME` to move the whole configuration root. Set `PIG_CODING_AGENT_DIR` 
 }
 ```
 
-Add `"$schema": "https://pi.dev/schemas/settings.schema.json"` to `settings.json` for editor validation and completion. PiG keeps the key when it writes the file. The schema is the one Pi 1.5.0 publishes. It does not list the PiG-only keys, but it accepts them.
+Add `"$schema": "https://pi.dev/schemas/settings.schema.json"` to `settings.json` for editor validation and completion. PiG keeps the key when it writes the file. The schema is the one Pi 1.6.0 publishes. It does not list the PiG-only keys, but it accepts them.
 
-Use `/settings` to change a setting from inside a session. PiG writes the file for you and applies the change without a restart.
+Use `/settings` to change a setting from inside a session. PiG writes the file for you and applies the change without a restart. When the file cannot be written, PiG prints `Failed to save settings: <error>`, so you know the change will not survive a restart; Pi 1.6.0 reports the failed write only in the settings warnings of a later start (D633).
 
 [Settings by example](/docs/latest/settings-examples) shows the common keys at work, with the output to expect.
 
 ## Where PiG reads settings
 
-PiG merges two files. A key set in the project file overrides the same key in the global file. Resource lists are combined. `defaultProjectTrust`, `httpProxy`, `cacheWarming`, `extensionsAutoUpgrade` and `extensionsTypescriptRuntime` are global settings: PiG ignores them in the project file.
+PiG merges two files. A key set in the project file overrides the same key in the global file. Resource lists are combined. `defaultProjectTrust`, `httpProxy`, `cacheWarming`, `extensionsAutoUpgrade`, `extensionsTypescriptRuntime` and `terminal.framePacing` are global settings: PiG ignores them in the project file.
 
 | Scope | Path |
 |---|---|
@@ -32,7 +32,7 @@ PiG reads the project file only after you trust the project. An untrusted projec
 
 If PiG is killed (`kill -9`, power loss), it can leave `settings.json.lock` next to the settings file. A lock younger than 10 seconds counts as held, so the next start waits about 0.2 seconds for each settings load, then warns `Invalid settings file ...: Lock file is already being held` and goes on with the defaults it has. After 10 seconds the lock is taken over. You can also delete the `settings.json.lock` directory. Pi behaves the same way.
 
-A value of the wrong JSON type, such as `{"skills": 5}` or `{"enabledModels": [5]}`, is ignored, and PiG applies the other settings of the file. PiG prints one warning for each file that held such values, for example `Warning: Invalid settings file <path>: ignored settings of the wrong type: "skills" (expected an array of strings)`. Pi 1.5.0 exits with a `TypeError` for these values, or reads a string as a list of one-character patterns (D158).
+A value of the wrong JSON type, such as `{"skills": 5}` or `{"enabledModels": [5]}`, is ignored, and PiG applies the other settings of the file. PiG prints one warning for each file that held such values, for example `Warning: Invalid settings file <path>: ignored settings of the wrong type: "skills" (expected an array of strings)`. Pi 1.6.0 exits with a `TypeError` for these values, or reads a string as a list of one-character patterns (D158).
 
 An empty default column means PiG has no value for the key until you set one, or the value depends on what it detects.
 
@@ -50,8 +50,8 @@ An empty default column means PiG has no value for the key until you set one, or
 | `retry` | object | see meaning | Agent retry policy: `enabled` (default `true`), `maxRetries` (default `3`), `baseDelayMs` (default `2000`) and `maxAgentDelayMs` (the cap on each retry delay, default `60000`). An explicit `0` is kept. See [provider retries](#provider-retries) for `retry.provider`. |
 | `httpProxy` | string | unset | Global HTTP/HTTPS proxy URL. Sets only absent `HTTP_PROXY` and `HTTPS_PROXY` environment variables. Provider requests use CONNECT tunnels; `NO_PROXY` controls bypasses. Global setting only. |
 | `websocketConnectTimeoutMs` | number | `15000` | WebSocket opening-handshake timeout in milliseconds. `0` or `"disabled"` turns it off. Explicit request options override the setting. |
-| `httpIdleTimeoutMs` | number | `300000` | Idle timeout for provider requests, in milliseconds: the wait for response headers and for each part of the body. `0` or `"disabled"` turns it off. Keepalive comments and pings do not restart it, so a stream that sends only keepalives ends with an error after this timeout. Pi 1.5.0 waits for ever on such a stream (D131, [Pi #10761](https://github.com/earendil-works/pi/issues/10761)). |
-| `cacheWarming` | string | `streaming` | `off`, `streaming`, or `idle`. Keeps the provider's prompt cache warm with periodic requests. Global setting only: PiG ignores it in a project file. See [cache warming](#cache-warming). |
+| `httpIdleTimeoutMs` | number | `300000` | Idle timeout for provider requests, in milliseconds: the wait for response headers and for each part of the body. `0` or `"disabled"` turns it off. Keepalive comments and pings do not restart it, so a stream that sends only keepalives ends with an error after this timeout. Pi 1.6.0 waits for ever on such a stream (D131, [Pi #10761](https://github.com/earendil-works/pi/issues/10761)). |
+| `cacheWarming` | string | `idle` | `off`, `streaming`, or `idle`. Keeps the provider's prompt cache warm with periodic requests. Global setting only: PiG ignores it in a project file. See [cache warming](#cache-warming). |
 
 ### Provider retries
 
@@ -68,8 +68,8 @@ Keep `retry.provider.maxRetries` at `0` unless you need provider-level retries. 
 Cache warming is on by default, as in Pi. Each refresh is a real provider request that you pay for. PiG replays the last request with a one-token output limit shortly before the prompt cache expires, so the next request reads the cache instead of writing it again at full price.
 
 - `off`: PiG never sends refreshes.
-- `streaming`: only while the agent is running. This is the default.
-- `idle`: while the agent runs, and between runs for up to 30 minutes after the last request.
+- `streaming`: only while the agent is running.
+- `idle`: while the agent runs, and between runs for up to 30 minutes after the last request. This is the default.
 
 A refresh is sent only when the model declares a prompt cache lifetime and PiG expects it to save at least $0.05 in avoided cache-miss cost. Warming stops when the conversation or model changes, after one hour (30 minutes when idle), and when the session ends. Refresh usage counts toward the session's token and cost totals, but it never enters the model's context. `/session` shows the mode, the next decision, and its estimated cost. An extension can change the decision with a `cache_warming_decision` handler.
 
@@ -130,6 +130,8 @@ To turn cache warming off, choose `off` for **Cache warming** in `/settings`, or
 | `terminal.imageWidthCells` | number | `60` | Width of a rendered image, in terminal cells. |
 | `terminal.clearOnShrink` | boolean | `false` | Repaint the screen when content shrinks. |
 | `terminal.showTerminalProgress` | boolean | `false` | Show OSC 9;4 progress in the terminal tab. |
+| `terminal.screenWriter` | `"writer" \| "pi"` | `"pi"` | PiG-only (D624). What a fullscreen terminal is sent: `"pi"`, the default in 0.8.0, sends the bytes Pi sends; `"writer"` selects the screen writer, which sends only what a frame changes on the screen. Read from the global settings file only, when PiG starts; `PIG_TUI_SCREEN_WRITER` overrides it. |
+| `terminal.framePacing` | `"pi" \| "adaptive"` | `"pi"` | PiG-only (D625). How soon the next frame of a streaming reply may begin in fullscreen mode: `"pi"`, the default, waits Pi's 16 ms everywhere; `"adaptive"` is opt-in and waits four times what the last frame took, between 10 and 16 ms, when `terminal.screenWriter` is `"writer"` and on the terminals listed in [Terminal setup](/docs/latest/terminal-setup#display-problems), which also says what it trades: a shorter median time between visible changes, a 99th percentile half a millisecond to 2 ms longer while a file is written, and 4 to 7 % more CPU time. Any other value is `"pi"`. With `"adaptive"` and without the screen writer, the setting has no effect: interactive mode shows a warning at start and frames keep Pi's 16 ms. Global setting, read when PiG starts. `PIG_FRAME_PACING` overrides it. |
 | `images.autoResize` | boolean | `true` | Resize an image to at most 2000 by 2000 pixels before PiG sends it to a model. |
 | `images.blockImages` | boolean | `false` | Keep images away from the model. Each image in a message or tool result is replaced by the text `Image reading is disabled.` before the request is sent, as in Pi (`sdk.ts:312`; PiG `coding/block_images.go`). |
 
@@ -144,7 +146,7 @@ To turn cache warming off, choose `off` for **Cache warming** in `/settings`, or
 | `themes` | string[] |  | Theme paths to load. |
 | `enableSkillCommands` | boolean | `true` | Offer skills as `/skill:name` commands. |
 
-Resource paths in the global file resolve from the agent directory. Paths in the project file resolve from the project's `.pig` directory. Absolute paths and a leading `~` work. Resource lists accept glob exclusions with `!pattern`, exact inclusion with `+path`, and exact exclusion with `-path`. A leading `~` in these patterns expands to your home directory, for example `!~/claude-backup/skills/pdf`, as in Pi 1.5.0. Pi 1.1.0 matched the `~` literally, so such a pattern matched nothing ([Pi #10765](https://github.com/earendil-works/pi/issues/10765)).
+Resource paths in the global file resolve from the agent directory. Paths in the project file resolve from the project's `.pig` directory. Absolute paths and a leading `~` work. Resource lists accept glob exclusions with `!pattern`, exact inclusion with `+path`, and exact exclusion with `-path`. A leading `~` in these patterns expands to your home directory, for example `!~/claude-backup/skills/pdf`, as in Pi 1.6.0. Pi 1.1.0 matched the `~` literally, so such a pattern matched nothing ([Pi #10765](https://github.com/earendil-works/pi/issues/10765)).
 
 The built-in extensions are named `builtin:mcp`, `builtin:llama.cpp`, `builtin:codemode`, and `builtin:tool-search` in `extensions`. They load by default; `-builtin:mcp` turns one off. A `+builtin:<name>` or `-builtin:<name>` entry in the project file overrides the global file. `pig config` lists them under Built-in. `--no-extensions` turns them off too, and `-e builtin:<name>` loads one explicitly.
 
@@ -166,7 +168,7 @@ A setting wins over the matching `PI_HYPERLINKS`, `PI_IMAGE_PROTOCOL` or `PI_TRU
 | `shellCommandPrefix` | string |  | Prefix applied to every shell command. |
 | `externalEditor` | string | `$VISUAL`, `$EDITOR`, then the platform default | Editor opened by `app.editor.external`. |
 | `npmCommand` | string[] | `["npm"]` | Command and arguments used to run npm for package lookup and installation. |
-| `selfUpdateCommand` | string[] | none | Command and arguments `pig update` runs to update PiG itself, with `{packageName}`, `{version}` and `{installSpec}` placeholders. `PI_SELF_UPDATE_COMMAND` takes precedence. **Can only be set in agent-directory settings.** See [Custom update command](cli.md#custom-update-command). |
+| `selfUpdateCommand` | string[] | none | Command and arguments `pig update` runs to update PiG itself, with `{packageName}`, `{version}` and `{installSpec}` placeholders. `PIG_SELF_UPDATE_COMMAND` (or Pi's name, `PI_SELF_UPDATE_COMMAND`) takes precedence. **Can only be set in agent-directory settings.** See [Custom update command](cli.md#custom-update-command). |
 
 ## Tools
 
@@ -197,7 +199,7 @@ The built-in tools are `read`, `bash`, `powershell`, `edit`, `write`, `grep`, `f
 |---|---|---|---|
 | `warnings` | object | see meaning | Warning toggles: `anthropicExtraUsage` (default `true`) warns when Anthropic subscription auth may use paid extra usage. |
 | `showCacheMissNotices` | boolean | `false` | Report a significant prompt cache miss and each successful cache-warming refresh. |
-| `enableInstallTelemetry` | boolean | `true` | Gate for the anonymous install/update ping and the pig-branded OpenRouter, NVIDIA, and Cloudflare attribution headers. When on, PiG sends one HTTPS GET carrying only your PiG version (`?version=<version>`) and PiG's `User-Agent` header to `https://pi-in-go.dev/api/report-install`, after a fresh install and after an update that has new changelog entries, and at no other time. The site stores one data point (the version and arrival time) per call and never logs your IP address or User-Agent. Set to `false`, or set `PI_TELEMETRY=0`, to opt out; `PI_OFFLINE=1` also stops it. Override with `PI_TELEMETRY`. The endpoint is PiG's own (D64). |
+| `enableInstallTelemetry` | boolean | `true` | Gate for the anonymous install/update ping and the pig-branded OpenRouter, NVIDIA, and Cloudflare attribution headers. When on, PiG sends one HTTPS GET carrying only your PiG version (`?version=<version>`) and PiG's `User-Agent` header to `https://pi-in-go.dev/api/report-install`, after a fresh install and after an update that has new changelog entries, and at no other time. The site stores one data point (the version and arrival time) per call and never logs your IP address or User-Agent. Set to `false`, or set `PIG_TELEMETRY=0` (or Pi's `PI_TELEMETRY=0`), to opt out; `PI_OFFLINE=1` also stops it. Override with `PIG_TELEMETRY` or `PI_TELEMETRY`; `PIG_TELEMETRY` decides when both are set. The endpoint is PiG's own (D64). |
 | `enableAnalytics` | boolean | `false` | Opt in to analytics data sharing. PiG stores the choice; nothing sends data. |
 | `trackingId` | string |  | Analytics tracking identifier. PiG writes this on the first opt-in and keeps it when you toggle `enableAnalytics`. Bug reports omit it. |
 | `deviceId` | string |  | Stable random ID of this installation. PiG writes it to the global settings file the first time a sign-in needs it and ignores a `deviceId` in a project file. Bug reports omit it. |

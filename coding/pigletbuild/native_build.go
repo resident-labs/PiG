@@ -37,7 +37,7 @@ import (
 func buildNativeArtifact(ctx context.Context, source pigSource, p *piglet.Piglet, cells []subprocess.CellSpec, componentPlan pigletartifact.Plan, resolution *pigletartifact.Record, opts Options, outPath string, stdout, stderr io.Writer) ([]signature.EmbeddedFile, error) {
 	sourceRoot := source.Root
 	if sourceRoot == "" {
-		return nil, fmt.Errorf("source-unavailable: no Pig source tree to build; remedy: %s", sourceUnavailableRemedy)
+		return nil, fmt.Errorf("source-unavailable: no PiG source tree to build; remedy: %s", sourceUnavailableRemedy)
 	}
 	cacheRoot, err := os.MkdirTemp("", "piglet-binary-build-*")
 	if err != nil {
@@ -66,6 +66,9 @@ func buildNativeArtifact(ctx context.Context, source pigSource, p *piglet.Piglet
 			}
 			entries, err := collectFused(cell)
 			if err != nil {
+				return nil, err
+			}
+			if err := bakeFusedSourceDigests(p, entries); err != nil {
 				return nil, err
 			}
 			fused = append(fused, entries...)
@@ -562,6 +565,8 @@ type fusedEntry struct {
 	ModulePath       string
 	Package          string
 	WorkspaceModules []string
+	// SourceDigest is subprocess.FusedSourceDigest of Root for a Piglet built with `build.fusedReload: source`, else empty.
+	SourceDigest string
 }
 
 // isGoFactoryCell reports whether a planned cell is a Go SDK-factory cell, the
@@ -609,6 +614,24 @@ func collectFused(cell subprocess.CellSpec) ([]fusedEntry, error) {
 	return out, nil
 }
 
+// bakeFusedSourceDigests sets each entry's source digest for a Piglet built with `build.fusedReload: source`: the Binary then runs a
+// member whose source changed since the build from that source. Without the key nothing is baked and the generated registry is the
+// one a build wrote before the key existed.
+// pig additive (D31): a fused member whose source changed runs from its source.
+func bakeFusedSourceDigests(p *piglet.Piglet, entries []fusedEntry) error {
+	if p == nil || p.Build == nil || p.Build.FusedReload != piglet.FusedReloadSource {
+		return nil
+	}
+	for i := range entries {
+		digest, err := subprocess.FusedSourceDigest(entries[i].Root)
+		if err != nil {
+			return fmt.Errorf("fuse %q: source digest for build.fusedReload: %w", entries[i].Name, err)
+		}
+		entries[i].SourceDigest = digest
+	}
+	return nil
+}
+
 // overlayFuse imports each extension factory and the frontend member through
 // their real package paths and adds the members' module graph to the build's
 // view of Pig's go.mod and checksum files. The go.sum overlay, and the
@@ -623,11 +646,11 @@ func overlayFuse(o *buildOverlay, sourceRoot string, fused []fusedEntry, fronten
 
 	originalGoMod, err := os.ReadFile(goModPath)
 	if err != nil {
-		return fusedModuleGraph{}, fmt.Errorf("read Pig go.mod: %w", err)
+		return fusedModuleGraph{}, fmt.Errorf("read PiG go.mod: %w", err)
 	}
 	parsed, err := modfile.Parse(goModPath, originalGoMod, nil)
 	if err != nil {
-		return fusedModuleGraph{}, fmt.Errorf("parse Pig go.mod: %w", err)
+		return fusedModuleGraph{}, fmt.Errorf("parse PiG go.mod: %w", err)
 	}
 	members := fused
 	if frontendMember != nil {
@@ -654,7 +677,7 @@ func overlayFuse(o *buildOverlay, sourceRoot string, fused []fusedEntry, fronten
 	for _, sumFile := range sumFiles {
 		original, err := os.ReadFile(sumFile)
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fusedModuleGraph{}, fmt.Errorf("read Pig checksums: %w", err)
+			return fusedModuleGraph{}, fmt.Errorf("read PiG checksums: %w", err)
 		}
 		merged, err := mergeGoSum(original, graph.roots)
 		if err != nil {
@@ -713,6 +736,11 @@ func renderFuseRegistry(fused []fusedEntry) string {
 	b.WriteString(")\n\nfunc init() {\n")
 	for _, f := range fused {
 		_, _ = fmt.Fprintf(&b, "\tregisterFactory(%q, %s.%s)\n", f.Name, f.Pkg, f.Factory)
+	}
+	for _, f := range fused {
+		if f.SourceDigest != "" {
+			_, _ = fmt.Fprintf(&b, "\tregisterSource(%q, %q)\n", f.Name, f.SourceDigest)
+		}
 	}
 	b.WriteString("}\n")
 	return b.String()

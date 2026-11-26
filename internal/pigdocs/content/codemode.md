@@ -126,6 +126,10 @@ A call that fails, is blocked, or gets invalid arguments rejects with an `Error`
 
 The `codemode` description lists tools with their TypeScript declarations, grouped by namespace (for example one MCP server). Tools with `deferred` exposure, which includes MCP tools with the default `codemode` exposure, are not listed, so the description stays the same while MCP servers connect. Listed declarations share a budget of 3000 estimated tokens (`codemode.inlineBudget` in [settings](settings.md#tools)). Scripts find the other tools with `searchTools()`, `describeTool()`, `describeNamespace()`, or by filtering `ALL_TOOLS`.
 
+### Migrating from prefix namespaces (Go embedders)
+
+Code mode namespaces are declared by extensions, not derived from tool-name prefixes (Pi 5e24c6b1f, a breaking change for Go callers). You are affected if you embed durable code mode or a durable harness and used `codemode.Namespace` with a `Prefix`, `codemode.ToolOptions.Namespaces`, or the old `Section(tools, namespaces, budget)` signature; these are removed with no fallback, and a tool name is no longer matched against a prefix. To migrate, put the tools of one namespace in one `durable.Extension` and set `Extension.Namespace` to `&durable.ToolNamespace{Name, Description, Instructions}` (for example one extension per MCP server), rename the tools to their plain names (drop the `server_` prefix the namespace used to strip), and call `codemode.Section(tools, extensions, budget)` with the selected extensions; `codemode.NamespacesOf(extensions)` maps tool names to namespaces. A tool that several extensions name belongs to the first extension that does. `Description` is the one line shown in the `codemode` section, `Instructions` are returned only by `describeNamespace()`, and `searchTools()` searches both.
+
 While `codemode` is active, `codemode.mode` in [settings](settings.md#tools) decides how the other tools are presented. With `on` (default) declared tools stay declared, and their descriptions say in one line how scripts call them and what the call resolves to. With `only` they are hidden from the model and listed in the `codemode` description instead, so the model calls them through scripts. Tool declarations in the `codemode` description, `describeTool()`, and `ALL_TOOLS` carry the tools' prompt guidelines, since the system prompt rules only cover declared tools.
 
 ## Store values
@@ -307,6 +311,28 @@ Extensions generate images without codemode through `ctx.modelRegistry.generateI
 - At most two codemode VMs may be alive across all sessions in one pig process; `PI_CODEMODE_MAX_WORKERS` changes the limit. A cancelled VM occupies its slot until it exits. At capacity, new scripts wait for a free VM in arrival order. A script that gets no VM within 60 seconds, or before its `timeout_ms`, fails without running.
 - A script that waits on a promise that can never settle (no tool call pending) fails immediately, since there are no timers.
 - Scripts cannot start other `codemode` scripts.
+
+## Embedding codemode in a signed macOS app
+
+The `pig` releases are not affected by this section. It is for a Go program that links the `codemode` package, or PiG's built-in Code Mode extension, and that you sign yourself with the macOS Hardened Runtime (`codesign --options runtime`).
+
+wazero's compiler engine, which codemode uses by default, writes machine code into an anonymous memory page, makes the page executable and runs it. The Hardened Runtime refuses that unless the app says it may. Without the entitlement the process is killed with SIGKILL (a code signing "Invalid Page" crash) the first time a script runs; no error reaches your code before the kill.
+
+Give the app one of two things:
+
+- **The entitlement (recommended).** Add `com.apple.security.cs.allow-unsigned-executable-memory` to the app's entitlements. `com.apple.security.cs.allow-jit` is not enough: wazero maps its pages without `MAP_JIT`, and a signed Go binary with only `allow-jit` was still killed in a test on macOS 26 (arm64), while the same binary with `allow-unsigned-executable-memory` ran.
+- **The interpreter.** When the app cannot carry that entitlement, set `Interpreter: true` on `codemode.SandboxOptions` (or `codemode.InlineSandboxOptions`), on `codemode.ServeOptions` for `ServeRemote`, or on the built-in extension's options (`builtin.Options.Codemode.Interpreter`, which is `codemode.Options.Interpreter`). The default stays the compiler. The interpreter needs no entitlement. Its results match the compiler's except for deep recursion (below), and a `CacheDir` is ignored because it keeps no compiled code.
+
+The interpreter is slow. Measured on a Linux amd64 machine (Go 1.27.2, wazero 1.12.0), each `Execute` boots a fresh QuickJS VM, and the median of five runs after the first was:
+
+| Script | Compiler | Interpreter |
+| --- | ---: | ---: |
+| Names of `ALL_TOOLS` (does nothing else) | 26 ms | 1.2 s |
+| 20,000 records filtered, mapped, grouped, sorted, round-tripped through JSON | 152 ms | 8.4 s |
+
+That is about 50 times slower for both. A script that does nothing still costs over a second, because starting the VM runs the prelude interpreted. A run of the first script on a macOS 26 arm64 laptop under heavy load took 2 to 7 s per run on the interpreter. Two behaviors differ besides speed. A script that recurses without end is not given a catchable `RangeError`: wazero's interpreter stops the VM first and the execution fails with a sandbox error (`wasm error: stack overflow`), where the compiler lets the script catch the `RangeError`. And the script deadline and the half-second halt grace are wall-clock, so a script that needs a second of compiled time needs about a minute on the interpreter; raise `TimeoutMs` for it. The `codemode` test suite, run with the interpreter forced on, passed except for tests that assert the compiler (the cache directory), tests whose deadlines are a few hundred milliseconds, and the two deep-recursion tests, `TestTurnsDeepRecursionIntoACatchableRangeError` and `TestScriptOutcomesMatchPi`.
+
+Choose it only for a host that cannot take the entitlement, and keep script deadlines (300 s by default) and agent loops in mind. Another way around the entitlement is to run `ServeRemote` in a helper process that you sign differently.
 
 ## Tool search
 

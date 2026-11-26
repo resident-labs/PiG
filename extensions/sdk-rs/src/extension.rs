@@ -6,6 +6,7 @@ use crate::context::{
 use crate::kit::{Rendered, View};
 use crate::oauth::{OAuthLoginCallbacks, OAuthProvider, ProviderOAuthConfig};
 use crate::protocol::*;
+use crate::render_card::{RenderCards, RenderState};
 use crate::theme::UiState;
 use crate::tool_render::{
     ToolRenderCallHandler, ToolRenderCallViewHandler, ToolRenderContext, ToolRenderResult,
@@ -16,7 +17,6 @@ use crate::transport::UnixStream;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -303,13 +303,15 @@ impl EventSubscriber {
         match result {
             Ok(reply) => {
                 if let Some(err) = reply.error {
-                    eprintln!(
-                        "extension: {method} {event:?}: {}",
+                    crate::diagnostic::diagnose(&format!(
+                        "extension: {method} {event:?}: {}\n",
                         crate::context::host_error_message(err)
-                    );
+                    ));
                 }
             }
-            Err(err) => eprintln!("extension: {method} {event:?}: {err}"),
+            Err(err) => {
+                crate::diagnostic::diagnose(&format!("extension: {method} {event:?}: {err}\n"))
+            }
         }
     }
 
@@ -398,6 +400,10 @@ pub struct MessageRenderOptions {
     /// Horizontal padding configured by the outputPad setting.
     #[serde(rename = "outputPad")]
     pub output_pad: u32,
+    /// The renderer state of this message: it starts empty and every render of the same displayed message, and every event handler registered
+    /// with [`Extension::message_view_event`], shares it, as the WeakMap a Pi renderer keeps by message does. Not part of the wire options.
+    #[serde(skip)]
+    pub state: RenderState,
 }
 
 /// Options supplied to custom session-entry renderers.
@@ -405,6 +411,10 @@ pub struct MessageRenderOptions {
 pub struct EntryRenderOptions {
     #[serde(default)]
     pub expanded: bool,
+    /// The renderer state of this entry: see [`MessageRenderOptions::state`]; the event handler is registered with
+    /// [`Extension::entry_view_event`].
+    #[serde(skip)]
+    pub state: RenderState,
 }
 
 /// The commands, shortcuts and renderers a handler registered after load through [`Context`]. They replace a load-time registration with the same key, as a later `registerCommand` replaces an earlier one in Pi's Map (loader.ts).
@@ -483,6 +493,19 @@ pub(crate) type MessageRenderFn = Box<
 pub(crate) type EntryRenderFn =
     Box<dyn Fn(&Context, Value, EntryRenderOptions, u32) -> Result<Rendered, String> + Send + Sync>;
 
+/// The handler of the events of a message view renderer's view.
+pub(crate) type MessageViewEventFn = Box<
+    dyn Fn(&Context, Value, MessageRenderOptions, crate::kit::Event) -> Result<(), String>
+        + Send
+        + Sync,
+>;
+/// The handler of the events of an entry view renderer's view.
+pub(crate) type EntryViewEventFn = Box<
+    dyn Fn(&Context, Value, EntryRenderOptions, crate::kit::Event) -> Result<(), String>
+        + Send
+        + Sync,
+>;
+
 /// Pi's MarkdownTransformContext: the transcript message being rendered
 /// ("user", "assistant" or "assistant-thinking"), whether it is still
 /// streaming, and the width it is rendered at.
@@ -506,6 +529,17 @@ pub struct MarkdownTransformContext {
 /// MarkdownTransformer). Returning `None` keeps the input.
 pub type MarkdownTransformerHandler =
     Box<dyn Fn(&str, &MarkdownTransformContext) -> Option<String> + Send + Sync>;
+
+/// Pi's `MarkdownTransformerOptions`: the surfaces a Markdown transformer runs on.
+#[derive(Debug, Clone, Default)]
+pub struct MarkdownTransformerOptions {
+    /// The `MarkdownTransformContext::message_type` values the transformer runs on: `"user"`, `"assistant"`,
+    /// `"assistant-thinking"` (the default), `"custom"` (custom messages without a message renderer and expanded skill
+    /// blocks), `"summary"` (expanded branch and compaction summaries) and `"changelog"` (What's New, `/changelog`,
+    /// Extension Updates and the Update Available note). `None` selects the default types; `Some(vec![])` runs the
+    /// transformer nowhere.
+    pub message_types: Option<Vec<String>>,
+}
 
 /// Flag type for extension CLI flags.
 #[derive(Debug, Clone, Copy)]
@@ -570,6 +604,8 @@ struct RequestCancel {
     flag: Arc<AtomicBool>,
     reason: Arc<Mutex<Option<String>>>,
     provider_stream: Arc<Mutex<Option<Arc<ModelEventStream>>>>,
+    // Set by an ordinary cancel and by the end of the runtime: the request has ended. A signal-only cancel leaves it clear.
+    ended: Arc<AtomicBool>,
 }
 
 impl RequestCancel {
@@ -579,16 +615,28 @@ impl RequestCancel {
             reason: Arc::new(Mutex::new(None)),
             signal: crate::ProviderSignal::new(),
             provider_stream: Arc::new(Mutex::new(None)),
+            ended: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    // Aborts the signal the handler holds, which is all a signal-only cancel does: the request goes on. The stream of a provider_stream_simple request is left to its author, as Pi's consumer has no check of the signal (packages/agent/src/agent-loop.ts:424-478).
     fn cancel(&self, reason: impl Into<String>) {
         self.flag.store(true, Ordering::Relaxed);
         *self.reason.lock().unwrap() = Some(reason.into());
         self.signal.cancel();
+    }
+
+    // An ordinary cancel, or the end of the runtime: the request has ended. Its signal aborts and the stream of a provider_stream_simple request is ended, so its forwarder stops and answers the abort. The flag is set before the stream ends, so a stream this ended is never answered as one its author ended.
+    fn end_request(&self, reason: impl Into<String>) {
+        self.ended.store(true, Ordering::Relaxed);
+        self.cancel(reason);
         if let Some(stream) = self.provider_stream.lock().unwrap().as_ref() {
             stream.end(Value::Null);
         }
+    }
+
+    fn request_ended(&self) -> bool {
+        self.ended.load(Ordering::Relaxed)
     }
 }
 
@@ -685,7 +733,7 @@ impl WidthDeliveries {
             };
             for handler in handlers {
                 // One handler's panic must not stop the others, as a thrown handler error rejects one call upstream.
-                let _ = catch_unwind(AssertUnwindSafe(|| handler(width)));
+                let _ = crate::diagnostic::recover(|| handler(width));
             }
         }
     }
@@ -788,6 +836,32 @@ impl Context {
     }
 }
 
+/// Stack of the thread of a request whose arguments nest past serde_json's limit. Such arguments can nest as deep as the host's own JSON marshal allows (10000 levels), and
+/// dropping, ordering or writing the `Value` recurses once per level. Measured at 10016 levels in a release build (the host builds extensions with `--release`): a drop needs
+/// 0.6 MiB, a clone 2.3 MiB for arrays and 4.6 MiB for objects, `to_value` up to 5.8 MiB, an ordering up to 9.0 MiB; a debug build needs 3 to 5 times as much (a clone of
+/// objects 19.9 MiB, an ordering about 3.1 KB per level). 64 MiB covers a debug build.
+const DEEP_REQUEST_THREAD_STACK: usize = 64 * 1024 * 1024;
+
+/// Stack of every other request's thread: 8 MiB, what a C thread gets on Linux (`ulimit -s`). A request can still meet a deep value that did not come in its arguments (a
+/// `model_stream_event` carrying the tool arguments of a partial message, a host call's result holding a session entry), and what the SDK does with one 10000 levels deep
+/// (drop, clone, `to_string`, compare) needs up to 4.6 MiB in a release build, which Rust's 2 MiB default does not leave room for. A thread stack is address space that is not
+/// resident until used, and is committed only under `vm.overcommit_memory=2` or `ulimit -v`, where 8 MiB per concurrent request is what any C program pays; 64 MiB per request
+/// would not be.
+const REQUEST_THREAD_STACK: usize = 8 * 1024 * 1024;
+
+/// Stack of the thread that reads the connection (`run_with_socket`): the main loop clones the deep value of a notification event and of an event-stream keyframe or delta
+/// (4.6 MiB for objects at 10016 levels in a release build) and drops it, so it takes the stack of a normal request.
+const MAIN_LOOP_STACK: usize = REQUEST_THREAD_STACK;
+
+/// The stack size a request's thread asks for: the deep stack when its arguments needed the deep decode, and otherwise `REQUEST_THREAD_STACK`.
+pub(crate) fn request_stack_size(req: &RequestMsg) -> usize {
+    if req.deep_args {
+        DEEP_REQUEST_THREAD_STACK
+    } else {
+        REQUEST_THREAD_STACK
+    }
+}
+
 /// Extension is the main builder for a pig subprocess extension.
 pub struct Extension {
     name: String,
@@ -806,9 +880,18 @@ pub struct Extension {
     tool_prepare_fns: HashMap<String, ToolPrepareArguments>,
     command_fns: HashMap<String, CommandHandler>,
     shortcut_fns: HashMap<String, ShortcutHandler>,
+    /// D614: answers the intents of this extension's mounts.
+    view_intent_fn: Option<crate::ui_view::ViewIntentHandler>,
+    /// D614: run when what the attached client draws changed.
+    view_abilities_fns: Vec<crate::ui_view::ViewAbilitiesHandler>,
     renderer_fns: HashMap<String, MessageRenderFn>,
     entry_renderer_fns: HashMap<String, EntryRenderFn>,
+    message_view_event_fns: HashMap<String, MessageViewEventFn>,
+    entry_view_event_fns: HashMap<String, EntryViewEventFn>,
+    /// The renderer state of the messages and entries the host shows, by the host's key.
+    render_cards: RenderCards,
     markdown_transformer: Option<MarkdownTransformerHandler>,
+    markdown_message_types: Option<Vec<String>>,
     /// PiG-only: the extension owns the thinking runs of assistant messages (`own_thinking_runs`); the register frame carries it.
     owns_thinking_runs: bool,
     // oauth_fns holds OAuth closures for providers registered with an OAuth
@@ -844,9 +927,15 @@ impl Extension {
             tool_prepare_fns: HashMap::new(),
             command_fns: HashMap::new(),
             shortcut_fns: HashMap::new(),
+            view_intent_fn: None,
+            view_abilities_fns: Vec::new(),
             renderer_fns: HashMap::new(),
             entry_renderer_fns: HashMap::new(),
+            message_view_event_fns: HashMap::new(),
+            entry_view_event_fns: HashMap::new(),
+            render_cards: RenderCards::default(),
             markdown_transformer: None,
+            markdown_message_types: None,
             owns_thinking_runs: false,
             oauth_fns: HashMap::new(),
             tool_renderers: ToolRenderers::default(),
@@ -859,6 +948,24 @@ impl Extension {
             bus: Arc::new(crate::event_bus::BusRegistry::default()),
             loaded_fns: Vec::new(),
         }
+    }
+
+    /// Answers the intents of this extension's mounts (D614). A later call replaces the handler.
+    pub fn on_view_intent(
+        &mut self,
+        handler: impl Fn(crate::ViewIntentInvocation) -> crate::ViewIntentResult + Send + Sync + 'static,
+    ) {
+        self.view_intent_fn = Some(Box::new(handler));
+    }
+
+    /// Runs `handler` when what the attached client draws changed (D614): the first client attached, the abilities changed, or the last client left (`None`; a client that draws no slot is a record with no slots). It is where an extension mounts its views for a client that arrives while the session is idle, and stops work no client can see. The handler receives the abilities of the change it is delivered for, and [`Context::view_abilities`] already reports them when it runs, so a mount it makes is checked against that client. The state an extension starts in is not a change: an extension loaded while a client is attached reads [`Context::view_abilities`] at `session_start`. A session no client attaches to never runs the handler.
+    ///
+    /// Handlers run in registration order on a worker thread, one change at a time in the order the changes arrived, never on the thread that reads the host's replies, so a handler can make a blocking host call. The host does not wait for them. A handler that panics does not stop the others.
+    pub fn on_view_abilities(
+        &mut self,
+        handler: impl Fn(&Context, Option<crate::ViewAbilities>) + Send + Sync + 'static,
+    ) {
+        self.view_abilities_fns.push(Box::new(handler));
     }
 
     /// Runs `handler` once the extension is registered with the host and has received its state, before it serves any request (`session_start` included). It is the place for work a factory cannot do: a [`Context`] exists, so the handler can read session state, call the host and emit on [`Context::events`]. Handlers run in registration order, one at a time, on a thread of their own, so a host call the host answers itself is answered. The host's requests wait behind them (a listener dispatch excepted), so a handler must not wait for something that needs this extension to serve a request, such as a call that runs one of its own tools or event handlers: that wait never ends. A handler that panics is reported on stderr and does not stop the next. Pi has no such hook: its factory runs with no context and the extension's first handler is `session_start`.
@@ -1422,6 +1529,7 @@ impl Extension {
             stream_simple: false,
             image_apis: Vec::new(),
             classifier_apis: Vec::new(),
+            refresh_models: false,
         });
         self.oauth_fns.insert(name, provider);
     }
@@ -1512,15 +1620,63 @@ impl Extension {
         );
     }
 
+    /// Register the handler of the events of `custom_type`'s message view renderer ([`Self::message_view_renderer`]). The host answers the
+    /// terminal from the description of a [`crate::kit::MouseRegion`] at once and reports the events its handler ran for; the handler changes
+    /// the message's [`MessageRenderOptions::state`] here, and the next render request, which runs after every event the host had taken, draws
+    /// the message again. `message` and `options` are those of the message's last render; the events of one message arrive in order. A later
+    /// registration replaces an earlier one. This is local to the extension: nothing is declared to the host.
+    ///
+    /// pig additive (D276)
+    pub fn message_view_event(
+        &mut self,
+        custom_type: impl Into<String>,
+        handler: impl Fn(&Context, Value, MessageRenderOptions, crate::kit::Event) -> Result<(), String>
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        self.message_view_event_fns
+            .insert(custom_type.into(), Box::new(handler));
+    }
+
+    /// Register the handler of the events of `custom_type`'s entry view renderer ([`Self::entry_view_renderer`]); see
+    /// [`Self::message_view_event`].
+    ///
+    /// pig additive (D276)
+    pub fn entry_view_event(
+        &mut self,
+        custom_type: impl Into<String>,
+        handler: impl Fn(&Context, Value, EntryRenderOptions, crate::kit::Event) -> Result<(), String>
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        self.entry_view_event_fns
+            .insert(custom_type.into(), Box::new(handler));
+    }
+
     /// Register the extension's display-only Markdown transform (Pi's
-    /// `pi.registerMarkdownTransformer`). The host applies it to user and
-    /// assistant Markdown in the interactive transcript, after its own
-    /// transformers; a later registration replaces an earlier one.
+    /// `pi.registerMarkdownTransformer`). The host applies it to user,
+    /// assistant and thinking Markdown in the interactive transcript, after its
+    /// own transformers; a later registration replaces an earlier one. See
+    /// [`Extension::markdown_transformer_with_options`] to choose the surfaces.
     pub fn markdown_transformer(
         &mut self,
         transformer: impl Fn(&str, &MarkdownTransformContext) -> Option<String> + Send + Sync + 'static,
     ) {
+        self.markdown_transformer_with_options(transformer, MarkdownTransformerOptions::default());
+    }
+
+    /// Like [`Extension::markdown_transformer`], with Pi's `options.messageTypes`: the transformer runs on the surfaces
+    /// listed (`"user"`, `"assistant"`, `"assistant-thinking"`, `"custom"`, `"summary"` and `"changelog"`), see
+    /// [`MarkdownTransformerOptions`].
+    pub fn markdown_transformer_with_options(
+        &mut self,
+        transformer: impl Fn(&str, &MarkdownTransformContext) -> Option<String> + Send + Sync + 'static,
+        options: MarkdownTransformerOptions,
+    ) {
         self.markdown_transformer = Some(Box::new(transformer));
+        self.markdown_message_types = options.message_types;
     }
 
     /// PiG-only, product-neutral: declare that this extension owns the thinking runs of assistant messages, so a thinking run that is hidden or draws
@@ -1620,8 +1776,21 @@ impl Extension {
         self.run_with_socket(&sock_path)
     }
 
-    /// Connect to the host at the given socket path.
+    /// Connect to the host at the given socket path. The connection is served on a thread with `MAIN_LOOP_STACK` bytes of stack, so the caller's own stack (2 MiB for a
+    /// `thread::spawn`, as the packed runner starts each member) does not bound the depth of a value the main loop holds, clones or drops: a deep notification event, an event-stream
+    /// keyframe and its delta's operations. An isolated and a packed extension therefore read the same frames.
     pub fn run_with_socket(self, sock_path: &str) -> io::Result<()> {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("pig-extension-main".to_string())
+                .stack_size(MAIN_LOOP_STACK)
+                .spawn_scoped(scope, || self.serve_connection(sock_path))?
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    }
+
+    fn serve_connection(self, sock_path: &str) -> io::Result<()> {
         let conn = match crate::host_helpers::take_dialled(sock_path) {
             Some(conn) => {
                 // The extension serves the connection from here: its calls go through the reader thread, and every host call is allowed.
@@ -1637,9 +1806,15 @@ impl Extension {
         bus.adopt(&conn);
         self.events.connect(&conn);
         // A node factory's pi.events.on runs before its runtime registers; a native listener subscribed before run does the same.
-        let mut early_dispatches: std::collections::VecDeque<
+        // early_frames are the frames the host sent before the ready that the main loop serves once the extension is ready, in arrival order: listener dispatches, and notifies other than a state. early_states are the states it sent before the ready, which are applied before the ready's snapshot.
+        let mut early_frames: std::collections::VecDeque<
             crate::protocol::Envelope<Box<serde_json::value::RawValue>>,
         > = std::collections::VecDeque::new();
+        let mut early_states: Vec<Value> = Vec::new();
+        // What the factory's calls read on this connection before the run took it.
+        for env in conn.take_early_notifies() {
+            keep_early_notify(env, &mut early_states, &mut early_frames);
+        }
         // A shutdown read while a subscription's result is awaited is acted on once the run has registered.
         let mut shutdown_during_subscriptions = false;
         for crate::event_bus::LiveOp {
@@ -1668,7 +1843,7 @@ impl Extension {
                             .as_ref()
                             .is_some_and(|req| req.method == "events.dispatch") =>
                     {
-                        early_dispatches.push_back(env)
+                        early_frames.push_back(env)
                     }
                     "notify"
                         if env
@@ -1678,6 +1853,7 @@ impl Extension {
                     {
                         bus.release(env.notify.as_ref().and_then(|notify| notify.args.as_ref()))
                     }
+                    "notify" => keep_early_notify(env, &mut early_states, &mut early_frames),
                     "shutdown" => shutdown_during_subscriptions = true,
                     other => {
                         return Err(io::Error::new(
@@ -1714,6 +1890,13 @@ impl Extension {
                 renderers: self.renderers.clone(),
                 entry_renderers: self.entry_renderers.clone(),
                 markdown_transformer: self.markdown_transformer.is_some(),
+                markdown_message_types: self.markdown_transformer.is_some().then(|| {
+                    self.markdown_message_types.clone().unwrap_or_else(|| {
+                        ["user", "assistant", "assistant-thinking"]
+                            .map(String::from)
+                            .to_vec()
+                    })
+                }),
                 owns_thinking_runs: self.owns_thinking_runs,
                 tool_renderers: self.tool_renderers.resolvers.len(),
                 mcp_servers: self.mcp_servers.clone(),
@@ -1740,7 +1923,7 @@ impl Extension {
                         .as_ref()
                         .is_some_and(|req| req.method == "events.dispatch") =>
                 {
-                    early_dispatches.push_back(env)
+                    early_frames.push_back(env)
                 }
                 "notify"
                     if env
@@ -1750,6 +1933,7 @@ impl Extension {
                 {
                     bus.release(env.notify.as_ref().and_then(|notify| notify.args.as_ref()))
                 }
+                "notify" => keep_early_notify(env, &mut early_states, &mut early_frames),
                 "shutdown" => shutdown_before_ready = true,
                 _ => {
                     answer = Some(env);
@@ -1776,9 +1960,13 @@ impl Extension {
         let shared_height = Arc::new(AtomicU32::new(ready.height));
         let shared_identity = Arc::new(Mutex::new(crate::context::SessionIdentity::default()));
         let shared_session = Arc::new(Mutex::new(crate::context::SessionMirror::default()));
-        // Initialize session mirror from the ready payload.
-        if let Some(ref state) = ready.state
-            && let Some(session) = state.get("session")
+        // The states in arrival order: one the host sent before the ready is older than the ready's snapshot, so it is applied first.
+        let states: Vec<&Value> = early_states.iter().chain(ready.state.as_ref()).collect();
+        // Initialize session mirror from the states.
+        for session in states
+            .iter()
+            .copied()
+            .filter_map(|state| state.get("session"))
         {
             let _ = shared_session.lock().unwrap().apply_update(session);
         }
@@ -1787,11 +1975,12 @@ impl Extension {
         ));
         *host_subs.source_info.lock().unwrap() = ready.source_info.clone();
         let shared_ui = Arc::new(Mutex::new(UiState::default()));
-        if let Some(state) = ready.state.as_ref().and_then(|state| state.as_object()) {
+        for state in states.iter().copied().filter_map(|state| state.as_object()) {
             shared_ui.lock().unwrap().apply_state(state);
             shared_identity.lock().unwrap().apply_state(state);
             conn.api_state.lock().unwrap().apply_state(state);
             conn.views.apply_state(state);
+            conn.view_state.apply_state(state);
         }
         {
             let mut models = conn.virtual_models.lock().unwrap();
@@ -1849,6 +2038,15 @@ impl Extension {
             system_prompt: None,
         };
         let ext = Arc::new(self);
+        for index in 0..ext.view_abilities_fns.len() {
+            let (handler_ext, handler_ctx) = (ext.clone(), base_ctx.clone());
+            base_ctx
+                .host_subs
+                .view_abilities
+                .subscribe_for_good(Arc::new(move |abilities: Option<crate::ViewAbilities>| {
+                    (handler_ext.view_abilities_fns[index])(&handler_ctx, abilities)
+                }));
+        }
         let active_requests: Arc<Mutex<HashMap<String, RequestCancel>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let request_threads = ext.provider_objects.workers.clone();
@@ -1867,17 +2065,15 @@ impl Extension {
                 .name("pig-on-loaded".to_string())
                 .spawn(move || {
                     for handler in &loaded_ext.loaded_fns {
-                        if let Err(payload) =
-                            catch_unwind(AssertUnwindSafe(|| handler(&loaded_ctx)))
-                        {
+                        if let Err(payload) = crate::diagnostic::recover(|| handler(&loaded_ctx)) {
                             let detail = payload
                                 .downcast_ref::<String>()
                                 .cloned()
                                 .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()));
-                            eprintln!(
-                                "pig: on_loaded handler panicked: {}",
+                            crate::diagnostic::diagnose(&format!(
+                                "pig: on_loaded handler panicked: {}\n",
                                 detail.unwrap_or_default()
-                            );
+                            ));
                         }
                     }
                     opening_gate.open();
@@ -1894,7 +2090,7 @@ impl Extension {
             width_deliveries.stop();
             base_ctx.host_subs.stop();
             for cancel in active_requests.lock().unwrap().values() {
-                cancel.cancel(reason);
+                cancel.end_request(reason);
             }
             // The sessions end with the connection, as the host disposes them: no listener runs after it.
             conn.children.close_all();
@@ -1918,7 +2114,7 @@ impl Extension {
         // Main loop.
         let mut event_replicas = crate::event_stream::EventReplicas::default();
         loop {
-            let env = match early_dispatches.pop_front() {
+            let env = match early_frames.pop_front() {
                 Some(env) => env,
                 None if shutdown_before_ready => return stop_requests("shutdown"),
                 None => match conn.read_envelope() {
@@ -1945,12 +2141,24 @@ impl Extension {
                         event_replicas.apply(&mut req);
                         conn.request_state(&id, "started", None)?;
                         let cancel = RequestCancel::new();
+                        if req.signal_aborted {
+                            // session_before_compact / session_before_tree dispatched after the event's signal aborted: the request starts cancelled, as a cancel frame queued ahead of it would (runner.ts emit awaits the handler with event.signal aborted), so is_cancelled() is true on the handler's first line.
+                            cancel.cancel("context canceled".to_string());
+                        }
                         active_requests
                             .lock()
                             .unwrap()
                             .insert(id.clone(), cancel.clone());
                         let active = active_requests.clone();
                         let base = base_ctx.clone_for_request(cancel.clone(), None, id.to_string());
+                        // A command handler and a withSession callback get Pi's command context: its host calls carry that kind for the context's whole life.
+                        if let Some(parent) = base
+                            .request_parent
+                            .as_ref()
+                            .filter(|_| matches!(req.method.as_str(), "command" | "with_session"))
+                        {
+                            parent.mark_command();
+                        }
                         let loaded_gate = loaded_gate.clone();
                         let conn = conn.clone();
                         let ext = ext.clone();
@@ -1978,11 +2186,12 @@ impl Extension {
                         let failed_threads = threads.clone();
                         if let Err(err) = thread::Builder::new()
                             .name(format!("pig-request-{id}"))
+                            .stack_size(request_stack_size(&req))
                             .spawn(move || {
                                 if req.method != "events.dispatch" {
                                     loaded_gate.wait();
                                 }
-                                let handled = catch_unwind(AssertUnwindSafe(|| {
+                                let handled = crate::diagnostic::recover(|| {
                                     ext.handle_request(
                                         &base,
                                         &conn,
@@ -1994,29 +2203,26 @@ impl Extension {
                                             request: request_start.as_deref(),
                                         },
                                     )
-                                }));
+                                });
                                 if let Err(payload) = handled {
                                     // The panic value reaches the caller, as a thrown Error's message does in Pi (the stale-context message is raised this way).
                                     let detail =
                                         payload.downcast_ref::<String>().cloned().or_else(|| {
                                             payload.downcast_ref::<&str>().map(|s| s.to_string())
                                         });
+                                    let message = match detail {
+                                        Some(detail) => {
+                                            format!("extension handler panicked: {detail}")
+                                        }
+                                        None => "extension handler panicked".to_string(),
+                                    };
+                                    let error = ErrorInfo {
+                                        code: Some("handler_panic".to_string()),
+                                        message,
+                                        shell_exit: None,
+                                    };
                                     let respond = || {
-                                        let _ = conn.respond(
-                                            &id,
-                                            None,
-                                            Some(ErrorInfo {
-                                                code: Some("handler_panic".to_string()),
-                                                message: match detail {
-                                                    Some(detail) => format!(
-                                                        "extension handler panicked: {detail}"
-                                                    ),
-                                                    None => {
-                                                        "extension handler panicked".to_string()
-                                                    }
-                                                },
-                                            }),
-                                        );
+                                        let _ = conn.respond(&id, None, Some(error));
                                     };
                                     // A handler that panics after its dialog was answered still responds in the order of the answers.
                                     match &start {
@@ -2048,6 +2254,7 @@ impl Extension {
                                 Some(ErrorInfo {
                                     code: Some("handler_start".to_string()),
                                     message: format!("start extension handler: {err}"),
+                                    shell_exit: None,
                                 }),
                             );
                         }
@@ -2061,23 +2268,40 @@ impl Extension {
                         .filter(|id| !id.is_empty())
                         .or(env.id.as_deref())
                         .unwrap_or("");
-                    conn.cancel_pending_calls_for(request_id);
+                    // A signal-only cancel (session_before_compact / session_before_tree: Pi's abort fires event.signal and nothing else) aborts the signal the handler holds and cancels no host call: the handler's calls, pending and later, are answered and its reply is delivered. An ordinary cancel ends the request and its calls.
+                    let signal_only = env.cancel.as_ref().is_some_and(|c| c.signal_only);
+                    if !signal_only {
+                        conn.cancel_pending_calls_for(request_id);
+                    }
                     if let Some(cancel) = active_requests.lock().unwrap().get(request_id) {
                         let reason = env
                             .cancel
                             .as_ref()
                             .map(|c| c.reason.clone())
                             .unwrap_or_default();
-                        cancel.cancel(reason);
+                        if signal_only {
+                            cancel.cancel(reason);
+                        } else {
+                            cancel.end_request(reason);
+                        }
                     }
                 }
                 "notify" => {
                     if let Some(notify) = env.notify {
+                        if notify.args_error.is_some() {
+                            // A notification nested past what the reader takes cannot be decoded: it is dropped, with a diagnostic, and the connection goes on.
+                            crate::diagnostic::diagnose(&format!(
+                                "pig_sdk: dropped the {} notification: it nests deeper than the reader takes\n",
+                                notify.method
+                            ));
+                            continue;
+                        }
                         match notify.method.as_str() {
                             "events.release" => ext.bus.release(notify.args.as_ref()),
                             "tool_render_release" => {
                                 ext.tool_renderers.release(notify.args.as_ref());
                             }
+                            "render_release" => ext.render_cards.release(notify.args.as_ref()),
                             "autocomplete.release" => {
                                 if let Some(id) =
                                     notify.args.as_ref().and_then(|args| args["id"].as_str())
@@ -2151,6 +2375,9 @@ impl Extension {
                                     base_ctx.shared_identity.lock().unwrap().apply_state(state);
                                     conn.api_state.lock().unwrap().apply_state(state);
                                     conn.views.apply_state(state);
+                                    if let Some(abilities) = conn.view_state.apply_state(state) {
+                                        base_ctx.host_subs.publish_view_abilities(abilities);
+                                    }
                                     let (footer_changed, branch_changed) = conn.footer.apply(state);
                                     if footer_changed {
                                         base_ctx.refresh_footer();
@@ -2306,6 +2533,31 @@ impl Extension {
                                     );
                                 }
                             }
+                            "ui.custom.invalidate" => {
+                                let Some(args) = notify.args.as_ref() else {
+                                    continue;
+                                };
+                                let key = args
+                                    .get("key")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let count = args.get("count").and_then(Value::as_u64).unwrap_or(0);
+                                if count == 0 {
+                                    continue;
+                                }
+                                let overlay = base_ctx.overlays.lock().unwrap().get(&key).cloned();
+                                let Some(overlay) = overlay else {
+                                    continue;
+                                };
+                                if let Err(err) = overlay.send_invalidate(count) {
+                                    overlay.active.store(false, Ordering::Release);
+                                    let _ = conn.notify(
+                                        "ui.custom.close",
+                                        Some(serde_json::json!({"key": key, "error": err})),
+                                    );
+                                }
+                            }
                             "ui.custom.input" => {
                                 let Some(args) = notify.custom_input else {
                                     continue;
@@ -2408,6 +2660,7 @@ impl Extension {
                 Some(ErrorInfo {
                     code: None,
                     message: format!("unknown oauth provider: {}", name),
+                    shell_exit: None,
                 }),
             );
             return;
@@ -2415,6 +2668,7 @@ impl Extension {
         let err = |msg: String| ErrorInfo {
             code: None,
             message: msg,
+            shell_exit: None,
         };
         match req.method.as_str() {
             "oauth_login" => {
@@ -2456,6 +2710,27 @@ impl Extension {
                     .map(|f| f(decode_creds(&req.args)))
                     .unwrap_or_default();
                 let _ = conn.respond(id, Some(serde_json::json!({ "apiKey": key })), None);
+            }
+            "oauth_modify_models" => {
+                let Some(modify) = provider.modify_models.as_ref() else {
+                    let _ = conn.respond(
+                        id,
+                        None,
+                        Some(err("provider does not support modifyModels".into())),
+                    );
+                    return;
+                };
+                let args = req.args.clone().unwrap_or(Value::Null);
+                let models = args["models"].as_array().cloned().unwrap_or_default();
+                match modify(models, decode_creds(&Some(args["credentials"].clone()))) {
+                    Ok(models) => {
+                        let _ =
+                            conn.respond(id, Some(serde_json::json!({ "models": models })), None);
+                    }
+                    Err(e) => {
+                        let _ = conn.respond(id, None, Some(err(e)));
+                    }
+                }
             }
             "oauth_credential_status" => {
                 let Some(store) = provider.credential_store.as_ref() else {
@@ -2537,6 +2812,25 @@ impl Extension {
             tool: start,
             request: request_start,
         } = starts;
+        if let Some(message) = req.args_error.take() {
+            // Arguments nested past the bound are Pi's RangeError: the call fails with it, and the connection keeps serving.
+            if let Some(request_start) = request_start {
+                request_start.begin();
+            }
+            if let Some(start) = start {
+                start.begin();
+            }
+            let _ = conn.respond(
+                id,
+                None,
+                Some(ErrorInfo {
+                    code: None,
+                    message,
+                    shell_exit: None,
+                }),
+            );
+            return;
+        }
         match req.method.as_str() {
             "autocomplete.sync" | "autocomplete.suggest" => {
                 let ctx = base_ctx.clone_for_request(cancel.clone(), None, id.to_string());
@@ -2550,6 +2844,7 @@ impl Extension {
                         Some(ErrorInfo {
                             code: None,
                             message: err.to_string(),
+                            shell_exit: None,
                         }),
                     ),
                 };
@@ -2569,6 +2864,7 @@ impl Extension {
                         Some(ErrorInfo {
                             code: None,
                             message,
+                            shell_exit: None,
                         }),
                     ),
                 };
@@ -2586,6 +2882,7 @@ impl Extension {
                         Some(ErrorInfo {
                             code: None,
                             message,
+                            shell_exit: None,
                         }),
                     ),
                 };
@@ -2608,6 +2905,7 @@ impl Extension {
                         Some(ErrorInfo {
                             code: None,
                             message,
+                            shell_exit: None,
                         }),
                     ),
                 };
@@ -2628,6 +2926,7 @@ impl Extension {
                             Some(ErrorInfo {
                                 code: None,
                                 message,
+                                shell_exit: None,
                             }),
                         );
                     }
@@ -2647,6 +2946,7 @@ impl Extension {
                             Some(ErrorInfo {
                                 code: None,
                                 message,
+                                shell_exit: None,
                             }),
                         );
                     }
@@ -2656,7 +2956,7 @@ impl Extension {
                 // The host waits for the output chunks, in order, before this answer; the request's cancellation is the exec's signal.
                 let updates = conn.clone();
                 let request_id = id.to_string();
-                let result = catch_unwind(AssertUnwindSafe(|| {
+                let result = crate::diagnostic::recover(|| {
                     crate::user_bash::run_user_bash_exec(
                         &conn.bash_operations,
                         req,
@@ -2670,18 +2970,20 @@ impl Extension {
                             );
                         },
                     )
-                }))
-                .unwrap_or_else(|_| Err("bash operations panicked".to_string()));
+                })
+                .unwrap_or_else(|_| Err("bash operations panicked".into()));
                 match result {
                     Ok(value) => {
                         let _ = conn.respond(id, Some(value), None);
                     }
-                    Err(message) => {
+                    Err(error) => {
+                        let (message, shell_exit) = error.into_parts();
                         let _ = conn.respond(
                             id,
                             None,
                             Some(ErrorInfo {
                                 code: None,
+                                shell_exit,
                                 message,
                             }),
                         );
@@ -2695,6 +2997,24 @@ impl Extension {
                     let provider = req.tool.as_deref().unwrap_or("");
                     let api = args["api"].as_str().unwrap_or("");
                     let kind = args["kind"].as_str().unwrap_or("");
+                    if kind == "refreshModels" {
+                        // upstream: types.ts:1930; the models the callback returns (null for none) are the answer.
+                        let refresh = self
+                            .provider_callbacks
+                            .refresh_models(provider)
+                            .ok_or_else(|| format!("Provider {provider} has no refreshModels"))?;
+                        return crate::diagnostic::recover(|| {
+                            self.provider_objects.refresh_config(
+                                conn,
+                                id,
+                                provider,
+                                &args["context"],
+                                cancel.signal.clone(),
+                                &refresh,
+                            )
+                        })
+                        .map_err(|_| format!("provider {provider} refreshModels panicked"))?;
+                    }
                     let (images, label) = match kind {
                         "images" => (true, "image"),
                         "classifiers" => (false, "classifier"),
@@ -2710,13 +3030,13 @@ impl Extension {
                         signal: cancel.signal.clone(),
                         values: args["options"].clone(),
                     };
-                    catch_unwind(AssertUnwindSafe(|| {
+                    crate::diagnostic::recover(|| {
                         callback(
                             Arc::new(args["model"].clone()),
                             args["context"].clone(),
                             options,
                         )
-                    }))
+                    })
                     .map_err(|_| format!("provider {provider} {label} implementation panicked"))?
                 })();
                 match result {
@@ -2730,6 +3050,7 @@ impl Extension {
                             Some(ErrorInfo {
                                 code: None,
                                 message,
+                                shell_exit: None,
                             }),
                         );
                     }
@@ -2767,6 +3088,7 @@ impl Extension {
                 let error = failure.map(|message| ErrorInfo {
                     code: None,
                     message,
+                    shell_exit: None,
                 });
                 let _ = conn.respond(id, None, error);
             }
@@ -2786,9 +3108,8 @@ impl Extension {
                             format!("unknown virtual model {}/{}", args.provider, args.id)
                         })?;
                     let ctx = base_ctx.clone_for_request(cancel.clone(), None, id.to_string());
-                    let route =
-                        catch_unwind(AssertUnwindSafe(|| (model.route)(&ctx, args.request)))
-                            .map_err(|_| "virtual model router panicked".to_string())??;
+                    let route = crate::diagnostic::recover(|| (model.route)(&ctx, args.request))
+                        .map_err(|_| "virtual model router panicked".to_string())??;
                     serde_json::to_value(route).map_err(|err| err.to_string())
                 })();
                 match outcome {
@@ -2802,6 +3123,7 @@ impl Extension {
                             Some(ErrorInfo {
                                 code: None,
                                 message,
+                                shell_exit: None,
                             }),
                         );
                     }
@@ -2829,7 +3151,7 @@ impl Extension {
                     .unwrap_or(Value::Object(Default::default()));
                 let outcome = match hook {
                     None => Err(format!("tool {name} has no prepareArguments")),
-                    Some(hook) => catch_unwind(AssertUnwindSafe(|| hook(args)))
+                    Some(hook) => crate::diagnostic::recover(|| hook(args))
                         .map_err(|_| format!("prepareArguments of {name} panicked"))
                         .and_then(|prepared| prepared),
                 };
@@ -2844,6 +3166,7 @@ impl Extension {
                             Some(ErrorInfo {
                                 code: None,
                                 message,
+                                shell_exit: None,
                             }),
                         );
                     }
@@ -2863,7 +3186,7 @@ impl Extension {
                     .unwrap_or(Value::Object(Default::default()));
                 let outcome = match hook {
                     None => Err(format!("tool {name} has no reachesTools")),
-                    Some(hook) => catch_unwind(AssertUnwindSafe(|| hook(&input)))
+                    Some(hook) => crate::diagnostic::recover(|| hook(&input))
                         .map_err(|_| format!("reachesTools of {name} panicked"))
                         .map(|reach| match reach {
                             crate::ToolReach::All => Value::from("all"),
@@ -2881,6 +3204,7 @@ impl Extension {
                             Some(ErrorInfo {
                                 code: None,
                                 message,
+                                shell_exit: None,
                             }),
                         );
                     }
@@ -2903,7 +3227,7 @@ impl Extension {
                         .map_err(|err| format!("decode tool_prepare_loadout: {err}"))
                         .and_then(|payload| {
                             let loadout = crate::ToolLoadout::from(payload);
-                            catch_unwind(AssertUnwindSafe(|| hook(&loadout)))
+                            crate::diagnostic::recover(|| hook(&loadout))
                                 .map_err(|_| format!("prepareLoadout of {name} panicked"))
                         })
                         .and_then(|changes| {
@@ -2922,6 +3246,7 @@ impl Extension {
                             Some(ErrorInfo {
                                 code: None,
                                 message,
+                                shell_exit: None,
                             }),
                         );
                     }
@@ -2936,6 +3261,7 @@ impl Extension {
                     .map(|message| ErrorInfo {
                         code: None,
                         message,
+                        shell_exit: None,
                     });
                 let _ = conn.respond(id, None, error);
             }
@@ -2953,15 +3279,16 @@ impl Extension {
                         args["context"].clone(),
                         args["options"].clone(),
                     )?;
+                    // An ordinary cancel ends the request (RequestCancel::end_request): the stream is ended, the loop stops and the answer is the abort. A signal-only cancel, the abort of a turn, aborts the signal the author holds and nothing else: what its stream gives after it is forwarded and its result is the answer.
                     {
                         let mut active = cancel.provider_stream.lock().unwrap();
                         *active = Some(stream.clone());
-                        if ctx.is_cancelled() {
+                        if cancel.request_ended() {
                             stream.end(Value::Null);
                         }
                     }
                     while let Some(event) = stream.next() {
-                        if ctx.is_cancelled() {
+                        if cancel.request_ended() {
                             return Err("provider stream aborted".into());
                         };
                         conn.notify(
@@ -2970,7 +3297,7 @@ impl Extension {
                         )
                         .map_err(|error| error.to_string())?;
                     }
-                    if ctx.is_cancelled() {
+                    if cancel.request_ended() {
                         return Err("provider stream aborted".into());
                     };
                     Ok(stream.result().unwrap_or(Value::Null))
@@ -2987,6 +3314,7 @@ impl Extension {
                             Some(ErrorInfo {
                                 code: None,
                                 message,
+                                shell_exit: None,
                             }),
                         );
                     }
@@ -2995,6 +3323,7 @@ impl Extension {
             "oauth_login"
             | "oauth_refresh"
             | "oauth_get_api_key"
+            | "oauth_modify_models"
             | "oauth_credential_status"
             | "oauth_store_credentials"
             | "oauth_delete_credentials" => {
@@ -3018,10 +3347,8 @@ impl Extension {
                 let mut current = original.clone();
                 let mut consume = false;
                 for handler in handlers {
-                    let verdict = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        handler(&current)
-                    }))
-                    .unwrap_or_default();
+                    let verdict =
+                        crate::diagnostic::recover(|| handler(&current)).unwrap_or_default();
                     if verdict.consume {
                         consume = true;
                         break;
@@ -3095,6 +3422,7 @@ impl Extension {
                                 Some(ErrorInfo {
                                     code: None,
                                     message: s,
+                                    shell_exit: None,
                                 }),
                             );
                         }
@@ -3111,6 +3439,7 @@ impl Extension {
                         Some(ErrorInfo {
                             code: None,
                             message: format!("unknown tool: {}", tool_name),
+                            shell_exit: None,
                         }),
                     );
                 }
@@ -3124,6 +3453,7 @@ impl Extension {
                         Some(ErrorInfo {
                             code: None,
                             message,
+                            shell_exit: None,
                         }),
                     ),
                 };
@@ -3159,6 +3489,7 @@ impl Extension {
                                 Some(ErrorInfo {
                                     code: None,
                                     message: s,
+                                    shell_exit: None,
                                 }),
                             );
                         }
@@ -3170,6 +3501,7 @@ impl Extension {
                         Some(ErrorInfo {
                             code: None,
                             message: format!("unknown command: {}", cmd_name),
+                            shell_exit: None,
                         }),
                     );
                 }
@@ -3182,6 +3514,7 @@ impl Extension {
                         Some(ErrorInfo {
                             code: None,
                             message: message.clone(),
+                            shell_exit: None,
                         }),
                     );
                     return;
@@ -3222,6 +3555,39 @@ impl Extension {
                     Some("context" | "context_with_system")
                 )
                 .then(|| data.get("messages").cloned());
+                // Pi hands every before_provider_request handler the one payload and sends what the runner returns: a handler that edits it in place and returns nothing changes the request (runner.ts emitBeforeProviderRequest returns currentPayload). The host cannot share the value, so the reply carries the payload the handler left when it returned no result and the JSON text differs (member order is an edit, as for a tool_call input), even when the handler failed.
+                let provider_payload_before = (req.event.as_deref()
+                    == Some("before_provider_request"))
+                .then(|| {
+                    data.get("payload")
+                        .filter(|payload| payload.is_object() || payload.is_array())
+                        .and_then(|payload| serde_json::to_string(payload).ok())
+                })
+                .flatten();
+                // The messages an event's handler is handed that it may edit in place, as the host sent them: the reply carries the ones the handler left different.
+                let event_messages_before = event_message_texts(req.event.as_deref(), &data);
+                // The members of a message_start, message_update, turn_start, agent_start or agent_end event as the handler receives them: the reply names the ones it assigned, reassigned or deleted.
+                let event_members_before = member_snapshot(req.event.as_deref(), &data);
+                // The members of a tool_result event as the host sent them, with whether each is an object or a list: the reply names the ones the handler left different.
+                let tool_result_before = (req.event.as_deref() == Some("tool_result")).then(|| {
+                    [
+                        "content",
+                        "details",
+                        "isError",
+                        "structuredContent",
+                        "usage",
+                    ]
+                    .map(|name| {
+                        (
+                            name,
+                            data.get(name).and_then(|member| {
+                                serde_json::to_string(member)
+                                    .ok()
+                                    .map(|text| (text, member.is_object() || member.is_array()))
+                            }),
+                        )
+                    })
+                });
                 // The emission's shared options: a before_agent_start handler edits them through its event, and the reply carries them.
                 let mut prompt_state: Option<Arc<crate::context::SystemPromptState>> = None;
                 let result = if let Some(handler) = self.events.handler(handler_id) {
@@ -3234,7 +3600,7 @@ impl Extension {
                     if let Some(request_start) = request_start {
                         request_start.begin();
                     }
-                    match catch_unwind(AssertUnwindSafe(|| handler(&ctx, &mut data))) {
+                    match crate::diagnostic::recover(|| handler(&ctx, &mut data)) {
                         Ok(result) => result,
                         Err(payload) => Err(payload
                             .downcast_ref::<String>()
@@ -3260,6 +3626,7 @@ impl Extension {
                         Some(ErrorInfo {
                             code: None,
                             message,
+                            shell_exit: None,
                         }),
                     ),
                 };
@@ -3300,6 +3667,32 @@ impl Extension {
                         });
                     }
                 }
+                // Pi hands a context handler a filtered copy of the list over the one set of message objects (runner.ts emitContext): an edit to a message stays after a throw, so the reply of a failed handler carries the messages it was handed, as it left them. The host keeps them as the messages it holds and takes none of a change to the list.
+                if req.event.as_deref() == Some("context")
+                    && error.is_some()
+                    && let Some(messages) =
+                        data.get("messages").filter(|messages| messages.is_array())
+                    && context_messages_before.as_ref().and_then(Option::as_ref) != Some(messages)
+                {
+                    value = Some(
+                        serde_json::json!({ "messages": messages, "_pigContextUnchanged": true }),
+                    );
+                }
+                if let Some(before) = provider_payload_before
+                    && matches!(value, None | Some(Value::Null))
+                    && let Some(after) = data.get("payload")
+                    && serde_json::to_string(after).ok().as_deref() != Some(before.as_str())
+                {
+                    value = Some(after.clone());
+                }
+                // Pi's before_provider_headers handlers mutate event.headers in place and the return value is ignored (runner.ts emitBeforeProviderHeaders): the reply is the headers the handler left, even when it failed.
+                if req.event.as_deref() == Some("before_provider_headers") {
+                    value = Some(
+                        data.get("headers")
+                            .cloned()
+                            .unwrap_or_else(|| Value::Object(Default::default())),
+                    );
+                }
                 if let Some(options) = prompt_state.as_ref().map(|state| state.options()) {
                     value = Some(serde_json::json!({
                         "_pigPromptSections": options.get("sections"),
@@ -3317,17 +3710,95 @@ impl Extension {
                     }
                     value = Some(reply);
                 }
-                // pig additive (D19): preserve boundary mutations alongside handler errors.
+                // pig divergence (D541): a handler owns its event as a value, so replacing event.message or event.messages is the same change as editing inside it, and the reply carries it as an edit where Pi keeps the original.
+                // Pi hands every message_end handler the one message and stores that object (runner.ts emitMessageEnd, agent-session.ts appendMessage), so a handler's in-place edit of event.message is the message the next handlers, the entry and the next request hold, even when it failed. The reply carries the messages the handler left when the JSON text differs from the one it received (member order is an edit), and the handler's result.
+                if matches!(
+                    req.event.as_deref(),
+                    Some("message_start" | "message_end" | "agent_end")
+                ) && let Some(before) = &event_messages_before
+                {
+                    let mut reply = serde_json::json!({ "_pigEventResult": value });
+                    let mut edits = event_message_edits(req.event.as_deref(), &data, before);
+                    if let Some(members) = &event_members_before {
+                        edits.extend(member_edits(&data, members));
+                    }
+                    if !edits.is_empty() {
+                        reply["_pigEventEdits"] = Value::Array(edits);
+                    }
+                    value = Some(reply);
+                }
+                // Pi hands every tool_result handler the one currentEvent, so a member a handler assigns on it is what the next handler sees, and an edit made to an object the caller handed over is in the caller's result too (runner.ts emitToolResult, agent-session.ts _afterToolCall). The reply names the members the handler left different from the ones it received (JSON text, member order included), with their new values, also when it failed. A Rust handler owns the event as a value, so an object member it changed is an edit to the object it received: assigning a new object to it is the same value edit.
+                if let Some(before) = tool_result_before {
+                    let mut members = serde_json::Map::new();
+                    let (mut changed, mut shared) = (Vec::new(), Vec::new());
+                    for (name, was) in &before {
+                        let now = data.get(*name);
+                        let differs = match (was, now) {
+                            (None, None) => false,
+                            (Some((text, _)), Some(now)) => {
+                                serde_json::to_string(now).ok().as_deref() != Some(text.as_str())
+                            }
+                            _ => true,
+                        };
+                        if differs {
+                            changed.push(*name);
+                            if let Some(now) = now {
+                                members.insert((*name).to_string(), now.clone());
+                                if matches!(was, Some((_, true)))
+                                    && (now.is_object() || now.is_array())
+                                {
+                                    shared.push(*name);
+                                }
+                            }
+                        }
+                    }
+                    let mut reply = serde_json::json!({ "_pigToolResultResult": value });
+                    if !changed.is_empty() {
+                        reply["_pigToolResultEdits"] = serde_json::json!({ "members": members, "changed": changed, "shared": shared });
+                    }
+                    value = Some(reply);
+                }
+                // pig additive (D19): preserve boundary mutations alongside handler errors. A turn_end handler also edits the turn's messages in place (Pi hands every handler the turn's message objects): the reply carries the ones it left different, beside the boundary members.
                 if matches!(
                     req.event.as_deref(),
                     Some("agent_before_settle" | "turn_end")
                 ) {
-                    value = Some(serde_json::json!({
+                    let mut reply = serde_json::json!({
                         "_pigBoundaryEntries": data.get("entries"),
                         "_pigBoundaryResult": value,
-                    }));
+                    });
+                    if let Some(before) = &event_messages_before {
+                        let edits = event_message_edits(req.event.as_deref(), &data, before);
+                        if !edits.is_empty() {
+                            reply["_pigEventEdits"] = Value::Array(edits);
+                        }
+                    }
+                    value = Some(reply);
+                }
+                // pig divergence (D541): a message_update handler's edit of the partial's content, and a replacement of event.assistantMessageEvent, is not sent back: nothing compares the handler's copy of the stream's partial with what the host sent (a full compare per delta is the measured cost).
+                // message_update, turn_start and agent_start (message_start and agent_end replied above): a member a handler assigns, reassigns or deletes is what the later handlers of the dispatch see (runner.ts emit), also from a handler that failed.
+                if matches!(
+                    req.event.as_deref(),
+                    Some("message_update" | "turn_start" | "agent_start")
+                ) && let Some(members) = &event_members_before
+                {
+                    let edits = member_edits(&data, members);
+                    if !edits.is_empty() {
+                        value = Some(
+                            serde_json::json!({ "_pigEventEdits": edits, "_pigEventResult": value }),
+                        );
+                    }
                 }
                 let _ = conn.respond(id, value, error);
+            }
+            "ui.view.intent" => {
+                let ctx = base_ctx.clone_for_request(cancel.clone(), None, id.to_string());
+                let value = crate::ui_view::handle_intent(
+                    self.view_intent_fn.as_ref(),
+                    ctx,
+                    req.args.as_ref(),
+                );
+                let _ = conn.respond(id, Some(value), None);
             }
             "shortcut" => {
                 let shortcut_key = req.tool.as_deref().unwrap_or("");
@@ -3348,6 +3819,7 @@ impl Extension {
                                 Some(ErrorInfo {
                                     code: None,
                                     message: s,
+                                    shell_exit: None,
                                 }),
                             );
                         }
@@ -3359,6 +3831,7 @@ impl Extension {
                         Some(ErrorInfo {
                             code: None,
                             message: format!("unknown shortcut: {}", shortcut_key),
+                            shell_exit: None,
                         }),
                     );
                 }
@@ -3375,19 +3848,28 @@ impl Extension {
                         .args
                         .clone()
                         .unwrap_or(Value::Object(Default::default()));
-                    let message = args
-                        .get("message")
-                        .cloned()
-                        .unwrap_or(Value::Object(Default::default()));
-                    let options = args
-                        .get("options")
-                        .cloned()
-                        .and_then(|v| serde_json::from_value(v).ok())
-                        .unwrap_or_default();
+                    let options = |state: &RenderState| {
+                        let mut options: MessageRenderOptions = args
+                            .get("options")
+                            .cloned()
+                            .and_then(|v| serde_json::from_value(v).ok())
+                            .unwrap_or_default();
+                        options.state = state.clone();
+                        options
+                    };
                     let width = args.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    match handler(&ctx, message, options, width)
-                        .and_then(|rendered| rendered.into_result(&conn.views))
-                    {
+                    match self.render_cards.run(
+                        &args,
+                        "message",
+                        |message, state, event| match self.message_view_event_fns.get(custom_type) {
+                            Some(handle) => handle(&ctx, message, options(state), event),
+                            None => Ok(()),
+                        },
+                        |message, state| {
+                            handler(&ctx, message, options(state), width)
+                                .and_then(|rendered| rendered.into_result(&conn.views))
+                        },
+                    ) {
                         Ok(result) => {
                             let _ = conn.respond(id, Some(result), None);
                         }
@@ -3398,6 +3880,7 @@ impl Extension {
                                 Some(ErrorInfo {
                                     code: None,
                                     message,
+                                    shell_exit: None,
                                 }),
                             );
                         }
@@ -3409,6 +3892,7 @@ impl Extension {
                         Some(ErrorInfo {
                             code: None,
                             message: format!("unknown renderer: {}", custom_type),
+                            shell_exit: None,
                         }),
                     );
                 }
@@ -3427,15 +3911,16 @@ impl Extension {
                         Some(ErrorInfo {
                             code: None,
                             message: format!("command {} has no getArgumentCompletions", cmd_name),
+                            shell_exit: None,
                         }),
                     );
                 }
             }
             "resolve_tool_renderers" => {
                 // A resolver that panics answers an error, as a resolver that throws upstream.
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match crate::diagnostic::recover(|| {
                     self.tool_renderers.resolve(conn, req.args.as_ref())
-                })) {
+                }) {
                     Ok(answer) => {
                         let _ = conn.respond(id, Some(answer), None);
                     }
@@ -3446,6 +3931,7 @@ impl Extension {
                             Some(ErrorInfo {
                                 code: None,
                                 message: "tool renderer resolver panicked".to_string(),
+                                shell_exit: None,
                             }),
                         );
                     }
@@ -3469,6 +3955,7 @@ impl Extension {
                             Some(ErrorInfo {
                                 code: None,
                                 message,
+                                shell_exit: None,
                             }),
                         );
                     }
@@ -3489,11 +3976,9 @@ impl Extension {
                     .and_then(|v| serde_json::from_value(v).ok())
                     .unwrap_or_default();
                 let transformed = self.markdown_transformer.as_ref().and_then(|transformer| {
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        transformer(&markdown, &context)
-                    }))
-                    .ok()
-                    .flatten()
+                    crate::diagnostic::recover(|| transformer(&markdown, &context))
+                        .ok()
+                        .flatten()
                 });
                 let _ = conn.respond(id, transformed.map(Value::String), None);
             }
@@ -3509,19 +3994,28 @@ impl Extension {
                         .args
                         .clone()
                         .unwrap_or(Value::Object(Default::default()));
-                    let entry = args
-                        .get("entry")
-                        .cloned()
-                        .unwrap_or(Value::Object(Default::default()));
-                    let options = args
-                        .get("options")
-                        .cloned()
-                        .and_then(|v| serde_json::from_value(v).ok())
-                        .unwrap_or_default();
+                    let options = |state: &RenderState| {
+                        let mut options: EntryRenderOptions = args
+                            .get("options")
+                            .cloned()
+                            .and_then(|v| serde_json::from_value(v).ok())
+                            .unwrap_or_default();
+                        options.state = state.clone();
+                        options
+                    };
                     let width = args.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    match handler(&ctx, entry, options, width)
-                        .and_then(|rendered| rendered.into_result(&conn.views))
-                    {
+                    match self.render_cards.run(
+                        &args,
+                        "entry",
+                        |entry, state, event| match self.entry_view_event_fns.get(custom_type) {
+                            Some(handle) => handle(&ctx, entry, options(state), event),
+                            None => Ok(()),
+                        },
+                        |entry, state| {
+                            handler(&ctx, entry, options(state), width)
+                                .and_then(|rendered| rendered.into_result(&conn.views))
+                        },
+                    ) {
                         Ok(result) => {
                             let _ = conn.respond(id, Some(result), None);
                         }
@@ -3532,6 +4026,7 @@ impl Extension {
                                 Some(ErrorInfo {
                                     code: None,
                                     message,
+                                    shell_exit: None,
                                 }),
                             );
                         }
@@ -3543,6 +4038,7 @@ impl Extension {
                         Some(ErrorInfo {
                             code: None,
                             message: format!("unknown entry renderer: {}", custom_type),
+                            shell_exit: None,
                         }),
                     );
                 }
@@ -3554,6 +4050,7 @@ impl Extension {
                     Some(ErrorInfo {
                         code: None,
                         message: format!("unknown method: {}", req.method),
+                        shell_exit: None,
                     }),
                 );
             }
@@ -3570,11 +4067,148 @@ pub fn context_unchanged() -> Option<Value> {
     Some(serde_json::json!({ "_pigContextUnchanged": true }))
 }
 
-/// Connect and close a failed packed member's socket so the host stops waiting for registration.
+/// End the host's wait for a failed packed member after its factory failed (it panicked), so the host stops waiting for registration.
+/// A factory that called a host helper (`parse_frontmatter`, `parse_date`, a `pi.events` call) before it failed left the connection that call dialled open, and the host
+/// reads the registration of the connection it accepted first: that one is closed. With no such connection the socket is connected to and closed.
 /// Uses the same transport as `Extension::run_with_socket` and sends no registration frame.
 // pig additive (D20): generated packed runners report factory failures independently of live siblings.
 pub fn report_load_failure(sock_path: &str) -> io::Result<()> {
+    if let Some(conn) = crate::host_helpers::take_dialled(sock_path) {
+        conn.close_transport();
+        return Ok(());
+    }
     UnixStream::connect(sock_path).map(drop)
+}
+
+/// The message objects of an event a handler may edit in place, by the position the reply names them at (`_pigEventEdits`): message_end has one.
+fn event_messages<'a>(event: Option<&str>, data: &'a Value) -> Vec<Option<&'a Value>> {
+    match event {
+        Some("message_start" | "message_end") => vec![data.get("message")],
+        Some("agent_end") => data
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(Some)
+            .collect(),
+        Some("turn_end") => std::iter::once(data.get("message"))
+            .chain(
+                data.get("toolResults")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(Some),
+            )
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The members of an event as the handler receives them, when the event is one whose members the reply carries: each name, and the value of a scalar member. An object or a list member
+/// has no identity a Rust handler could keep or change (it owns the value), so an edit inside one is an edit of the message it holds, which the message entries carry, and only its
+/// presence is compared: a member the handler adds or deletes is found, one it replaces with another object or list is not.
+fn member_snapshot(event: Option<&str>, data: &Value) -> Option<Vec<(String, Option<u64>)>> {
+    if !matches!(
+        event,
+        Some("message_start" | "message_update" | "turn_start" | "agent_start" | "agent_end")
+    ) {
+        return None;
+    }
+    Some(
+        data.as_object()?
+            .iter()
+            .map(|(name, value)| (name.clone(), scalar_fingerprint(value)))
+            .collect(),
+    )
+}
+
+/// A hash of a scalar member's value (none for an object or a list), so a snapshot copies no payload: a delta frame's text member is the size of the whole message so far.
+fn scalar_fingerprint(value: &Value) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match value {
+        Value::Object(_) | Value::Array(_) => return None,
+        Value::Null => 0u8.hash(&mut hasher),
+        Value::Bool(flag) => (1u8, *flag).hash(&mut hasher),
+        Value::Number(number) => (2u8, number.to_string()).hash(&mut hasher),
+        Value::String(text) => (3u8, text).hash(&mut hasher),
+    }
+    Some(hasher.finish())
+}
+
+/// The members the handler left different from the ones it received, as the second form of the reply's `_pigEventEdits` entries: `{member, value}` for one it added or whose scalar
+/// value changed, `{member, deleted: true}` for one it deleted.
+fn member_edits(data: &Value, before: &[(String, Option<u64>)]) -> Vec<Value> {
+    let Some(object) = data.as_object() else {
+        return Vec::new();
+    };
+    let mut edits = Vec::new();
+    for (name, was) in before {
+        match object.get(name) {
+            None => edits.push(serde_json::json!({ "member": name, "deleted": true })),
+            Some(now) if was.is_some_and(|was| scalar_fingerprint(now) != Some(was)) => {
+                edits.push(serde_json::json!({ "member": name, "value": now }));
+            }
+            Some(_) => {}
+        }
+    }
+    for (name, now) in object {
+        if !before.iter().any(|(was, _)| was == name) {
+            edits.push(serde_json::json!({ "member": name, "value": now }));
+        }
+    }
+    edits
+}
+
+/// The JSON text of each message of the event as the handler receives it, or `None` for an event with no messages. A value that is no object has no text: it is no edit.
+fn event_message_texts(event: Option<&str>, data: &Value) -> Option<Vec<Option<String>>> {
+    let messages = event_messages(event, data);
+    if messages.is_empty() {
+        return None;
+    }
+    Some(
+        messages
+            .iter()
+            .map(|message| {
+                message
+                    .filter(|message| message.is_object())
+                    .and_then(|message| serde_json::to_string(message).ok())
+            })
+            .collect(),
+    )
+}
+
+/// The messages whose JSON text the handler changed (member order is an edit), each at its position, as the handler left it.
+fn event_message_edits(event: Option<&str>, data: &Value, before: &[Option<String>]) -> Vec<Value> {
+    event_messages(event, data)
+        .iter()
+        .enumerate()
+        .filter_map(|(at, message)| {
+            let message = (*message)?;
+            let was = before.get(at)?.as_deref()?;
+            (serde_json::to_string(message).ok().as_deref() != Some(was))
+                .then(|| serde_json::json!({ "at": at, "message": message }))
+        })
+        .collect()
+}
+
+/// Keeps a notify the host sent before the ready. A state is older than the ready's snapshot, so `run` applies it before that snapshot; any other notify is served by the main loop once the extension is ready, in arrival order. Neither is dropped, and neither fails the load.
+fn keep_early_notify(
+    env: Envelope<Box<serde_json::value::RawValue>>,
+    states: &mut Vec<Value>,
+    frames: &mut VecDeque<Envelope<Box<serde_json::value::RawValue>>>,
+) {
+    let state = env
+        .notify
+        .as_ref()
+        .filter(|notify| notify.method == "state_update")
+        .and_then(|notify| notify.args.as_ref())
+        .and_then(|args| args.get("state"))
+        .cloned();
+    match state {
+        Some(state) => states.push(state),
+        None => frames.push_back(env),
+    }
 }
 
 fn resolve_socket_path_from_env() -> io::Result<String> {
@@ -3854,10 +4488,13 @@ mod tests {
                 msg_type: "request".to_string(),
                 id: Some("r1".to_string()),
                 request: Some(RequestMsg {
+                    signal_aborted: false,
                     child_session: None,
                     terminal_input: None,
                     stream: None,
                     stream_error: None,
+                    args_error: None,
+                    deep_args: false,
                     tool_call_index: None,
                     args_raw: None,
                     method: "render_message".to_string(),
@@ -3939,10 +4576,13 @@ mod tests {
                 msg_type: "request".to_string(),
                 id: Some("req-1".to_string()),
                 request: Some(RequestMsg {
+                    signal_aborted: false,
                     child_session: None,
                     terminal_input: None,
                     stream: None,
                     stream_error: None,
+                    args_error: None,
+                    deep_args: false,
                     tool_call_index: None,
                     args_raw: None,
                     method: "command".to_string(),
@@ -3965,6 +4605,7 @@ mod tests {
                 cancel: Some(crate::protocol::CancelMsg {
                     request_id: "req-1".to_string(),
                     reason: "test cancel".to_string(),
+                    signal_only: false,
                 }),
                 ..Default::default()
             },
@@ -3986,6 +4627,386 @@ mod tests {
         );
         handle.join().unwrap().unwrap();
         let _ = std::fs::remove_file(sock);
+    }
+
+    fn cancel_env(request_id: &str, reason: &str, signal_only: bool) -> Envelope {
+        Envelope {
+            msg_type: "cancel".to_string(),
+            id: Some(request_id.to_string()),
+            cancel: Some(crate::protocol::CancelMsg {
+                request_id: request_id.to_string(),
+                reason: reason.to_string(),
+                signal_only,
+            }),
+            ..Default::default()
+        }
+    }
+
+    // What `start_pending_ask` hands back: the socket, the call frame, the handler's report, the extension's thread and the socket's path.
+    type PendingAsk = (
+        UnixStream,
+        Envelope,
+        mpsc::Receiver<(bool, bool, bool)>,
+        std::thread::JoinHandle<std::io::Result<()>>,
+        std::path::PathBuf,
+    );
+
+    // Starts an extension whose "ask" command blocks in a host input call, runs it to the pending call, and hands back the socket, the call frame and what the handler reports once the call returns: (signal aborted, first input ok, second input ok).
+    fn start_pending_ask(tag: &str) -> PendingAsk {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sock = std::env::temp_dir().join(format!("pig-sdk-rs-{tag}-{unique}.sock"));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (report_tx, report_rx) = mpsc::channel();
+        let mut ext = Extension::new("cancel-kinds");
+        ext.command("ask", "wait for input", move |ctx, _args| {
+            let first = ctx.input("Question", "Answer").is_ok();
+            let aborted = ctx.is_cancelled();
+            let second = ctx.input("Again", "Answer").is_ok();
+            let _ = report_tx.send((aborted, first, second));
+            CommandResult::Ok
+        });
+        let sock_for_ext = sock.clone();
+        let handle =
+            std::thread::spawn(move || ext.run_with_socket(sock_for_ext.to_str().unwrap()));
+        let (mut stream, _) = listener.accept().unwrap();
+        assert_eq!(read_env(&mut stream).msg_type, "register");
+        write_env(
+            &mut stream,
+            &Envelope {
+                msg_type: "ready".to_string(),
+                ready: Some(ReadyMsg {
+                    cwd: "/tmp".to_string(),
+                    mode: "tui".to_string(),
+                    width: 80,
+                    height: 24,
+                    source_info: None,
+                    state: None,
+                }),
+                ..Default::default()
+            },
+        );
+        write_env(
+            &mut stream,
+            &Envelope {
+                msg_type: "request".to_string(),
+                id: Some("req-ask".to_string()),
+                request: Some(RequestMsg {
+                    signal_aborted: false,
+                    child_session: None,
+                    terminal_input: None,
+                    stream: None,
+                    stream_error: None,
+                    args_error: None,
+                    deep_args: false,
+                    tool_call_index: None,
+                    args_raw: None,
+                    method: "command".to_string(),
+                    tool: Some("ask".to_string()),
+                    event: None,
+                    handler_id: 0,
+                    tool_call_id: None,
+                    batch: None,
+                    args: None,
+                }),
+                ..Default::default()
+            },
+        );
+        let call = read_env(&mut stream);
+        assert_eq!(call.msg_type, "call");
+        assert_eq!(
+            call.call.as_ref().unwrap().parent_request_id.as_deref(),
+            Some("req-ask")
+        );
+        (stream, call, report_rx, handle, sock)
+    }
+
+    fn answer_call(stream: &mut UnixStream, call: &Envelope) {
+        write_env(
+            stream,
+            &Envelope {
+                msg_type: "call_result".to_string(),
+                id: call.id.clone(),
+                call_result: Some(crate::protocol::CallResultMsg {
+                    result: Some(serde_json::json!({"text":"ok","ok":true})),
+                    error: None,
+                }),
+                ..Default::default()
+            },
+        );
+    }
+
+    fn ping_pong(stream: &mut UnixStream, nonce: &str) {
+        write_env(
+            stream,
+            &Envelope {
+                msg_type: "ping".to_string(),
+                ping: Some(crate::protocol::PingMsg {
+                    nonce: nonce.to_string(),
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(read_env(stream).pong.unwrap().nonce, nonce);
+    }
+
+    #[test]
+    fn signal_only_cancel_aborts_the_signal_and_leaves_host_calls_running() {
+        let (mut stream, call, report_rx, handle, sock) = start_pending_ask("signal-only");
+        write_env(&mut stream, &cancel_env("req-ask", "signal only", true));
+        // The pong follows the cancel in the read loop, so the cancel is handled before the call is answered.
+        ping_pong(&mut stream, "after-signal-only");
+        answer_call(&mut stream, &call);
+        // The handler's second call is not refused: the host sees it and answers it.
+        let second = read_env(&mut stream);
+        assert_eq!(second.msg_type, "call");
+        answer_call(&mut stream, &second);
+        assert_eq!(
+            report_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (true, true, true)
+        );
+        let response = read_env(&mut stream);
+        assert_eq!(response.msg_type, "response");
+        assert_eq!(response.id.as_deref(), Some("req-ask"));
+        assert!(response.response.unwrap().error.is_none());
+        write_env(
+            &mut stream,
+            &Envelope {
+                msg_type: "shutdown".to_string(),
+                ..Default::default()
+            },
+        );
+        handle.join().unwrap().unwrap();
+        let _ = std::fs::remove_file(sock);
+    }
+
+    #[test]
+    fn ordinary_cancel_after_signal_only_cancel_ends_the_request_and_its_host_calls() {
+        let (mut stream, _call, report_rx, handle, sock) = start_pending_ask("ordinary-after");
+        write_env(&mut stream, &cancel_env("req-ask", "signal only", true));
+        write_env(&mut stream, &cancel_env("req-ask", "ordinary", false));
+        // The pending call fails and the later call is refused: the next frame is the response, not a second call.
+        assert_eq!(
+            report_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (true, false, false)
+        );
+        let response = read_env(&mut stream);
+        assert_eq!(response.msg_type, "response");
+        assert_eq!(response.id.as_deref(), Some("req-ask"));
+        write_env(
+            &mut stream,
+            &Envelope {
+                msg_type: "shutdown".to_string(),
+                ..Default::default()
+            },
+        );
+        handle.join().unwrap().unwrap();
+        let _ = std::fs::remove_file(sock);
+    }
+
+    // Runs one provider_stream_simple request of an author that pushes start, waits until its request's signal aborts, then (when `release` is given) for the test's word, and goes on: it pushes a text_delta and ends its stream with a result. `host` plays the host from the request's first frame to its response.
+    fn run_provider_stream_probe(
+        tag: &str,
+        release: Option<mpsc::Receiver<()>>,
+        host: impl FnOnce(&mut UnixStream),
+    ) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sock = std::env::temp_dir().join(format!("pig-sdk-rs-{tag}-{unique}.sock"));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let mut ext = Extension::new("stream-cancel-kinds");
+        let release = std::sync::Mutex::new(release);
+        ext.register_provider_stream(
+            "probe",
+            serde_json::json!({"api":"probe-api","baseUrl":"https://extension.invalid","apiKey":"probe-key","models":[]}),
+            move |ctx, _model, _request, _options| {
+                let stream = std::sync::Arc::new(crate::ModelEventStream::new());
+                let producer = stream.clone();
+                let ctx = ctx.clone();
+                let release = release.lock().unwrap().take();
+                std::thread::spawn(move || {
+                    producer.push(serde_json::json!({"type":"start","partial":{"role":"assistant","content":[]}}));
+                    while !ctx.is_cancelled() {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    if let Some(release) = release {
+                        let _ = release.recv_timeout(Duration::from_secs(5));
+                    }
+                    producer.push(serde_json::json!({"type":"text_delta","contentIndex":0,"delta":"after the abort","partial":{"role":"assistant","content":[{"type":"text","text":"after the abort"}]}}));
+                    producer.end(serde_json::json!({"role":"assistant","content":[{"type":"text","text":"the author's result"}],"stopReason":"stop"}));
+                });
+                Ok(stream)
+            },
+        );
+        let sock_for_ext = sock.clone();
+        let handle =
+            std::thread::spawn(move || ext.run_with_socket(sock_for_ext.to_str().unwrap()));
+        let (mut stream, _) = listener.accept().unwrap();
+        assert_eq!(read_env(&mut stream).msg_type, "register");
+        write_env(
+            &mut stream,
+            &Envelope {
+                msg_type: "ready".to_string(),
+                ready: Some(ReadyMsg {
+                    cwd: "/tmp".to_string(),
+                    mode: "tui".to_string(),
+                    width: 80,
+                    height: 24,
+                    source_info: None,
+                    state: None,
+                }),
+                ..Default::default()
+            },
+        );
+        write_env(
+            &mut stream,
+            &Envelope {
+                msg_type: "request".to_string(),
+                id: Some("req-stream".to_string()),
+                request: Some(RequestMsg {
+                    signal_aborted: false,
+                    child_session: None,
+                    terminal_input: None,
+                    stream: None,
+                    stream_error: None,
+                    args_error: None,
+                    deep_args: false,
+                    tool_call_index: None,
+                    args_raw: None,
+                    method: "provider_stream_simple".to_string(),
+                    tool: Some("probe".to_string()),
+                    event: None,
+                    handler_id: 0,
+                    tool_call_id: None,
+                    batch: None,
+                    args: Some(serde_json::json!({"model":{},"context":{},"options":{}})),
+                }),
+                ..Default::default()
+            },
+        );
+        host(&mut stream);
+        write_env(
+            &mut stream,
+            &Envelope {
+                msg_type: "shutdown".to_string(),
+                ..Default::default()
+            },
+        );
+        handle.join().unwrap().unwrap();
+        let _ = std::fs::remove_file(sock);
+    }
+
+    // Reads frames up to the next stream event of the request, whose type it returns, or up to the request's response.
+    fn next_stream_frame(
+        stream: &mut UnixStream,
+    ) -> (Option<String>, Option<crate::protocol::ResponseMsg>) {
+        loop {
+            let env = read_env(stream);
+            match env.msg_type.as_str() {
+                "notify" => {
+                    if let Some(notify) = env
+                        .notify
+                        .as_ref()
+                        .filter(|notify| notify.method == "provider_stream_event")
+                    {
+                        let kind = notify
+                            .args
+                            .as_ref()
+                            .and_then(|args| args["result"]["type"].as_str());
+                        return (Some(kind.unwrap_or_default().to_string()), None);
+                    }
+                }
+                "response" => return (None, env.response),
+                "call" => answer_call(stream, &env),
+                _ => {}
+            }
+        }
+    }
+
+    // Pi's consumer of a response has no check of the abort signal (packages/agent/src/agent-loop.ts:424-478): after the abort of a turn, a signal-only cancel, the author's signal is aborted, the events its stream gives are forwarded and its result is the answer.
+    #[test]
+    fn provider_stream_goes_on_after_a_signal_only_cancel_and_answers_the_authors_result() {
+        run_provider_stream_probe("stream-signal-only", None, |stream| {
+            assert_eq!(next_stream_frame(stream).0.as_deref(), Some("start"));
+            write_env(stream, &cancel_env("req-stream", "context canceled", true));
+            assert_eq!(
+                next_stream_frame(stream).0.as_deref(),
+                Some("text_delta"),
+                "the event the author pushed after the abort of its signal is forwarded"
+            );
+            let (event, response) = next_stream_frame(stream);
+            assert_eq!(event, None);
+            let response = response.unwrap();
+            assert_eq!(response.error.map(|error| error.message), None);
+            assert_eq!(
+                response.result.unwrap()["content"][0]["text"],
+                "the author's result"
+            );
+        });
+    }
+
+    // An ordinary cancel ends the request, also after a signal-only cancel: the author's stream is ended, nothing more is forwarded and the answer is the abort.
+    #[test]
+    fn ordinary_cancel_after_a_signal_only_cancel_ends_the_provider_stream_request() {
+        let (release_tx, release_rx) = mpsc::channel();
+        run_provider_stream_probe("stream-ordinary-after", Some(release_rx), |stream| {
+            assert_eq!(next_stream_frame(stream).0.as_deref(), Some("start"));
+            write_env(stream, &cancel_env("req-stream", "context canceled", true));
+            write_env(
+                stream,
+                &cancel_env("req-stream", "the host ends the request", false),
+            );
+            let (event, response) = next_stream_frame(stream);
+            assert_eq!(
+                event, None,
+                "no event is forwarded after the ordinary cancel"
+            );
+            assert_eq!(
+                response
+                    .unwrap()
+                    .error
+                    .map(|error| error.message)
+                    .as_deref(),
+                Some("provider stream aborted")
+            );
+            let _ = release_tx.send(());
+        });
+    }
+
+    #[test]
+    fn oauth_registration_flags_modify_models_and_uses_callback_server_beside_refresh_models() {
+        use crate::oauth::{OAuthCredentials, OAuthProvider};
+        let mut ext = Extension::new("flags");
+        ext.register_provider_operations(
+            "dyn",
+            serde_json::json!({"baseUrl": "https://dyn.test", "apiKey": "key"}),
+            crate::ProviderOperations::new().refresh_models(|_| Ok(None)),
+        );
+        ext.register_oauth_provider(
+            "dyn",
+            serde_json::json!({}),
+            OAuthProvider {
+                modify_models: Some(Box::new(|models, _| Ok(models))),
+                uses_callback_server: true,
+                ..OAuthProvider::new("Dyn", |_| Ok(OAuthCredentials::default()))
+            },
+        );
+        assert_eq!(
+            ext.providers.len(),
+            2,
+            "a name's declarations stay separate, the registry merges them"
+        );
+        assert!(ext.providers[0].refresh_models);
+        assert_eq!(ext.providers[0].config["baseUrl"], "https://dyn.test");
+        assert_eq!(ext.providers[1].config["oauth"]["has_modify_models"], true);
+        assert_eq!(ext.providers[1].config["oauth"]["usesCallbackServer"], true);
+        assert!(ext.oauth_fns.contains_key("dyn"));
     }
 
     #[test]
@@ -4062,6 +5083,8 @@ mod tests {
             credential_store: Some(Box::new(FakeStore {
                 stored: StdMutex::new(None),
             })),
+            modify_models: None,
+            uses_callback_server: false,
         };
         ext.register_oauth_provider(
             "example-provider",
@@ -4107,10 +5130,13 @@ mod tests {
                 msg_type: "request".to_string(),
                 id: Some("login-1".to_string()),
                 request: Some(RequestMsg {
+                    signal_aborted: false,
                     child_session: None,
                     terminal_input: None,
                     stream: None,
                     stream_error: None,
+                    args_error: None,
+                    deep_args: false,
                     tool_call_index: None,
                     args_raw: None,
                     method: "oauth_login".to_string(),
@@ -4176,10 +5202,13 @@ mod tests {
                 msg_type: "request".to_string(),
                 id: Some("key-1".to_string()),
                 request: Some(RequestMsg {
+                    signal_aborted: false,
                     child_session: None,
                     terminal_input: None,
                     stream: None,
                     stream_error: None,
+                    args_error: None,
+                    deep_args: false,
                     tool_call_index: None,
                     args_raw: None,
                     method: "oauth_get_api_key".to_string(),
@@ -4203,10 +5232,13 @@ mod tests {
                 msg_type: "request".to_string(),
                 id: Some("ref-1".to_string()),
                 request: Some(RequestMsg {
+                    signal_aborted: false,
                     child_session: None,
                     terminal_input: None,
                     stream: None,
                     stream_error: None,
+                    args_error: None,
+                    deep_args: false,
                     tool_call_index: None,
                     args_raw: None,
                     method: "oauth_refresh".to_string(),
@@ -4231,10 +5263,13 @@ mod tests {
                 msg_type: "request".to_string(),
                 id: Some("store-1".to_string()),
                 request: Some(RequestMsg {
+                    signal_aborted: false,
                     child_session: None,
                     terminal_input: None,
                     stream: None,
                     stream_error: None,
+                    args_error: None,
+                    deep_args: false,
                     tool_call_index: None,
                     args_raw: None,
                     method: "oauth_store_credentials".to_string(),
@@ -4256,10 +5291,13 @@ mod tests {
                 msg_type: "request".to_string(),
                 id: Some("status-1".to_string()),
                 request: Some(RequestMsg {
+                    signal_aborted: false,
                     child_session: None,
                     terminal_input: None,
                     stream: None,
                     stream_error: None,
+                    args_error: None,
+                    deep_args: false,
                     tool_call_index: None,
                     args_raw: None,
                     method: "oauth_credential_status".to_string(),
@@ -4351,10 +5389,13 @@ mod tests {
                 msg_type: "request".to_string(),
                 id: Some("req-state".to_string()),
                 request: Some(RequestMsg {
+                    signal_aborted: false,
                     child_session: None,
                     terminal_input: None,
                     stream: None,
                     stream_error: None,
+                    args_error: None,
+                    deep_args: false,
                     tool_call_index: None,
                     args_raw: None,
                     method: "command".to_string(),
@@ -4386,10 +5427,13 @@ mod tests {
                 msg_type: "request".to_string(),
                 id: Some("req-user".to_string()),
                 request: Some(RequestMsg {
+                    signal_aborted: false,
                     child_session: None,
                     terminal_input: None,
                     stream: None,
                     stream_error: None,
+                    args_error: None,
+                    deep_args: false,
                     tool_call_index: None,
                     args_raw: None,
                     method: "command".to_string(),
@@ -4457,10 +5501,13 @@ mod tests {
                 msg_type: "request".to_string(),
                 id: Some("req-title".to_string()),
                 request: Some(RequestMsg {
+                    signal_aborted: false,
                     child_session: None,
                     terminal_input: None,
                     stream: None,
                     stream_error: None,
+                    args_error: None,
+                    deep_args: false,
                     tool_call_index: None,
                     args_raw: None,
                     method: "command".to_string(),
@@ -4517,10 +5564,13 @@ mod tests {
                 msg_type: "request".to_string(),
                 id: Some("req-panic".to_string()),
                 request: Some(RequestMsg {
+                    signal_aborted: false,
                     child_session: None,
                     terminal_input: None,
                     stream: None,
                     stream_error: None,
+                    args_error: None,
+                    deep_args: false,
                     tool_call_index: None,
                     args_raw: None,
                     method: "command".to_string(),
@@ -4599,10 +5649,13 @@ mod tests {
                 msg_type: "request".to_string(),
                 id: Some("req-label".to_string()),
                 request: Some(RequestMsg {
+                    signal_aborted: false,
                     child_session: None,
                     terminal_input: None,
                     stream: None,
                     stream_error: None,
+                    args_error: None,
+                    deep_args: false,
                     tool_call_index: None,
                     args_raw: None,
                     method: "command".to_string(),
@@ -4629,6 +5682,7 @@ mod tests {
                             error: Some(crate::protocol::ErrorInfo {
                                 code: None,
                                 message: "Entry missing-entry not found".to_string(),
+                                shell_exit: None,
                             }),
                         }),
                         ..Default::default()
@@ -4664,10 +5718,13 @@ mod tests {
             msg_type: "request".to_string(),
             id: Some(id.to_string()),
             request: Some(RequestMsg {
+                signal_aborted: false,
                 child_session: None,
                 terminal_input: None,
                 stream: None,
                 stream_error: None,
+                args_error: None,
+                deep_args: false,
                 tool_call_index: None,
                 args_raw: None,
                 method: method.to_string(),
@@ -4687,6 +5744,7 @@ mod tests {
             msg_type: "notify".to_string(),
             notify: Some(crate::protocol::NotifyMsg {
                 custom_input: None,
+                args_error: None,
                 method: method.to_string(),
                 args: Some(args),
             }),

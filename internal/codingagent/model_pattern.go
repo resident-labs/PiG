@@ -11,6 +11,7 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/jsstring/localecompare"
 	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 )
 
 // ThinkingSuffixMode is ModelReferenceRequest.thinkingSuffix.
@@ -331,7 +332,7 @@ func withNamedRoutingVariants(pool []RuntimeModel, text string) []RuntimeModel {
 			if !ai.IsOpenRouterBase(model.Provider, model.ID) {
 				continue
 			}
-			id := model.ID + ":" + variant
+			id, name := ai.OpenRouterVariantIdentity(model.ID, model.Name, variant)
 			// The text may lead with the provider ("openrouter/gpt-4o:nitro"), which the model text after it need not repeat.
 			modelStem := strings.TrimPrefix(stem, jsstring.ToLower(model.Provider)+"/")
 			if !strings.Contains(jsstring.ToLower(model.ID), modelStem) && !strings.Contains(jsstring.ToLower(model.Name), modelStem) && !strings.Contains(jsstring.ToLower(model.Provider+"/"+model.ID), stem) {
@@ -341,8 +342,7 @@ func withNamedRoutingVariants(pool []RuntimeModel, text string) []RuntimeModel {
 				continue
 			}
 			derived := model
-			derived.ID = id
-			derived.Name = model.Name + " (" + variant + ")"
+			derived.ID, derived.Name = id, name
 			extended = append(extended, derived)
 		}
 	}
@@ -436,7 +436,7 @@ func bestFuzzyMatch(matches []RuntimeModel) *RuntimeModel {
 		return nil
 	}
 	collator := localecompare.NewCollator()
-	slices.SortStableFunc(candidates, func(a, b RuntimeModel) int {
+	sortx.Stable(candidates, func(a, b RuntimeModel) int {
 		return collator.CompareString(b.ID, a.ID)
 	})
 	return &candidates[0]

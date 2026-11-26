@@ -1,7 +1,7 @@
 // Microtask tick-order probe for Pi 0.99.1's Google Generative AI provider (D82 W6/W5).
 //
 // Runs the REAL provider (`pi-ai/dist/api/google-generative-ai.js`, source
-// packages/ai/src/api/google-generative-ai.ts:59-330) over the REAL `@google/genai` 2.21.0 SDK
+// packages/ai/src/api/google-generative-ai.ts:59-330) over the REAL `@google/genai` 2.32.0 SDK
 // (dist/node/index.mjs: tslib __asyncGenerator `processStreamResponse` 13780-13830 and
 // `generateContentStreamInternal` 15768+), with only `globalThis.fetch` replaced. The replacement
 // returns a `Response` over a Web `ReadableStream` whose chunks are enqueued in a controlled
@@ -40,7 +40,7 @@ const root = process.env.PI_PACKAGE_ROOT;
 assert.ok(root, 'PI_PACKAGE_ROOT must name the installed @earendil-works/pi-coding-agent directory');
 const scope = root + '/node_modules/@earendil-works/';
 const genaiDir = root + '/node_modules/@google/genai';
-for (const [dir, version] of [[root, PI_PACKAGE_VERSION], [scope + 'pi-ai', PI_PACKAGE_VERSION], [genaiDir, '2.21.0']]) {
+for (const [dir, version] of [[root, PI_PACKAGE_VERSION], [scope + 'pi-ai', PI_PACKAGE_VERSION], [genaiDir, '2.32.0']]) {
   assert.equal(JSON.parse(await readFile(dir + '/package.json', 'utf8')).version, version, dir);
 }
 const load = path => import(pathToFileURL(path).href);
@@ -110,7 +110,7 @@ const cases = [
 
 const model = { id: 'gemini-2.5-flash', name: 'probe', api: 'google-generative-ai', provider: 'google', baseUrl: 'http://probe.invalid/v1beta', reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 100 };
 const context = { messages: [{ role: 'user', content: 'go', timestamp: 0 }] };
-const params = { model: model.id, contents: [{ role: 'user', parts: [{ text: 'go' }] }] };
+const params = { model: model.id, contents: [{ role: 'user', parts: [{ text: 'go' }] }], config: { automaticContinuation: false } };
 const realFetch = globalThis.fetch;
 
 // The fetch replacement: resolves from a macrotask (a network callback), like undici's headers arrival.
@@ -186,10 +186,10 @@ async function runProvider(c) {
 }
 
 // The wall clock and generated IDs are the only nondeterministic values.
-const scrub = value => JSON.parse(JSON.stringify(value).replace(/"timestamp":\d+/g, '"timestamp":0'));
+const scrub = value => JSON.parse(JSON.stringify(value).replace(/"timestamp":\d+/g, '"timestamp":0').replace(/"durationMs":\d+/g, '"durationMs":0'));
 
 const out = {
-  pi: PIG_UPSTREAM_VERSION, genai: '2.21.0', node: process.version,
+  pi: PIG_UPSTREAM_VERSION, genai: '2.32.0', node: process.version,
   cap: CAP,
   note: 'stamp = (seg, tick); see probe.mjs header. array order within a stamp is execution order.',
   cases: [],

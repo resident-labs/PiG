@@ -10,7 +10,7 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
-// Ports packages/chord/src/next/store/catalog.ts
+// Ports packages/chord/src/store/catalog.ts
 //
 // The catalog (slice 6a §2, §5): the table definitions the store records (version, state, columns, key, fingerprint,
 // indexes), read once at open, changed only by `table`, `index`, `dropIndex` and `alter` writes inside a step, and in
@@ -107,6 +107,9 @@ type TableRecord struct {
 	Fingerprint string `json:"fingerprint"`
 	// Indexes are the index definitions by name: their declared columns (the key is appended when rendered).
 	Indexes IndexRecords `json:"indexes"`
+
+	// position is the table's place in the catalog (Pi's Map insertion order): see Step.Records.
+	position int
 }
 
 // TableRecordFromJSON reads a decoded JSON table record (as stored).
@@ -145,7 +148,7 @@ func ReadCatalog(executor sqlite.SqliteExecutor) (map[string]*TableRecord, error
 		return nil, err
 	}
 	catalog := make(map[string]*TableRecord, len(rows))
-	for _, row := range rows {
+	for position, row := range rows {
 		name, _ := row["name"].(string)
 		definition, _ := row["definition"].(string)
 		parsed, err := delta.DecodeJson([]byte(definition))
@@ -156,6 +159,7 @@ func ReadCatalog(executor sqlite.SqliteExecutor) (map[string]*TableRecord, error
 		if err != nil {
 			return nil, err
 		}
+		record.position = position
 		catalog[name] = record
 	}
 	return catalog, nil

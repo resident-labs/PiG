@@ -2,13 +2,13 @@ package coding
 
 import (
 	"context"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
+	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
 )
 
 // transferTarget is a second model of the harness's provider, with the given context window.
@@ -135,12 +135,30 @@ func TestTransferLeavesABoundaryWhenNoSummaryFits(t *testing.T) {
 	if err != nil || result.Path != TransferBoundary || !strings.Contains(result.Reason, "overloaded") || !strings.Contains(result.Reason, "context too long") || h.session.Model().ID != "faux-2" || h.provider.callCount() != 1 || fallback.callCount() != 1 {
 		t.Fatalf("%+v %v; summary calls: old %d, new %d", result, err, h.provider.callCount(), fallback.callCount())
 	}
-	data, err := os.ReadFile(h.session.Path())
+	path := h.session.Path()
+	entries, err := icodingagent.LoadEntriesFromFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "This session moved to a new model without its earlier conversation") || !strings.Contains(string(data), h.session.Path()) || !strings.Contains(string(data), "first word") {
-		t.Fatal("the boundary or the earlier conversation is missing from the session file")
+	var boundary string
+	var keptEarlier bool
+	for _, entry := range entries {
+		switch entry := entry.(type) {
+		case icodingagent.CompactionEntry:
+			boundary = entry.Summary
+		case icodingagent.MessageEntry:
+			if user := entry.Message.User; user != nil {
+				if text, ok := user.Content.(ai.UserText); ok && strings.HasPrefix(string(text), "first word") {
+					keptEarlier = true
+				}
+			}
+		}
+	}
+	if !strings.HasPrefix(boundary, "This session moved to a new model without its earlier conversation:") || !strings.Contains(boundary, "previous session's file, "+path+".") {
+		t.Fatalf("boundary %q does not name session file %q", boundary, path)
+	}
+	if !keptEarlier {
+		t.Fatal("the earlier conversation is missing from the session file")
 	}
 }
 

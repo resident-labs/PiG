@@ -15339,6 +15339,27 @@
       ]
     },
     {
+      "id": "BF-4362bb1",
+      "title": "Fix in shipped code",
+      "symptom": "Fix in shipped code",
+      "rootCause": "- Update TestAutoCompactionSurfacesRefreshFailureOnce to match P16's CompactLive error capitalization ('Summarization failed: ...'). - Update StreamOptions.ActiveEffortAtTopLevel doc comment to reflect upstream's 'low' default when effort markers are present.",
+      "rootCauseSource": "commit",
+      "userImpact": "Behavior differed from Pi",
+      "platform": "All platforms",
+      "class": "own",
+      "fixedIn": "Unreleased",
+      "origin": "commit",
+      "commits": [
+        {
+          "hash": "4362bb1844",
+          "date": "2026-11-25"
+        }
+      ],
+      "tests": [
+        "coding/session_summary_auth_refresh_test.go::TestAutoCompactionSurfacesRefreshFailureOnce"
+      ]
+    },
+    {
       "id": "BF-439c708",
       "title": "Device-code logins (GitHub Copilot, Kimi Code, Meta, Radius) use the `verification_uri` a server sends only…",
       "symptom": "Device-code logins (GitHub Copilot, Kimi Code, Meta, Radius) use the `verification_uri` a server sends only when it is an `http:` or `https:` URL, and open and show its normalized form, so a malicious login server cannot make `pig` launch a `file:` or custom protocol URL.",
@@ -15573,6 +15594,28 @@
         "test/extension-conformance/resume_tools_test.go::TestResumeActivatesExtensionToolsTheBranchNeverMentionedAcrossSDKs",
         "tui/autocomplete_upstream_test.go::TestUpstreamAutocompleteFD",
         "tui/file_autocomplete_test.go::TestBuildFdPathQuery"
+      ]
+    },
+    {
+      "id": "BF-4434517",
+      "title": "Avoid replaying the entire session history before every codemode script",
+      "symptom": "Avoid replaying the entire session history before every codemode script.",
+      "rootCause": "Persistent store reads now replay only entries appended since the previous script; switching branches rebuilds the store from that branch.",
+      "rootCauseSource": "release note",
+      "userImpact": "Behavior differed from Pi",
+      "platform": "All platforms",
+      "class": "own",
+      "fixedIn": "Unreleased",
+      "releaseNote": "Avoid replaying the entire session history before every codemode script. Persistent store reads now replay only entries appended since the previous script; switching branches rebuilds the store from that branch.",
+      "origin": "release note",
+      "commits": [
+        {
+          "hash": "4434517f63",
+          "date": "2026-11-11"
+        }
+      ],
+      "tests": [
+        "coding/extension/builtin/codemode/branch_store_cache_test.go::TestBranchStoreCacheReadsOnlyNewEntries"
       ]
     },
     {
@@ -16224,6 +16267,53 @@
         }
       ],
       "tests": []
+    },
+    {
+      "id": "BF-46ebfe3",
+      "title": "Keep attachment resize results in the recorded queue entry when the user message has custom members",
+      "symptom": "Keep attachment resize results in the recorded queue entry when the user message has custom members.",
+      "rootCause": "Queue delivery replaced the typed image content but retained the original JSON source to preserve the custom members.",
+      "rootCauseSource": "release note",
+      "userImpact": "Behavior differed from Pi",
+      "platform": "All platforms",
+      "class": "own",
+      "fixedIn": "Unreleased",
+      "releaseNote": "Keep attachment resize results in the recorded queue entry when the user message has custom members.",
+      "origin": "release note",
+      "commits": [
+        {
+          "hash": "46ebfe3343",
+          "date": "2026-11-26"
+        }
+      ],
+      "tests": [
+        "agent/message_source_test.go::TestReplaceContentBlocksKeepsRetainedUserMembers",
+        "coding/session_queue_images_test.go::TestSessionResizesImagesInQueuedSteeringAndFollowUpMessages"
+      ]
+    },
+    {
+      "id": "BF-46ebfe3-2",
+      "title": "Release the old request snapshot on session replacement, and show streamed progress during live compaction…",
+      "symptom": "Release the old request snapshot on session replacement, and show streamed progress during live compaction without changing Escape cancellation.",
+      "rootCause": "The live compaction path retained its last request across session replacement and skipped the standalone summarizer's progress reader.",
+      "rootCauseSource": "release note",
+      "userImpact": "Behavior differed from Pi",
+      "platform": "All platforms",
+      "class": "own",
+      "fixedIn": "Unreleased",
+      "releaseNote": "Release the old request snapshot on session replacement, and show streamed progress during live compaction without changing Escape cancellation.",
+      "origin": "release note",
+      "commits": [
+        {
+          "hash": "46ebfe3343",
+          "date": "2026-11-26"
+        }
+      ],
+      "tests": [
+        "coding/session_message_sequence_test.go::TestReplaceInnerReleasesTheNumberedMessages",
+        "internal/codingagent/interactive_compaction_progress_test.go::TestCompactionEscapeDuringTheStreamLeavesNothingRunning",
+        "internal/codingagent/interactive_compaction_progress_test.go::TestCompactionLineShowsElapsedTimeAndStreamedTokens"
+      ]
     },
     {
       "id": "BF-4706781",
@@ -49912,6 +50002,31 @@
       ]
     },
     {
+      "id": "BF-bbd36e4",
+      "title": "Avoid decoding message history when the first codemode script rebuilds its persistent store after a process…",
+      "symptom": "Avoid decoding message history when the first codemode script rebuilds its persistent store after a process restart.",
+      "rootCause": "",
+      "rootCauseSource": "",
+      "userImpact": "Behavior differed from Pi",
+      "platform": "All platforms",
+      "class": "own",
+      "fixedIn": "Unreleased",
+      "releaseNote": "Avoid decoding message history when the first codemode script rebuilds its persistent store after a process restart.",
+      "origin": "release note",
+      "commits": [
+        {
+          "hash": "bbd36e427d",
+          "date": "2026-11-11"
+        }
+      ],
+      "tests": [
+        "coding/extension/builtin/codemode/branch_store_cache_test.go::TestBranchStoreCacheColdUsesMetadata",
+        "coding/extension/builtin/codemode/branch_store_differential_test.go::TestReviewCacheConcurrent",
+        "coding/extension/builtin/codemode/branch_store_differential_test.go::TestReviewCacheDifferential",
+        "coding/extension/builtin/codemode/real_session_bench_test.go::TestExecuteRealSessionProfile"
+      ]
+    },
+    {
       "id": "BF-bc02460",
       "title": "Changing the output padding now applies at once to the branch-summary, compaction-summary and…",
       "symptom": "Changing the output padding now applies at once to the branch-summary, compaction-summary and skill-invocation cards already in the transcript.",
@@ -56336,6 +56451,54 @@
       ],
       "tests": [
         "automation/ci/bugledger/bugledger_test.go::TestEveryNewDivergenceIsAccountedFor"
+      ]
+    },
+    {
+      "id": "BF-d6eafcd",
+      "title": "Bound semantic idleness only on native OpenAI Responses requests with provider ID `openai` and no custom…",
+      "symptom": "Bound semantic idleness only on native OpenAI Responses requests with provider ID `openai` and no custom Fetch (D131).",
+      "rootCause": "A model call with no semantic SSE event for 180 s (connect and first byte included) aborts with StreamStallError and retries through the transport-failure path. OpenAI and Codex Responses requests ask for reasoning.summary detailed by default.",
+      "rootCauseSource": "commit",
+      "userImpact": "An operation failed or was rejected",
+      "platform": "All platforms",
+      "class": "own",
+      "fixedIn": "Unreleased",
+      "releaseNote": "Bound semantic idleness only on native OpenAI Responses requests with provider ID `openai` and no custom Fetch (D131). The independent request-start budget defaults to 180 seconds, covers connection establishment and non-SSE error bodies, and sends a typed failure through existing retry/backoff. Positive `StreamOptions.StallTimeoutMs` overrides the budget; zero or less disables it. EOF and Close release the new timer and cancellation callback. Existing legacy D131 behavior and diagnostics remain unchanged.",
+      "origin": "release note",
+      "commits": [
+        {
+          "hash": "0b85b749d6",
+          "date": "2026-11-05"
+        },
+        {
+          "hash": "a982e300b7",
+          "date": "2026-11-05"
+        },
+        {
+          "hash": "bd304691c2",
+          "date": "2026-11-05"
+        },
+        {
+          "hash": "d6eafcdc9c",
+          "date": "2026-11-05"
+        }
+      ],
+      "tests": [
+        "ai/max_thinking_upstream_test.go::TestMaxThinkingUpstream",
+        "ai/openai_codex_request_test.go::TestOpenAICodexResponses_RequestMatchesCodexProtocol",
+        "ai/openai_codex_sse_upstream_test.go::TestCodexSSEAndPayloadUpstream",
+        "ai/reasoning_summary_default_test.go::TestResponsesRequestAsksForADetailedReasoningSummaryByDefault",
+        "ai/stream_stall_exclusions_test.go::TestStreamStallCustomFetchKeepsBaseTransport",
+        "ai/stream_stall_exclusions_test.go::TestStreamStallExcludedRoutesKeepBaseErrors",
+        "ai/stream_stall_exclusions_test.go::TestStreamStallUnmarkedRequestsKeepLegacyD131",
+        "ai/stream_stall_test.go::TestStreamStallNativeCleanup",
+        "ai/stream_stall_test.go::TestStreamStallNativeCloseCannotRearmBufferedRead",
+        "ai/stream_stall_test.go::TestStreamStallNativeDefaultAndDisable",
+        "ai/stream_stall_test.go::TestStreamStallNativeKeepaliveBytesDoNotPreventExpiry",
+        "ai/stream_stall_test.go::TestStreamStallNativeRequestPhases",
+        "ai/stream_stall_test.go::TestStreamStallNativeRetryBackoffAndLimit",
+        "ai/stream_stall_test.go::TestStreamStallNativeRetryCanRecover",
+        "ai/stream_stall_test.go::TestStreamStallNativeSemanticProgress"
       ]
     },
     {
@@ -70217,6 +70380,10 @@
       "entry": "BF-648ff3e-13"
     },
     {
+      "id": "D192",
+      "title": "Dyna's native OpenAI Responses route defaults reasoning.summary to detailed"
+    },
+    {
       "id": "D195",
       "title": "An empty AWS_BEARER_TOKEN_BEDROCK is no token, where Pi's AWS SDK treats the variable as set and the request…",
       "entry": "BF-D195"
@@ -70558,6 +70725,14 @@
       "id": "D661",
       "title": "After an external SIGTSTP and `fg` pig arms the terminal again; the terminal is not reset before the external…",
       "entry": "BF-f36632c"
+    },
+    {
+      "id": "D10004",
+      "title": "Dyna model transfer bounds the old and new model's summaries together"
+    },
+    {
+      "id": "D10007",
+      "title": "Dyna bounds the deferred tool names in a context head"
     }
   ],
   "exemptCommits": {

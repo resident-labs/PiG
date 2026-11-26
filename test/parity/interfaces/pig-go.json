@@ -337514,6 +337514,17 @@
       "shapeHash": "sha256:7d4c95da8a651cf3bf9d861fa4dd99f942580e615ca698e7af4d0709e8c4966f"
     },
     {
+      "id": "go:github.com/MichaelKinsy/PiG/internal/codingagent/compaction#resultWithProgress",
+      "package": "github.com/MichaelKinsy/PiG/internal/codingagent/compaction",
+      "name": "resultWithProgress",
+      "kind": "function",
+      "exported": false,
+      "shape": {
+        "type": "func(ctx context.Context, stream *github.com/MichaelKinsy/PiG/ai.AssistantMessageEventStream) *github.com/MichaelKinsy/PiG/ai.AssistantMessage"
+      },
+      "shapeHash": "sha256:5b1687feacfd6199368db4fe1c1f78dae203bad266d786183e37815d5d0628f8"
+    },
+    {
       "id": "go:github.com/MichaelKinsy/PiG/internal/codingagent/compaction#scaledTokens",
       "package": "github.com/MichaelKinsy/PiG/internal/codingagent/compaction",
       "name": "scaledTokens",

@@ -580,6 +580,7 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 | [BF-433d232-2](#bf-433d232-2) | An extension custom message whose content is a block array (text or images), or an empty string, now reaches… | PiG's own defect | All platforms | 0.5.0 |
 | [BF-433d232-3](#bf-433d232-3) | `DefaultResourceLoader.reload`: new live-Pi oracle `TestDefaultResourceLoaderReloadMatchesPi`… | PiG's own defect | All platforms | 0.5.0 |
 | [BF-433d232-4](#bf-433d232-4) | `ReadOnlyAuthStorage`: new live-Pi oracle `TestReadOnlyAuthStorageMatchesPi`… | PiG's own defect | All platforms | 0.5.0 |
+| [BF-4362bb1](#bf-4362bb1) | Fix in shipped code | PiG's own defect | All platforms | Unreleased |
 | [BF-439c708](#bf-439c708) | Device-code logins (GitHub Copilot, Kimi Code, Meta, Radius) use the `verification_uri` a server sends only… | PiG's own defect | All platforms | 0.7.0 |
 | [BF-439c708-2](#bf-439c708-2) | A pi-messages event whose `contentIndex` is not an integer naming the next block (for a `_start` event) or an… | PiG's own defect | All platforms | 0.7.0 |
 | [BF-43a2293](#bf-43a2293) | Key order of non-index keys stays byte order (a Go map has no insertion order): question Q-state-order filed | PiG's own defect | All platforms | Unreleased |
@@ -589,6 +590,7 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 | [BF-43d2597-2](#bf-43d2597-2) | `/compact <instructions>` applies the instructions to the summary of the start of a turn that compaction… | A fix Pi shipped that PiG ported | All platforms | 0.5.2 |
 | [BF-43d2597-3](#bf-43d2597-3) | A resumed session and `/tree` navigation activate the extension tools the branch never added or removed, such… | A fix Pi shipped that PiG ported | All platforms | 0.5.2 |
 | [BF-43d2597-4](#bf-43d2597-4) | Switching to a session whose system message holds a `toolsAdded` or `toolsRemoved` member the loadout restore… | A fix Pi shipped that PiG ported | All platforms | 0.5.2 |
+| [BF-4434517](#bf-4434517) | Avoid replaying the entire session history before every codemode script | PiG's own defect | All platforms | Unreleased |
 | [BF-4463d9e](#bf-4463d9e) | In the Go Chord v2 workers (`chord/nextnode/workers`), `Workers.Retry` and a plugin rollout no longer leave a… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-4477a81](#bf-4477a81) | A chord app's `Close` kept going after a step failed and joined the errors; it now stops at the first failing… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-4477d23](#bf-4477d23) | A server killed in the middle of importing or deleting the data of one address (an app built with the kit… | PiG's own defect | All platforms | 0.8.0 |
@@ -612,6 +614,8 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 | [BF-464b14e](#bf-464b14e) | Fix in shipped code | PiG's own defect | All platforms | Unreleased |
 | [BF-4669953](#bf-4669953) | `/export` HTML no longer shows raw terminal hyperlink escape codes around links in custom tool output; http… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-46abed3](#bf-46abed3) | Fix in shipped code | PiG's own defect | All platforms | Unreleased |
+| [BF-46ebfe3](#bf-46ebfe3) | Keep attachment resize results in the recorded queue entry when the user message has custom members | PiG's own defect | All platforms | Unreleased |
+| [BF-46ebfe3-2](#bf-46ebfe3-2) | Release the old request snapshot on session replacement, and show streamed progress during live compaction… | PiG's own defect | All platforms | Unreleased |
 | [BF-4706781](#bf-4706781) | Tool output and streamed shell output no longer keep the parameters of private-parameter CSI sequences such… | PiG's own defect | All platforms | 0.7.0 |
 | [BF-4706781-2](#bf-4706781-2) | A package whose `pi` object holds only metadata such as `changelogPath` is loaded by directory auto-discovery… | PiG's own defect | All platforms | 0.7.0 |
 | [BF-4706781-3](#bf-4706781-3) | With `codemode.mode: "on"`, the description of a tool whose output schema is a union of objects lists each… | PiG's own defect | All platforms | 0.7.0 |
@@ -1838,6 +1842,7 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 | [BF-bb9e9d8](#bf-bb9e9d8) | fix(extensions): parallel Node runtime linking reports the walk-order first failure under every schedule | PiG's own defect | All platforms | Unreleased |
 | [BF-bba3679](#bf-bba3679) | Images in the formats Photon decodes beyond PNG, JPEG, GIF, WebP, BMP and TIFF are now decoded the way Pi… | PiG's own defect | All platforms | 0.7.0 |
 | [BF-bbccefd](#bf-bbccefd) | A Durable value that holds a lone UTF-16 surrogate is stored as Pi stores it | PiG's own defect | All platforms | 0.8.0 |
+| [BF-bbd36e4](#bf-bbd36e4) | Avoid decoding message history when the first codemode script rebuilds its persistent store after a process… | PiG's own defect | All platforms | Unreleased |
 | [BF-bc02460](#bf-bc02460) | Changing the output padding now applies at once to the branch-summary, compaction-summary and… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-bc05945](#bf-bc05945) | A resumed session takes the model its registry lists for the saved provider and id, with that listing's API… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-bc24321](#bf-bc24321) | fix(mem M3): arm the idle collection at run end and run it after 500 ms | PiG's own defect | All platforms | Unreleased |
@@ -2059,6 +2064,7 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 | [BF-d6613f8](#bf-d6613f8) | A tool call whose arguments were cut inside a surrogate pair (the codemode card cuts a call's arguments at 77… | PiG's own defect | All platforms | 0.8.0 |
 | [BF-d6aaf72](#bf-d6aaf72) | A `setTimeout(0)` or `setImmediate` callback that an extension queues while an RPC stdin command runs (a… | PiG's own defect | All platforms | 0.5.2 |
 | [BF-d6e0dca](#bf-d6e0dca) | The extension SDK surface matrix and the extension API pages say that `setEditorComponent` and… | PiG's own defect | All platforms | 0.5.0 |
+| [BF-d6eafcd](#bf-d6eafcd) | Bound semantic idleness only on native OpenAI Responses requests with provider ID `openai` and no custom… | PiG's own defect | All platforms | Unreleased |
 | [BF-d71c4e2](#bf-d71c4e2) | Lower- and upper-casing in `tui`, `internal/codingagent` and `internal/nodespawn` keeps a lone UTF-16… | PiG's own defect | Windows | 0.7.0 |
 | [BF-d71c4e2-2](#bf-d71c4e2-2) | A glob filter, model scope or other `internal/minimatch` pattern with a numeric brace range beyond 2^53… | PiG's own defect | All platforms | 0.7.0 |
 | [BF-d73376b](#bf-d73376b) | fix: closing a registry's model tasks joins the native Models collection's own refresh and auth work | PiG's own defect | All platforms | Unreleased |
@@ -10253,6 +10259,19 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Tests:** `agent/convert_custom_upstream_test.go::TestConvertToLLMCustomMessagesMatchUpstreamConvertToLlm`, `agent/convert_custom_upstream_test.go::TestConvertToLLMToolFlowMatchesUpstreamTransformOrder`, `agent/convert_custom_upstream_test.go::TestCustomMessagesReachProvidersAsUpstreamContentBlocks`, `agent/transform_custom_user_boundary_test.go::TestAnthropicRequestAfterBranchSummaryHasNoOrphanToolResult`, `agent/transform_custom_user_boundary_test.go::TestConvertToLLMCustomMessageWithoutWireOutputKeepsToolFlow`, `agent/transform_custom_user_boundary_test.go::TestConvertToLLMCustomUserMessageInterruptsToolFlow`, `agent/transform_custom_user_boundary_test.go::TestConvertToLLMHoldsSystemMessageUntilToolFlowCloses`, `ai/anthropic_messages_payload_oracle_test.go::TestAnthropicMessagesPayloadMatchesPi` and 7 more in docs/bug-ledger.json
 - **Release note:** `ReadOnlyAuthStorage`: new live-Pi oracle `TestReadOnlyAuthStorageMatchesPi` (`ai/auth_storage_readonly_oracle_test.go`; 800 auth.json files x 1-5 operations over read, list, refused modify and delete, and a file rewrite between operations that a loaded store must not see; valid and invalid credential shapes: non-string key, non-string env value, env null/array, OAuth missing access/refresh/expires or with a string expiry, null/array/scalar entries and roots). Results and thrown messages match; no bug found. 9 mutations red (key/env/OAuth validation, command-key bypass, refused modify, null root, error text). Equivalent mutants: the finite-expiry check (Go's JSON decoder already rejects `1e999`), the empty-key and API-key type guards in Read (`resolveStoredCredential` repeats both). Not compared: V8 text after "Failed to read auth.json: ".
 
+### BF-4362bb1
+
+**Fix in shipped code**
+
+- **Source:** PiG's own defect
+- **Symptom:** Fix in shipped code
+- **Root cause:** - Update TestAutoCompactionSurfacesRefreshFailureOnce to match P16's CompactLive error capitalization ('Summarization failed: ...'). - Update StreamOptions.ActiveEffortAtTopLevel doc comment to reflect upstream's 'low' default when effort markers are present.
+- **User impact:** Behavior differed from Pi
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `4362bb1844` (2026-11-25)
+- **Tests:** `coding/session_summary_auth_refresh_test.go::TestAutoCompactionSurfacesRefreshFailureOnce`
+
 ### BF-439c708
 
 **Device-code logins (GitHub Copilot, Kimi Code, Meta, Radius) use the `verification_uri` a server sends only…**
@@ -10376,6 +10395,20 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Fix commits:** `43d259770e` (2026-10-21)
 - **Tests:** `agent/tool_replay_error_test.go::TestToolReplayErrorMatchesPi`, `coding/cli/rpc_replacement_order_test.go::TestRPCSwitchSessionFailsWithTheSystemReplayTypeError`, `coding/runtime_switch_wrong_typed_system_test.go::TestSwitchSessionRejectsAWrongTypedSystemReplayLikePi`, `coding/session_resume_default_tools_port_test.go::TestResumeRestoresTheRecordedLoadoutPort`, `internal/codingagent/compaction/context_edit_test.go::TestCompactAppliesCustomInstructionsToTheTurnPrefixSummaryOfASplitTurn`, `test/extension-conformance/resume_tools_test.go::TestResumeActivatesExtensionToolsTheBranchNeverMentionedAcrossSDKs`, `tui/autocomplete_upstream_test.go::TestUpstreamAutocompleteFD`, `tui/file_autocomplete_test.go::TestBuildFdPathQuery`
 - **Release note:** Switching to a session whose system message holds a `toolsAdded` or `toolsRemoved` member the loadout restore cannot read fails with the TypeError of Pi's tool-list replay; a system message with an unreadable `content` no longer fails the switch (Pi bd3c9b82).
+
+### BF-4434517
+
+**Avoid replaying the entire session history before every codemode script**
+
+- **Source:** PiG's own defect
+- **Symptom:** Avoid replaying the entire session history before every codemode script.
+- **Root cause:** Persistent store reads now replay only entries appended since the previous script; switching branches rebuilds the store from that branch.
+- **User impact:** Behavior differed from Pi
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `4434517f63` (2026-11-11)
+- **Tests:** `coding/extension/builtin/codemode/branch_store_cache_test.go::TestBranchStoreCacheReadsOnlyNewEntries`
+- **Release note:** Avoid replaying the entire session history before every codemode script. Persistent store reads now replay only entries appended since the previous script; switching branches rebuilds the store from that branch.
 
 ### BF-4463d9e
 
@@ -10693,6 +10726,34 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Fixed in:** Unreleased
 - **Fix commits:** `46abed3453` (2026-10-21)
 - **Tests:** None recorded.
+
+### BF-46ebfe3
+
+**Keep attachment resize results in the recorded queue entry when the user message has custom members**
+
+- **Source:** PiG's own defect
+- **Symptom:** Keep attachment resize results in the recorded queue entry when the user message has custom members.
+- **Root cause:** Queue delivery replaced the typed image content but retained the original JSON source to preserve the custom members.
+- **User impact:** Behavior differed from Pi
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `46ebfe3343` (2026-11-26)
+- **Tests:** `agent/message_source_test.go::TestReplaceContentBlocksKeepsRetainedUserMembers`, `coding/session_queue_images_test.go::TestSessionResizesImagesInQueuedSteeringAndFollowUpMessages`
+- **Release note:** Keep attachment resize results in the recorded queue entry when the user message has custom members.
+
+### BF-46ebfe3-2
+
+**Release the old request snapshot on session replacement, and show streamed progress during live compaction…**
+
+- **Source:** PiG's own defect
+- **Symptom:** Release the old request snapshot on session replacement, and show streamed progress during live compaction without changing Escape cancellation.
+- **Root cause:** The live compaction path retained its last request across session replacement and skipped the standalone summarizer's progress reader.
+- **User impact:** Behavior differed from Pi
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `46ebfe3343` (2026-11-26)
+- **Tests:** `coding/session_message_sequence_test.go::TestReplaceInnerReleasesTheNumberedMessages`, `internal/codingagent/interactive_compaction_progress_test.go::TestCompactionEscapeDuringTheStreamLeavesNothingRunning`, `internal/codingagent/interactive_compaction_progress_test.go::TestCompactionLineShowsElapsedTimeAndStreamedTokens`
+- **Release note:** Release the old request snapshot on session replacement, and show streamed progress during live compaction without changing Escape cancellation.
 
 ### BF-4706781
 
@@ -27745,6 +27806,20 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Tests:** `durable/harness/surrogate_observable_test.go::TestANestedKeyErrorQuotesTheKeyAsPiDoes`, `durable/harness/surrogate_observable_test.go::TestOwnedTasksKeepsALoneSurrogateInTheRecordsItReturns`, `durable/harness/tool_checkpoint_order_test.go::TestAToolCheckpointKeepsALoneSurrogateInItsArguments`, `durable/harness/tool_checkpoint_order_test.go::TestHarnessJSONKeepsALoneSurrogateInSelectionsAndViewDocs`, `durable/storage/sqlite/rows_pi_oracle_test.go::TestRowsMatchPi`, `durable/storage/sqlite/rows_test.go::TestParseJSONReadsALoneSurrogateEscapeAsTheUnit`, `durable/surrogate_pi_oracle_test.go::TestAddressIdKeepsDifferentLoneSurrogatesApart`, `durable/surrogate_pi_oracle_test.go::TestLoneSurrogatesDecodeAsJSONParseDoes` and 1 more in docs/bug-ledger.json
 - **Release note:** A Durable value that holds a lone UTF-16 surrogate is stored as Pi stores it. Task states and outcomes (checkpoint, result, error message, reason), entry drafts, context edits, document contents, tool controls, compaction `modelOverrides` keys, a tool call's checkpoint arguments, extension and tool selections and view documents went through Go's `encoding/json`, which writes the unit as U+FFFD where `JSON.stringify` writes `\ud800`, and read the escape back as U+FFFD. Two document kinds that differ only in such a unit also got one `AddressId`. SqliteStorage read a stored record's escape as U+FFFD as well. `ownedTasks` returned a task's kind, input and checkpoint with U+FFFD for such a unit, and a nested call key's error quoted the key with Go's escaping (`\u003c` for `<`, U+FFFD for the unit) where Pi's `JSON.stringify` does not. Pi's own `JSON.stringify`, `documents.ts` `addressId` and `tool.ts` `checkKey` answer for the encoders in the new tests.
 
+### BF-bbd36e4
+
+**Avoid decoding message history when the first codemode script rebuilds its persistent store after a process…**
+
+- **Source:** PiG's own defect
+- **Symptom:** Avoid decoding message history when the first codemode script rebuilds its persistent store after a process restart.
+- **Root cause:** Not recorded.
+- **User impact:** Behavior differed from Pi
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `bbd36e427d` (2026-11-11)
+- **Tests:** `coding/extension/builtin/codemode/branch_store_cache_test.go::TestBranchStoreCacheColdUsesMetadata`, `coding/extension/builtin/codemode/branch_store_differential_test.go::TestReviewCacheConcurrent`, `coding/extension/builtin/codemode/branch_store_differential_test.go::TestReviewCacheDifferential`, `coding/extension/builtin/codemode/real_session_bench_test.go::TestExecuteRealSessionProfile`
+- **Release note:** Avoid decoding message history when the first codemode script rebuilds its persistent store after a process restart.
+
 ### BF-bc02460
 
 **Changing the output padding now applies at once to the branch-summary, compaction-summary and…**
@@ -30802,6 +30877,20 @@ Entries are listed by ID. The page carries no totals, so a pull request that add
 - **Fix commits:** `d6e0dca953` (2026-10-09)
 - **Tests:** `automation/ci/bugledger/bugledger_test.go::TestEveryNewDivergenceIsAccountedFor`
 - **Release note:** The extension SDK surface matrix and the extension API pages say that `setEditorComponent` and `getEditorComponent` exist in the Go, Rust and Python SDKs and that the getter returns the factory the extension installed. They described the Go getter as always returning nil and the Rust and Python getters as missing.
+
+### BF-d6eafcd
+
+**Bound semantic idleness only on native OpenAI Responses requests with provider ID `openai` and no custom…**
+
+- **Source:** PiG's own defect
+- **Symptom:** Bound semantic idleness only on native OpenAI Responses requests with provider ID `openai` and no custom Fetch (D131).
+- **Root cause:** A model call with no semantic SSE event for 180 s (connect and first byte included) aborts with StreamStallError and retries through the transport-failure path. OpenAI and Codex Responses requests ask for reasoning.summary detailed by default.
+- **User impact:** An operation failed or was rejected
+- **Platform:** All platforms
+- **Fixed in:** Unreleased
+- **Fix commits:** `0b85b749d6` (2026-11-05), `a982e300b7` (2026-11-05), `bd304691c2` (2026-11-05), `d6eafcdc9c` (2026-11-05)
+- **Tests:** `ai/max_thinking_upstream_test.go::TestMaxThinkingUpstream`, `ai/openai_codex_request_test.go::TestOpenAICodexResponses_RequestMatchesCodexProtocol`, `ai/openai_codex_sse_upstream_test.go::TestCodexSSEAndPayloadUpstream`, `ai/reasoning_summary_default_test.go::TestResponsesRequestAsksForADetailedReasoningSummaryByDefault`, `ai/stream_stall_exclusions_test.go::TestStreamStallCustomFetchKeepsBaseTransport`, `ai/stream_stall_exclusions_test.go::TestStreamStallExcludedRoutesKeepBaseErrors`, `ai/stream_stall_exclusions_test.go::TestStreamStallUnmarkedRequestsKeepLegacyD131`, `ai/stream_stall_test.go::TestStreamStallNativeCleanup` and 7 more in docs/bug-ledger.json
+- **Release note:** Bound semantic idleness only on native OpenAI Responses requests with provider ID `openai` and no custom Fetch (D131). The independent request-start budget defaults to 180 seconds, covers connection establishment and non-SSE error bodies, and sends a typed failure through existing retry/backoff. Positive `StreamOptions.StallTimeoutMs` overrides the budget; zero or less disables it. EOF and Close release the new timer and cancellation callback. Existing legacy D131 behavior and diagnostics remain unchanged.
 
 ### BF-d71c4e2
 
@@ -36995,6 +37084,7 @@ Each divergence record is accounted for here. A divergence that fixes a Pi defec
 | D186 | A hung-up terminal: PiG gives extensions `session_shutdown` for at most a second and exits 129; Pi's exit… | deliberate difference |
 | D187 | A native SDK holds a batch's first host calls and responses in call and answer order, where Pi's single… | deliberate difference |
 | D190 | The built-in file mutation queue also orders mutations of one existing file reached through a hard link or a… | [BF-648ff3e-13](#bf-648ff3e-13) |
+| D192 | Dyna's native OpenAI Responses route defaults reasoning.summary to detailed | deliberate difference |
 | D195 | An empty AWS_BEARER_TOKEN_BEDROCK is no token, where Pi's AWS SDK treats the variable as set and the request… | [BF-D195](#bf-d195) |
 | D196 | Under skip-auth a bearer token from the process environment is not sent over an http:// endpoint, where Pi's… | [BF-D196](#bf-d196) |
 | D197 | The env daemon's limit of open files is the hard limit, where Pi's daemon keeps the soft limit it inherited | [BF-D197](#bf-d197) |
@@ -37066,6 +37156,8 @@ Each divergence record is accounted for here. A divergence that fixes a Pi defec
 | D658 | The Go, Rust, Python and Lisp SDKs invoke handlers in request arrival order, but a descheduled thread can run… | [BF-D658](#bf-d658) |
 | D660 | A reply whose model has no known context window starts no threshold compaction, where Pi compacts after every… | [BF-87ea4f9](#bf-87ea4f9) |
 | D661 | After an external SIGTSTP and `fg` pig arms the terminal again; the terminal is not reset before the external… | [BF-f36632c](#bf-f36632c) |
+| D10004 | Dyna model transfer bounds the old and new model's summaries together | deliberate difference |
+| D10007 | Dyna bounds the deferred tool names in a context head | deliberate difference |
 
 ## Fix-titled commits that are not bugs in a release
 

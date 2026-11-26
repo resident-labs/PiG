@@ -46432,6 +46432,17 @@
       "shapeHash": "sha256:705b38f6fd132289f820abb3a7a49521a71ca708a4cacb9f2a3d8266b2925730"
     },
     {
+      "id": "go:github.com/MichaelKinsy/PiG/ai#isTestFauxLiveCompaction",
+      "package": "github.com/MichaelKinsy/PiG/ai",
+      "name": "isTestFauxLiveCompaction",
+      "kind": "function",
+      "exported": false,
+      "shape": {
+        "type": "func(text string) bool"
+      },
+      "shapeHash": "sha256:c8ce0cb8a710a927c0a9eafe45e698c5341929803e6bf45e7bcade784dac1e82"
+    },
+    {
       "id": "go:github.com/MichaelKinsy/PiG/ai#isThinkingPart",
       "package": "github.com/MichaelKinsy/PiG/ai",
       "name": "isThinkingPart",
@@ -85029,6 +85040,17 @@
         "type": "func(message github.com/MichaelKinsy/PiG/agent.AgentMessage) github.com/MichaelKinsy/PiG/coding/extension.CustomMessage"
       },
       "shapeHash": "sha256:321680ee46c4a0f45a5be83a13a18383fa9efbfe0593819bdad691b1d0fe0ddb"
+    },
+    {
+      "id": "go:github.com/MichaelKinsy/PiG/coding#decodeContextUpdateDetails",
+      "package": "github.com/MichaelKinsy/PiG/coding",
+      "name": "decodeContextUpdateDetails",
+      "kind": "function",
+      "exported": false,
+      "shape": {
+        "type": "func(raw github.com/MichaelKinsy/PiG/extensions/sdk/json.RawMessage) (map[string]string, bool)"
+      },
+      "shapeHash": "sha256:06075cdb90729c613f1a7043d48dc2733ba8101b7bfe9ce41aca9854b110505d"
     },
     {
       "id": "go:github.com/MichaelKinsy/PiG/coding#decodeEvent",
@@ -124123,6 +124145,17 @@
         "type": "func(ctx context.Context) string"
       },
       "shapeHash": "sha256:f099367730f8af45f1d2f355493ca0cc185bb5d3703954556971ba45b4eeebb4"
+    },
+    {
+      "id": "go:github.com/MichaelKinsy/PiG/coding/extension/builtin/codemode#applyStoreEntry",
+      "package": "github.com/MichaelKinsy/PiG/coding/extension/builtin/codemode",
+      "name": "applyStoreEntry",
+      "kind": "function",
+      "exported": false,
+      "shape": {
+        "type": "func(store map[string]encoding/json.RawMessage, entry github.com/MichaelKinsy/PiG/internal/codingagent.SessionEntry)"
+      },
+      "shapeHash": "sha256:6af1ab1c3a63c9c516ed973d2f96532c714502ba665262507fd2b35f7a63ca7a"
     },
     {
       "id": "go:github.com/MichaelKinsy/PiG/coding/extension/builtin/codemode#argOrUndefined",
@@ -337674,9 +337707,9 @@
       "kind": "function",
       "exported": false,
       "shape": {
-        "type": "func(ctx context.Context, request LiveRequest, prompt string, retry *github.com/MichaelKinsy/PiG/ai.RetryPolicy, callbacks github.com/MichaelKinsy/PiG/ai.RetryCallbacks) (string, *github.com/MichaelKinsy/PiG/ai.Usage, error)"
+        "type": "func(ctx context.Context, request LiveRequest, basePrompt string, retry *github.com/MichaelKinsy/PiG/ai.RetryPolicy, callbacks github.com/MichaelKinsy/PiG/ai.RetryCallbacks) (string, *github.com/MichaelKinsy/PiG/ai.Usage, error)"
       },
-      "shapeHash": "sha256:fdf0dff592c5c53262410ef07e8ef0b6cb1c093fface4234241a830339b2f1f9"
+      "shapeHash": "sha256:fb403ef533c825d00ca7230d4db654cc8bd899d966ea4222941ad5b47fcf8514"
     },
     {
       "id": "go:github.com/MichaelKinsy/PiG/internal/codingagent/compaction#summaryPlan",

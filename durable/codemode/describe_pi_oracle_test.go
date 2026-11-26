@@ -318,8 +318,9 @@ func TestDescribeMatchesPiOnSeededToolSets(t *testing.T) {
 				t.Errorf("DefaultInlineBudget = %d, Pi %d (%v)", DefaultInlineBudget, pi.Budget, err)
 			}
 		case "description":
+			want = withDynaCodemodeHelp(t, want)
 			if got := Description(op.Models); got != want {
-				t.Errorf("Description(%v) differs from Pi", op.Models)
+				t.Errorf("Description(%v) = %q, expected %q", op.Models, got, want)
 			}
 		case "sample":
 			got, err := sampleOf(registration(t, op.Tool))

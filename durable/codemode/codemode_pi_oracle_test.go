@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os/exec"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/MichaelKinsy/PiG/chord/delta"
@@ -229,13 +230,26 @@ func compareDocument(t *testing.T, name string, got *durable.AnyDocDefinition, p
 	}
 }
 
+// withDynaCodemodeHelp applies only the two P19 phrases (PATCHES.md) to Pi's expected text.
+func withDynaCodemodeHelp(t *testing.T, description string) string {
+	t.Helper()
+	const resultText = "resolves to a string, or an object"
+	const storeText = "keep JSON values across codemode calls."
+	if strings.Count(description, resultText) != 1 || strings.Count(description, storeText) != 1 {
+		t.Fatalf("Pi changed the help text patched by P19: %q", description)
+	}
+	description = strings.Replace(description, resultText, "resolves to a string, the text you would see with any truncation notice, or an object", 1)
+	return strings.Replace(description, storeText, "keep small JSON values (up to 256 KB, such as IDs or summaries) across codemode calls; large data goes to a file.", 1)
+}
+
 func compareVariant(t *testing.T, options codemodeOptions, pi codemodeVariant) {
 	t.Helper()
 	toolOptions := ToolOptions{Models: options.Models, InlineBudget: options.InlineBudget}
 	tool := CreateTool(toolOptions)
 	label := fmt.Sprintf("models %v", options.Models)
-	if tool.Name != pi.Tool.Name || tool.Description != pi.Tool.Description {
-		t.Errorf("%s: tool %q / description differs from Pi's %q", label, tool.Name, pi.Tool.Name)
+	wantDescription := withDynaCodemodeHelp(t, pi.Tool.Description)
+	if tool.Name != pi.Tool.Name || tool.Description != wantDescription {
+		t.Errorf("%s: tool %q description = %q; expected tool %q description %q", label, tool.Name, tool.Description, pi.Tool.Name, wantDescription)
 	}
 	parameters, err := tool.ParametersJSON()
 	if err != nil {

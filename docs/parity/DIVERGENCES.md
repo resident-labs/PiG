@@ -4540,3 +4540,31 @@ Call-site markers (`pig divergence (D661): ...`): `tui/continue_signal.go` (`con
 Evidence: `tui/continue_signal_unix_test.go` (the seven cases of `packages/tui/test/suspend-signal.test.ts` listed in `docs/parity/suspend.md`, including both `TuiMainScreen` and `TuiAltScreen` in `TestContinueSignalListenerLastsUntilStopHasRestored`, plus `TestContinueSignalRawModeOwnershipSpansMakeRawAndRestoreCooked`, `TestRearmRawModeBalancesKittyKeyboardStack`, `TestContinueSignalOwnershipFollowsEachRenderer`, `TestContinueSignalRemoveClearsOnlyItsOwnRegistration`, `TestContinueSignalStartStopDoesNotLeakGoroutines`, `TestContinueSignalTuiSurfaceSuspendAndResume`, `TestContinueSignalIgnoresRendererNotOnProcessTerminal`, `TestContinueSignalIgnoresWriterBackedRendererWithNilTerminal`); `internal/codingagent/interactive_continue_unix_test.go` (`TestContinueHandlerRearmsOnTheOwnerLoopWhileTheTerminalIsOwned`, `TestContinueHandlerStopDoesNotHangWhenUITaskChannelIsFull`, `TestRearmTerminalDoesNotRestoreCookedOrDeadlockOnBlockedReader`, `TestRearmWithOpsRunsStopStartRenderOnlyWhenForeground`); `internal/codingagent/startup_continue_pty_linux_test.go` (`TestInitInstallsContinueHandlerBeforeTerminalStart`, `TestInitOwnsTerminalForSIGCONTAsSoonAsStartTerminalArmsIt`, `TestSIGCONTUnderRawTermiosRestoringShellRearmsAndRedraws`, `TestFrontendSurfaceRearmBalancesKittyStack`); `test/integration/external_sigtstp_pty_linux_test.go` under job-control bash 5.2 and dash 0.5.12 on a pseudo-terminal (`TestExternalSIGTSTPSuspendsLikeCtrlZ`, `TestExternalSIGTSTPUnderDashJobControl`, `TestSIGTSTPInStartupWindowRearmsTerminal`, `TestExternalSIGTSTPAndBareSIGCONTDoNotDumpScrollbackInFullscreen`, `TestExternalSIGTSTPBackgroundContinueTouchesNothing`, and regression guards `TestCtrlZKeyKeepsItsModeSequences`, `TestExternalSIGTSTPKeepsARunGoing`, `TestSIGTSTPWhileAnExternalEditorOwnsTheTerminal`).
 
 Parity allowance: no parity scenario compares external `kill -TSTP` or `TUI.setSuspendSignalHandler`. The pinned Pi 1.6.0 (`faac585884ae`) oracle carries `e4f50d76` and `3107a58d`, and parity scenarios run no external job control; the Ctrl+Z key scenarios (`40-suspend-resume-session`, `43-suspend-signal-order`) are unchanged.
+
+## D10004 Dyna model transfer bounds the old and new model's summaries together
+
+What: `Session.TransferModel` gives the old model and the optional target-model fallback one ten-minute summary deadline. If that deadline expires, the transfer keeps a conversation that fits or records a boundary for one that does not fit. Caller cancellation leaves the current model in place.
+
+Why: a Dyna model handoff must finish even when one provider stalls. Both attempts share a single budget so changing the provider cannot restart the clock.
+
+Scope: the Dyna transfer path (P4 in `PATCHES.md`), not ordinary model selection or compaction requests. Pi checks and compacts the new model's context on its next request rather than performing this pre-switch transfer.
+
+Evidence: `TestATransferWhoseSummaryTimesOutMovesAnyway`, `TestTransferFallsBackAfterATimeoutOnlyWithMostOfTheBudgetLeft`, and `TestAStoppedTransferKeepsTheModel` exercise the timeout, fallback budget, and cancellation.
+
+Parity allowance: the Pi SDK does not expose this pre-switch handoff; the hermetic Session tests pin the fork behavior.
+
+Remove when: Pi supplies an equivalent cancellable handoff with a shared deadline and Dyna uses it.
+
+## D10007 Dyna bounds the deferred tool names in a context head
+
+What: when Dyna context updates add the `deferred_tools` section to a session head, it lists at most 80 tool names per namespace and 80 action names per tool. The displayed count accounts for the names it omits; those names remain discoverable through the tool catalog.
+
+Why: large MCP catalogs should not fill the initial context of a session or undo the space saved by compaction.
+
+Scope: the Dyna-only prompt section (P7 in `PATCHES.md`). The limit does not change which tools are registered or can be loaded. Pi has no equivalent `deferred_tools` section in a context-update head.
+
+Evidence: `TestTheDeferredToolsSectionCountsWhatItLeavesOut` checks the visible names and omitted counts at the limit; `TestTheDeferredToolsSectionSortsByName` checks deterministic name order.
+
+Parity allowance: the exact fork-only prompt content is tested directly because Pi does not emit this section.
+
+Remove when: Pi supplies a bounded equivalent section and Dyna uses it.

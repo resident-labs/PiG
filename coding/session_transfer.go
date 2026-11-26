@@ -28,6 +28,7 @@ const (
 )
 
 // transferSummaryTimeout bounds both summary attempts together. A test shortens it.
+// pig divergence (D10004): Dyna's pre-switch summaries share one deadline.
 var transferSummaryTimeout = 10 * time.Minute
 
 // transferCompactAbove is the context size above which a transfer to another model compacts on the old one even when

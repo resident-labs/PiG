@@ -160,6 +160,7 @@ func (s *Session) promptToolOrder(names []string) []string {
 const deferredToolsSection = "deferred_tools"
 
 // maxDeferredNames is how many tools a namespace lists, and actions a tool; the rest are counted.
+// pig divergence (D10007): Dyna's deferred-tools prompt section bounds both lists.
 const maxDeferredNames = 80
 
 // deferredTool is a tool the deferred_tools section names: its name, its namespace's, and the action enum of its schema.

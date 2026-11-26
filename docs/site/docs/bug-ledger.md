@@ -37161,7 +37161,7 @@ Each divergence record is accounted for here. A divergence that fixes a Pi defec
 
 ## Fix-titled commits that are not bugs in a release
 
-- Failure found by the integration build of unreleased work: 2
+- Failure found by the integration build of unreleased work: 3
 - Fix reverted before release: 2
 - Follow-up to unreleased work: 47
 - Repair of a merge between development branches: 9

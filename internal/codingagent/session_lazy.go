@@ -318,7 +318,7 @@ func (r HandleReads) GetTree() []*SessionTreeNode { return r.treeHandles() }
 
 // GetEntry is Session.GetEntry with a lazy message entry.
 func (r HandleReads) GetEntry(id string) (SessionEntry, bool) {
-	return r.Session.GetEntryHandle(id)
+	return r.GetEntryHandle(id)
 }
 
 // GetEntryHandle reads entry metadata without decoding message payloads. Callers that inspect payloads must use the error-returning sessionentry read funnel.

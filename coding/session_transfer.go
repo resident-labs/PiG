@@ -127,7 +127,7 @@ func (s *Session) TransferModel(ctx context.Context, target *ai.Model, options M
 	if ctx.Err() != nil {
 		return ModelTransferResult{Path: TransferAborted, TokensBefore: before, TokensAfter: before}, nil
 	}
-	if !exceeds(settings) && !(changesModel && before > transferCompactAbove) {
+	if !exceeds(settings) && (!changesModel || before <= transferCompactAbove) {
 		return ModelTransferResult{Path: unchanged, TokensBefore: before, TokensAfter: before}, apply()
 	}
 
@@ -212,10 +212,11 @@ func (s *Session) summarizeTransfer(ctx context.Context, prep compaction.Compact
 	}
 	result, fallbackErr := s.runDefaultCompaction(ctx, prep, run.fallback, "", reason)
 	if fallbackErr != nil {
+		sourceFailure := fmt.Sprint(err)
 		if run.source == nil {
-			return result, fmt.Errorf("%v; new model: %w", err, fallbackErr)
+			return result, fmt.Errorf("%s; new model: %w", sourceFailure, fallbackErr)
 		}
-		return result, fmt.Errorf("old model: %v; new model: %w", err, fallbackErr)
+		return result, fmt.Errorf("old model: %s; new model: %w", sourceFailure, fallbackErr)
 	}
 	run.summarizedBy = run.fallback
 	return result, nil

@@ -61,7 +61,8 @@ func (s *Session) loadDeferredTool(name string) agent.AgentTool {
 	if !slices.Contains(active, name) {
 		entry, listed := s.toolRegistry.entry(name)
 		exposure := toolExposureOf(entry.registration.Definition)
-		if !listed || (exposure != extension.ToolExposureDeferred && exposure != extension.ToolExposureCodemode) || !(slices.Contains(active, "tool_search") || slices.Contains(active, "codemode")) {
+		if !listed || (exposure != extension.ToolExposureDeferred && exposure != extension.ToolExposureCodemode) ||
+			(!slices.Contains(active, "tool_search") && !slices.Contains(active, "codemode")) {
 			return nil
 		}
 		s.setActiveToolsByName(append(active, name))

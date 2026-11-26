@@ -3,6 +3,7 @@ package compaction
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"time"
 
@@ -122,8 +123,9 @@ func isOverflow(err error) bool {
 
 func sendLive(ctx context.Context, request LiveRequest, messages []ai.Message, prompt string) (string, *ai.Usage, error) {
 	ask := ai.UserMessage{Content: ai.UserContentBlocks{ai.TextContent{Text: prompt}}, Timestamp: time.Now().UnixMilli()}
-	full := append(messages[:len(messages):len(messages)], ask)
-	message := resultWithProgress(ctx, request.Stream(ctx, request.Model, ai.Context{Messages: full}, request.Options))
+	messages = slices.Clip(messages)
+	messages = append(messages, ask)
+	message := resultWithProgress(ctx, request.Stream(ctx, request.Model, ai.Context{Messages: messages}, request.Options))
 	if ctx.Err() != nil {
 		return "", nil, ctx.Err()
 	}

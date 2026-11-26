@@ -109,7 +109,7 @@ func TestCompactLiveDropsTheOldestMessagesOnOverflow(t *testing.T) {
 	if _, err := CompactLive(t.Context(), livePrep(), request, "", nil, ai.RetryCallbacks{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(sizes) != 3 || !(sizes[0] > sizes[1] && sizes[1] > sizes[2]) {
+	if len(sizes) != 3 || sizes[0] <= sizes[1] || sizes[1] <= sizes[2] {
 		t.Fatalf("request sizes = %v, want three shrinking requests", sizes)
 	}
 	for _, first := range firsts {

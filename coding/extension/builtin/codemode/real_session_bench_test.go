@@ -5,14 +5,15 @@ package codemode
 import (
 	"context"
 	"encoding/json"
-	"github.com/MichaelKinsy/PiG/coding/extension"
-	"github.com/MichaelKinsy/PiG/internal/codingagent"
 	"os"
 	"path/filepath"
 	"runtime/pprof"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/internal/codingagent"
 )
 
 // TestExecuteRealSessionProfile is opt-in because its input is a private session.
@@ -105,10 +106,15 @@ func TestExecuteRealSessionProfile(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err = pprof.StartCPUProfile(f); err != nil {
+		defer func() {
+			if err := f.Close(); err != nil {
+				t.Errorf("close CPU profile: %v", err)
+			}
+		}()
+		if err := pprof.StartCPUProfile(f); err != nil {
 			t.Fatal(err)
 		}
-		defer func() { pprof.StopCPUProfile(); f.Close() }()
+		defer pprof.StopCPUProfile()
 	}
 	start = time.Now()
 	run()
@@ -123,8 +129,12 @@ func TestExecuteRealSessionProfile(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer f.Close()
-		if err = pprof.Lookup("allocs").WriteTo(f, 0); err != nil {
+		defer func() {
+			if err := f.Close(); err != nil {
+				t.Errorf("close heap profile: %v", err)
+			}
+		}()
+		if err := pprof.Lookup("allocs").WriteTo(f, 0); err != nil {
 			t.Fatal(err)
 		}
 	}

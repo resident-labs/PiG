@@ -1523,3 +1523,10 @@ commit = "eb9075718e2f380e44972dc21c10c2128913cd1d"
 class = "CITE"
 cite = "packages/coding-agent/src/modes/interactive/interactive-mode.ts:4403"
 reason = "Pi 03de604b8 updates maybeShowThinkingDropNotice (interactive-mode.ts:4403) so both Anthropic and OpenAI reasoning drop notices include the deduplicated reasons list before (details in session). Commit eb9075718e updates the expected notice strings in assistant_diagnostics_unit_test.go to match."
+
+[[entry]]
+path = "test/parity/correspondence/golang_test.go"
+commit = "0574bb58c32798a6be9fb4ca53812c100584859a"
+class = "NOBEHAVIOR"
+cite = ""
+reason = "These fixtures exercise PiG's Go AST correspondence checker, not Pi runtime behavior. The checker requires a live return under the successful live-request guard and a top-level standalone return into the shared body with the standalone flag, then checks the summary generator binding. The synthetic source and expected diagnostics now cover those edges and reject missing or incorrect edges. Pi has no counterpart to this checker or its diagnostics."

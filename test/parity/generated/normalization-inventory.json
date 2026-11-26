@@ -61,6 +61,11 @@
       "reason": "transcript_sequences_equal compares the ordered escape sequences and text runs of one stretch of the terminal transcript token by token, byte for byte, with no normalisation. Its only exemption is a floating sequence a scenario declares: exactly one complete sequence or one OSC number, present in every run of both binaries, never written earlier than Pi's earliest recorded position, with Pi evidence of at least two distinct positions. It removes that sequence's place from the comparison and nothing else."
     },
     {
+      "source": "test/parity/testdata/dyna-responses-expectation.mjs",
+      "sha256": "48fbb047f5837d758f58135cc2c6a91fcda5c4787694487e05a581546bdb3151",
+      "reason": "D192 expected-value projection: require the native Responses default auto and substitute detailed only. The callers select defaulted native Responses requests; the PiG capture is never rewritten."
+    },
+    {
       "source": "test/parity/testdata/list-limit-number-pi.mjs",
       "sha256": "f1c046bca2b1daa796629ea8c6947f2165bbaec9983b69b552346193706043b9",
       "reason": "This numeric-renderer probe selects the complete warning-bracket text from Pi's actual renderResult output under an explicit unstyled fixture theme. It claims number/notice text only, not terminal layout or ANSI styling; full themed body rows are checked by the Go caller regression."
@@ -77,8 +82,8 @@
     },
     {
       "source": "test/parity/testdata/provider-wire-pi.mjs",
-      "sha256": "16312cb15fc4c7ceff57fcd00c32703f66fb2a198b21a34ec5d0c459198a38be",
-      "reason": "Legacy role/key/auth summaries are diagnostic only: wireBody now compares the entire captured HTTP request body alongside them. Aggregated provider response summaries do not prove mode events; real-provider RPC/JSON scenarios compare those separately."
+      "sha256": "ae19ee56c6a5707dd066a7beada9379f30caae05779d5522cba43362d354540f",
+      "reason": "Legacy role/key/auth summaries are diagnostic only: wireBody compares the entire captured HTTP request body alongside them. D192 projects only the two verified native Responses summary defaults; Codex and Azure remain unmodified. Aggregated response summaries do not prove mode events; real-provider RPC/JSON scenarios compare those separately."
     },
     {
       "source": "test/parity/testdata/provider-wire-pig/main.go",
@@ -86,9 +91,14 @@
       "reason": "Legacy role/key/auth summaries are diagnostic only: wireBody now compares the entire captured HTTP request body alongside them. Aggregated provider response summaries do not prove mode events; real-provider RPC/JSON scenarios compare those separately."
     },
     {
+      "source": "test/parity/testdata/reasoning-options/pi.mjs",
+      "sha256": "bf4e57d363e914ec7fcc2e8370ee1f1c97000d7be128fc036083d0478d7f2803",
+      "reason": "D192 projects only the native Responses mandatory-low summary after requiring Pi's captured default. All other payload and metadata values remain untouched."
+    },
+    {
       "source": "test/parity/testdata/rpc-wire-drift.py",
-      "sha256": "8f4921e4970807abe6d0b809f5648871ca4f9fd05fabdf778edccf5baf23043e",
-      "reason": "This probe emits complete mutation, UI, recovery, compaction, fork, switch and initial-state records without identity rewriting. The scenario's shared typed JSON comparator owns aliases. Other prompt events are outside these focused contracts and the complete RPC stream is captured as raw.json, not discarded. The fixture selects an explicit session directory, but generated filename syntax remains checked."
+      "sha256": "acccfa0c25a198052ea5b12ce93b8cb089106ac0880dfa19bcbce17e82241d43",
+      "reason": "This probe emits complete mutation, UI, recovery, compaction, fork, switch and initial-state records without identity rewriting. The scenario's shared typed JSON comparator owns aliases. Other prompt events are outside these focused contracts and the complete RPC stream is captured as raw.json, not discarded. The fixture selects an explicit session directory, but generated filename syntax remains checked. A second model forces standalone compaction and the probe checks the actual provider request, not an aliased summary or token count."
     },
     {
       "source": "test/parity/testdata/session-collision-pi.mjs",
@@ -9554,6 +9564,18 @@
     {
       "scenario": "test/parity/scenarios/rpc/56-rpc-codemode-returned-values.toml",
       "transforms": [
+        {
+          "kind": "normalize_replace",
+          "pattern": "resolves to a string, or an object",
+          "with": "resolves to a string, the text you would see with any truncation notice, or an object",
+          "reason": "P19: only the upstream tool-return help phrase is projected onto the fork's wording. Raw assertions distinguish the two sides."
+        },
+        {
+          "kind": "normalize_replace",
+          "pattern": "keep JSON values across codemode calls\\.",
+          "with": "keep small JSON values (up to 256 KB, such as IDs or summaries) across codemode calls; large data goes to a file.",
+          "reason": "P19: only the upstream store help phrase is projected onto the fork's wording. Raw assertions distinguish the two sides."
+        },
         {
           "kind": "normalize_replace",
           "pattern": "parity-snap-cwd-[0-9]{10}",

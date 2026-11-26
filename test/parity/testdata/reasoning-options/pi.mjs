@@ -3,6 +3,7 @@ import { join, resolve } from 'node:path';
 import { getEffortThinkingLevelMap } from '../../../../.upstream/current/packages/ai/catalog/reasoning.ts';
 import { getOpenRouterThinkingLevelMap } from '../../../../.upstream/current/packages/ai/catalog/sources/openrouter.ts';
 import { pathToFileURL } from 'node:url';
+import { expectNativeResponsesSummary } from '../dyna-responses-expectation.mjs';
 const root=process.env.PI_PACKAGE_ROOT??resolve('extensions/sdk-ts/node_modules/@earendil-works/pi-coding-agent');
 const ai=join(root,'node_modules/@earendil-works/pi-ai/dist');
 const {normalizeContext}=await import(pathToFileURL(join(ai,'compat.js')));
@@ -15,6 +16,9 @@ for(const api of ['openai-completions','openai-responses']){
   let captured=false;
   await streamSimple(model,normalizeContext({messages:[{role:'user',content:'Hello',timestamp:0}]}),{apiKey:'test',reasoning:name==='mandatory-low'?'low':undefined,onPayload(payload){output[`${api}/${name}`]=payload.reasoning??null;captured=true;throw new Error('captured');}}).result();
   if(!captured)throw new Error('no captured payload');
+  if (api === 'openai-responses' && name === 'mandatory-low') {
+   expectNativeResponsesSummary(output[`${api}/${name}`]);
+  }
  }
 }
 for (const test of JSON.parse(readFileSync('test/parity/testdata/reasoning-options/metadata.json', 'utf8'))) {

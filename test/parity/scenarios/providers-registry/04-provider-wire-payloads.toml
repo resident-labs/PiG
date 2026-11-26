@@ -8,7 +8,7 @@
 # side drives the matching pig providers through Provider.Stream and the same
 # OnPayload hook. This asserts request shape, endpoint path, auth header kind,
 # message roles, tool presence, token field names, reasoning/session fields, and
-# wrapper behavior without live model calls.
+# wrapper behavior without live model calls. D192: the Pi fixture verifies its default summary is auto before projecting detailed onto the two native Responses captures. Codex and Azure stay unchanged.
 #
 # The 0.84 OpenAI-completions probe also drives the public simple-stream path
 # with model defaults plus request sampling overrides, Baseten

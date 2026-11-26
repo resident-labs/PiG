@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { zstdDecompressSync } from 'node:zlib';
+import { expectNativeResponsesSummary } from './dyna-responses-expectation.mjs';
 
 function version() {
   const m = readFileSync('internal/coding/pigversion/pigversion.go', 'utf8').match(/UpstreamPackageVersion = "([^"]+)"/);
@@ -66,6 +67,8 @@ out.openaiResponses = await probeOpenAIResponses();
 out.openaiCodexResponses = await probeOpenAICodexResponses();
 out.azureOpenAIResponses = await probeAzureOpenAIResponses();
 out.openaiResponsesGrammar = await probeOpenAIResponsesGrammar();
+expectNativeResponsesSummary(out.openaiResponses.wireBody.reasoning);
+expectNativeResponsesSummary(out.openaiResponsesGrammar.wireBody.reasoning);
 out.anthropic = await probeAnthropic();
 out.google = await probeGoogle();
 out.googleToolIds = await probeGoogleToolIds();

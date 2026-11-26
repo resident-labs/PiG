@@ -27,6 +27,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         request = self.rfile.read(int(self.headers['Content-Length']))
+        self.server.requests.append(request)
         type(self).calls += 1
         if b'RETRY' in request and not self.server.retried:
             self.server.retried = True
@@ -58,10 +59,13 @@ def run(host, root, initial_only=False):
     cwd = Path(tempfile.mkdtemp(prefix='rpc-wire-')).resolve()
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Provider)
     server.retried = False
+    server.requests = []
     worker = threading.Thread(target=server.serve_forever)
     worker.start()
     url = f'http://127.0.0.1:{server.server_port}'
-    (agent / 'models.json').write_text(json.dumps({'providers': {'anthropic': {'baseUrl': url, 'api': 'anthropic-messages', 'apiKey': 'fixture-key', 'models': [{'id': 'wire-model', 'name': 'Wire model', 'reasoning': True, 'contextWindow': 200000, 'maxTokens': 8192}]}}}))
+    models = [dict(id=model_id, name=name, reasoning=True, contextWindow=200000, maxTokens=8192)
+              for model_id, name in [('wire-model', 'Wire model'), ('summary-model', 'Summary model')]]
+    (agent / 'models.json').write_text(json.dumps({'providers': {'anthropic': {'baseUrl': url, 'api': 'anthropic-messages', 'apiKey': 'fixture-key', 'models': models}}}))
     (agent / 'settings.json').write_text(json.dumps({'defaultThinkingLevel': 'medium' if initial_only else 'off', 'compaction': {'enabled': False, 'keepRecentTokens': 1}, 'retry': {'enabled': True, 'maxRetries': 1, 'baseDelayMs': 1}}))
     binary = os.environ.get('PIG_PARITY_PIG_BIN', str(REPO / 'bin/pig')) if host == 'pig' else str(REPO / 'extensions/sdk-ts/node_modules/.bin/pi')
     env = {'PATH': os.environ['PATH'], 'HOME': str(root), 'PIG_HOME': str(root), 'PIG_CODING_AGENT_DIR': str(agent), 'PI_CODING_AGENT_DIR': str(agent), 'NO_COLOR': '1'}
@@ -114,7 +118,15 @@ def run(host, root, initial_only=False):
         edits = [v for v in persisted if v['type'] == 'context_edit']
         assert [v['entry'] for v in recovery] == edits and edits, (recovery, edits)
         selected.extend(recovery)
+        # Changing models prevents P16 from extending its previous live request. Compare the standalone split-turn summary on both sides.
+        swapped = command('set_model', provider='anthropic', modelId='summary-model')
+        assert swapped[-1]['success'], swapped
+        selected.extend(swapped)
+        first_summary = len(server.requests)
         selected.extend(command('compact'))
+        summary, = server.requests[first_summary:]
+        assert json.loads(summary)['model'] == 'summary-model', summary
+        assert b"Create a concise checkpoint of the user's request and the progress shown above." in summary, summary
         selected.extend(command('fork', entryId='absent'))
         missing = root / 'explicit.jsonl'
         switched = command('switch_session', sessionPath=str(missing))

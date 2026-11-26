@@ -1,6 +1,6 @@
 # Behavior family: rpc
 # Surface: the codemode tool appends a script's returned value like text(): execute.ts:509 keeps every value except undefined, and valueText (execute.ts:251-254) prints JSON.stringify(value). Pi 1.1.0 prints "null" for `return null`, also ahead of a console block, and nothing for `return undefined`. PiG printed nothing for null before coding/extension/builtin/codemode/execute.go valueText checked for a JSON string.
-# Each prompt waits for its own agent_settled, so the four tool results arrive in order.
+# Each prompt waits for its own agent_settled, so the four tool results arrive in order. P19 changes two help phrases in the system tool definition; check their original bytes on each side before comparing the full trace.
 
 name = "56-rpc-codemode-returned-values"
 description = "RPC codemode: returned null, undefined and array values print as Pi prints them."
@@ -49,13 +49,25 @@ exit_code = 0
 output_equal = true
 stderr_equal = true
 runs = 3
+pig_contains = ['resolves to a string, the text you would see with any truncation notice, or an object', 'keep small JSON values (up to 256 KB, such as IDs or summaries) across codemode calls; large data goes to a file.']
+pig_not_contain = ['resolves to a string, or an object', 'keep JSON values across codemode calls.']
+pi_contains = ['resolves to a string, or an object', 'keep JSON values across codemode calls.']
+pi_not_contain = ['resolves to a string, the text you would see with any truncation notice, or an object', 'keep small JSON values (up to 256 KB, such as IDs or summaries) across codemode calls; large data goes to a file.']
 both_contain = [
   '"text":"null"',
   '"text":"null\n<console_output>\na\n</console_output>"',
   '"text":"[null,\"x\",1.5]"',
 ]
 
-# normalize-rationale: Only independent clocks and the isolated cwd identity vary; retain every other byte and property order.
+# normalize-rationale: Alias independent clocks and paths and project the two exact P19 help changes. All other bytes and property order remain compared.
+[[assert.normalize_replace]]
+pattern = 'resolves to a string, or an object'
+with = 'resolves to a string, the text you would see with any truncation notice, or an object'
+reason = "P19: only the upstream tool-return help phrase is projected onto the fork's wording. Raw assertions distinguish the two sides."
+[[assert.normalize_replace]]
+pattern = 'keep JSON values across codemode calls\.'
+with = 'keep small JSON values (up to 256 KB, such as IDs or summaries) across codemode calls; large data goes to a file.'
+reason = "P19: only the upstream store help phrase is projected onto the fork's wording. Raw assertions distinguish the two sides."
 [[assert.normalize_replace]]
 pattern = 'parity-snap-cwd-[0-9]{10}'
 with = 'parity-snap-cwd-0000000000'

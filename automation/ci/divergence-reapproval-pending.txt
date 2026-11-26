@@ -8,5 +8,3 @@
 # generator listed them in reading order: tokens-changed, large-insert, medium, owner-statement-after, small.
 D131 scope Dyna P13 carries the previously approved native OpenAI Responses watchdog onto upstream's hash-bound idle-timeout ledger.
 D192 new Dyna P13's existing detailed-summary record has no approval hash in the upstream format.
-D10004 new Records Dyna P4's existing shared ten-minute model transfer summary budget.
-D10007 new Records Dyna P7's existing limit of 80 deferred tool names per namespace and action names per tool.

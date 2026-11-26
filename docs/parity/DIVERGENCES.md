@@ -4555,6 +4555,8 @@ Parity allowance: the Pi SDK does not expose this pre-switch handoff; the hermet
 
 Remove when: Pi supplies an equivalent cancellable handoff with a shared deadline and Dyna uses it.
 
+SCRUTINIZED:approved 2026-11-26 text-sha256:414e4748a22f0d09
+
 ## D10007 Dyna bounds the deferred tool names in a context head
 
 What: when Dyna context updates add the `deferred_tools` section to a session head, it lists at most 80 tool names per namespace and 80 action names per tool. The displayed count accounts for the names it omits; those names remain discoverable through the tool catalog.
@@ -4568,3 +4570,5 @@ Evidence: `TestTheDeferredToolsSectionCountsWhatItLeavesOut` checks the visible 
 Parity allowance: the exact fork-only prompt content is tested directly because Pi does not emit this section.
 
 Remove when: Pi supplies a bounded equivalent section and Dyna uses it.
+
+SCRUTINIZED:approved 2026-11-26 text-sha256:46559fd24977278a

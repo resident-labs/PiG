@@ -2257,9 +2257,9 @@
         "call:agent/agent_loop.go#Agent.createLoopConfig"
       ],
       "evidence": [
+        "test:agent/before_request_test.go#TestNoBeforeRequestDoesNotPollSteeringBeforeNextTurnPreparation",
         "test:agent/standalone_loop_test.go#TestRunAgentLoop_PrepareNextTurnFailureRejectsTheRun",
-        "test:agent/standalone_loop_test.go#TestRunAgentLoop_PrepareNextTurnReplacesTheModel",
-        "test:agent/standalone_loop_test.go#TestRunAgentLoop_ResolvesTheAPIKeyForEveryRequestFromTheRequestedProvider"
+        "test:agent/standalone_loop_test.go#TestRunAgentLoop_PrepareNextTurnReplacesTheModel"
       ],
       "asyncContract": "An awaited Promise is a blocking Go call that returns the value or error; AbortSignal is the context.Context argument; no detached goroutine."
     },
@@ -3518,7 +3518,7 @@
         "shape": "complete"
       },
       "production": [
-        "call:agent/agent.go#Agent.SetTools"
+        "call:agent/agent.go#Agent.SetResolveUnloadedTool"
       ],
       "evidence": [
         "test:agent/agent_upstream_test.go#TestAgent_UpdatesStateWithMutators",
@@ -9292,8 +9292,8 @@
       ],
       "evidence": [
         "test:ai/sampling_options_upstream_test.go#TestSamplingParamsByThinkingLevelDirectStreamUpstream",
-        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi",
-        "test:ai/mistral_wire_body_oracle_test.go#TestMistralWireBodyMatchesPi"
+        "test:ai/reasoning_summary_default_test.go#TestResponsesRequestAsksForADetailedReasoningSummaryByDefault",
+        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi"
       ]
     },
     {
@@ -19854,11 +19854,11 @@
       ],
       "layers": {
         "behavior": "complete",
-        "production": "public-api-tested",
+        "production": "complete",
         "shape": "complete"
       },
       "production": [
-        "public-api:ai/known_provider.go#KnownProvider"
+        "call:ai/openai_responses.go#openAIResponsesProvider.Stream"
       ],
       "evidence": [
         "test:ai/known_provider_upstream_test.go#TestKnownProviderConstantsMatchTheUpstreamUnionAndTheCatalog"
@@ -26641,8 +26641,8 @@
       ],
       "evidence": [
         "test:ai/sampling_options_upstream_test.go#TestSamplingParamsByThinkingLevelDirectStreamUpstream",
-        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi",
-        "test:ai/mistral_wire_body_oracle_test.go#TestMistralWireBodyMatchesPi"
+        "test:ai/reasoning_summary_default_test.go#TestResponsesRequestAsksForADetailedReasoningSummaryByDefault",
+        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi"
       ]
     },
     {
@@ -29117,8 +29117,8 @@
       ],
       "evidence": [
         "test:ai/sampling_options_upstream_test.go#TestSamplingParamsByThinkingLevelDirectStreamUpstream",
-        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi",
-        "test:ai/mistral_wire_body_oracle_test.go#TestMistralWireBodyMatchesPi"
+        "test:ai/reasoning_summary_default_test.go#TestResponsesRequestAsksForADetailedReasoningSummaryByDefault",
+        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi"
       ]
     },
     {
@@ -38197,8 +38197,8 @@
       ],
       "evidence": [
         "test:ai/sampling_options_upstream_test.go#TestSamplingParamsByThinkingLevelDirectStreamUpstream",
-        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi",
-        "test:ai/mistral_wire_body_oracle_test.go#TestMistralWireBodyMatchesPi"
+        "test:ai/reasoning_summary_default_test.go#TestResponsesRequestAsksForADetailedReasoningSummaryByDefault",
+        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi"
       ]
     },
     {
@@ -44593,8 +44593,8 @@
       ],
       "evidence": [
         "test:ai/sampling_options_upstream_test.go#TestSamplingParamsByThinkingLevelDirectStreamUpstream",
-        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi",
-        "test:ai/mistral_wire_body_oracle_test.go#TestMistralWireBodyMatchesPi"
+        "test:ai/reasoning_summary_default_test.go#TestResponsesRequestAsksForADetailedReasoningSummaryByDefault",
+        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi"
       ]
     },
     {
@@ -47196,8 +47196,8 @@
       ],
       "evidence": [
         "test:ai/sampling_options_upstream_test.go#TestSamplingParamsByThinkingLevelDirectStreamUpstream",
-        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi",
-        "test:ai/mistral_wire_body_oracle_test.go#TestMistralWireBodyMatchesPi"
+        "test:ai/reasoning_summary_default_test.go#TestResponsesRequestAsksForADetailedReasoningSummaryByDefault",
+        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi"
       ]
     },
     {
@@ -53836,8 +53836,8 @@
       ],
       "evidence": [
         "test:ai/sampling_options_upstream_test.go#TestSamplingParamsByThinkingLevelDirectStreamUpstream",
-        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi",
-        "test:ai/mistral_wire_body_oracle_test.go#TestMistralWireBodyMatchesPi"
+        "test:ai/reasoning_summary_default_test.go#TestResponsesRequestAsksForADetailedReasoningSummaryByDefault",
+        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi"
       ]
     },
     {
@@ -65392,11 +65392,11 @@
       ],
       "layers": {
         "behavior": "complete",
-        "production": "public-api-tested",
+        "production": "complete",
         "shape": "complete"
       },
       "production": [
-        "public-api:ai/known_provider.go#KnownProvider"
+        "call:ai/openai_responses.go#openAIResponsesProvider.Stream"
       ],
       "evidence": [
         "test:ai/known_provider_upstream_test.go#TestKnownProviderConstantsMatchTheUpstreamUnionAndTheCatalog"
@@ -72303,8 +72303,8 @@
       ],
       "evidence": [
         "test:ai/sampling_options_upstream_test.go#TestSamplingParamsByThinkingLevelDirectStreamUpstream",
-        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi",
-        "test:ai/mistral_wire_body_oracle_test.go#TestMistralWireBodyMatchesPi"
+        "test:ai/reasoning_summary_default_test.go#TestResponsesRequestAsksForADetailedReasoningSummaryByDefault",
+        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi"
       ]
     },
     {
@@ -74867,8 +74867,8 @@
       ],
       "evidence": [
         "test:ai/sampling_options_upstream_test.go#TestSamplingParamsByThinkingLevelDirectStreamUpstream",
-        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi",
-        "test:ai/mistral_wire_body_oracle_test.go#TestMistralWireBodyMatchesPi"
+        "test:ai/reasoning_summary_default_test.go#TestResponsesRequestAsksForADetailedReasoningSummaryByDefault",
+        "test:ai/google_wire_body_oracle_test.go#TestGoogleWireBodyMatchesPi"
       ]
     },
     {
@@ -167903,8 +167903,8 @@
       ],
       "evidence": [
         "test:coding/extension/builtin/codemode/store_oracle_test.go#TestStoreEntryDataKeepsUnpairedSurrogateKeys",
-        "test:coding/extension/builtin/codemode/details_store_test.go#TestStoreEntryDataAndFullOutputPathDetails",
-        "test:ai/content_json_to_test.go#TestContentMarshalJSONWritesWhatJSONStringifyWrites"
+        "test:coding/extension/builtin/codemode/branch_store_cache_test.go#TestBranchStoreCacheColdUsesMetadata",
+        "test:coding/extension/builtin/codemode/branch_store_cache_test.go#TestBranchStoreCacheReadsOnlyNewEntries"
       ]
     },
     {
@@ -167924,7 +167924,9 @@
         "call:coding/extension/builtin/codemode/execute.go#Execute"
       ],
       "evidence": [
-        "test:coding/extension/builtin/codemode/store_oracle_test.go#TestStoreEntryDataKeepsUnpairedSurrogateKeys"
+        "test:coding/extension/builtin/codemode/store_oracle_test.go#TestStoreEntryDataKeepsUnpairedSurrogateKeys",
+        "test:coding/extension/builtin/codemode/branch_store_cache_test.go#TestBranchStoreCacheReadsOnlyNewEntries",
+        "test:coding/extension/builtin/codemode/branch_store_differential_test.go#TestReviewCacheDifferential"
       ]
     },
     {
@@ -167944,7 +167946,9 @@
         "call:coding/extension/builtin/codemode/execute.go#Execute"
       ],
       "evidence": [
-        "test:coding/extension/builtin/codemode/store_oracle_test.go#TestStoreEntryDataKeepsUnpairedSurrogateKeys"
+        "test:coding/extension/builtin/codemode/store_oracle_test.go#TestStoreEntryDataKeepsUnpairedSurrogateKeys",
+        "test:coding/extension/builtin/codemode/branch_store_cache_test.go#TestBranchStoreCacheColdUsesMetadata",
+        "test:coding/extension/builtin/codemode/branch_store_cache_test.go#TestBranchStoreCacheReadsOnlyNewEntries"
       ]
     },
     {
@@ -168008,7 +168012,8 @@
         "call:coding/extension/builtin/codemode/execute.go#Execute"
       ],
       "evidence": [
-        "test:coding/extension/builtin/codemode/details_store_test.go#TestStoreEntryDataAndFullOutputPathDetails"
+        "test:coding/extension/builtin/codemode/details_store_test.go#TestStoreEntryDataAndFullOutputPathDetails",
+        "test:coding/extension/builtin/codemode/output_budget_test.go#TestConfiguredOutputBudget"
       ]
     },
     {
@@ -168128,11 +168133,11 @@
       ],
       "layers": {
         "behavior": "complete",
-        "production": "complete",
+        "production": "test-exercised",
         "shape": "complete"
       },
       "production": [
-        "call:internal/codingagent/compaction/compaction.go#Compact"
+        "tested:internal/codingagent/compaction/compaction.go#Compact"
       ],
       "evidence": [
         "test:internal/codingagent/compaction/coding_compaction_upstream_test.go#TestCodingCompactionUpstream",
@@ -168151,11 +168156,11 @@
       ],
       "layers": {
         "behavior": "complete",
-        "production": "complete",
+        "production": "test-exercised",
         "shape": "complete"
       },
       "production": [
-        "call:internal/codingagent/compaction/compaction.go#Compact"
+        "tested:internal/codingagent/compaction/compaction.go#Compact"
       ],
       "evidence": [
         "test:internal/codingagent/compaction/coding_compaction_upstream_test.go#TestCodingCompactionUpstream",
@@ -172463,8 +172468,8 @@
       ],
       "evidence": [
         "test:internal/codingagent/tools/create_tool_factories_test.go#TestCreateToolFactoriesBindTheirCwdAndOptions",
-        "test:internal/codingagent/tools/read_directory_test.go#TestReadDirectoryReportsNodeEISDIR",
-        "test:internal/codingagent/tools/tool_definition_test.go#TestToolDefinitionFromAgentToolKeepsTheParameterMemberOrder"
+        "test:internal/codingagent/tools/read_caps_test.go#TestReadConfiguredOutputCaps",
+        "test:internal/codingagent/tools/read_directory_test.go#TestReadDirectoryReportsNodeEISDIR"
       ]
     },
     {
@@ -172485,8 +172490,8 @@
       ],
       "evidence": [
         "test:internal/codingagent/tools/create_tool_factories_test.go#TestCreateToolFactoriesBindTheirCwdAndOptions",
-        "test:internal/codingagent/tools/read_directory_test.go#TestReadDirectoryReportsNodeEISDIR",
-        "test:internal/codingagent/tools/tool_definition_test.go#TestToolDefinitionFromAgentToolKeepsTheParameterMemberOrder"
+        "test:internal/codingagent/tools/read_caps_test.go#TestReadConfiguredOutputCaps",
+        "test:internal/codingagent/tools/read_directory_test.go#TestReadDirectoryReportsNodeEISDIR"
       ]
     },
     {
@@ -175380,7 +175385,7 @@
         "shape": "complete"
       },
       "production": [
-        "call:internal/codingagent/tools/read_stream.go#selectLinesFromStream"
+        "call:internal/codingagent/tools/read.go#ReadTool.outputLimits"
       ],
       "evidence": [
         "test:internal/codingagent/tools/truncate_head_test.go#TestTruncationOptionsDefaultsApplyOnlyToOmittedLimits"
@@ -208241,7 +208246,7 @@
       "evidence": [
         "test:internal/codingagent/tools/create_tool_factories_test.go#TestCreateReadOnlyToolsPassesEachToolItsOptionsAndTheBinDir",
         "test:internal/codingagent/tools/create_tool_factories_test.go#TestCreateToolFactoriesBindTheirCwdAndOptions",
-        "test:internal/codingagent/tools/tool_options_test.go#TestToolsOptionsReachEachTool"
+        "test:internal/codingagent/tools/read_caps_test.go#TestReadConfiguredOutputCaps"
       ]
     },
     {
@@ -209283,7 +209288,7 @@
         "shape": "complete"
       },
       "production": [
-        "call:internal/packagemanager/resolve.go#PackageManager.Resolve"
+        "call:internal/packagemanager/resolve.go#PackageManager.ResolveContext"
       ],
       "evidence": [
         "test:internal/packagemanager/resolve_oracle_test.go#TestResolveMatchesPiOnRandomFixtures",
@@ -209305,7 +209310,7 @@
         "shape": "complete"
       },
       "production": [
-        "call:internal/packagemanager/resolve.go#PackageManager.Resolve"
+        "call:internal/packagemanager/resolve.go#PackageManager.ResolveContext"
       ],
       "evidence": [
         "test:internal/packagemanager/managed_root_cwd_test.go#TestEmptyAgentDirNeverWritesIntoTheProcessDirectory",
@@ -209327,7 +209332,7 @@
         "shape": "complete"
       },
       "production": [
-        "call:internal/packagemanager/resolve.go#PackageManager.Resolve"
+        "call:internal/packagemanager/resolve.go#PackageManager.ResolveContext"
       ],
       "evidence": [
         "test:internal/packagemanager/malformed_manifest_upstream_test.go#TestResolveIgnoresInvalidManifestResourceFieldsWithoutDroppingValidFields",
@@ -209349,7 +209354,7 @@
         "shape": "complete"
       },
       "production": [
-        "call:internal/packagemanager/resolve.go#PackageManager.Resolve"
+        "call:internal/packagemanager/resolve.go#PackageManager.ResolveContext"
       ],
       "evidence": [
         "test:internal/packagemanager/malformed_manifest_upstream_test.go#TestResolveIgnoresInvalidManifestResourceFieldsWithoutDroppingValidFields",
@@ -209371,7 +209376,7 @@
         "shape": "complete"
       },
       "production": [
-        "call:internal/packagemanager/resolve.go#PackageManager.Resolve"
+        "call:internal/packagemanager/resolve.go#PackageManager.ResolveContext"
       ],
       "evidence": [
         "test:internal/packagemanager/resolve_oracle_test.go#TestResolveMatchesPiOnRandomFixtures",
@@ -210287,7 +210292,8 @@
       ],
       "evidence": [
         "test:coding/resource_loader_extend_test.go#TestResourceLoaderInterfaceExtendsAndReloads",
-        "test:coding/resource_loader_prompt_sources_test.go#TestDefaultLoaderReportsSystemPromptSourcePaths"
+        "test:coding/resource_loader_prompt_sources_test.go#TestDefaultLoaderReportsSystemPromptSourcePaths",
+        "test:coding/session_context_updates_test.go#TestASkillEditReachesTheNextRequest"
       ],
       "asyncContract": "An awaited Promise is a blocking Go call that returns the value or error; AbortSignal is the context.Context argument; no detached goroutine."
     },
@@ -210309,7 +210315,8 @@
       ],
       "evidence": [
         "test:coding/resource_loader_extend_test.go#TestResourceLoaderInterfaceExtendsAndReloads",
-        "test:coding/resource_loader_prompt_sources_test.go#TestDefaultLoaderReportsSystemPromptSourcePaths"
+        "test:coding/resource_loader_prompt_sources_test.go#TestDefaultLoaderReportsSystemPromptSourcePaths",
+        "test:coding/session_context_updates_test.go#TestASkillEditReachesTheNextRequest"
       ],
       "asyncContract": "An awaited Promise is a blocking Go call that returns the value or error; AbortSignal is the context.Context argument; no detached goroutine."
     },
@@ -232189,7 +232196,7 @@
       "evidence": [
         "test:coding/extension/builtin/toolsearch/toolsearch_oracle_test.go#TestToolSearchMatchesPi",
         "test:coding/extension/builtin/toolsearch/toolsearch_oracle_test.go#TestToolSearchNameQueriesMatchPi",
-        "test:coding/mcp_session_upstream_test.go#TestAgentSessionMCPDeclaresDirectlyExposedMCPToolsToTheModel"
+        "test:coding/extension/builtin/toolsearch/toolsearch_upstream_test.go#TestBm25RankerRanksAToolMatchingMoreQueryTermsFirstWhateverTheScores"
       ]
     },
     {

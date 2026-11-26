@@ -231,7 +231,7 @@ func withNativeResponsesSummary(t *testing.T, payload string) string {
 	decoder := jsontext.NewDecoder(strings.NewReader(payload), jsonopts.Parse)
 	for {
 		token, err := decoder.ReadToken()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			return payload
 		}
 		if err != nil {

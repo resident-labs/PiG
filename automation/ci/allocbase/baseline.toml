@@ -1050,8 +1050,8 @@ allocs = 4
 
 [[benchmark]]
 package = "./ai"
-benchmark = "BenchmarkResolveCatalogRecordSequentialAll"
-allocs = 88
+benchmark = "BenchmarkResolveCatalogRecordSequentialAll/per-100-cold-chunks"
+allocs = 1934
 
 [[benchmark]]
 package = "./ai"

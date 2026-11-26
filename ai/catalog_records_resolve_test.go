@@ -29,12 +29,27 @@ func BenchmarkResolveCatalogRecordAlternateChunks(b *testing.B) {
 }
 
 func BenchmarkResolveCatalogRecordSequentialAll(b *testing.B) {
-	b.ReportAllocs()
-	for b.Loop() {
-		for i := range GeneratedModels {
-			resolveSink += len(ResolveCatalogRecord(GeneratedModels[i].Record))
+	b.Run("per-100-cold-chunks", func(b *testing.B) {
+		// Catalog refreshes change the chunk count and earlier benchmarks may
+		// have warmed some chunks. Each remaining chunk must open exactly once.
+		startChunks := CatalogChunksExpanded()
+		coldChunks := len(recordChunks) - startChunks
+		if coldChunks == 0 {
+			b.Skip("the catalog is already warm; measure in a fresh test process with -run '^$'")
 		}
-	}
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		for b.Loop() {
+			for i := range GeneratedModels {
+				resolveSink += len(ResolveCatalogRecord(GeneratedModels[i].Record))
+			}
+		}
+		runtime.ReadMemStats(&after)
+		if got := CatalogChunksExpanded() - startChunks; got != coldChunks {
+			b.Fatalf("expanded %d chunks across the sweeps, want %d", got, coldChunks)
+		}
+		b.ReportMetric(float64(after.Mallocs-before.Mallocs)*100/float64(coldChunks), "allocs/op")
+	})
 }
 
 func BenchmarkResolveCatalogRecordParallel(b *testing.B) {

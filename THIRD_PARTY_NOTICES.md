@@ -61,13 +61,13 @@ Distributed file: `.github/CODE_OF_CONDUCT.md`
 
 PiG customizes the enforcement contact and preserves the required source and license attribution in the document.
 
-## grok-mermaid 0.2.2
+## lovely-mermaid 0.3.3
 
-Source: <https://github.com/xl0/grok-mermaid/tree/v0.2.2>
+Source: <https://github.com/xl0/lovely-mermaid/tree/v0.3.3>
 
-Reviewed source revision: `3430584a71350d72b5a0310e91bcd55578a9f981`
+Reviewed source revision: `a28f683ef3d9eda3497e5818f4f18dfdc3a87ed9`
 
-Published npm integrity: `sha512-XcJEP5dDC8liHBh52mlLjU18fNvu1ckFsu0QpIG3+APZ270fsj9wxpiA6cOURmbUEuoMVgjbC2+UYgTdCqqgzA==`
+Published npm integrity: `sha512-EMLJS934qwt2MLO/a5o+T/89HGbuXZPwmCpHIhHO+DVrm+y5tHlEHgpZzlC2o4yW/rFPHRFO9xSMafzqH4wH5A==`
 
 Distributed files: `internal/mermaid/**`
 
@@ -86,7 +86,7 @@ Distributed file: `internal/mermaid/width_data.go`
 - Copyright (c) 2015 The Rust Project Developers
 - License: Apache-2.0 OR MIT; PiG uses the MIT option for this derived data
 
-The width table is generated through `grok-mermaid` from the exact `unicode-width` 0.2.0 crate pinned by `grok-mermaid`'s width oracle. The required MIT copyright and permission notice is preserved here, and the canonical MIT text is in `LICENSES/MIT.txt`.
+The width table is generated through `lovely-mermaid` from the exact `unicode-width` 0.2.0 crate pinned by `lovely-mermaid`'s width oracle. The required MIT copyright and permission notice is preserved here, and the canonical MIT text is in `LICENSES/MIT.txt`.
 
 ## png 0.17.14 and fdeflate 0.3.6
 
@@ -251,7 +251,7 @@ Upstream Pi identifies portions of its ANSI utility as derived from these projec
 
 Source: <https://github.com/highlightjs/highlight.js/tree/11.9.0>
 
-Distributed file: `internal/codingagent/export/assets/vendor/highlight.min.js`
+Distributed file: `internal/codingagent/export/assets/src/highlight.min.js`, embedded as `internal/codingagent/export/assets/vendor/highlight.min.js.gz`
 
 ```text
 BSD 3-Clause License
@@ -289,7 +289,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Source: <https://github.com/markedjs/marked/tree/v18.0.11>
 
-Distributed file: `internal/codingagent/export/assets/vendor/marked.min.js`
+Distributed file: `internal/codingagent/export/assets/src/marked.min.js`, embedded as `internal/codingagent/export/assets/vendor/marked.min.js.gz`
 
 ```text
 Marked
@@ -334,7 +334,7 @@ This software is provided by the copyright holders and contributors “as is” 
 
 Source: <https://github.com/tats-u/markdown-cjk-friendly/tree/main/packages/marked-cjk-friendly>
 
-Distributed files: `internal/codingagent/export/assets/vendor/marked-cjk-friendly.min.js`, which the exported HTML embeds, and `coding/extension/host/subprocess/runtime-node/shims/marked-cjk-friendly/`, the unmodified `dist/index.js`, `package.json` and `LICENSE` that pi-tui's Markdown component imports in Node extensions. PiG's Markdown renderer ports the package's `emStrong` rules to Go in `tui/markdown_marked.go` and `tui/markdown_cjk.go`.
+Distributed files: `internal/codingagent/export/assets/src/marked-cjk-friendly.min.js`, which the exported HTML embeds (as `internal/codingagent/export/assets/vendor/marked-cjk-friendly.min.js.gz`), and `coding/extension/host/subprocess/runtime-node/shims/marked-cjk-friendly/`, the unmodified `dist/index.js`, `package.json` and `LICENSE` that pi-tui's Markdown component imports in Node extensions. PiG's Markdown renderer ports the package's `emStrong` rules to Go in `tui/markdown_marked.go` and `tui/markdown_cjk.go`.
 
 ```text
 MIT License
@@ -393,9 +393,43 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-## @earendil-works/pi-telemetry 1.4.0
+## Pi's durable closure (`third_party/pi-packs`)
 
-The plugins component's Node subprocess runs Pi's chord host, which imports Pi's telemetry contracts. `chord/nextnode/plugins/node/pi/node_modules/@earendil-works/pi-telemetry` is the npm package `@earendil-works/pi-telemetry@1.4.0` (the version Pi's `packages/chord/package.json` depends on, checked by `automation/gen/vendor-chord-plugins-node.sh`): its `package.json` and its compiled `dist/*.js` modules except `dist/testing/`, unmodified.
+`third_party/pi-packs/*.tgz` are the `npm pack` outputs of the pinned Pi source build's `@earendil-works/pi-durable` closure (`chord`, `pi-ai`, `pi-codemode`, `pi-durable`, `pi-schema`, `pi-telemetry`), unmodified, which `durable/core/host/cf`, `durable/interop` and `bench/k8s/image/pi-durable` install through `file:` dependencies (`automation/pin/vendor.py`, `make vendor-pi-packs`). `manifest.json` lists each pack's name, version, sha512 integrity and licence field.
+
+Each package declares `"license": "MIT"` (author Mario Zechner, repository `earendil-works/pi`) and ships no license file; `@earendil-works/pi-schema` also carries `THIRD_PARTY_NOTICES/typebox-LICENSE` (TypeBox 1.3.27, MIT) inside its pack. No pack bundles a dependency. `third_party/pi-packs/LICENSE` is the `LICENSE` of `earendil-works/pi` at the pinned commit, verbatim:
+
+```text
+MIT License
+
+Copyright (c) 2025 Mario Zechner
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## Pi's declarations in the TypeScript extension types (`extensions/sdk-ts/pi-pin.d.ts`)
+
+`extensions/sdk-ts/pi-pin.d.ts` is generated from the declaration files (`dist/**/*.d.ts`) and the model catalog JSON of the pinned Pi source build's `@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai`, `@earendil-works/pi-tui` and `@earendil-works/pi-agent-core` (`extensions/sdk-ts/scripts/pin-bundle.mjs`, `make vendor-sdk-ts-pin-declarations`): each file's declarations with their comments inside one ambient module block, module specifiers rewritten, and each catalog as the type of its data. It ships in the `@michaelkinsy/pig-extension-types` package. Each of the four packages declares `"license": "MIT"` (author Mario Zechner, repository `earendil-works/pi`); the file's header carries Pi's copyright and permission notice, the text of `third_party/pi-packs/LICENSE`.
+
+## @earendil-works/pi-telemetry (the pinned build)
+
+The plugins component's Node subprocess runs Pi's chord host, which imports Pi's telemetry contracts. `chord/nextnode/plugins/node/pi/node_modules/@earendil-works/pi-telemetry` is the pinned build's `@earendil-works/pi-telemetry` (the version Pi's `packages/chord/package.json` depends on, checked by `automation/gen/vendor-chord-plugins-node.sh`): its `package.json` and its compiled `dist/*.js` modules except `dist/testing/`, unmodified and byte for byte the files of the pack in `third_party/pi-packs` (`pin.py check-vendored` compares them).
 
 The package declares `"license": "MIT"` (author Mario Zechner, repository `earendil-works/pi`, directory `packages/telemetry`) and its README's License section says `MIT`; the npm tarball ships no license file. The license text is the `LICENSE` of the repository it is published from, `earendil-works/pi`:
 
@@ -473,7 +507,7 @@ THIS SOFTWARE.
 
 The Node extension runtime highlights code for Pi 0.87.1's `highlightCode` and `getMarkdownTheme` with the same highlighter Pi 0.87.1 uses. `coding/extension/host/subprocess/runtime-node/shims/highlight.js/` holds the unmodified CommonJS build (`lib/`), `package.json` and `LICENSE` of the npm package `highlight.js@10.7.3` (integrity `sha512-tzcUFauisWKNHaRkN4Wjl/ZA07gENAjFl3J/c480dprkGTg5EQstgaNFqBfUqCq54kZRIEcreTsAgF/m2quD7A==`), copied by `automation/gen/vendor-pi-dist.sh`.
 
-`tui/internal/hljs/` ports the same highlighter to Go for PiG's own `highlightCode`: its `.go` files translate `lib/core.js` and the language callbacks, `grammars_eager.json.gz` and `grammars_all.json.gz` serialize the language definitions Pi 1.0.0 registers (`automation/gen/generate-highlight-grammars.mjs`), and `testdata/corpus.json` holds the test inputs of highlight.js's repository at tag 10.7.3 (`automation/gen/import-highlight-corpus.mjs`).
+`tui/internal/hljs/` ports the same highlighter to Go for PiG's own `highlightCode`: its `.go` files translate `lib/core.js` and the language callbacks, `grammars_eager.json.gz` and `grammars_all.json.zst` serialize the language definitions Pi 1.0.0 registers (`automation/gen/generate-highlight-grammars.mjs`), and `testdata/corpus.json` holds the test inputs of highlight.js's repository at tag 10.7.3 (`automation/gen/import-highlight-corpus.mjs`).
 
 ```text
 BSD 3-Clause License
@@ -681,6 +715,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## @google/genai 2.32.0 (three enum declarations)
+
+Pi's `api/google-shared` module imports the `FinishReason`, `FunctionCallingConfigMode` and `ThinkingLevel` enums from `@google/genai`, which PiG does not ship to extensions. `coding/extension/host/subprocess/runtime-node/shims/google-genai-enums.mjs` holds those three declarations, copied byte for byte from `dist/node/index.mjs` of the npm package `@google/genai@2.32.0` (integrity `sha512-+PDtco2/Z0ONdzCGekCoCT+O1VJS9xJQNN4XzQpXG/t3El/SWWMkCWlFRO1KmivOHPa4Q0VjUYu1HBKCZ/v33Q==`) by `automation/gen/vendor-pi-ai-apis.mjs`, with the package's licence header. The package is licensed under the Apache License, Version 2.0; the file keeps its notice (`Copyright 2025 Google LLC`, `SPDX-License-Identifier: Apache-2.0`) and the canonical text is in `LICENSES/Apache-2.0.txt`. The package has no `NOTICE` file.
+
 ## Independent Node SDK dependencies
 
 `automation/gen/vendor-pi-dist.sh` copies the following exact production dependencies from the locked Pi 0.87.1 installation. Paths are relative to `coding/extension/host/subprocess/runtime-node/shims/`. Each package retains its published manifest and complete license. The Photon package includes its published WebAssembly image-processing asset; it is not an extension runtime.
@@ -688,7 +726,7 @@ SOFTWARE.
 | Package | Version | License | Retained notice and license |
 |---|---|---|---|
 | chalk | 6.0.0 | MIT | `chalk/license` |
-| undici | 8.10.2 | MIT | `undici/LICENSE` |
+| undici | 8.12.4 | MIT | `undici/LICENSE` |
 | semver | 7.8.5 | ISC | `semver/LICENSE` |
 | minimatch | 11.0.3 | BlueOak-1.0.0 | `minimatch/LICENSE.md` |
 | @isaacs/nonrecursive-glob-match | 1.0.3 | BlueOak-1.0.0 | `minimatch/node_modules/@isaacs/nonrecursive-glob-match/LICENSE.md` |
@@ -696,7 +734,7 @@ SOFTWARE.
 | balanced-match | 4.0.4 | MIT | `minimatch/node_modules/brace-expansion/node_modules/balanced-match/LICENSE.md` |
 | hosted-git-info | 9.0.3 | ISC | `hosted-git-info/LICENSE` |
 | lru-cache | 11.4.0 | BlueOak-1.0.0 | `hosted-git-info/node_modules/lru-cache/LICENSE.md` |
-| grok-mermaid | 0.2.3 | Apache-2.0 | `grok-mermaid/LICENSE` |
+| lovely-mermaid | 0.3.3 | Apache-2.0 | `lovely-mermaid/LICENSE` |
 | @silvia-odwyer/photon-node | 0.3.4 | Apache-2.0 | `photon-node/LICENSE.md` |
 | proper-lockfile | 4.1.2 | MIT | `proper-lockfile/LICENSE` |
 | retry | 0.12.0 | MIT | `proper-lockfile/node_modules/retry/License` |
@@ -717,13 +755,17 @@ Source: <https://github.com/libuv/libuv/blob/v1.51.0/src/win/process.c>
 
 `extensions/sdk/json/` derives from the Go Authors' Go 1.27.1 `src/encoding/json` implementation, with lossless UTF-16 surrogate handling for the extension wire. It retains the Go Authors' copyright headers and BSD-3-Clause license in `extensions/sdk/json/LICENSE`. `extensions/sdk/json/README.md` records the source files and local modifications. The SDK source bundle carries this license.
 
+## Go sort
+
+`internal/sortx/zsortfunc.go` is the Go Authors' Go 1.27.3 `src/sort/zsortfunc.go` with the `lessSwap`, `sortedHint`, `xorshift` and `nextPowerOfTwo` declarations of `src/sort/sort.go` that it needs, under the package name `sortx`. It retains the Go Authors' copyright header, under the BSD-3-Clause license in `LICENSES/BSD-3-Clause.txt`.
+
 ## Unicode 17.0.0 character data
 
 The generated `tui/widthx/unicode_tables.go` derives character properties and emoji sequences from the Unicode Character Database and Unicode emoji data, pinned in `tui/widthx/gen/inputs.sha256`. Copyright © 1991-2026 Unicode, Inc. Used under Unicode License V3, reproduced in `LICENSES/Unicode-3.0.txt` (source: https://www.unicode.org/license.txt). This data license supplements the MIT license for the Go implementation.
 
 ## quickjs-wasi 3.6.2 and the codemode prelude
 
-`codemode/assets/quickjs.wasm` is the unmodified `quickjs.wasm` of the npm package `quickjs-wasi@3.6.2` (SHA-256 `d4c9375f2b1ca4dc95f72c8aa2982a7a9951ac8011490d79c6582df732b4bbd9`), the engine that upstream's codemode package runs. The module contains QuickJS-NG (MIT, copyright Ben Noordhuis, Saúl Ibarra Corretgé, Fabrice Bellard and Charlie Gordon) and wasi-libc from wasi-sdk 30. PiG hosts it with wazero (Apache-2.0, `LICENSES/Apache-2.0.txt`). `codemode/assets/prelude.js` is upstream's `PRELUDE_SOURCE` (MIT, copyright (c) 2025 Mario Zechner). `codemode/assets/PROVENANCE.md` records the source and the refresh procedure.
+`codemode/assets/raw/quickjs.wasm` (embedded as `codemode/assets/quickjs.wasm.zst`) and `coding/extension/host/subprocess/runtime-node/shims/quickjs-wasi/quickjs.wasm` are the unmodified `quickjs.wasm` of the npm package `quickjs-wasi@3.6.2` (SHA-256 `d4c9375f2b1ca4dc95f72c8aa2982a7a9951ac8011490d79c6582df732b4bbd9`), the engine that upstream's codemode package runs. The compiled WebAssembly binaries contain QuickJS-NG (MIT, copyright Ben Noordhuis, Saúl Ibarra Corretgé, Fabrice Bellard and Charlie Gordon) and wasi-libc from wasi-sdk 30 (`WebAssembly/wasi-sdk` tag `wasi-sdk-30`, commit `3d4ea12dbee832e92a4734c938fa980395f59da3`; `WebAssembly/wasi-libc` submodule commit `ec0effd769df5f05b647216578bcf5d3b5449725`). PiG hosts it with wazero (Apache-2.0, `LICENSES/Apache-2.0.txt`). `codemode/assets/prelude.js` is upstream's `PRELUDE_SOURCE` (MIT, copyright (c) 2025 Mario Zechner). `codemode/assets/PROVENANCE.md` records the source and the refresh procedure.
 
 ```text
 MIT License
@@ -749,11 +791,135 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
+### wasi-libc (wasi-sdk 30)
+
+Source: <https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-30> (commit `3d4ea12dbee832e92a4734c938fa980395f59da3`), `src/wasi-libc` at <https://github.com/WebAssembly/wasi-libc/tree/ec0effd769df5f05b647216578bcf5d3b5449725>
+
+License texts are reproduced in `LICENSES/Apache-2.0.txt`, `LICENSES/LLVM-exception.txt`, `LICENSES/MIT.txt`, `LICENSES/BSD-2-Clause.txt`, `LICENSES/BSD-3-Clause.txt`, and `LICENSES/CC0-1.0.txt`.
+
+Top-level `wasi-libc/LICENSE`:
+
+```text
+wasi-libc as a whole is multi-licensed under the
+Apache License v2.0 with LLVM Exceptions, the Apache License v2.0, and
+the MIT License. See the LICENSE-APACHE-LLVM, LICENSE-APACHE and LICENSE-MIT
+files, respectively, for details.
+
+Portions of this software are derived from third-party works covered by
+their own licenses:
+
+dlmalloc/                     - CC0; see the notice in malloc.c for details
+emmalloc/                     - MIT; see the notice in emmalloc.c for details
+libc-bottom-half/cloudlibc/   - BSD-2-Clause; see the LICENSE file for details
+libc-top-half/musl/           - MIT; see the COPYRIGHT file for details
+fts/musl-fts/                 - BSD-3-Clause; see the COPYING file for details
+
+wasi-libc's changes to these files are multi-licensed under the
+Apache License v2.0 with LLVM Exceptions, the Apache License v2.0,
+the MIT License, and the original licenses of the third-party works.
+```
+
+Component notices from `WebAssembly/wasi-libc@ec0effd769df5f05b647216578bcf5d3b5449725`:
+
+- **dlmalloc** (`dlmalloc/src/malloc.c`, CC0-1.0): written by Doug Lea and released to the public domain under CC0 1.0 Universal (`LICENSES/CC0-1.0.txt`).
+- **emmalloc** (`emmalloc/emmalloc.c`, MIT): `Copyright 2018 The Emscripten Authors. All rights reserved.` (dual-licensed under MIT and UIUC/NCSA; included under MIT per `wasi-libc/LICENSE`).
+- **cloudlibc** (`libc-bottom-half/cloudlibc/LICENSE`, BSD-2-Clause):
+
+```text
+Copyright (c) 2015-2017 Nuxi (https://nuxi.nl/) and contributors.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGE.
+```
+
+- **musl** (`libc-top-half/musl/COPYRIGHT`, MIT):
+
+```text
+Copyright © 2005-2020 Rich Felker, et al.
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+- **musl-fts** (`fts/musl-fts/COPYING`, BSD-3-Clause):
+
+```text
+Copyright (c) 1989, 1993
+   The Regents of the University of California.  All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+3. Neither the name of the University nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGE.
+```
+
 ## Model Context Protocol TypeScript SDK v1.29.0 (OAuth client)
 
 Source: <https://github.com/modelcontextprotocol/typescript-sdk/blob/v1.29.0/src/client/auth.ts>
 
 `mcp/oauth` translates, through upstream's `packages/mcp/src/oauth`, the SDK's OAuth client subset (discovery, PKCE authorization code flow, dynamic client registration, token refresh) into Go. It retains the notice Copyright (c) 2024 Anthropic, PBC, under the MIT license reproduced in `LICENSES/MIT.txt`.
+
+## modernc.org/sqlite v1.62.0 (SQLite driver layer, PiG fork)
+
+Source: <https://gitlab.com/cznic/sqlite/-/tree/v1.62.0>
+
+Distributed files: `third_party/sqlite/`, a package of the root module. The directory is the non-test Go files of the v1.62.0 root package (the `database/sql/driver` layer; the transpiled SQLite library `modernc.org/sqlite/lib` stays the module dependency) with the changes listed in `third_party/sqlite/FORK.md` (a `_threading_mode` DSN parameter, and no `database/sql` registration).
+
+- Copyright (c) 2017 The Sqlite Authors.
+- License: BSD-3-Clause, in `third_party/sqlite/LICENSE` and `LICENSES/BSD-3-Clause.txt`.
 
 ## santhosh-tekuri/jsonschema v6.0.2 (JSON Schema validator, PiG fork)
 
@@ -781,6 +947,15 @@ Distributed files: `third_party/semver/`, a package of the root module. The dire
 
 - Copyright (C) 2014-2019 Matt Butcher and Matt Farina.
 - License: MIT, in `third_party/semver/LICENSE.txt` and `LICENSES/MIT.txt`.
+
+## golang.org/x/text v0.43.0 (collation, PiG fork)
+
+Source: <https://github.com/golang/text/tree/v0.43.0>
+
+Distributed files: `third_party/collate/`, a package of the root module. It holds the algorithm of `collate` and `internal/colltab` of v0.43.0 for the root locale and the default options, and the root part of the tables of `collate/tables.go`, with the changes listed in `third_party/collate/FORK.md` (the tables of the other locales are not copied).
+
+- Copyright 2009 The Go Authors.
+- License: BSD-3-Clause, in `third_party/collate/LICENSE` and `LICENSES/BSD-3-Clause.txt`.
 
 ## evanw/esbuild v0.28.2 (plugin builds)
 

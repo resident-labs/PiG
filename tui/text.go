@@ -19,12 +19,17 @@ type Text struct {
 	PaddingX   int
 	PaddingY   int
 	CustomBgFn func(string) string
-	Style      string // pig compatibility: extra ANSI prefix applied per line
 
 	cachedText  string
 	cachedWidth int
 	cachedLines []string
 	cacheValid  bool
+	// rendered reports that Render drew the text. wrapCache keeps the padded rows of each line of the text drawn last, for
+	// the width and padding in wrapWidth and wrapPaddingX; it is made when a drawn text changes and dropped by Invalidate.
+	rendered     bool
+	wrapCache    *widthx.LineWrapCache
+	wrapWidth    int
+	wrapPaddingX int
 }
 
 // NewText creates a text component. pig keeps zero padding as the default for
@@ -43,7 +48,14 @@ func (t *Text) SetText(content string) {
 		return
 	}
 	t.Content = content
-	t.Invalidate()
+	// The text changed after it was drawn: the lines it keeps are drawn again from the rows of the last text, not wrapped again. A text
+	// that is never drawn twice with different content holds no such rows.
+	t.invalidatable.Invalidate()
+	t.cacheValid = false
+	t.cachedLines = nil
+	if t.rendered && t.wrapCache == nil {
+		t.wrapCache = &widthx.LineWrapCache{}
+	}
 }
 
 // SetPaddingX sets the horizontal padding and invalidates the cached lines (text.ts setPaddingX).
@@ -61,6 +73,7 @@ func (t *Text) Invalidate() {
 	t.invalidatable.Invalidate()
 	t.cacheValid = false
 	t.cachedLines = nil
+	t.wrapCache = nil
 }
 
 func (t *Text) Render(width int) []string {
@@ -72,6 +85,7 @@ func (t *Text) Render(width int) []string {
 		t.cachedWidth = width
 		t.cachedLines = []string{}
 		t.cacheValid = true
+		t.rendered = true
 		return t.cachedLines
 	}
 
@@ -80,41 +94,47 @@ func (t *Text) Render(width int) []string {
 	// available width (upstream text.ts clamps paddingX the same way).
 	paddingX := min(t.PaddingX, max(0, (width-1)/2))
 	contentWidth := max(1, width-paddingX*2)
-	wrapped := widthx.WrapTextWithAnsi(normalized, contentWidth)
-	left := strings.Repeat(" ", paddingX)
-	right := strings.Repeat(" ", paddingX)
-	contentLines := make([]string, 0, len(wrapped))
-
-	for _, line := range wrapped {
-		lineWithMargins := left + line + right
-		if t.Style != "" {
-			// Close common text styles without resetting background color.
-			lineWithMargins = t.Style + lineWithMargins + SGRFgReset + SGRBoldDimReset + SGRItalicReset + SGRUnderlineReset + SGRStrikeReset + SGRInverseReset
+	margin := strings.Repeat(" ", paddingX)
+	var contentLines []string
+	if t.wrapCache != nil && t.CustomBgFn == nil {
+		// The lines the last text left unchanged keep their padded rows: a streamed tool call changes the end of its text.
+		if t.wrapPaddingX != paddingX || t.wrapWidth != width {
+			t.wrapCache.Reset()
 		}
-		if t.CustomBgFn != nil {
-			contentLines = append(contentLines, t.CustomBgFn(padToWidth(lineWithMargins, width)))
-		} else {
-			contentLines = append(contentLines, padToWidth(lineWithMargins, width))
+		t.wrapPaddingX, t.wrapWidth = paddingX, width
+		contentLines = t.wrapCache.Wrap(normalized, contentWidth, func(row string) string { return padToWidth(margin+row+margin, width) })
+	} else {
+		wrapped := widthx.WrapTextWithAnsi(normalized, contentWidth)
+		contentLines = make([]string, 0, len(wrapped))
+		for _, line := range wrapped {
+			lineWithMargins := margin + line + margin
+			if t.CustomBgFn != nil {
+				contentLines = append(contentLines, t.CustomBgFn(padToWidth(lineWithMargins, width)))
+			} else {
+				contentLines = append(contentLines, padToWidth(lineWithMargins, width))
+			}
 		}
 	}
 
+	// The background function runs once per padding row, after the content rows, as text.ts calls it.
 	emptyLine := strings.Repeat(" ", max(width, 0))
-	if t.CustomBgFn != nil {
-		emptyLine = t.CustomBgFn(emptyLine)
+	emptyLines := make([]string, max(t.PaddingY, 0))
+	for i := range emptyLines {
+		emptyLines[i] = emptyLine
+		if t.CustomBgFn != nil {
+			emptyLines[i] = t.CustomBgFn(emptyLine)
+		}
 	}
 	result := make([]string, 0, capHint(len(contentLines), 2*t.PaddingY))
-	for range t.PaddingY {
-		result = append(result, emptyLine)
-	}
+	result = append(result, emptyLines...)
 	result = append(result, contentLines...)
-	for range t.PaddingY {
-		result = append(result, emptyLine)
-	}
+	result = append(result, emptyLines...)
 
 	t.cachedText = t.Content
 	t.cachedWidth = width
 	t.cachedLines = result
 	t.cacheValid = true
+	t.rendered = true
 	return result
 }
 

@@ -1086,23 +1086,26 @@ type treeSection func(width int) []string
 func (s treeSection) Render(width int) []string { return s(max(width, 0)) }
 func (treeSection) Invalidate()                 {}
 
-// renderHelp draws the key hint rows; the header stays visible while label input replaces the tree rows (TreeHelp).
+// renderHelp draws the key hint rows; the header stays visible while label input replaces the tree rows (TreeHelp). The rows are already wrapped to the width, which is never below one cell.
 func (t *TreeSelectorComponent) renderHelp(width int) []string {
-	headerHint := treeHelpLines(width)
-	lines := make([]string, 0, len(headerHint))
-	for _, line := range headerHint {
-		lines = append(lines, widthx.TruncateToWidth(line, width, "...", false))
-	}
-	return lines
+	return treeHelpLines(width)
 }
 
-// renderSearchLine draws "Type to search:" in muted, mirroring tree-selector.ts:1169-1171; the active query renders in accent after it (SearchLine).
+// renderSearchLine draws "Type to search:" in muted, mirroring tree-selector.ts SearchLine; the active query renders in accent after it.
+// Pi main 2cfab7c26 (#9157), in the pin, draws the line with a trailing space when the query is empty and, while the selector is
+// focused and no label is being edited, a CURSOR_MARKER plus a reverse-video cell in the last column, as Resume Session's search does.
 func (t *TreeSelectorComponent) renderSearchLine(width int) []string {
-	searchLine := "  " + fg(ActiveTheme().Muted, "Type to search:")
-	if t.searchQuery != "" {
-		searchLine += " " + fg(ActiveTheme().Accent, t.searchQuery)
+	if width <= 0 {
+		return []string{""}
 	}
-	return []string{widthx.TruncateToWidth(searchLine, width, "...", false)}
+	searchLine := "  " + fg(ActiveTheme().Muted, "Type to search:") + " "
+	if t.searchQuery != "" {
+		searchLine += fg(ActiveTheme().Accent, t.searchQuery)
+	}
+	if !t.focused || t.labelInput != nil {
+		return []string{widthx.TruncateToWidth(searchLine, width, "...", false)}
+	}
+	return []string{widthx.TruncateToWidth(searchLine, max(0, width-1), "...", false) + widthx.CursorMarker + "\x1b[7m \x1b[27m"}
 }
 
 // renderLabelInput draws the label prompt, the shared Input and the configured key hints while a label is edited (LabelInput).
@@ -1429,7 +1432,7 @@ func (t *TreeList) HandleInput(data string) {
 			t.recomputeVisible()
 		}
 	case kb.Matches(data, "app.tree.editLabel"):
-		if len(t.rows) > 0 && t.cursor >= 0 && t.cursor < len(t.rows) {
+		if t.cursorInRange() {
 			t.labelNode = t.rows[t.cursor].node
 			t.labelInput = NewInput(InputOptions{})
 			t.labelInput.SetFocused(t.focused)
@@ -1489,9 +1492,6 @@ func (t *TreeList) handleLabelInput(data string) {
 
 // cycleFilterMode cycles the filter, clears folds, and preserves selection through the shared visibility rebuild.
 func (t *TreeList) cycleFilterMode(direction int) {
-	if len(t.filterModes) <= 1 {
-		return
-	}
 	idx := 0
 	for i, m := range t.filterModes {
 		if m == t.filterMode {

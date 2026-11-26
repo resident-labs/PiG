@@ -45,13 +45,17 @@ class: `session-` / `sm-` SessionManager, `settings-` SettingsManager, `registry
 | model calls: `modelStream`, `complete`, `classify`, `generateImages`, `ModelRegistry`, event streams, fetch transport | `model-stream`, `model-types`, `event-stream` |
 | session replacement (`new-session`, `fork`, `navigate-tree`, `switch-session`), child agent sessions, `createAgentSessionRuntime`, services | `session-ops`, `child-session`, `agent-runtime` |
 | session graph: SessionManager, SettingsManager, resource loader, package manager, project trust, host info, ModelRuntime, ExtensionRunner, extension factories, MCP options, the event bus, builtin tool delegation | `session-manager`, `settings-manager`, `resource-loader`, `package-manager`, `project-trust`, `host-info`, `model-runtime`, `create-provider`, `extension-runner`, `extension-factories`, `mcp-options`, `event-bus`, `builtin-tool` |
-| pure helpers: Type engine, pi-ai, pi-tui (width, keys, fuzzy, colors, keybindings incl. `tui-get-select-page-index`, theme), compaction, truncation, conversation, frontmatter/diff/image/clipboard host calls | `type-engine`, `type-schema`, `pi-ai`, `tui-*`, `compaction`, `truncate`, `conversation`, `coding-helpers`, `host-helper` |
+| pure helpers: Type engine (`value-check` and `value-errors` are pi-ai's `Value.Check` and `Value.Errors` and run `type-refine` refinements), pi-ai, pi-tui (width, keys, fuzzy, colors, keybindings incl. `tui-get-select-page-index`, theme), compaction, truncation, conversation, frontmatter/diff/image/clipboard host calls | `type-engine`, `type-schema`, `pi-ai`, `tui-*`, `compaction`, `truncate`, `conversation`, `coding-helpers`, `host-helper` |
 
 `ctx-call-host` stays the escape hatch for any wire method. A member the SDK does not serve signals `pig:unsupported-capability` naming the lane that owns
 it (the few that remain are the `gap:` cells shared with the other SDKs in `test/parity/sdk-exports.toml`).
 
 The feature files plug into the connection loop through `src/hooks.lisp` (`def-register-contributor`, `def-ready-hook`, `def-state-hook`,
 `def-stop-hook`, `def-notify`, `def-request`, `extension-extra`), so `dispatch.lisp` knows no feature.
+
+## Stack
+
+Every thread of the image has SBCL's default 2 MB control stack (a larger one is committed in full by every thread on Windows). Values the host sends nest up to 10000 levels and can be wide, so the walks over them do not recurse on that stack past a fixed depth: the JSON reader and writer (`json.lisp`, bound `*max-json-depth*` = 10016) recurse to 256 levels and keep deeper containers on a stack of their own, and the event-stream copy (`clone-stream-value`), the key ordering of tool arguments (`core-js-ordered`), `cx-json-stringify`, the bigint check (`ts-holds-big-int`) and the palette comparison (`ts-json-equal`) are iterative. `cx-json-stringify` writes to one stream, never an `&rest` list, so width costs no stack either. `tests/deep-tests.lisp` runs each at 10000 levels and 200000 members on the 2 MB stack of the test runner. The walks that stay recursive are bounded by something other than the host's data: schemas and values an extension hands to the type engine (`te-encode`, `te-decode`; Pi's TypeBox recurses the same way), `cx-js-value-string` and `ai-js-string` (arrays only, measured to 12600 levels), and the length of a delta's path (`stream-update`, to 28000 steps).
 
 ## Tests
 

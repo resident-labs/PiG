@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, } from "node:fs";
-import { join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
+import { ModelsError } from "../pi-ai/sdk-bundle/index.js";
 import { Markdown } from "../../pi-tui.mjs";
 import chalk from "../../chalk/source/index.js";
 import lockfile from "../../proper-lockfile.mjs";
@@ -7,7 +8,7 @@ import { selectConfig } from "./cli/config-selector.js";
 import { createProjectTrustContext } from "./cli/project-trust.js";
 import { APP_NAME, CONFIG_DIR_NAME, detectInstallChange, detectInstallMethod, getAgentDir, getConfiguredSelfUpdateArgv, getPackageDir, getSelfUpdateCommand, getSelfUpdateUnavailableInstruction, makeConfiguredSelfUpdateCommand, PACKAGE_NAME, VERSION, } from "./config.js";
 import { ModelRuntime } from "./core/model-runtime.js";
-import { DefaultPackageManager } from "./core/package-manager.js";
+import { DefaultPackageManager, isOfflineModeEnabled } from "./core/package-manager.js";
 import { resolveProjectTrusted } from "./core/project-trust.js";
 import { DefaultResourceLoader, formatPackageInstallWarning, isBuiltinExtension } from "./core/resource-loader.js";
 import { SettingsManager } from "./core/settings-manager.js";
@@ -67,11 +68,24 @@ async function runManagedNpmCi(stageDir) {
     if (code !== 0)
         throw new Error(`npm ${args.join(" ")} exited with code ${code ?? "unknown"}`);
 }
+/**
+ * Environment for the managed release smoke test, with the Node.js running this update
+ * first on PATH. On Windows the managed launcher runs Pi on the installer's standalone
+ * Node without changing PATH, so the release's `node_modules/.bin` shim may otherwise
+ * run an older system Node that cannot load the new release.
+ */
+function getManagedReleaseVerifyEnv() {
+    const nodeDir = dirname(process.execPath);
+    const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+    const currentPath = process.env[pathKey] ?? "";
+    return { ...process.env, [pathKey]: [nodeDir, currentPath].filter(Boolean).join(delimiter) };
+}
 function verifyManagedRelease(releaseDir, expectedVersion) {
     const binPath = join(releaseDir, "node_modules", ".bin", process.platform === "win32" ? `${APP_NAME}.cmd` : APP_NAME);
     const result = spawnProcessSync(binPath, ["--version"], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
+        env: getManagedReleaseVerifyEnv(),
     });
     if (result.error || result.status !== 0) {
         const reason = result.error?.message || result.stderr.trim() || `exit code ${result.status ?? "unknown"}`;
@@ -552,9 +566,18 @@ async function refreshModelCatalogs(agentDir) {
         if (result.aborted) {
             throw new Error("Model catalog refresh timed out.");
         }
-        if (result.errors.size > 0) {
-            const details = Array.from(result.errors, ([provider, error]) => `${provider}: ${error.message}`).join("; ");
-            throw new Error(`Could not refresh model catalogs: ${details}`);
+        const failures = [];
+        for (const [provider, error] of result.errors) {
+            // A stale login only affects that provider's catalog; the others are still worth refreshing.
+            if (error instanceof ModelsError && error.code === "oauth") {
+                console.warn(chalk.yellow(`Warning: skipped model catalog for ${provider}: ${error.message}\nLog in again with \`${APP_NAME} auth login ${provider}\` to refresh it.`));
+            }
+            else {
+                failures.push(`${provider}: ${error.message}`);
+            }
+        }
+        if (failures.length > 0) {
+            throw new Error(`Could not refresh model catalogs: ${failures.join("; ")}`);
         }
     }
     finally {
@@ -885,11 +908,19 @@ export async function handlePackageCommand(args, runtimeOptions = {}) {
     reportSettingsErrors(settingsManager, "package command");
     const selfUpdateNpmCommand = settingsManager.getGlobalSettings().npmCommand;
     const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+    // Update result events describe a changed package, e.g. "npm:foo 1.2.0 -> 1.3.0".
+    const updatedPackages = [];
+    // Progress messages are warnings, e.g. npm reinstalled the old version from stale registry metadata.
+    let warningCount = 0;
     packageManager.setProgressCallback((event) => {
-        if (event.type === "start") {
+        if (event.type === "result" && event.action === "update" && event.message) {
+            updatedPackages.push(event.message);
+        }
+        else if (event.type === "start") {
             process.stdout.write(chalk.dim(`${event.message}\n`));
         }
         else if (event.type === "progress" && event.message) {
+            warningCount++;
             process.stdout.write(chalk.yellow(`${event.message}\n`));
         }
     });
@@ -948,11 +979,24 @@ export async function handlePackageCommand(args, runtimeOptions = {}) {
                 if (updateTargetIncludesExtensions(target)) {
                     const updateSource = target.type === "extensions" ? target.source : undefined;
                     await packageManager.update(updateSource);
-                    if (updateSource) {
-                        console.log(chalk.green(`Updated ${updateSource}`));
+                    // Only claim "up to date" when the update actually checked and nothing warned.
+                    if (isOfflineModeEnabled()) {
+                        console.log(chalk.yellow("Skipped package updates (offline mode)"));
+                    }
+                    else if (updatedPackages.length === 0 && warningCount > 0) {
+                        console.log(chalk.yellow(updateSource
+                            ? `${updateSource} was not updated, see the warnings above`
+                            : "No packages were updated, see the warnings above"));
+                    }
+                    else if (updatedPackages.length === 0) {
+                        console.log(chalk.green(updateSource ? `${updateSource} is already up to date` : "Packages are already up to date"));
                     }
                     else {
-                        console.log(chalk.green("Updated packages"));
+                        const count = updatedPackages.length;
+                        console.log(chalk.green(`Updated ${count} package${count === 1 ? "" : "s"}:`));
+                        for (const message of updatedPackages) {
+                            console.log(`  ${message}`);
+                        }
                     }
                 }
                 if (updateTargetIncludesSelf(target)) {

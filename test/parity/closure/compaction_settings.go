@@ -13,6 +13,7 @@ type closureVerticalBehavior struct {
 	facets         []string
 	upstreamRanges []sourceRange
 	targets        []providerWireTarget
+	route          []sourceRange
 }
 
 func AddCompactionSettingsBehaviors(root string, snapshot *Snapshot, records []Record) ([]Record, error) {
@@ -52,7 +53,7 @@ func AddCompactionSettingsBehaviors(root string, snapshot *Snapshot, records []R
 			if err != nil {
 				return nil, fmt.Errorf("add %s target: %w", targetDefinition.id, err)
 			}
-			rootPinIDs, err := addSourceRanges(root, snapshot, pins, []sourceRange{targetDefinition.rootRef})
+			rootPinIDs, err := addSourceRanges(root, snapshot, pins, append([]sourceRange{targetDefinition.rootRef}, definition.route...))
 			if err != nil {
 				return nil, fmt.Errorf("add %s reachability: %w", targetDefinition.id, err)
 			}
@@ -91,10 +92,15 @@ func AddCompactionSettingsBehaviors(root string, snapshot *Snapshot, records []R
 
 func compactionSettingsDefinitions() []closureVerticalBehavior {
 	compactionRoot := sourceRange{repository: "pig", path: "coding/session.go", semanticID: "coding.Session.compaction-call", start: "prep := compaction.PrepareCompaction(entries, settings)", end: "if err == nil && compactCtx.Err() != nil {"}
+	standaloneRoute := []sourceRange{
+		{repository: "pig", path: "coding/session_summarization_auth.go", semanticID: "coding.Session.standalone-compaction-dispatch", start: "func (s *Session) runDefaultCompaction(", end: "// sessionRequest is one request"},
+		{repository: "pig", path: "internal/codingagent/compaction/compaction.go", semanticID: "compaction.CompactStandalone", start: "func CompactStandalone(", end: "func compact("},
+	}
+	prefixCall := sourceRange{repository: "pig", path: "internal/codingagent/compaction/compaction.go", semanticID: "compaction.compact.turn-prefix-call", start: "prefixSummary, prefixUsage, err := generateTurnPrefixSummary(", end: "if err != nil {"}
 	settingsRoot := sourceRange{repository: "pig", path: "internal/codingagent/slash_session_handlers.go", semanticID: "codingagent.settings.selector", start: "func settingsHandler(sc *SlashContext) error {", end: "return settingsHandlerTUI(sc, config)"}
 	compactTarget := providerWireTarget{
-		id: "compaction-compact", symbol: "compaction.Compact", goFact: "go:github.com/MichaelKinsy/PiG/internal/codingagent/compaction#Compact",
-		rangeRef: sourceRange{repository: "pig", path: "internal/codingagent/compaction/compaction.go", semanticID: "compaction.Compact", start: "func Compact(", end: ""}, rootRef: compactionRoot,
+		id: "compaction-compact", symbol: "compaction.compact", goFact: "go:github.com/MichaelKinsy/PiG/internal/codingagent/compaction#compact",
+		rangeRef: sourceRange{repository: "pig", path: "internal/codingagent/compaction/compaction.go", semanticID: "compaction.compact", start: "func compact(", end: ""}, rootRef: compactionRoot,
 	}
 	cancellationTarget := providerWireTarget{
 		id: "compaction-turn-prefix-cancellation", symbol: "compaction.generateTurnPrefixSummary", goFact: "go:github.com/MichaelKinsy/PiG/internal/codingagent/compaction#generateTurnPrefixSummary",
@@ -120,11 +126,11 @@ func compactionSettingsDefinitions() []closureVerticalBehavior {
 	return []closureVerticalBehavior{
 		{
 			id: "compaction-split-order", name: "split-turn history summary completes before prefix summary", facets: []string{"order", "result"},
-			upstreamRanges: []sourceRange{{repository: "upstream", path: "packages/coding-agent/src/core/compaction/compaction.ts", semanticID: "compaction.compact.split-turn", start: "export async function compact(", end: "async function generateTurnPrefixSummary("}}, targets: []providerWireTarget{compactTarget},
+			upstreamRanges: []sourceRange{{repository: "upstream", path: "packages/coding-agent/src/core/compaction/compaction.ts", semanticID: "compaction.compact.split-turn", start: "export async function compact(", end: "async function generateTurnPrefixSummary("}}, targets: []providerWireTarget{compactTarget}, route: standaloneRoute,
 		},
 		{
 			id: "compaction-cancellation", name: "turn-prefix cancellation surfaces the exact abort error", facets: []string{"cancel", "error"},
-			upstreamRanges: []sourceRange{{repository: "upstream", path: "packages/coding-agent/src/core/compaction/compaction.ts", semanticID: "compaction.generateTurnPrefixSummary", start: "async function generateTurnPrefixSummary(", end: ""}}, targets: []providerWireTarget{cancellationTarget},
+			upstreamRanges: []sourceRange{{repository: "upstream", path: "packages/coding-agent/src/core/compaction/compaction.ts", semanticID: "compaction.generateTurnPrefixSummary", start: "async function generateTurnPrefixSummary(", end: ""}}, targets: []providerWireTarget{cancellationTarget}, route: append(slices.Clone(standaloneRoute), prefixCall),
 		},
 		{
 			id: "compaction-history-boundary", name: "prior compaction retained-root history remains summarized", facets: []string{"history", "restoration"},

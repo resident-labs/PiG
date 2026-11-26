@@ -145,8 +145,9 @@ help-parity: ## List the parity and porting targets (automation/make/parity.mk)
 ##@ Release maintenance
 
 .PHONY: set-version module-publication module-size
-set-version: ## Update the release identity; preserve dependencies unless SET_VERSION_ARGS=--release-modules
-	@./automation/ci/with-isolated-pig-home.sh go run ./automation/release/set-version -version "$(VERSION)" $(SET_VERSION_ARGS)
+set-version: ## Update the release identity, then regenerate the SDK bundles that carry the version (not on a dry run); preserve dependencies unless SET_VERSION_ARGS=--release-modules
+	@PIG_CACHE_HOME="$(PIG_CACHE_HOME)" ./automation/ci/with-isolated-pig-home.sh go run ./automation/release/set-version -version "$(VERSION)" $(SET_VERSION_ARGS)
+	@$(if $(findstring --dry-run,$(SET_VERSION_ARGS)),:,$(MAKE) sdk-bundles)
 
 module-publication: ## Verify nested Go dependency tags and checksums against their public source
 	@./automation/ci/with-isolated-pig-home.sh python3 -B -m unittest automation/ci/test_module_publication.py
@@ -167,6 +168,15 @@ clean: ## Remove bin/ and tmp/ (builds, eval results, profiles, benchmarks)
 node-runtime: ## Regenerate the embedded Node runtime archive and content digest
 	go generate ./coding/extension/host/subprocess
 
+node-runtime-drift: ## Fail when the embedded Node runtime archive or digest differs from runtime-node (regenerate with make node-runtime)
+	go test -count=1 ./coding/extension/host/subprocess -run "^TestNodeRuntimeArchiveMatchesSources$$"
+
+# The shims follow the installed oracle, the archive follows the shims: the two gates cover the two links, and make generate runs both writers in that order.
+vendor-pi-dist-drift: parity-deps ## Fail when the vendored Pi runtime (runtime-node/shims) differs from what make vendor-pi-dist writes from the installed oracle (regenerate with make vendor-pi-dist, then make node-runtime)
+	@./automation/ci/vendor-pi-dist-drift.sh
+
+.PHONY: node-runtime-drift vendor-pi-dist-drift
+
 build: node-runtime ## Compile every package (go build ./...)
 	go build -buildvcs=false ./...
 
@@ -176,7 +186,7 @@ install: node-runtime ## Install a stripped pig to PIG_BIN (default ~/.local/bin
 	@mkdir -p $(dir $(PIG_BIN))
 	CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags "-s -w -X github.com/MichaelKinsy/PiG/coding/cli.Build=$$(git rev-parse --short HEAD 2>/dev/null || echo dev)" -o $(PIG_BIN) ./cmd/pig
 	@[ "$$(uname -s)" = "Darwin" ] && command -v codesign >/dev/null 2>&1 && codesign --force --sign - $(PIG_BIN) >/dev/null 2>&1 || true
-	@echo "installed: $$($(PIG_BIN) --version) → $(PIG_BIN)"
+	@echo "installed: $$($(PIG_BIN) version | sed -n 1p) → $(PIG_BIN)"
 
 # build-env-daemons: one static pi-env daemon per remote system the SSH bootstrap supports, laid out as the bootstrap
 # looks for them: $(ENV_DAEMON_DIR)/pi-env-<platform>-<arch>/pi-env[.exe]. Go links GOOS=android only with cgo, except on
@@ -199,11 +209,12 @@ build-env-daemons: ## Cross-build the pi-env daemon for every remote system SshC
 generate: export LC_ALL := C
 generate help-text: export FORCE_COLOR := 0
 
-generate: ## Regenerate committed inventories, coverage, catalogs, help, and docs mirrors
+generate: ## Regenerate committed inventories, coverage, catalogs, help, docs mirrors, the vendored Pi runtime and its embedded archive (needs the pinned Pi oracle: make parity-deps)
 	@$(MAKE) divergences
 	@$(MAKE) piglet-strip-ids
 	@$(MAKE) sdk-bundles
 	@$(MAKE) model-catalogs
+	@$(MAKE) vendor-pi-dist
 	@$(MAKE) node-runtime
 	@$(MAKE) highlight-grammars
 	@$(MAKE) help-text
@@ -222,11 +233,15 @@ help-text: parity-deps ## Regenerate the pinned upstream CLI help with PiG's ide
 	@./automation/gen/gen-help.sh
 
 highlight-grammars: parity-deps ## Snapshot Pi's highlight.js grammars into tui/internal/hljs and re-record Pi's highlighting oracle
-	@node automation/gen/generate-highlight-grammars.mjs "$(PI_PACKAGE_ROOT)" tui/internal/hljs
+	@dir=$$(mktemp -d) && trap 'rm -rf "$$dir"' EXIT && node automation/gen/generate-highlight-grammars.mjs "$(PI_PACKAGE_ROOT)" tui/internal/hljs "$$dir/grammars_all.json" && go run ./automation/gen/zstdfile "$$dir/grammars_all.json" tui/internal/hljs/grammars_all.json.zst
 	@node automation/gen/generate-highlight-oracle.mjs "$(PI_PACKAGE_ROOT)" tui/internal/hljs/testdata/corpus.json tui/internal/hljs/testdata/oracle.json.gz
 
 zone-names: ## Regenerate the long time-zone names Node's ICU prints for date mapping keys (needs Node; output depends on Node's ICU, so it is not part of `make generate`)
 	@node automation/gen/generate-zone-names.mjs > internal/yaml12/zonenames_gen.go
+
+intl-tables: ## Regenerate the number and time tables FormatNumber/FormatTime read from the pinned Node's Intl (needs the pinned Node; output depends on its ICU, so it is not part of `make generate`; `go test ./chord/next/surfaces` is the drift check)
+	@node automation/gen/generate-intl-tables.mjs > chord/next/surfaces/intl_gen.go.tmp && mv chord/next/surfaces/intl_gen.go.tmp chord/next/surfaces/intl_gen.go || { rm -f chord/next/surfaces/intl_gen.go.tmp; exit 1; }
+	@gofmt -w chord/next/surfaces/intl_gen.go
 
 windows-zones: ## Regenerate CLDR's Windows-to-IANA zone mapping that Node's ICU uses to name the host zone on Windows (downloads windowsZones.xml for Node's CLDR release)
 	@node automation/gen/generate-windows-zones.mjs > internal/yaml12/windowszones_gen.go
@@ -243,7 +258,7 @@ changelog-unreleased: ## Print the Unreleased changelog assembled from the fragm
 changelog-check: ## Fail on a changelog fragment that is not named <lane>-<sha>.md after a commit reachable from HEAD, is not sections of bullets, or has a "### Fixed" bullet without a reachable <!-- fix: <sha> --> marker; needs the full history (fragments listed in automation/ci/changelogfrag/legacy.txt are exempt from the name and reachability rules, not from the marker rule)
 	@go run ./automation/ci/changelogfrag -check
 
-changelog-fold: ## Fold the changelog.d fragments into the VERSION section of CHANGELOG.md and delete them (integrator; rerun at release for later fragments)
+changelog-fold: ## Fold the changelog.d fragments into the VERSION section of CHANGELOG.md and delete them (integrator; rerun at release for later fragments); stops while the Unreleased section holds entries (set-version --move-unreleased moves them) and does not fold into Unreleased
 	@test -n "$(VERSION)" || { echo "usage: make changelog-fold VERSION=x.y.z" >&2; exit 2; }
 	@go run ./automation/ci/changelogfrag -fold=$(VERSION)
 
@@ -253,31 +268,52 @@ piglet-strip-ids: ## Regenerate the Piglet strip ID table and the strip ID enums
 piglet-strip-ids-drift: ## Fail when the Piglet strip ID table or the schema strip ID enums differ from the registrations
 	@go run ./coding/piglet/internal/genstripids -check
 
-piglet-strip-build: ## Vet every package and build cmd/pig with every Piglet strip build tag (D92)
-	@tags=$$(go run ./coding/piglet/internal/genstripids -print-tags) && go vet -tags "$$tags" ./... && CGO_ENABLED=0 go build -tags "$$tags" -o /dev/null ./cmd/pig
+piglet-strip-build: ## Vet every package and build cmd/pig with every Piglet strip build tag, and run the tests written for a stripped build (D92)
+	@tags=$$(go run ./coding/piglet/internal/genstripids -print-tags) && ./automation/ci/go-vet.sh -tags "$$tags" && CGO_ENABLED=0 go build -tags "$$tags" -o /dev/null ./cmd/pig && go test -tags "$$tags" -count=1 -run '^TestStrippedMcpBuild' ./internal/codingagent
 
-# The compressed SDK copies are pure Go to regenerate (go generate runs automation/gen/embed-bundle.go and pack-lisp-sdk.go): the .gz of each SDK source, the bundle_embed.go lists, the Lisp sdk.tgz and bundle_pack.go. Each generator keeps an existing copy that already holds the source's text, so only a stale copy is rewritten.
-sdk-bundles: ## Regenerate the compressed SDK copies and embed lists of extensions/sdk, sdk-lisp, sdk-py and sdk-rs from their sources (go generate)
-	@for dir in extensions/sdk extensions/sdk-lisp extensions/sdk-py extensions/sdk-rs; do (cd $$dir && go generate .) || exit 1; done
+# piglet-strip-matrix took 2610 s (43.5 minutes) at 8 CPUs in its default mode, so it is a release gate (release-check) and a nightly job
+# (.github/workflows/nightly.yml), not a part of ci-contracts; piglet-strip-guard is the part of it a pull request runs.
+piglet-strip-matrix: ## Check cmd/pig under each Piglet strip build tag that strips a model API alone, and under all tags (slow; release-check and nightly): vet every package, test ./ai/ against the set's red list (automation/ci/stripmatrix/red) with ./ai/providers/... and ./durable/harness/..., and run the stripped binary (--list-models, provider-bridge, an extension's complete()). STRIP_MATRIX_SETS=all takes every tag alone, with vet and the binary; STRIP_MATRIX_TESTS=all also runs the tests for every set
+	@go run ./automation/ci/stripmatrix -sets $(or $(STRIP_MATRIX_SETS),api) -tests $(or $(STRIP_MATRIX_TESTS),api)
 
-sdk-bundles-drift: ## Fail when a compressed SDK copy differs from its source (regenerate with make sdk-bundles)
+piglet-strip-guard: ## Vet ./ai/... and its tests, live files included, under each Piglet strip build tag that strips a model API alone and under all tags: the fast part of piglet-strip-matrix (ci-contracts)
+	@go run ./automation/ci/stripmatrix -guard
+
+# piglet-strip-tests runs the tests of the coding agent under every strip tag set, so a test that needs a built-in a tag compiles out and
+# has no build constraint on its file fails in the night it is added. One set is the cost of the ./coding/... and ./internal/codingagent/...
+# test run plus a rebuild of what the tag changes (STRIP_TESTS_MINUTES); all 22 sets are the nightly workflow's strip-tests jobs, one per set.
+piglet-strip-tests: ## Test ./coding/... and ./internal/codingagent/... under each Piglet strip build tag alone and under all tags (hours; the nightly workflow runs one set per job): STRIP_TESTS_SET='tag,tag' takes one set, as -print-sets lists it
+	@go run ./automation/ci/stripmatrix -coding -sets all $(if $(STRIP_TESTS_SET),-set '$(STRIP_TESTS_SET)')
+
+# The SDK bundles are pure Go to regenerate (go generate in each SDK directory): the Go SDK's bundle in the root module (internal/gosdkbundle), the Python, Rust and Lisp bundles (extensions/sdk-py, sdk-rs, sdk-lisp) are sdk.zst, the SDK's files as one zstd frame, and bundle_pack.go, which embeds it with the file list and the staging hash (automation/gen/packsdk). The nested module extensions/sdk keeps the bundle it was published with, a gzip copy of each source under .gz and bundle_embed.go (automation/gen/embed-bundle.go). Each generator keeps an existing frame or copy that already holds the source's text, so only a stale one is rewritten.
+sdk-bundles: ## Regenerate the packed SDK bundles (sdk.zst, bundle_pack.go) of the Go, Python, Rust and Lisp SDKs, and the nested Go SDK module's own gzip bundle, from their sources (go generate)
+	@for dir in extensions/sdk internal/gosdkbundle extensions/sdk-lisp extensions/sdk-py extensions/sdk-rs; do (cd $$dir && go generate .) || exit 1; done
+
+sdk-bundles-drift: ## Fail when a packed SDK bundle differs from its sources (regenerate with make sdk-bundles)
 	@./automation/ci/sdk-bundles-drift.sh
 
-.PHONY: sdk-bundles sdk-bundles-drift generate divergences divergences-drift help-text highlight-grammars zone-names windows-zones piglet-strip-ids piglet-strip-ids-drift piglet-strip-build changelog-unreleased changelog-check changelog-fold
+.PHONY: sdk-bundles sdk-bundles-drift generate divergences divergences-drift divergence-approve help-text highlight-grammars zone-names intl-tables windows-zones piglet-strip-ids piglet-strip-ids-drift piglet-strip-build piglet-strip-matrix piglet-strip-guard piglet-strip-tests changelog-unreleased changelog-check changelog-fold
 
 ##@ Test and lint
 
-vet: ## Run go vet on every package, natively and for every shipped Windows architecture and for Android (Termux)
-	go vet ./...
-	GOOS=windows GOARCH=amd64 go vet ./...
-	GOOS=windows GOARCH=arm64 go vet ./...
-	CGO_ENABLED=0 GOOS=android GOARCH=arm64 go vet ./...
+vet-native: ## Run native go vet, vet-tags checks, and tagged go vet
+	./automation/ci/go-vet.sh
+	./automation/ci/vet-tags.sh check
+	python3 -B -m unittest discover -s automation/ci -p test_vet_tags.py
+	./automation/ci/go-vet.sh -tags "$$(./automation/ci/vet-tags.sh tags)"
+
+vet-platforms: ## Run cross-platform go vet for every platform declared in automation/ci/vet-tags.txt
+	./automation/ci/vet-tags.sh platforms | while read -r vars; do env $$vars ./automation/ci/go-vet.sh || exit 1; done
+
+vet: vet-native vet-platforms ## Run go vet on every package: natively, once for each platform and once with every build tag the tree declares (automation/ci/vet-tags.txt; vet-tags.sh check fails on a tag or an operating system without a row)
 
 LINT_BASE ?= main
 
 lint: ## Run golangci-lint over the repository (part of make check)
 	@echo "Running golangci-lint..."
 	go tool golangci-lint run --allow-parallel-runners --build-tags=integration,live,parity ./...
+	@echo "Running golangci-lint over the go.work modules the root pattern does not reach..."
+	for module in extensions/sdk piglets/pig-bolt piglets/porter/extensions/pig-porter; do (cd $$module && go tool golangci-lint run --allow-parallel-runners --build-tags=integration,live,parity --config $(CURDIR)/.golangci.yml ./...) || exit 1; done
 	@echo "Checking the Durable core import boundary (no encoding/json, reflect or template in the Wasm closure)..."
 	go test -count=1 ./durable/core/contracttest/boundary/
 
@@ -311,6 +347,11 @@ test-changed: test-prereqs interface-deps parity-deps durable-interop-deps ## Te
 
 .PHONY: test-changed
 
+pre-push: ## CI's cheap checks run locally the CI way: DCO, source-hygiene, shellcheck, gitleaks, ruff, docs-drift, vet, staticcheck (PIG_GATE_BASE, default origin/main)
+	@./automation/ci/pre-push-gate.sh
+
+.PHONY: pre-push
+
 # Long real-PTY sessions run on PiG and Pi; see docs/testing/journeys.md.
 JOURNEY_BASE ?= @{upstream}
 journeys: parity-deps ## Run every PTY journey against PiG and Pi (CI); timings in tmp/journeys/timing.json
@@ -319,29 +360,38 @@ journeys: parity-deps ## Run every PTY journey against PiG and Pi (CI); timings 
 journeys-changed: parity-deps ## Run only the PTY journeys whose Touches prefixes contain a file changed since JOURNEY_BASE (default @{upstream}); lane gate
 	JOURNEY_CHANGED_BASE='$(JOURNEY_BASE)' JOURNEY_PARALLEL=$${JOURNEY_PARALLEL:-2} go test -timeout 30m -tags parity ./test/journeys -run TestJourneys -count=1
 
-.PHONY: journeys journeys-changed test-aot-conformance
+.PHONY: journeys journeys-changed test-aot-conformance test-pig-bolt-build
 
 # Every maintained nested Go module must pass without workspace assistance.
 # Fixture modules are included because they exercise the same clean-clone
 # dependency boundaries as independently distributed modules.
+# GO_NESTED_MODULES is the list of them. test-sdk-go and test-go-modules test
+# each one and go-fix-clean runs go fix in each one, always with GOWORK=off.
+GO_NESTED_MODULES := \
+	extensions/sdk \
+	coding/cli/testdata/login-preview \
+	coding/extension/host/subprocess/testdata/sdk-fixture \
+	examples/extensions/go-factory \
+	examples/extensions/plan-mode \
+	piglets/pig-bolt \
+	piglets/porter/extensions/pig-porter \
+	piglets/standard
+
 test-sdk-go: ## Test the Go extension SDK module on its own
 	@cd extensions/sdk && GOWORK=off go test $(GO_TEST_CI_COUNT) ./...
 
 test-go-modules: test-sdk-go ## Test every maintained nested Go module with GOWORK=off
 	@set -eu; \
-	for module in \
-		coding/cli/testdata/login-preview \
-		coding/extension/host/subprocess/testdata/sdk-fixture \
-		examples/extensions/go-factory \
-		piglets/aot \
-		piglets/porter/extensions/pig-porter \
-		piglets/standard; do \
+	for module in $(filter-out extensions/sdk,$(GO_NESTED_MODULES)); do \
 		echo "testing Go module: $$module"; \
 		(cd "$$module" && GOWORK=off go test $(GO_TEST_CI_COUNT) ./...); \
 	done
 
-test-aot-conformance: ## Run the extension conformance suite on the compiled aot host (needs PIG_AOT_TEST_COMPILER, the Pi-Bolt 0.7.4 runtime executable)
-	@piglets/aot/conformance.sh
+test-pig-bolt-build: ## Build a compiled host with the pinned Pi-Bolt compiler (the Piglet's installer downloads and verifies it) and start it: the guard against a compiler release that crashes on PiG's runtime tree
+	@cd piglets/pig-bolt && GOWORK=off PIG_AOT_TEST_DOWNLOAD=1 go test ./extensions/boltruntime -run '^(TestBuildCompilesAnExtensionSetAndTheHostRegistersIt|TestBuildCompilesAnExtensionThatLocatesItselfAndItFindsItsFiles|TestBuildRefusesWhatTheRewriteCannotPin)$$' -count=1 -timeout 20m -v
+
+test-aot-conformance: ## Run the extension conformance suite on the compiled Pi-Bolt host (needs PIG_AOT_TEST_COMPILER, the Pi-Bolt 1.1.2 runtime executable)
+	@piglets/pig-bolt/conformance.sh
 
 # The Rust SDK's own unit tests. `test` builds the Rust conformance fixtures,
 # which compiles the SDK library but not its test targets, so a test-only break
@@ -360,7 +410,27 @@ lint-rust: ## cargo fmt --check and cargo clippy --all-targets -D warnings over 
 test-sdk-py: ## Run the Python extension SDK's pytest suite with its hash-locked dev dependencies
 	@PIG_CACHE_HOME="$(PIG_CACHE_HOME)" ./automation/ci/test-sdk-py.sh
 
-.PHONY: test-sdk-py
+# The same suite under CPython 3.11, the oldest interpreter the SDK supports (requires-python >=3.11): its JSON reader is bound by the recursion limit, so tests/test_deep_frames.py guards that
+# a frame of the 10000 levels the host sends is still read there. PIG_SDK_PY_311 names the interpreter; CI installs one with actions/setup-python.
+PIG_SDK_PY_311 ?= python3.11
+test-sdk-py-311: ## Run the Python extension SDK's pytest suite under CPython 3.11 (PIG_SDK_PY_311 names the interpreter)
+	@command -v "$(PIG_SDK_PY_311)" >/dev/null || { echo "test-sdk-py-311: no Python 3.11 interpreter at $(PIG_SDK_PY_311): install one or set PIG_SDK_PY_311" >&2; exit 1; }
+	@"$(PIG_SDK_PY_311)" -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 11) else "test-sdk-py-311: $(PIG_SDK_PY_311) is Python %d.%d, not 3.11" % sys.version_info[:2])'
+	@PIG_CACHE_HOME="$(PIG_CACHE_HOME)" PIG_SDK_PY_PYTHON="$(PIG_SDK_PY_311)" ./automation/ci/test-sdk-py.sh
+
+.PHONY: test-sdk-py test-sdk-py-311 lint-sdk-py lint-shell
+
+# The Python SDK's ruff check, the one the Security workflow's Source assurance job runs (ruff is pinned in automation/ci/security-tools.in; install: pip install -r automation/ci/security-tools.txt).
+# The binary embeds extensions/sdk-py (sdk.zst, bundle_pack.go): after ruff the target runs the pack drift check, so a source change without make sdk-bundles fails here and not only in CI Bookkeeping.
+lint-sdk-py: ## ruff check over the Python extension SDK and the drift check of its packed bundle (the Security workflow runs this target)
+	@command -v ruff >/dev/null || { echo "lint-sdk-py: ruff not found; pip install --require-hashes -r automation/ci/security-tools.txt" >&2; exit 1; }
+	ruff check extensions/sdk-py
+	@./automation/ci/sdk-bundles-drift.sh extensions/sdk-py
+
+# ShellCheck over the tracked shell scripts, the one the Security workflow's Source assurance job runs. It fails when the installed ShellCheck is not the
+# version pinned in automation/ci/install-shellcheck.sh (the one place the version lives; make pre-push shares this script).
+lint-shell: ## ShellCheck (CI's pinned version) over the tracked shell scripts under automation and docs/site/public (the Security workflow runs this target)
+	@./automation/ci/lint-shell.sh
 
 # The Lisp SDK's own tests (JSON vectors, the wire against an in-process fake host), run by the pinned SBCL that
 # automation/ci/install-sbcl.sh builds; PIG_SBCL names it. A missing SBCL fails: it is an environment failure, never a skip.
@@ -385,7 +455,7 @@ test-sdk-conformance: ## Run the SDK conformance scenario table against every ex
 test-mcp-conformance: ## Run the official MCP client conformance suite against PiG's MCP client (needs network the first time; see test/mcp-conformance/README.md)
 	@go run ./test/mcp-conformance/run $(MCP_CONFORMANCE_ARGS)
 
-test-sdk-ts: parity-deps ## Check the pinned TypeScript extension declarations and runtime helpers
+test-sdk-ts: parity-deps ## Check the TypeScript extension declarations (pi-pin.d.ts equals the pinned build and is current, an author's project compiles against it, the differences from the published release are reported) and runtime helpers
 	@cd extensions/sdk-ts && npm test
 
 # Resolve the selected Rust toolchain before validators replace HOME so tool-manager shims do not select a different compiler.
@@ -456,8 +526,9 @@ test-race: ## Race and goroutine-leak gate for the TUI concurrency model
 	@./automation/ci/test-race.sh
 
 # The nightly workflow runs these outside make check: whole-package -race on the concurrency owners, and every Fuzz target for PIG_FUZZ_TIME.
+# test-race-nightly runs go test without test-fixtures.sh, so do not hand Makefile's unfilled default CARGO_TARGET_DIR to TestMain (which otherwise skips the warmed SharedCargoTargetDir).
 test-race-nightly: ## Whole-package -race and goroutine-leak gate (nightly)
-	@./automation/ci/test-race-nightly.sh
+	@$(if $(filter file,$(origin CARGO_TARGET_DIR)),env -u CARGO_TARGET_DIR )./automation/ci/test-race-nightly.sh
 
 fuzz-nightly: ## Run every Fuzz target for PIG_FUZZ_TIME, default 30s (nightly)
 	@./automation/ci/fuzz-nightly.sh
@@ -470,26 +541,37 @@ test-oracle-sweeps-nightly: ## Full Pi-oracle sweeps that the fast tier runs as 
 .PHONY: test-race-nightly fuzz-nightly test-oracle-sweeps-nightly
 
 # go-fix-clean enforces AGENTS.md rule #3 (Go 1.27 idiom compliance).
-# `go fix -diff ./...` must produce zero output. If this target fails,
-# run `go fix ./...`, manually validate any suggestions that would
-# change observable behavior (e.g. type changes like
-# `slices.Contains` returning bool vs a string flag), then commit.
-go-fix-clean: ## Fail when go fix would change any file
+# `go fix -diff ./...` must produce zero output in the root module and in
+# every maintained nested Go module (GO_NESTED_MODULES): ./... stops at a
+# nested go.mod, so the root run alone never reads those. If this target
+# fails, run `go fix ./...` in the module it names (GOWORK=off in a nested
+# one), manually validate any suggestions that would change observable
+# behavior (e.g. type changes like `slices.Contains` returning bool vs a
+# string flag), then commit.
+go-fix-clean: ## Fail when go fix would change any file of the root module or of a maintained nested Go module
 	@# Judge the diff on stdout; stderr (tool warnings) passes through. go fix
-	@# exits non-zero when it has a diff, so a failure without one is an error.
-	@# third_party holds vendored upstream source kept byte-identical except for
-	@# the edits its FORK.md lists, so go fix does not modernize it.
-	@packages=$$(go list ./...) || exit 1; packages=$$(printf '%s\n' $$packages | grep -v '/third_party/'); \
-	status=0; diff_output=$$(go fix -diff $$packages) || status=$$?; \
-	if [ -n "$$diff_output" ]; then \
-		echo "FAIL: go fix -diff produced output (AGENTS.md rule #3)."; \
-		echo "Run \`go fix ./...\` and validate suggestions before committing."; \
-		echo "First 40 lines of diff:"; \
-		echo "$$diff_output" | head -40; \
-		exit 1; \
-	fi; \
-	if [ "$$status" -ne 0 ]; then echo "FAIL: go fix -diff exited $$status without a diff."; exit 1; fi
-	@echo "go fix: clean (Go 1.27 idioms compliant)"
+	@# exits non-zero when it has a diff, so a failure without one is an error
+	@# (a go list that fails is one). third_party holds vendored upstream source
+	@# kept byte-identical except for the edits its FORK.md lists, so go fix
+	@# does not modernize it.
+	@for module in . $(GO_NESTED_MODULES); do \
+		status=0; diff_output=$$( \
+			if [ "$$module" != . ]; then cd "$$module" || exit 1; export GOWORK=off; fi; \
+			packages=$$(go list ./...) || exit 1; packages=$$(printf '%s\n' $$packages | grep -v '/third_party/'); \
+			go fix -diff $$packages) || status=$$?; \
+		if [ -n "$$diff_output" ]; then \
+			echo "FAIL: go fix -diff produced output in Go module $$module (AGENTS.md rule #3)."; \
+			if [ "$$module" = . ]; then echo "Run \`go fix ./...\` and validate suggestions before committing."; \
+			else echo "Run \`(cd $$module && GOWORK=off go fix ./...)\` and validate suggestions before committing."; fi; \
+			echo "Files go fix would change:"; \
+			echo "$$diff_output" | sed -n 's/^+++ \(.*\) (new)$$/  \1/p'; \
+			echo "First 40 lines of diff:"; \
+			echo "$$diff_output" | head -40; \
+			exit 1; \
+		fi; \
+		if [ "$$status" -ne 0 ]; then echo "FAIL: go fix -diff exited $$status without a diff in Go module $$module."; exit 1; fi; \
+	done
+	@echo "go fix: clean (Go 1.27 idioms compliant) in the root module and $(words $(GO_NESTED_MODULES)) nested Go modules"
 
 # compliance checks the evidence behind the README badges and the OpenSSF
 # Best Practices criteria (docs/project/compliance.md): required files,
@@ -498,6 +580,7 @@ go-fix-clean: ## Fail when go fix would change any file
 compliance: ## Check badge and OpenSSF evidence: files, pins, workflow hardening, REUSE, govulncheck
 	@python3 -B -m unittest discover -s automation/ci -p test_go_pin.py
 	@python3 -B -m unittest discover -s automation/ci -p test_secret_scan_range.py
+	@python3 -B -m unittest discover -s automation/ci -p test_wait_preflight.py
 	@./automation/ci/check-compliance.py $(COMPLIANCE_ARGS)
 
 # divergence-consistency enforces AGENTS.md rule #4. Every divergence
@@ -506,8 +589,18 @@ compliance: ## Check badge and OpenSSF evidence: files, pins, workflow hardening
 divergence-consistency: ## Match every docs/parity/DIVERGENCES.md entry to its call-site marker
 	@./automation/ci/check-divergence-consistency.sh
 
-divergence-quality: ## Validate divergence records as enforceable contracts
+divergence-quality: ## Validate divergence records as enforceable contracts, each approval bound to the hash of its record's text
+	@python3 -B -m unittest discover -s automation/ci -p test_check_divergence_quality.py
 	@./automation/ci/check-divergence-quality.py
+
+divergence-approve: ## OWNER ONLY: approve the current text of record ID=D<N> (writes the date and text hash on its approval line, drops its pending entry, regenerates the ledger)
+	@test -n "$(ID)" || { echo "divergence-approve: set ID=D<N>" >&2; exit 2; }
+	@./automation/ci/check-divergence-quality.py --stamp $(ID)
+	@$(MAKE) --no-print-directory divergences
+
+# gui-import-guard keeps the dependency one-way: plugin UI code may import chord, chord never imports it.
+gui-import-guard: ## Fail when chord imports a plugin UI package
+	@./automation/ci/check-gui-import-guard.sh
 
 # divergence-guard fails on hidden divergences no docs/parity/DIVERGENCES.md entry
 # records: invented limits and timeouts, dropped events, swallowed errors,
@@ -536,6 +629,7 @@ perf-lint: ## Fail on performance antipatterns the baseline does not list (ratch
 # race-coverage fails when a package that starts goroutines or timers and has tests is in no nightly -race group of automation/ci/race-packages.txt (and is not exempt there with a reason).
 race-coverage: ## Fail on a concurrency package that no nightly -race group runs
 	@python3 -B -m unittest discover -s automation/ci -p test_race_coverage.py
+	@python3 -B -m unittest discover -s automation/ci -p test_fuzz_nightly.py
 	@./automation/ci/race-coverage.sh
 
 .PHONY: race-coverage
@@ -544,6 +638,13 @@ race-coverage: ## Fail on a concurrency package that no nightly -race group runs
 # -benchtime=5x with GOMAXPROCS=1, which takes about an hour, so it belongs in a nightly job, not in `make check`.
 alloc-baseline: ## Fail when a hot-path benchmark's allocs/op rises or falls from the committed baseline (slow; nightly)
 	@go run ./automation/ci/allocbase
+
+# alloc-baseline-changed is the pull request's form of alloc-baseline: the same tool, settings and verdict, for only the hot packages the change since TEST_BASE (default the branch's upstream, then main; the merge base with HEAD) makes the run measure: a package with a changed benchmark file, baseline row or non-test file, and the packages that import a changed one. A change that touches none of them measures nothing and passes at once. CI reads the commits only (-committed), as test-changed does.
+alloc-baseline-changed: ## Run alloc-baseline for the hot packages the change since TEST_BASE touches or imports (the pull request's form; a change that touches none exits 0 at once)
+	@base="$$TEST_BASE"; [ -n "$$base" ] || base='@{upstream}'; git rev-parse --verify --quiet "$$base^{commit}" >/dev/null || base=main; \
+	go run ./automation/ci/allocbase -changed-since "$$base" $${CI:+-committed}
+
+.PHONY: alloc-baseline-changed
 
 # docs-drift gates the shipped docs bundle against the code it describes: every
 # documented command must exist, every listable command must be documented, and
@@ -590,18 +691,19 @@ standard-check: ## Verify PiG Standard requires and resolves only fused extensio
 	@GOWORK=off ./automation/ci/with-isolated-pig-home.sh "$(CHECK_PIG_BIN)" install --validate-only --json piglets/standard/extensions/angrypigs >/dev/null
 	@GOWORK=off ./automation/ci/with-isolated-pig-home.sh "$(CHECK_PIG_BIN)" install --validate-only --json piglets/standard/extensions/bunruntime >/dev/null
 	@GOWORK=off ./automation/ci/with-isolated-pig-home.sh "$(CHECK_PIG_BIN)" piglet validate piglets/standard/pig-standard.yaml >/dev/null
-	@GOWORK=off ./automation/ci/with-isolated-pig-home.sh "$(CHECK_PIG_BIN)" piglet validate piglets/aot/pig-aot.yaml >/dev/null
+	@GOWORK=off ./automation/ci/with-isolated-pig-home.sh "$(CHECK_PIG_BIN)" piglet validate piglets/pig-bolt/pig-bolt.yaml >/dev/null
+	@GOWORK=off ./automation/ci/with-isolated-pig-home.sh "$(CHECK_PIG_BIN)" piglet validate piglets/pig-bolt/pig-aot.yaml >/dev/null
 
 ##@ Gates
 
-check-core: startup-proxies build vet lint test test-go-modules lint-rust test-sdk-rs test-sdk-py test-sdk-lisp test-sdk-ts test-term-engines typescript-extension-corpus examples-check test-race test-integration lint-scenarios port-map-drift coverage-drift standard-check go-fix-clean divergence-consistency divergence-quality divergence-guard divergences-drift autofix-check port-lint any-trap perf-lint race-coverage check-contracts-fast source-hygiene fixture-guard test-provenance docs-drift bug-ledger-check perf-scoreboard-check module-size ## All deterministic build, lint, unit, race, and drift gates
+check-core: startup-proxies build vet lint test test-go-modules lint-rust test-sdk-rs lint-sdk-py test-sdk-py test-sdk-py-311 test-sdk-lisp test-sdk-ts test-term-engines typescript-extension-corpus examples-check test-race test-integration lint-scenarios port-map-drift coverage-drift standard-check go-fix-clean divergence-consistency divergence-quality divergence-guard gui-import-guard divergences-drift node-runtime-drift vendor-pi-dist-drift autofix-check port-lint any-trap perf-lint race-coverage check-contracts-fast source-hygiene fixture-guard module-pins test-provenance docs-drift bug-ledger-check model-data-check perf-scoreboard-check module-size alloc-baseline-changed ## All deterministic build, lint, unit, race, and drift gates
 
 check: module-publication check-core parity-fast ## Pre-commit gate: published dependencies, check-core and parity-fast
 	@echo
 	@echo "make check: all gates green."
 	@echo
 	@echo "Reminder: run 'make coverage' before signaling success to refresh"
-	@echo "the AGENTS.md dashboard and test/parity/coverage.md. Do not hand-edit."
+	@echo "the AGENTS.md dashboard and test/parity/generated/coverage.md. Do not hand-edit."
 
 # verify = deterministic gates + declared durability parity + coverage.
 # The recommended one-shot for end-of-loop verification: `parity` proves every
@@ -615,8 +717,9 @@ qc: parity-bin ## Build a fresh pig, then run the smoke and focused parity QC
 	@PIG_BIN="$(PARITY_PIG_BIN)" ./automation/ci/qc-smoke.sh
 
 # Release gate. Tighter than `check`: parity-live must pass, coverage
-# must not regress, no new entries in docs/parity/DIVERGENCES.md without justification.
-release-check: parity-live parity-perf test-timing ## Release gate: live, perf and timing parity, no new divergences, no coverage loss
+# must not regress, no new entries in docs/parity/DIVERGENCES.md without justification, and the Piglet strip
+# matrix (piglet-strip-matrix, default mode) must hold for the builds that strip a model API.
+release-check: parity-live parity-perf test-timing piglet-strip-matrix ## Release gate: live, perf and timing parity, the Piglet strip matrix, no new divergences, no coverage loss
 	@./automation/ci/check-divergence-delta.sh
 	@python3 -B -m unittest discover -s automation/ci -p test_check_coverage_delta.py
 	@./automation/ci/check-coverage-delta.sh
@@ -755,8 +858,9 @@ bench-report: ## Re-render report.md and summary.csv from a raw.json: make bench
 additive-list: ## Regenerate the agent docs page additive-features.md from docs/additive-features.md
 	@python3 automation/gen/gen-additive-list.py
 
-docs-bundle: ## Regenerate the shared pages of the agent docs bundle, the glossary and the customize chooser from the site pages (internal/pigdocs/bundle-manifest.json)
+docs-bundle: ## Regenerate the shared pages of the agent docs bundle, the glossary and the customize chooser from the site pages (internal/pigdocs/bundle-manifest.json), then the compressed pages the binary embeds (go generate)
 	@python3 automation/gen/gen-docs-bundle.py
+	@cd internal/pigdocs && go generate .
 
 knowledge-graph: ## Regenerate the knowledge graph page, JSON-LD, and Mermaid from docs/knowledge-graph/pig.graph.json
 	@python3 automation/gen/gen-knowledge-graph.py
@@ -771,6 +875,16 @@ port-lens: ## Render the static port report (overview, port map, divergences, bu
 
 upstream-mirror: parity-deps ## Mirror the pinned Pi source into .upstream/current
 	@./automation/gen/mirror-upstream.sh
+	@python3 -B automation/ci/check-port-map-drift.py --apps
+
+# model-data-check runs TestPublishedModelDataValidates, which compares the published model data and its hidden manifest with the pinned Pi source. The test skips where the oracle is not installed, and a skip is not a pass: this gate installs the oracle (upstream-mirror), sets PIG_REQUIRE_PI_ORACLE so that a missing source fails the test, and fails when the test did not pass. MODEL_DATA_ORACLE=skip is the one opt-out; it says so and no gate sets it.
+model-data-check: ## Check the published model data against the pinned Pi source; fails when the oracle or the data is not installed (MODEL_DATA_ORACLE=skip opts out, loudly)
+	@if [ "$(MODEL_DATA_ORACLE)" = skip ]; then echo "model-data-check: SKIPPED by MODEL_DATA_ORACLE=skip: the published model data was NOT checked" >&2; exit 0; fi; \
+		[ -f .upstream/current/packages/ai/src/models.generated.ts ] || $(MAKE) upstream-mirror || exit 1; \
+		out=$$(PIG_REQUIRE_PI_ORACLE=1 go test ./cmd/check-model-data -run '^TestPublishedModelDataValidates$$' -count=1 -v 2>&1) || { printf '%s\n' "$$out"; exit 1; }; \
+		printf '%s\n' "$$out"; \
+		printf '%s\n' "$$out" | grep -q -- '--- PASS: TestPublishedModelDataValidates ' || { echo "model-data-check: TestPublishedModelDataValidates did not pass" >&2; exit 1; }; \
+		if printf '%s\n' "$$out" | grep -q -- '--- SKIP'; then echo "model-data-check: a test of the check skipped; a skip is not a pass" >&2; exit 1; fi
 
 pin-show: ## Show the effective upstream Pi pin and whether PI_UPSTREAM_REF overrides it
 	@$(PIN_TOOL) show
@@ -778,21 +892,33 @@ pin-show: ## Show the effective upstream Pi pin and whether PI_UPSTREAM_REF over
 pin-sync: ## Regenerate every committed file derived from .upstream/pin (pigversion.go, SDK and CI oracle pins, badges, ledger version fields)
 	@$(PIN_TOOL) sync
 
-pin-check: ## Test the pin tooling and fail when a file derived from .upstream/pin differs from its derivation
+pin-check: ## Test the pin tooling and fail when a file derived from .upstream/pin differs from its derivation or the vendored Pi packages are not the pin's
 	@python3 -B -m unittest discover -s automation/pin -p 'test_*.py'
 	@$(PIN_TOOL) sync --check
+	@$(PIN_TOOL) check-vendored
+	@node extensions/sdk-ts/scripts/check-pin-bundle.mjs
+
+pin-check-vendored-rebuild: parity-deps ## Pack the pinned Pi build again and require third_party/pi-packs to equal it (members and bytes)
+	@$(PIN_TOOL) check-vendored --rebuild
+
+vendor-sdk-ts-declarations: ## Freeze the published declarations of the peer dependency's Pi release for the sdk-ts drift test (npm pack, verified against package-lock.json; a no-op when the snapshot is current)
+	@cd extensions/sdk-ts && node scripts/freeze-published-declarations.mjs
+
+vendor-sdk-ts-pin-declarations: parity-deps ## Regenerate extensions/sdk-ts/pi-pin.d.ts, the pinned build's declarations an extension author type-checks against, from the installed oracle, and the peer dependencies it imports in package.json (with package-lock.json, through npm, when they change)
+	@cd extensions/sdk-ts && node scripts/pin-bundle.mjs
+
+vendor-pi-packs: parity-deps ## Regenerate third_party/pi-packs, the vendored `npm pack` of the pinned build's durable closure, and the locks of its consumers
+	@$(PIN_TOOL) vendor
 
 pin-ledgers: ## Generate the effective pin's per-pin ledgers (async-contracts, behavior-contracts, known-gaps, interface delta, custom-factory draft) from PIN_FROM=<tag|commit> (default: the committed pin)
 	@$(PIN_TOOL) ledgers $(if $(PIN_FROM),--from "$(PIN_FROM)")
 
-pin-bump: ## Move the pin to PI_UPSTREAM_REF=<tag|commit>, regenerate what derives from it, then mirror, install the oracle and generate the ledgers
+pin-bump: ## Move the pin to PI_UPSTREAM_REF=<tag|commit> and regenerate everything that derives from it, in one resumable run (retire carried work, mirror, inventories, ledgers, vendored Pi, observation oracles, gaps, make generate); a rerun resumes, a finished bump is a no-op; PIN_FROM=<ref> names the earlier pin only when the pin file moved without a record
 	@test -n "$(PI_UPSTREAM_REF)" || { echo "pin-bump: set PI_UPSTREAM_REF=<tag|commit>" >&2; exit 2; }
-	@old=$$(env -u PI_UPSTREAM_REF $(PIN_TOOL) get ref); env -u PI_UPSTREAM_REF $(PIN_TOOL) bump "$(PI_UPSTREAM_REF)"; \
-		$(MAKE) --no-print-directory PI_UPSTREAM_REF= upstream-mirror interface-proposals test-inventory-generate && \
-		$(MAKE) --no-print-directory PI_UPSTREAM_REF= PIN_FROM="$$old" pin-ledgers && \
-		$(MAKE) --no-print-directory PI_UPSTREAM_REF= vendor-pi-dist vendor-chord-plugins-node model-catalogs && \
-		./automation/gen/regenerate-observation-oracles.sh && \
-		./automation/gen/refresh-pi-test-sources.sh
+	@env -u PI_UPSTREAM_REF PIN_FROM="$(PIN_FROM)" python3 automation/pin/bump.py "$(PI_UPSTREAM_REF)"
+
+regenerate-alt-screen-oracle: parity-deps ## Re-record tui/testdata/alt-screen-oracle.json.gz from the installed Pi (the fixture TestAltScreenFixtureIsCurrent compares byte for byte)
+	@node tui/testdata/alt-screen-oracle.mjs "$$(cd extensions/sdk-ts/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui && pwd -P)/dist/index.js" | gzip -n -9 > tui/testdata/alt-screen-oracle.json.gz.tmp && mv tui/testdata/alt-screen-oracle.json.gz.tmp tui/testdata/alt-screen-oracle.json.gz
 
 vendor-pi-dist: parity-deps ## Regenerate the vendored Pi runtime (runtime-node/shims) from the installed oracle of the pinned Pi
 	@./automation/gen/vendor-pi-dist.sh
@@ -800,23 +926,34 @@ vendor-pi-dist: parity-deps ## Regenerate the vendored Pi runtime (runtime-node/
 vendor-chord-plugins-node: parity-deps upstream-mirror ## Regenerate chord/nextnode/plugins/node/pi, Pi's chord sources for the plugins component's Node subprocess
 	@./automation/gen/vendor-chord-plugins-node.sh
 
-generate-schemas: ## Regenerate schemas/*.schema.json, the JSON Schemas of models.json, settings.json, keybindings.json and themes (Pi scripts/generate-schemas.ts)
+vendor-chord-surfaces-client: parity-deps upstream-mirror ## Regenerate chord/nextnode/surfaces/client/pi, Pi's chord sources of the page's and the terminal's client runtimes (D601)
+	@./automation/gen/vendor-chord-surfaces-client.sh
+
+vendor-chord-carried-check: parity-deps ## Prove both vendored chord trees are their manifest's Pi commit plus its carried commits, from PI_REPO=<a Pi clone>
+	@./automation/gen/vendor-chord-carried-check.sh
+
+generate-schemas: ## Regenerate schemas/*.schema.json, the JSON Schemas of models.json, settings.json, keybindings.json and themes, and docs/site/docs/models-configuration.md (Pi scripts/generate-schemas.ts and generate-references.ts)
 	@go run ./cmd/generate-schemas
 
-model-catalogs: parity-deps ## Regenerate model catalogs from the pinned published Pi package
+model-catalogs: parity-deps ## Regenerate the model catalogs offline from the committed catalog source (automation/gen/catalog-source) and the oracle Pi's data made from it
 	@./automation/gen/generate-model-catalogs.sh
+
+# The one target that fetches: it replaces the recording of the upstream responses (models.dev, OpenRouter, Vercel AI Gateway, NVIDIA NIM, Radius; no key), then
+# rebuilds the oracle Pi over it and regenerates the catalogs. Review the diff of the catalog source and the generated files, then run `make generate`.
+model-catalogs-live: ## Fetch the upstream model catalogs live, replace the committed catalog source, rebuild the oracle over it and regenerate the model catalogs
+	@go run ./cmd/gen-models -record-source automation/gen/catalog-source -strict -json-only -json-output "$$(mktemp -d)/catalog"
+	@$(MAKE) model-catalogs
 
 ##@ Dependencies
 
 interface-deps: ## Install the locked TypeScript compiler used by parity inventories
 	@python3 automation/ci/npm-locked.py test/parity/interface-extractor
 
-durable-interop-deps: ## Install the Pi Durable packages the cross-runtime tests run on Node: the locked release of a tag pin, a build of the commit of a commit pin
-	@if [ "$$($(PIN_TOOL) get kind)" = tag ]; then python3 automation/ci/npm-locked.py durable/interop; else $(PIN_TOOL) install-oracle; fi
+durable-interop-deps: ## Install the locked npm tree of durable/interop: Pi's packages are the vendored build of the pin (third_party/pi-packs)
+	@python3 automation/ci/npm-locked.py durable/interop
 
-durable-core-host-deps: durable-interop-deps ## Install the locked npm tree of the Durable core's Cloudflare host, with Pi's packages from the pinned build (the release itself for a tag pin)
+durable-core-host-deps: ## Install the locked npm tree of the Durable core's Cloudflare host: Pi's packages are the vendored build of the pin (third_party/pi-packs)
 	@python3 automation/ci/npm-locked.py durable/core/host/cf
-	@$(PIN_TOOL) link-durable-host durable/core/host/cf
 
 durable-core-host-check: durable-contract-setup durable-core-host-deps upstream-mirror ## Typecheck and test the Cloudflare host and its pi-durable facade against the probe core built with TinyGo and Go; the upstream examples type-check against the pin's source mirror
 	@durable/core/host/cf/check.sh
@@ -871,7 +1008,7 @@ parity-deps: interface-deps durable-interop-deps ## Build the Pi comparator from
 	@test -d "$(PI_PACKAGE_ROOT)" || { echo "exact Pi package not found: $(PI_PACKAGE_ROOT)" >&2; exit 1; }
 	@$(PIN_TOOL) check-oracle
 
-.PHONY: bug-ledger-refresh port-lens pin-show pin-sync pin-check pin-bump pin-ledgers vendor-pi-dist vendor-chord-plugins-node bench-test bench-lock-verify bench-lock-bump bench-arms bench-overhead bench-reliability bench-longhistory bench-startup bench-aggregate bench-soak bench-local bench-durable bench-harbor bench-report durable-interop-deps durable-contract durable-contract-setup durable-contract-test node-runtime bug-ledger bug-ledger-check release-notes-draft npm-dist-test npm-dist-e2e compliance evals-mutate slop slop-check # Deterministic tmux-driven integration tier # Release gate. Tighter than `check` # The recommended one-shot for end-of-loop verification # docs-drift gates the shipped docs bundle against the code it describes # install # numbered in docs/parity/DIVERGENCES.md must have a matching `// pig divergence (DN) # the single-main-loop ownership invariant bench bench-base bench-compare build build-env-daemons check check-core clean dev divergence-guard divergence-quality doctor port-lint any-trap perf-lint evals evals-live evals-publish evals-requests evals-test examples-check go-fix-clean help help-parity interface-deps knowledge-graph lint lint-changed model-catalogs parity-deps perf-check pgo pig profile qc setup standard-check test test-fixtures test-go-modules test-mcp-conformance test-prereqs test-sdk-conformance test-sdk-go test-sdk-rs test-sdk-ts test-stress upstream-mirror vet durable-counts durable-bar durable-flat durable-counts-update durable-contract-trace durable-core-host-deps durable-core-host-check durable-core-budget
+.PHONY: bug-ledger-refresh port-lens pin-show pin-sync pin-check pin-check-vendored-rebuild vendor-pi-packs vendor-sdk-ts-declarations vendor-sdk-ts-pin-declarations pin-bump pin-ledgers vendor-pi-dist regenerate-alt-screen-oracle vendor-chord-plugins-node vendor-chord-surfaces-client vendor-chord-carried-check bench-test bench-lock-verify bench-lock-bump bench-arms bench-overhead bench-reliability bench-longhistory bench-startup bench-aggregate bench-soak bench-local bench-durable bench-harbor bench-report durable-interop-deps durable-contract durable-contract-setup durable-contract-test node-runtime bug-ledger bug-ledger-check model-data-check model-catalogs-live release-notes-draft npm-dist-test npm-dist-e2e compliance evals-mutate slop slop-check # Deterministic tmux-driven integration tier # Release gate. Tighter than `check` # The recommended one-shot for end-of-loop verification # docs-drift gates the shipped docs bundle against the code it describes # install # numbered in docs/parity/DIVERGENCES.md must have a matching `// pig divergence (DN) # the single-main-loop ownership invariant bench bench-base bench-compare build build-env-daemons check check-core clean dev divergence-guard divergence-quality doctor port-lint any-trap perf-lint evals evals-live evals-publish evals-requests evals-test examples-check go-fix-clean help help-parity interface-deps knowledge-graph lint lint-changed model-catalogs parity-deps perf-check pgo pig profile qc setup standard-check test test-fixtures test-go-modules test-mcp-conformance test-prereqs test-sdk-conformance test-sdk-go test-sdk-rs test-sdk-ts test-stress upstream-mirror vet durable-counts durable-bar durable-flat durable-counts-update durable-contract-trace durable-core-host-deps durable-core-host-check durable-core-budget
 
 include automation/make/parity.mk
 include automation/make/ci.mk

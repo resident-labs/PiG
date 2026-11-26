@@ -33,11 +33,11 @@ func (s *Session) SetActiveToolsByName(names []string) {
 	defer s.toolRegistryMu.Unlock()
 	previous := s.ActiveToolNames()
 	s.setActiveToolsByName(names)
-	// A loadout that deactivates a tool replaces the restored one, whose pending tools are dropped. One that only adds tools, like activating tool_search, keeps them.
+	// A loadout that deactivates a tool of the restored one replaces it, and its pending tools are dropped. One that only adds tools, like activating tool_search, keeps them, and so does one that only deactivates tools outside the restored loadout, such as an extension's own tool that the restore or reload activated as newly registered.
 	// upstream: agent-session.ts setActiveToolsByName
 	active := s.ActiveToolNames()
 	for _, name := range previous {
-		if !slices.Contains(active, name) {
+		if !slices.Contains(active, name) && slices.Contains(s.restoredToolNames, name) {
 			s.pendingToolNames = nil
 			break
 		}
@@ -61,7 +61,8 @@ func (s *Session) loadDeferredTool(name string) agent.AgentTool {
 	if !slices.Contains(active, name) {
 		entry, listed := s.toolRegistry.entry(name)
 		exposure := toolExposureOf(entry.registration.Definition)
-		if !listed || (exposure != extension.ToolExposureDeferred && exposure != extension.ToolExposureCodemode) || !(slices.Contains(active, "tool_search") || slices.Contains(active, "codemode")) {
+		if !listed || (exposure != extension.ToolExposureDeferred && exposure != extension.ToolExposureCodemode) ||
+			(!slices.Contains(active, "tool_search") && !slices.Contains(active, "codemode")) {
 			return nil
 		}
 		s.setActiveToolsByName(append(active, name))
@@ -220,7 +221,7 @@ func (s *Session) SetSystemPromptSections(sections ai.OrderedSections) {
 // restoreToolsFromTranscript activates the tools the current branch's transcript declares, with the +name/-name modifiers applied (upstream _restoreToolsFromTranscript). The whole branch is replayed, so a tool removed before a compaction stays inactive. Extension and SDK tools the branch never added or removed were registered after it recorded its loadout; they activate like newly registered tools unless they are registered with `defaultActive: false`, and built-in tools follow `defaultTools` instead. Declared tools the Session does not have yet, such as tools of MCP servers that are still connecting, stay pending until they register, if the allowlist and denylist admit them. A branch without a system message keeps the current tools. It returns the TypeError Pi's replay throws for a system message holding a tool list it cannot read, before it changes anything.
 func (s *Session) restoreToolsFromTranscript(modifiers ...string) error {
 	// The transcript is read before the loadout locks, so they are not held while the whole branch is read.
-	systems, err := replayedTranscript(s.inner)
+	systems, err := replayedTranscript(s.inner.Load())
 	if err != nil {
 		return err
 	}
@@ -246,6 +247,7 @@ func (s *Session) applyTranscriptTools(messages []agent.AgentMessage, modifiers 
 	s.toolRegistryMu.Lock()
 	defer s.toolRegistryMu.Unlock()
 	s.pendingToolNames = nil
+	s.restoredToolNames = nil
 	if len(systems) == 0 {
 		return
 	}
@@ -253,6 +255,8 @@ func (s *Session) applyTranscriptTools(messages []agent.AgentMessage, modifiers 
 	for _, tool := range ai.GetCurrentTools(systems) {
 		names = append(names, tool.Name)
 	}
+	// The loadout the branch recorded, which the pending tools belong to (upstream: agent-session.ts _restoredToolNames).
+	s.restoredToolNames = icodingagent.ApplyToolModifiers(slices.Clone(names), modifiers)
 	base := map[string]struct{}{}
 	for _, entry := range s.toolRegistry.base {
 		base[entry.tool.Name()] = struct{}{}

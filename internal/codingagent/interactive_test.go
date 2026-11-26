@@ -20,6 +20,7 @@ import (
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
+	"github.com/MichaelKinsy/PiG/internal/compactprogress"
 	"github.com/MichaelKinsy/PiG/tui"
 )
 
@@ -435,7 +436,7 @@ func TestFilterAllowedTools(t *testing.T) {
 	})
 }
 
-// ─── levelsForModel / maxThinkingIndex ────────────────────────────────────────
+// ─── levelsForModel ────────────────────────────────────────────────────────────
 
 func TestLevelsForModel(t *testing.T) {
 	t.Run("nil model", func(t *testing.T) {
@@ -487,52 +488,6 @@ func TestLevelsForModel(t *testing.T) {
 		}
 		if levels[0] != "minimal" {
 			t.Errorf("expected first level minimal, got %s", levels[0])
-		}
-	})
-}
-
-func TestMaxThinkingIndex(t *testing.T) {
-	t.Run("nil model", func(t *testing.T) {
-		if got := maxThinkingIndex(nil); got != 0 {
-			t.Errorf("expected 0, got %d", got)
-		}
-	})
-
-	t.Run("model with high", func(t *testing.T) {
-		m := &ai.Model{
-			Capabilities:     ai.ModelCapabilities{MaxThinking: ai.ThinkingLevelHigh},
-			ThinkingLevelMap: ai.ThinkingLevelMap{},
-		}
-		if got := maxThinkingIndex(m); got != 4 {
-			t.Errorf("expected 4, got %d", got)
-		}
-	})
-
-	t.Run("model with xhigh", func(t *testing.T) {
-		xh := "xhigh"
-		m := &ai.Model{
-			Capabilities:     ai.ModelCapabilities{MaxThinking: ai.ThinkingLevelXHigh},
-			ThinkingLevelMap: ai.ThinkingLevelMap{ai.ThinkingXHigh: &xh},
-		}
-		if got := maxThinkingIndex(m); got != 5 {
-			t.Errorf("expected 5, got %d", got)
-		}
-	})
-
-	t.Run("model with no thinking", func(t *testing.T) {
-		m := &ai.Model{Capabilities: ai.ModelCapabilities{MaxThinking: ""}}
-		if got := maxThinkingIndex(m); got != 0 {
-			t.Errorf("expected 0, got %d", got)
-		}
-	})
-
-	t.Run("model with low", func(t *testing.T) {
-		m := &ai.Model{
-			Capabilities:     ai.ModelCapabilities{MaxThinking: ai.ThinkingLevelLow},
-			ThinkingLevelMap: ai.ThinkingLevelMap{},
-		}
-		if got := maxThinkingIndex(m); got != 2 {
-			t.Errorf("expected 2, got %d", got)
 		}
 	})
 }
@@ -842,8 +797,11 @@ func TestInteractiveMode_AbortPushesErrorIntoPendingTools(t *testing.T) {
 	ch <- agent.MessageEndEvent{Message: msg}
 	close(ch)
 
+	// Each event passes the mode's Session listener before the owner loop applies it, as in production (subscribeSessionListener): the listener gives the aborted message its text.
+	session := &recordingCompactHandle{}
 	var comp *tui.ToolExecutionComponent
 	for ev := range ch {
+		m.handleSessionEvent(session, ev)
 		m.handleAgentEvent(ev)
 		if pending := m.toolByID["tc_1"]; pending != nil {
 			comp = pending
@@ -866,9 +824,10 @@ func TestInteractiveMode_AbortPushesErrorIntoPendingTools(t *testing.T) {
 	}
 }
 
-// upstream: interactive-mode.ts:3544 (message_end) replaces an aborted message's errorMessage with "Operation aborted",
+// upstream: interactive-mode.ts:3686-3697 (message_end) replaces an aborted message's errorMessage with "Operation aborted",
 // or "Aborted after N retry attempt(s)" while automatic retries ran, before the assistant block and every pending tool
-// component show it. A provider's own errorMessage ("Request was aborted") never reaches either.
+// component show it. A provider's own errorMessage ("Request was aborted") never reaches either. The replacement is made on
+// the message itself by the mode's Session listener, which the Session calls before it persists and publishes the event.
 func TestInteractiveMode_AbortedMessageNamesRetryAttempts(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -890,7 +849,8 @@ func TestInteractiveMode_AbortedMessageNamesRetryAttempts(t *testing.T) {
 				toolStarts:    make(map[string]time.Time),
 				pendingArgs:   make(map[int]*pendingToolArg),
 			}
-			m.opts.SessionHandle = &recordingCompactHandle{retryAttempt: tc.attempts}
+			session := &recordingCompactHandle{retryAttempt: tc.attempts}
+			m.opts.SessionHandle = session
 			msg := agent.AgentMessage{Assistant: &agent.AssistantMessage{Role: agent.RoleAssistant, StopReason: ai.StopReasonAborted, ErrorMessage: tc.provider}}
 			toolPartial := &ai.AssistantMessage{Content: []ai.AssistantContentBlock{
 				ai.ToolCall{ID: "tc_1", Name: "read", Arguments: ai.JsonObject{"path": "foo.go"}},
@@ -901,6 +861,7 @@ func TestInteractiveMode_AbortedMessageNamesRetryAttempts(t *testing.T) {
 				agent.MessageUpdateEvent{Message: msg, AssistantMessageEvent: ai.ToolCallDeltaEvent{ContentIndex: 0, Delta: `{"path":"foo.go"}`, Partial: toolPartial}},
 				agent.MessageEndEvent{Message: msg},
 			} {
+				m.handleSessionEvent(session, ev)
 				m.handleAgentEvent(ev)
 				if pending := m.toolByID["tc_1"]; pending != nil {
 					comp = pending
@@ -908,6 +869,9 @@ func TestInteractiveMode_AbortedMessageNamesRetryAttempts(t *testing.T) {
 			}
 			if comp == nil {
 				t.Fatal("expected tool component tc_1 to be created during streaming")
+			}
+			if got := msg.Assistant.ErrorMessage; got != tc.want {
+				t.Errorf("the message's errorMessage = %q, want %q", got, tc.want)
 			}
 			if got := stripANSITest(strings.Join(comp.Render(80), "\n")); !strings.Contains(got, tc.want) {
 				t.Errorf("tool component = %q, want %q", got, tc.want)
@@ -1453,7 +1417,7 @@ func TestInteractiveMode_CompactionQueueFlushStartsTurn(t *testing.T) {
 	m.abortFn = func() {}
 
 	m.compactionQueue = []compactionQueuedMessage{{text: "queued during compaction", mode: compactionQueueSteer}}
-	m.flushCompactionQueue(m.runCtx, true)
+	m.flushCompactionQueue(m.runCtx, false)
 
 	select {
 	case opts := <-seen:
@@ -1517,7 +1481,7 @@ func TestInteractiveMode_CompactionQueueFirstFollowUpPreservesModeWhenTurnSettle
 	m.turnActive.Store(true)
 	m.compactionQueue = []compactionQueuedMessage{{text: "follow after compact", mode: compactionQueueFollowUp}}
 
-	m.flushCompactionQueue(m.runCtx, true)
+	m.flushCompactionQueue(m.runCtx, false)
 	steering, followUps := m.agent.PendingMessages()
 	if len(steering) != 0 || len(followUps) != 1 || extractAgentMessageText(followUps[0]) != "follow after compact" {
 		t.Fatalf("first queued follow-up lost mode: steering=%v followUps=%v", steering, followUps)
@@ -1554,7 +1518,7 @@ func TestInteractiveMode_CompactionQueueFlushSkipsTurnWhenBusy(t *testing.T) {
 	m.isIdle = false
 	m.turnActive.Store(true)
 	m.compactionQueue = []compactionQueuedMessage{{text: "queued mid-turn", mode: compactionQueueSteer}}
-	m.flushCompactionQueue(m.runCtx, true)
+	m.flushCompactionQueue(m.runCtx, false)
 
 	select {
 	case <-seen:
@@ -1573,6 +1537,7 @@ func TestInteractiveMode_CompactionQueueFlushSkipsTurnWhenBusy(t *testing.T) {
 // and compaction decisions belong to coding.Session and are tested there.
 type recordingCompactHandle struct {
 	lastAssistant        *string
+	progress             *compactprogress.Progress
 	agent                *agent.Agent
 	thinkingSettings     *SettingsManager
 	inner                *Session
@@ -1669,6 +1634,15 @@ func (h *recordingCompactHandle) FlushDeferredCustomMessages() error {
 func (h *recordingCompactHandle) Agent() *agent.Agent             { return h.agent }
 func (h *recordingCompactHandle) Inner() *Session                 { return h.inner }
 func (h *recordingCompactHandle) Events() <-chan agent.AgentEvent { return nil }
+func (h *recordingCompactHandle) CompactionStreamedTokens() int64 {
+	if h.progress == nil {
+		return 0
+	}
+	return int64(h.progress.Tokens())
+}
+func (h *recordingCompactHandle) SubscribeFunc(func(agent.AgentEvent)) func() {
+	return func() {}
+}
 func (h *recordingCompactHandle) SetModel(model *ai.Model, options ...ModelMutationOptions) error {
 	h.switched = append(h.switched, model)
 	h.appendPersistedDefaultToScope(model, options)
@@ -1684,8 +1658,8 @@ func (h *recordingCompactHandle) appendPersistedDefaultToScope(model *ai.Model, 
 		h.scopedModels = append(h.scopedModels, extension.ScopedModel{Model: model})
 	}
 }
-func (h *recordingCompactHandle) ExtensionSetModel(_ context.Context, model *ai.Model) (bool, error) {
-	return true, h.SetModel(model)
+func (h *recordingCompactHandle) ExtensionSetModelOnMain(_ context.Context, model *ai.Model, dispatch func(func() error) error) (bool, error) {
+	return true, dispatch(func() error { return h.SetModel(model) })
 }
 func (h *recordingCompactHandle) SetModelOnMain(_ context.Context, model *ai.Model, options ModelMutationOptions, dispatch func(func() error) error) error {
 	return dispatch(func() error { return h.SetModel(model, options) })
@@ -1739,6 +1713,11 @@ func (h *recordingCompactHandle) ExportToJsonl(outputPath string) (string, error
 	return ExportSessionToJsonl(h.inner, outputPath, nil)
 }
 func (h *recordingCompactHandle) ReplaceInner(s *Session) { h.inner = s }
+
+// QueuedUserMessage builds the plain user message a Session builds for text without images.
+func (h *recordingCompactHandle) QueuedUserMessage(text string, images []ai.ImageContent) agent.AgentMessage {
+	return agent.AgentMessage{User: &agent.UserMessage{Role: agent.RoleUser, Content: promptContent(text, images), Timestamp: time.Now().UnixMilli()}}
+}
 
 // RecordUserBashResult appends to the inner Session, or returns bashRecordErr, as coding.Session.recordBashResult does when idle.
 func (h *recordingCompactHandle) RecordUserBashResult(command string, result BashResult, excludeFromContext bool) error {
@@ -1814,6 +1793,7 @@ func TestDynamicProviderInModelSurfaces(t *testing.T) {
 // buildChatViewport must install the live-themed scrollbar track and thumb (not
 // the ScrollView defaults), and a live theme change must repaint them.
 func TestBuildChatViewportWiresLiveThemedScrollbar(t *testing.T) {
+	restoreStartupTheme(t)
 	prev := tui.ActiveTheme().Name
 	t.Cleanup(func() { tui.SetTheme(prev) })
 
@@ -1906,6 +1886,9 @@ func newSwitchTuiProbeWithOptions(t *testing.T, opts InteractiveModeOptions) *In
 // mounting it, so a caller can order raw mode before the first mount as Run does.
 func newUnmountedSwitchTuiProbe(t *testing.T, opts InteractiveModeOptions, out io.Writer) *InteractiveMode {
 	t.Helper()
+	// A probe's test may select a theme, and /reload applies the theme of the settings, the system theme when none is set
+	// (interactive-mode.ts:6680): the test ends with the theme it began with.
+	restoreStartupTheme(t)
 	m := NewInteractiveMode(nil, opts)
 	m.runCtx = context.Background()
 	m.rendererOut = out
@@ -2328,7 +2311,7 @@ func TestCompactionFlushStartsTurnWhenIsIdleIsStaleFalse(t *testing.T) {
 	m.turnActive.Store(false)
 
 	m.compactionQueue = []compactionQueuedMessage{{text: "sent after compaction", mode: compactionQueueSteer}}
-	m.flushCompactionQueue(m.runCtx, true)
+	m.flushCompactionQueue(m.runCtx, false)
 
 	select {
 	case opts := <-seen:

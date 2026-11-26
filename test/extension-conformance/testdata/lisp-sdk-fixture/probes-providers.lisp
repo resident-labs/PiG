@@ -75,7 +75,7 @@
      (pv-hints-line (lambda (id) (pig:entry-render-options-key-text options id))
                     (lambda (id description) (pig:entry-render-options-key-hint options id description))
                     (pig:jget entry "data"))))
-  (pig:markdown-transformer ext #'pv-transform-markdown)
+  (pig:markdown-transformer ext #'pv-transform-markdown :message-types '("user" "assistant" "assistant-thinking" "custom" "summary" "changelog"))
   (pig:tool-renderer ext #'pv-resolve-tool)
   (pig:command ext "late_tool_renderer" "Register a tool renderer resolver after loading"
                (lambda (ctx args)
@@ -91,7 +91,7 @@
                  (declare (ignore ctx args))
                  (pig:register-provider
                   ext "conformance-probe"
-                  (pig:from-json "{\"baseUrl\":\"https://probe.invalid/v1\",\"api\":\"openai-completions\",\"apiKey\":\"probe-key\",\"models\":[{\"id\":\"probe-model\",\"name\":\"Probe Model\",\"reasoning\":false,\"input\":[\"text\"],\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0},\"contextWindow\":1000,\"maxTokens\":100}]}"))))
+                  (pig:from-json "{\"baseUrl\":\"https://probe.invalid/v1\",\"api\":\"openai-completions\",\"apiKey\":\"probe-key\",\"models\":[{\"id\":\"probe-model\",\"name\":\"Probe Model\",\"reasoning\":true,\"input\":[\"text\",\"image\"],\"cost\":{\"input\":3.5,\"output\":4.5,\"cacheRead\":0.35,\"cacheWrite\":0.45},\"contextWindow\":54321,\"maxTokens\":4321}]}"))))
   (pig:command ext "provider_probe_unregister" "Unregister the provider"
                (lambda (ctx args) (declare (ignore ctx args)) (pig:unregister-provider ext "conformance-probe"))))
 

@@ -30,6 +30,7 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/jsnumber"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/outputfiles"
+	"github.com/MichaelKinsy/PiG/internal/sessionentry"
 )
 
 const (
@@ -276,7 +277,7 @@ func truncateText(text string, maxChars int) string {
 	if jsstring.Length(text) <= maxChars {
 		return text
 	}
-	return jsstring.Slice(text, 0, maxChars-3) + "..."
+	return jsstring.SliceHead(text, maxChars-3) + "..."
 }
 
 func previewArgs(args json.RawMessage) string {
@@ -388,30 +389,34 @@ func decodeObjectMembers(raw json.RawMessage) (map[string]json.RawMessage, bool)
 	return members, true
 }
 
-// storeOf reads the values of `load()`: the `codemode-store` entries on the branch, applied from the root. Entries
-// with malformed data are ignored.
+// applyStoreEntry replays one codemode-store record. Non-custom entries are skipped without reading their records.
+func applyStoreEntry(store map[string]json.RawMessage, entry codingagent.SessionEntry) {
+	if entry.Base().Type != "custom" {
+		return
+	}
+	raw, err := sessionentry.ReadRaw(entry)
+	var fields struct {
+		CustomType string          `json:"customType"`
+		Data       json.RawMessage `json:"data"`
+	}
+	if err != nil || json.Unmarshal(raw, &fields) != nil || fields.CustomType != StoreEntryType {
+		return
+	}
+	set, deleted, ok := storeEntryData(fields.Data)
+	if !ok {
+		return
+	}
+	for _, key := range deleted {
+		delete(store, key)
+	}
+	maps.Copy(store, set)
+}
+
+// storeOf reads the values of `load()`: the `codemode-store` entries on the branch, applied from the root.
 func storeOf(branch []codingagent.SessionEntry) map[string]json.RawMessage {
 	store := map[string]json.RawMessage{}
 	for _, entry := range branch {
-		if entry.Base().Type != "custom" {
-			continue
-		}
-		var fields struct {
-			CustomType string          `json:"customType"`
-			Data       json.RawMessage `json:"data"`
-		}
-		raw, err := json.Marshal(entry)
-		if err != nil || json.Unmarshal(raw, &fields) != nil || fields.CustomType != StoreEntryType {
-			continue
-		}
-		set, deleted, ok := storeEntryData(fields.Data)
-		if !ok {
-			continue
-		}
-		for _, key := range deleted {
-			delete(store, key)
-		}
-		maps.Copy(store, set)
+		applyStoreEntry(store, entry)
 	}
 	return store
 }
@@ -457,26 +462,8 @@ func (c *branchStoreCache) read(manager extension.ReadonlySessionManager) map[st
 	if found {
 		maps.Copy(values, c.values)
 	}
-	// Replay only custom records, in root-to-leaf order, preserving deletion.
 	for _, entry := range slices.Backward(entries) {
-		if entry.Base().Type != "custom" {
-			continue
-		}
-		raw, err := json.Marshal(entry)
-		var fields struct {
-			CustomType string          `json:"customType"`
-			Data       json.RawMessage `json:"data"`
-		}
-		if err != nil || json.Unmarshal(raw, &fields) != nil || fields.CustomType != StoreEntryType {
-			continue
-		}
-		set, deleted, ok := storeEntryData(fields.Data)
-		if ok {
-			for _, key := range deleted {
-				delete(values, key)
-			}
-			maps.Copy(values, set)
-		}
+		applyStoreEntry(values, entry)
 	}
 	c.sessionID, c.leaf, c.values = id, "", values
 	if leaf != nil {
@@ -669,11 +656,8 @@ func truncateOutput(items []ai.ToolResultMessageContent, maxTokens int64) ([]ai.
 	headChars := budget / 2
 	tailChars := budget - headChars
 	removed := len(units) - headChars - tailChars
-	head := decodeUnits(units[:headChars])
-	tail := ""
-	if tailChars > 0 {
-		tail = decodeUnits(units[len(units)-tailChars:])
-	}
+	head := decodeUnits(jsstring.HeadUnits(units, headChars))
+	tail := decodeUnits(jsstring.TailUnits(units, tailChars))
 	text := fmt.Sprintf("Warning: truncated output (original token count: %d)\nTotal output lines: %d\n\n%s…%d tokens truncated…%s",
 		ceilDiv(len(units), charsPerToken), strings.Count(combined, "\n")+1, head, ceilDiv(removed, charsPerToken), tail)
 	path, err := spillOutput(combined)
@@ -769,11 +753,7 @@ func Execute(ctx context.Context, toolCallID string, params json.RawMessage, onU
 	}
 	samples := make(map[string]string, len(callable))
 	for _, tool := range callable {
-		sample, err := sandbox.RenderToolSample(toDeclaration(tool, guidelines[tool.Name]), sandbox.ToolRenderOptions{})
-		if err != nil {
-			return agent.AgentToolResult{}, err
-		}
-		samples[tool.Name] = sample
+		samples[tool.Name] = sandbox.RenderToolSample(toDeclaration(tool, guidelines[tool.Name]), sandbox.ToolRenderOptions{})
 	}
 	sandboxTools := make([]sandbox.Tool, len(callable))
 	for i, tool := range callable {
@@ -810,6 +790,7 @@ func Execute(ctx context.Context, toolCallID string, params json.RawMessage, onU
 		TimeoutMs:        math.Max(1, math.Round(deadline-waitedMs)),
 		MemoryLimitBytes: memoryLimitBytes,
 		CacheDir:         options.CacheDir,
+		Interpreter:      options.Interpreter, // pig additive (D263)
 		AcquireWorker:    reservation.acquireWorker,
 	})
 	if err != nil {

@@ -4,6 +4,7 @@ package codingagent
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -99,6 +100,17 @@ func TestParseChangelog_UnreleasedAtTopSkipped(t *testing.T) {
 	}
 }
 
+func TestParseChangelog_VersionedProseMentioningUnreleased(t *testing.T) {
+	in := "## [Unreleased]\n\n## [0.8.0] - 2026-11-23\n\n### Fixed\n\n- `make changelog-fold` stops while `## [Unreleased]` still holds entries.\n"
+	got := ParseChangelog(in)
+	if len(got) != 1 || got[0].Major != 0 || got[0].Minor != 8 || got[0].Patch != 0 {
+		t.Fatalf("expected 0.8.0 entry, got %#v", got)
+	}
+	if strings.Contains(got[0].Content, "\n## [Unreleased]") || strings.HasPrefix(got[0].Content, "## [Unreleased]") {
+		t.Fatalf("unexpected Unreleased heading in versioned entry: %q", got[0].Content)
+	}
+}
+
 func TestParseChangelog_BareNumericHeader(t *testing.T) {
 	// Upstream regex accepts both `## [1.2.3]` and `## 1.2.3` (the
 	// `\[?` and `\]?` are optional).
@@ -139,7 +151,7 @@ func TestParseChangelog_RealFile(t *testing.T) {
 		t.Fatalf("bundled CHANGELOG.md has no 0.0.0 development baseline: %#v", baseline)
 	}
 	for _, entry := range got {
-		if strings.Contains(entry.Content, "[Unreleased]") {
+		if strings.Contains(entry.Content, "\n## [Unreleased]") || strings.HasPrefix(entry.Content, "## [Unreleased]") {
 			t.Fatalf("unreleased content bled into a versioned entry: %q", entry.Content)
 		}
 	}
@@ -221,31 +233,70 @@ func minClampInt(a, b int) int {
 func TestGetNewEntries(t *testing.T) {
 	content := "## [2.0.0]\nNew major.\n\n## [1.1.0]\nMinor bump.\n\n## [1.0.0]\nInitial."
 	entries := ParseChangelog(content)
-
-	// All entries newer than 0.0.0
-	got := GetNewEntries(entries, "0.0.0")
-	if len(got) != 3 {
-		t.Fatalf("want 3 entries newer than 0.0.0, got %d", len(got))
+	count := func(since string) int {
+		t.Helper()
+		got, ok := GetNewEntries(entries, since)
+		if !ok {
+			t.Fatalf("GetNewEntries(%q) unreadable", since)
+		}
+		return len(got)
 	}
-
-	// Two entries newer than 1.0.0
-	got = GetNewEntries(entries, "1.0.0")
-	if len(got) != 2 {
-		t.Fatalf("want 2 entries newer than 1.0.0, got %d", len(got))
+	if n := count("0.0.0"); n != 3 {
+		t.Fatalf("want 3 entries newer than 0.0.0, got %d", n)
 	}
-	if got[0].Major != 2 || got[1].Minor != 1 {
-		t.Errorf("wrong entries: %+v", got)
+	got, _ := GetNewEntries(entries, "1.0.0")
+	if len(got) != 2 || got[0].Major != 2 || got[1].Minor != 1 {
+		t.Errorf("wrong entries newer than 1.0.0: %+v", got)
 	}
-
-	// No entries newer than 2.0.0
-	got = GetNewEntries(entries, "2.0.0")
-	if len(got) != 0 {
-		t.Fatalf("want 0 entries newer than 2.0.0, got %d", len(got))
+	if n := count("2.0.0"); n != 0 {
+		t.Fatalf("want 0 entries newer than 2.0.0, got %d", n)
 	}
+}
 
-	// Malformed sinceVersion treated as 0.0.0
-	got = GetNewEntries(entries, "bad")
-	if len(got) != 3 {
-		t.Fatalf("want 3 entries for malformed sinceVersion, got %d", len(got))
+// pi: packages/coding-agent/test/changelog.test.ts "getNewEntries" (Pi 9a1953961, #11703).
+func TestGetNewEntriesIgnoresPrereleaseAndBuildSuffixes(t *testing.T) {
+	entries := []ChangelogEntry{{Major: 0, Minor: 1, Patch: 5, Content: "0.1.5"}, {Major: 0, Minor: 1, Patch: 4, Content: "0.1.4"}}
+	contents := func(last string) []string {
+		got, ok := GetNewEntries(entries, last)
+		if !ok {
+			return nil
+		}
+		out := []string{}
+		for _, e := range got {
+			out = append(out, e.Content)
+		}
+		return out
+	}
+	for last, want := range map[string][]string{
+		"0.1.5-20261020.7": {},
+		"0.1.5+build.3":    {},
+		"0.1.4-beta.1":     {"0.1.5"},
+		"0.1.5":            {},
+		"0.1.3":            {"0.1.5", "0.1.4"},
+	} {
+		if got := contents(last); !slices.Equal(got, want) {
+			t.Errorf("since %q: %v, want %v", last, got, want)
+		}
+	}
+	if got, _ := GetNewEntries([]ChangelogEntry{{Major: 0, Minor: 10, Patch: 0, Content: "0.10.0"}}, "0.9.0"); len(got) != 1 {
+		t.Errorf("0.10.0 must be newer than 0.9.0")
+	}
+	for _, last := range []string{"latest", "0.1", "", "bad"} {
+		if got, ok := GetNewEntries(entries, last); ok || got != nil {
+			t.Errorf("since %q: want unreadable, got %v %v", last, got, ok)
+		}
+	}
+}
+
+// pi: interactive-mode-extension-changelog.test.ts / getChangelogForDisplay (Pi 9a1953961).
+func TestRecordChangelogVersionRecordsCurrentVersionForUnreadableLastSeen(t *testing.T) {
+	t.Setenv("PI_OFFLINE", "1")
+	sm := NewInMemorySettingsManager(Settings{LastChangelogVersion: "latest"})
+	entries := []ChangelogEntry{{Major: 0, Minor: 2, Patch: 0, Content: "## [0.2.0]\nnew"}}
+	if got := recordChangelogVersionAndMaybeReportInstall(sm, "0.2.0", entries); got != nil {
+		t.Errorf("unreadable last seen must show nothing, got %v", got)
+	}
+	if v := sm.GetLastChangelogVersion(); v != "0.2.0" {
+		t.Errorf("recorded %q, want 0.2.0", v)
 	}
 }

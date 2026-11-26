@@ -11,7 +11,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/link"
 )
 
-// Ports packages/chord/test/next/link/message.test.ts: round trips of every kind through both codecs, the byte layout
+// Ports packages/chord/test/link/message.test.ts: round trips of every kind through both codecs, the byte layout
 // of the binary codec, the tuples of the text codec, and the envelope check.
 
 const fingerprint = "0123456789abcdef"
@@ -44,14 +44,20 @@ func everyKind() []link.Message {
 	origin := hold(0, link.Text("{}"))
 	origin.Type = "t"
 	origin.Origin = some(2)
+	oldOrigin := &link.CallMessage{Origin: some(2), Call: 10, Hold: 3, Method: 0, Old: true}
 	return []link.Message{
 		&link.HelloMessage{Protocol: 1, Incarnation: incarnation, Calls: 256},
+		// No call window: a trusted link's.
+		&link.HelloMessage{Protocol: 1, Incarnation: incarnation},
 		first,
 		withIncarnation,
 		onlyIncarnation,
 		&link.ReleaseMessage{Hold: 0},
 		&link.CallMessage{Call: 3, Hold: 0, Method: 1, Args: link.Text(`{"text":"x"}`)},
 		&link.CallMessage{Call: 4, Hold: 0, Method: 0},
+		// A call that is old work (a restart's), alone and under an origin (Pi's also carries a trace: T6, no Trace here; no args, the text decoder's own branch).
+		&link.CallMessage{Call: 9, Hold: 0, Method: 1, Args: link.Text(`{"text":"x"}`), Old: true},
+		oldOrigin,
 		&link.AbortMessage{Call: 3},
 		&link.BoundMessage{Holds: []link.BoundEntry{{Hold: 0, Variant: 1, Members: []link.BoundMember{{Member: 0, Value: link.Text(`[1,"a"]`)}}, Failed: []link.FailedMember{{Member: 1, Error: released}}}}},
 		&link.BoundMessage{Holds: []link.BoundEntry{
@@ -70,6 +76,8 @@ func everyKind() []link.Message {
 		&link.FailedMessage{Hold: 0, Cause: transientCause(), RetryIn: some(0)},
 		// Not the object's fault (dependency model §2): no backoff window, an event wakes it.
 		&link.FailedMessage{Hold: 0, Cause: link.WireCause{Kind: "waiting", Error: chordError("contract_mismatch", "m")}},
+		// An admission refused the caller (slice 14 §2.4): no backoff window, the decision wakes it.
+		&link.FailedMessage{Hold: 0, Cause: link.WireCause{Kind: "denied", Error: chordError("forbidden", "no access")}},
 		// The wire error format in `failed` and `gone`: a plugin's error travels too.
 		&link.FailedMessage{Hold: 0, Cause: link.WireCause{Kind: "broken", Error: pluginError("config", "m")}},
 		&link.GoneMessage{Hold: 1, Error: pluginError("config", "m", object("at", 1.0))},
@@ -85,6 +93,15 @@ func everyKind() []link.Message {
 		&link.AckMessage{},
 		&link.AckMessage{Origin: some(1)},
 		&link.ClosedMessage{Origin: 300},
+		// Event acks: the event messages consumed, never a state ack.
+		&link.AckMessage{Events: some(1)},
+		&link.AckMessage{Origin: some(300), Events: some(4000)},
+		// Events: `at` a whole Date.now(), several holds and members in one message, and none (a relay's filtered one).
+		&link.EventMessage{Events: []link.WireEvent{
+			{Hold: 0, Member: 0, At: 1_762_819_200_123, Value: link.Text(`{"t":1,"y":0.5}`)},
+			{Hold: 300, Member: 2, At: 0, Value: link.Text("null")},
+		}},
+		&link.EventMessage{Origin: some(7)},
 		origin,
 		&link.ReleaseMessage{Origin: some(2), Hold: 3},
 		&link.CallMessage{Origin: some(2), Call: 1, Hold: 3, Method: 0, Args: link.Text("[1]")},
@@ -125,6 +142,7 @@ func TestMessages(t *testing.T) {
 				&link.ResultMessage{Call: 0, Value: deflated(), Segments: [][]byte{{7}}},
 				&link.BoundMessage{Holds: []link.BoundEntry{{Hold: 0, Variant: 0, Members: []link.BoundMember{{Member: 0, Value: deflated()}}}}},
 				&link.StateMessage{Holds: []link.StateEntry{{Hold: 0, Members: []link.StateMember{{Member: 0, Ops: deflated()}}}}},
+				&link.EventMessage{Origin: some(2), Events: []link.WireEvent{{Hold: 0, Member: 1, At: 5, Value: deflated()}}},
 			}
 			for _, message := range messages {
 				decoded, err := link.CheckMessage(decode(t, codec, encode(t, codec, message)), background)
@@ -173,7 +191,7 @@ func TestMessages(t *testing.T) {
 		t.Run("refuse an empty message, an unknown kind and trailing bytes", func(t *testing.T) {
 			release := encode(t, codec, &link.ReleaseMessage{Hold: 1})
 			trailing := append(append([]byte{}, release...), 0)
-			unknown := []byte{99}
+			unknown := []byte{63}
 			if codec == link.TextCodec {
 				trailing = append(append([]byte{}, release...), 0x20, 0x31)
 				unknown = []byte(`["?"]`)
@@ -269,6 +287,37 @@ func TestTheBinaryCodec(t *testing.T) {
 		if got := enc(&link.AckMessage{}); !bytes.Equal(got, []byte{13}) {
 			t.Fatalf("ack = %v", got)
 		}
+		// No call window is written as 0 (a window is at least 1) and read back as absent.
+		none := enc(&link.HelloMessage{Protocol: 1, Incarnation: incarnation})
+		if none[len(none)-1] != 0 || len(none) != 1+1+16+1 {
+			t.Fatalf("hello without a window = %v", none)
+		}
+		requireCanon(t, decode(t, binary, none), &link.HelloMessage{Protocol: 1, Incarnation: incarnation})
+		// An event ack: the kind byte's third flag, then its count (a state ack stays one byte).
+		if got := enc(&link.AckMessage{Events: some(3)}); !bytes.Equal(got, []byte{13 | 0x20, 3}) {
+			t.Fatalf("event ack = %v", got)
+		}
+		if got := enc(&link.AckMessage{Origin: some(300), Events: some(4000)}); !bytes.Equal(got, []byte{13 | 0x80 | 0x20, 0xac, 0x02, 0xa0, 0x1f}) {
+			t.Fatalf("event ack with origin = %v", got)
+		}
+		requireCanon(t, decode(t, binary, []byte{13 | 0x20, 3}), &link.AckMessage{Events: some(3)})
+		if _, err := binary.Decode([]byte{14 | 0x20, 1}); err == nil || !strings.Contains(err.Error(), "binary: an unknown kind") {
+			t.Fatalf("flag on a closed = %v", err)
+		}
+		// An event: kind 18, the entry count, then hold, member, at as varints and the value as a length-prefixed part.
+		event := &link.EventMessage{Events: []link.WireEvent{{Hold: 1, Member: 0, At: 9, Value: link.Text(`{"y":1}`)}}}
+		if got := enc(event); !bytes.Equal(got, append([]byte{18, 1, 1, 0, 9, 14}, `{"y":1}`...)) {
+			t.Fatalf("event = %v", got)
+		}
+		if got := enc(&link.EventMessage{Origin: some(7)}); !bytes.Equal(got, []byte{18 | 0x80, 7, 0}) {
+			t.Fatalf("empty event = %v", got)
+		}
+		// `at` is a whole Date.now(): a six-byte varint.
+		if got := enc(&link.EventMessage{Events: []link.WireEvent{{Hold: 0, Member: 2, At: 1_762_819_200_123, Value: link.Text("null")}}}); !bytes.Equal(got, []byte{18, 1, 0, 2, 0xfb, 0xa8, 0xd9, 0x81, 0xa7, 0x33, 8, 'n', 'u', 'l', 'l'}) {
+			t.Fatalf("event with a Date.now() = %v", got)
+		}
+		// Frames without the new fields decode as before.
+		requireCanon(t, decode(t, binary, []byte{13}), &link.AckMessage{})
 		// An origin: the kind byte's high bit, then the origin as a varint.
 		if got := enc(&link.AckMessage{Origin: some(300)}); !bytes.Equal(got, []byte{13 | 0x80, 0xac, 0x02}) {
 			t.Fatalf("ack with origin = %v", got)
@@ -278,17 +327,17 @@ func TestTheBinaryCodec(t *testing.T) {
 		}
 	})
 
-	t.Run("writes a failure's cause as one byte, 0 transient, 1 broken, 2 waiting (dependency model §2); refuses another", func(t *testing.T) {
+	t.Run("writes a failure's cause as one byte, 0 transient, 1 broken, 2 waiting, 3 denied (slice 14 §2.4); refuses another", func(t *testing.T) {
 		failed := func(kind string) link.Message {
 			return &link.FailedMessage{Hold: 0, Cause: link.WireCause{Kind: kind, Error: chordError("unavailable", "m")}}
 		}
-		for want, kind := range []string{"transient", "broken", "waiting"} {
+		for want, kind := range []string{"transient", "broken", "waiting", "denied"} {
 			if got := enc(failed(kind))[2]; int(got) != want {
 				t.Fatalf("%s = %d", kind, got)
 			}
 		}
 		forged := enc(failed("waiting"))
-		forged[2] = 3
+		forged[2] = 4
 		_, err := binary.Decode(forged)
 		requireErrorContains(t, err, "an unknown failure kind")
 	})
@@ -346,6 +395,24 @@ func TestTheBinaryCodec(t *testing.T) {
 		state := append(append([]byte{6}, bytes.Repeat([]byte{0x80}, 150)...), 0)
 		_, err := binary.Decode(state)
 		requireErrorContains(t, err, "a varint does not fit")
+	})
+
+	t.Run("flags a call that is old work of a reload in the kind byte (0x20); another kind with that flag is unknown", func(t *testing.T) {
+		call := enc(&link.CallMessage{Old: true})
+		if call[0] != 3|0x20 {
+			t.Fatalf("call kind byte = %#x", call[0])
+		}
+		decoded, err := binary.Decode(call)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := decoded.(*link.CallMessage); !ok || !reflect.DeepEqual(got, &link.CallMessage{Old: true}) {
+			t.Fatalf("decoded = %#v", decoded)
+		}
+		release := append([]byte{}, enc(&link.ReleaseMessage{Hold: 1})...)
+		release[0] |= 0x20
+		_, err = binary.Decode(release)
+		requireErrorContains(t, err, "unknown kind")
 	})
 
 	t.Run("refuses unknown hold flags", func(t *testing.T) {
@@ -418,10 +485,20 @@ func TestTheTextCodec(t *testing.T) {
 		wire := `{"kind":"chord","error":{"code":"unavailable","message":"m"}}`
 		check(&link.FailedMessage{Hold: 2, Cause: transientCause()}, `["f",2,"t",`+wire+`]`)
 		check(&link.FailedMessage{Hold: 2, Cause: transientCause(), RetryIn: some(750)}, `["f",2,"t",`+wire+`,750]`)
+		check(&link.FailedMessage{Hold: 2, Cause: link.WireCause{Kind: "denied", Error: chordError("unavailable", "m")}}, `["f",2,"d",`+wire+`]`)
 		check(&link.FailedMessage{Hold: 2, Cause: link.WireCause{Kind: "waiting", Error: chordError("unavailable", "m")}}, `["f",2,"w",`+wire+`]`)
 		_, err := decodeText(`["f",2,"x",{}]`)
 		requireErrorContains(t, err, "an unknown failure kind")
 		check(&link.AckMessage{}, `["a"]`)
+		check(&link.AckMessage{Events: some(2)}, `["a",2]`)
+		check(&link.EventMessage{Events: []link.WireEvent{{Hold: 1, Member: 0, At: 9, Value: link.Text(`{"y":1}`)}}}, `["E",[[1,0,9,[0,{"y":1}]]]]`)
+		check(&link.EventMessage{Origin: some(7)}, `["@",7,["E",[]]]`)
+		check(&link.AckMessage{Origin: some(300), Events: some(4000)}, `["@",300,["a",4000]]`)
+		check(&link.HelloMessage{Protocol: 1, Incarnation: incarnation}, `["h",1,"`+incarnation+`"]`)
+		_, err = decodeText(`["h",1,"` + incarnation + `",0]`)
+		requireErrorContains(t, err, "message schema")
+		_, err = decodeText(`["E",[[1,0,9]]]`)
+		requireErrorContains(t, err, "an event entry with 3 fields")
 		// An origin wraps the message's own tuple.
 		check(&link.ReleaseMessage{Origin: some(4), Hold: 3}, `["@",4,["R",3]]`)
 		check(&link.ClosedMessage{Origin: 4}, `["@",4,["C"]]`)

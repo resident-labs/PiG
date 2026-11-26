@@ -1,10 +1,16 @@
 # The Python fixture of the session graph conformance rows (session_graph_test.go): the script of testfixture/sessiongraph (Go), testdata/session-graph.mjs (Node, Pi's own classes) and testdata/session-graph-rust.
+import gc
 import json
 import os
 import threading
+import time
 
 import pig_sdk
 from pig_sdk import DefaultPackageManager, DefaultResourceLoader, ModelRuntime, ProjectTrustStore, SessionManager, SettingsManager, has_trust_requiring_project_resources
+
+# The aggressive-collector row (session_graph_gc_test.go) sets this: the collector runs on every container allocation, so a wrapper that nothing keeps alive is collected at once.
+if os.environ.get("PIG_SESSION_GRAPH_COLLECTOR"):
+    gc.set_threshold(1)
 
 
 def shape(entries):
@@ -684,9 +690,38 @@ def model_runtime_script(ctx, args):
     r["login"] = {"credential": credential, "prompts": seen, "events": events2, "listed": sorted(c["providerId"] for c in rt.list_credentials()), "status": rt.get_provider_auth_status("openai")}
     rt.logout("openai")
     r["login"]["afterLogout"] = sorted(c["providerId"] for c in rt.list_credentials())
+    rt.settle_credential_writes()
+    r["settled"] = True
     with open(auth) as handle:
         r["stored"] = json.load(handle)
+    r["pending"] = settle_pending_probe(rt, auth)
     return r
+
+
+def settle_pending_probe(rt, auth):
+    lock = auth + ".lock"
+    os.mkdir(lock)
+    logged_in = {}
+
+    def login():
+        try:
+            rt.login("openai", "api_key", lambda prompt: "sk-pending", lambda event: None)
+            logged_in["ok"] = True
+        except Exception:
+            logged_in["ok"] = False
+
+    thread = threading.Thread(target=login)
+    thread.start()
+    time.sleep(0.8)
+    threading.Timer(1.5, lambda: os.rmdir(lock)).start()
+    start = time.monotonic()
+    rt.settle_credential_writes()
+    waited = time.monotonic() - start >= 1.0
+    with open(auth) as handle:
+        key = (json.load(handle).get("openai") or {}).get("key")
+    thread.join()
+    rt.logout("openai")
+    return {"keyAtSettle": key, "waited": waited, "login": logged_in.get("ok", False)}
 
 
 def model_runtime_tool(ctx, params):
@@ -1316,6 +1351,8 @@ def extension_runner_script(ctx, args):
     )
     loader.reload()
     loaded = loader.get_extensions()
+    # The loader's last use: from here only the loaded extensions name it (the runner below puts their loader's handle on the wire).
+    del loader
     r["loaded"] = {"paths": [ext["path"] for ext in loaded.extensions], "tools": [ext["tools"] for ext in loaded.extensions], "errors": loaded["errors"], "sources": [ext["sourceInfo"]["source"] for ext in loaded.extensions], "runtime": _runtime_view(loaded.runtime)}
 
     manager = SessionManager.in_memory(ctx, cwd)
@@ -1444,6 +1481,7 @@ def extension_runner_script(ctx, args):
     started = runner.emit_before_agent_start({"messageType": "user", "prompt": "do it"}, {"cwd": cwd, "customPrompt": "base"})
     forced = started["systemPromptOptions"].get("forceSystemPrompt") or ""
     emits["beforeAgentStart"] = {"messages": started["messages"], "forced": {"startsWithBase": forced.startswith("base"), "endsWithA": forced.endswith("[A]")}, "customPrompt": started["systemPromptOptions"].get("customPrompt")}
+    runner.emit({"type": "message_start", "message": {"role": "user", "content": "hi", "timestamp": 1}})
     put("messageEnd", runner.emit_message_end({"type": "message_end", "message": {"role": "user", "content": "hi", "timestamp": 1}}))
     emits["providerRequest"] = runner.emit_before_provider_request({"model": "m"})
     emits["providerHeaders"] = runner.emit_before_provider_headers({"x-del": "d", "x-keep": "k"})
@@ -1580,6 +1618,65 @@ def extension_runner_tool(ctx, params):
     return json.dumps(extension_runner_script(ctx, params))
 
 
+def extension_runner_signal_script(ctx, args):
+    """The two sequences of extension-runner-signal.mjs through the Python SDK's ExtensionRunner: get_signal answers the signal of the client's current run (Pi: one AbortController per run, agent.ts:518-527)."""
+    cwd, agent_dir = args["cwd"], args["agentDir"]
+    current = [None]
+    turn = {"type": "turn_start", "turnIndex": 0, "timestamp": 1}
+    message = {"type": "message_start", "message": {"role": "user", "content": "hi", "timestamp": 1}}
+
+    def rig():
+        rt = ModelRuntime.create(ctx, auth_path=args["mrAuth"], models_path=args["mrModels"], models_store_path=args["mrStore"])
+        settings = SettingsManager.in_memory(ctx, {"compaction": {"enabled": False}, "retry": {"enabled": False}, "defaultProvider": "mr-local", "defaultModel": "m1"})
+        loader = DefaultResourceLoader(
+            ctx, cwd=cwd, agent_dir=agent_dir, settings_manager=settings, runtime=pig_sdk.create_extension_runtime(ctx), no_extensions=True, no_skills=True,
+            no_prompt_templates=True, no_themes=True, no_context_files=True, additional_extension_paths=[args["signalProbe"]],
+        )
+        loader.reload()
+        loaded = loader.get_extensions()
+        del loader
+        manager = SessionManager.in_memory(ctx, cwd)
+        runner = pig_sdk.ExtensionRunner(ctx, loaded.extensions, loaded.runtime, cwd, manager, rt)
+        entries, errors = [], []
+        runner.bind_core({"append_entry": lambda custom_type, data: entries.append([custom_type, data])}, {"get_signal": lambda: current[0]})
+        runner.on_error(lambda report: errors.append({"event": report["event"], "error": report["error"]}))
+        return runner, entries, errors, loaded["errors"], loaded
+
+    r = {}
+
+    # Sequence 1, two live runs.
+    current[0] = pig_sdk.ProviderSignal()
+    runner, entries, errors, load_errors, _loaded = rig()
+    runner.emit({"type": "agent_start"})
+    second = pig_sdk.ProviderSignal()
+    current[0] = second
+    runner.emit(turn)
+    second.set()
+    runner.emit(message)
+    r["twoLiveRuns"] = {"entries": entries, "errors": errors, "loadErrors": load_errors}
+
+    # Sequence 2, the own abort missed.
+    first = pig_sdk.ProviderSignal()
+    current[0] = first
+    runner, entries, errors, load_errors, _loaded = rig()
+    runner.emit({"type": "agent_start"})
+    first.set()
+    nxt = pig_sdk.ProviderSignal()
+    current[0] = nxt
+    # The client drops its own reference to run 1's aborted signal and collects before run 2 is read: the wrapper must hold the signal itself, or it cannot say run 1 had aborted.
+    del first
+    gc.collect()
+    runner.emit(turn)
+    nxt.set()
+    runner.emit(message)
+    r["abortedThenLive"] = {"entries": entries, "errors": errors, "loadErrors": load_errors}
+    return r
+
+
+def extension_runner_signal_tool(ctx, params):
+    return json.dumps(extension_runner_signal_script(ctx, params))
+
+
 def _entry_text(message):
     content = message.get("content")
     if isinstance(content, str):
@@ -1607,7 +1704,10 @@ def agent_session_runtime_script(ctx, args):
             resource_loader_options=dict(quiet, additional_extension_paths=[args["runtimeProbe"]]),
         ))
         session = pig_sdk.create_agent_session_from_services(ctx, pig_sdk.CreateAgentSessionFromServicesOptions(services=services, session_manager=options.session_manager, session_start_event=start))
-        return pig_sdk.CreateAgentSessionRuntimeResult(session=session, services=services, diagnostics=services.diagnostics, model_fallback_message=session.model_fallback_message)
+        diagnostics = [*services.diagnostics, {"type": "warning", "message": "runtime diagnostics: startup"}]
+        if len(calls) > 1:
+            diagnostics.append({"type": "error", "message": "runtime diagnostics: replaced"})
+        return pig_sdk.CreateAgentSessionRuntimeResult(session=session, services=services, diagnostics=diagnostics, model_fallback_message=session.model_fallback_message)
 
     manager = SessionManager.create(ctx, cwd, session_dir)
     run_file = manager.get_session_file()
@@ -1662,6 +1762,8 @@ def agent_session_runtime_script(ctx, args):
         "cwd": runtime.cwd, "diagnostics": runtime.diagnostics, "fallback": runtime.model_fallback_message, "sameLog": current().get_session_id() == manager.get_session_id(),
         "servicesCwd": runtime.services.cwd, "servicesAgentDir": runtime.services.agent_dir == agent_dir, "calls": len(calls),
     }
+    r["takenAtStartup"] = runtime.take_unreported_diagnostics()
+    r["takenAtStartupAgain"] = runtime.take_unreported_diagnostics()
     runtime.session.prompt("one")
     r["prompted"] = {"kinds": kinds(), "persisted": os.path.exists(run_file)}
 
@@ -1672,6 +1774,8 @@ def agent_session_runtime_script(ctx, args):
         "result": created, "fresh": is_new(), "parentIsFirst": parent_is(run_file), "kinds": kinds(), "roles": roles(), "calls": list(calls[1:]),
         "rebinds": counts["rebinds"], "invalidations": counts["invalidations"],
     }
+    r["takenAfterNew"] = runtime.take_unreported_diagnostics()
+    r["takenAfterNewAgain"] = runtime.take_unreported_diagnostics()
     runtime.session.prompt("two")
 
     second_file = current().get_session_file()
@@ -1679,6 +1783,7 @@ def agent_session_runtime_script(ctx, args):
     r["forkCancelled"] = {"result": cancelling(lambda: runtime.fork(two_id)), "sameSession": not is_new()}
     forked = runtime.fork(two_id)
     r["fork"] = {"result": forked, "fresh": is_new(), "parentIsNotSecond": current().get_session_file() != second_file, "roles": roles(), "kinds": kinds(), "calls": len(calls) - 2}
+    r["takenAfterFork"] = runtime.take_unreported_diagnostics()
     runtime.session.prompt("three")
     forked_at = runtime.fork(assistant_id(), {"position": "at"})
     r["forkAt"] = {"result": forked_at, "fresh": is_new(), "roles": roles()}
@@ -1703,7 +1808,27 @@ def agent_session_runtime_script(ctx, args):
         "missing": error_text(lambda: runtime.import_from_jsonl(os.path.join(import_dir, "missing.jsonl"))),
     }
 
+    # reload after bind_extensions() with no bindings (Pi e03dca7a3843): the old extensions get session_shutdown and the new ones session_start.
+    with open(log_file) as handle:
+        logged_before_reload = len(handle.read().rstrip("\n").split("\n"))
+    runtime.session.reload()
+    with open(log_file) as handle:
+        r["reload"] = {"events": handle.read().rstrip("\n").split("\n")[logged_before_reload:]}
+
+    # dispose settles a run in flight before it emits session_shutdown; the model never ends this run, so only the abort can end it.
+    observe_file = os.path.join(cwd, "observe-run")
+    open(observe_file, "w", newline="").close()
+    hung = runtime.session
+    running = threading.Thread(target=lambda: hung.prompt("hang-forever"))
+    running.start()
+    deadline = time.monotonic() + 30
+    while "agent_start" not in open(log_file).read():
+        if time.monotonic() > deadline:
+            raise RuntimeError("the run never started")
+        time.sleep(0.01)
     runtime.dispose()
+    running.join()
+    os.remove(observe_file)
     r["counts"] = {"rebinds": counts["rebinds"], "invalidations": counts["invalidations"], "factoryCalls": len(calls), "reasons": [("null" if call["reason"] is None else call["reason"]) + ("+previous" if call["previous"] else "") for call in calls]}
     with open(log_file) as handle:
         r["events"] = handle.read().rstrip("\n").split("\n")
@@ -1728,6 +1853,7 @@ def new_extension():
     ext.register_tool(pig_sdk.ToolDefinition(name="extension_refs", label="extension_refs", description="Runs the compiled-in extension factories script.", parameters={"type": "object"}, execute=extension_refs_tool))
     ext.register_tool(pig_sdk.ToolDefinition(name="mcp_options", label="mcp_options", description="Runs the createMcpExtension function options script.", parameters={"type": "object"}, execute=mcp_options_tool))
     ext.register_tool(pig_sdk.ToolDefinition(name="extension_runner", label="extension_runner", description="Runs the createExtensionRuntime and ExtensionRunner script.", parameters={"type": "object"}, execute=extension_runner_tool))
+    ext.register_tool(pig_sdk.ToolDefinition(name="extension_runner_signal", label="extension_runner_signal", description="Runs the two-run signal script of the ExtensionRunner.", parameters={"type": "object"}, execute=extension_runner_signal_tool))
     ext.register_tool(pig_sdk.ToolDefinition(name="agent_session_runtime", label="agent_session_runtime", description="Runs the createAgentSessionRuntime script.", parameters={"type": "object"}, execute=agent_session_runtime_tool))
     ext.register_tool(pig_sdk.ToolDefinition(name="services", label="services", description="Runs the createAgentSessionServices script.", parameters={"type": "object"}, execute=services_tool))
     return ext

@@ -11,11 +11,12 @@ import (
 
 	chordctx "github.com/MichaelKinsy/PiG/chord/context"
 	"github.com/MichaelKinsy/PiG/chord/delta"
+	"github.com/MichaelKinsy/PiG/internal/chord/chordjson"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
-// Ports packages/chord/src/next/data/principal.ts: the app's caller identities, and the keys Chord derives from them.
+// Ports packages/chord/src/data/principal.ts: the app's caller identities, and the keys Chord derives from them.
 
 // Principal is an app's principal: plain JSON with a `kind`. Chord never persists it. It is a pointer so that a
 // principal has the identity upstream's per-object cache is keyed by.
@@ -58,8 +59,35 @@ func PrincipalKey(principal Principal, ctx context.Context, customKey *Principal
 	return key
 }
 
+// SamePrincipal is whether principal is other: the same default key (canonical JSON), each computed once per principal
+// object; no principal (nil, upstream's `undefined`) is none (Pi main de229e073).
+func SamePrincipal(principal, other Principal, ctx context.Context) bool {
+	return principal != nil && PrincipalKey(principal, ctx, nil) == PrincipalKey(other, ctx, nil)
+}
+
 // defaultKeys is the cache of default keys, by principal.
 var defaultKeys principalKeys
+
+// PrincipalJson is a principal's own JSON, as the wire carries it (its fields in insertion order): two principals give
+// the same text only when they serialize equally. Cached per principal object, one walk counted per object (the caller
+// part of the key under which the references of a host share one wire hold).
+func PrincipalJson(principal Principal, ctx context.Context) string {
+	if json, ok := wireJson.get(principal); ok {
+		return json
+	}
+	chordctx.Telemetry(ctx).Metrics().Counter("chord.data.walks", telemetry.InstrumentOptions{}).Add(1, nil)
+	encoded, err := chordjson.Marshal(principal)
+	if err != nil {
+		// Only a non-JSON value fails; a principal is plain JSON.
+		panic("data: JSON of a non-JSON principal: " + err.Error())
+	}
+	json := string(encoded)
+	wireJson.set(principal, json)
+	return json
+}
+
+// wireJson is the cache of principals' own JSON, by principal.
+var wireJson principalKeys
 
 // principalKeys is a cache of principal keys that does not retain its principals: entries are keyed by weak pointer
 // and removed once the principal is collected.

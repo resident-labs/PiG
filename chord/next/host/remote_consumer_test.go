@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 	"weak"
@@ -18,9 +19,9 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/nextnode"
 )
 
-// pi: packages/chord/src/next/remote/consumer.ts
+// pi: packages/chord/src/remote/consumer.ts
 
-// Ports packages/chord/test/next/remote/consumer.test.ts: the consumer side of a link, against a server host or a raw
+// Ports packages/chord/test/remote/consumer.test.ts: the consumer side of a link, against a server host or a raw
 // provider peer.
 
 // gotReference is what a Get that runs on a goroutine of its own returned.
@@ -769,6 +770,49 @@ func TestConsumerCallWindow(t *testing.T) {
 			}
 		})
 
+		// Ports "sends every call at once to a peer that announced no window (a trusted link's)".
+		t.Run("sends every call at once to a peer that announced no window (a trusted link's)", func(t *testing.T) {
+			client := newHost(t, HostOptions{OnError: func(HostError) {}})
+			mustLoad(t)(client.Load(nil, background))
+			a, b := link.MemoryLinkPair()
+			must(t, client.Connect(a, LinkOptions{Principal: serverPrincipal(), Codec: testCodec()}, background))
+			peer := newRawPeer(t, b, rawPeerOptions{NoCalls: true})
+			got := asyncGet(client, Notes, jsonObject("session", "S1"), background, GetOptions{})
+			hold := bindNext(t, peer)
+			notes := awaitReference(t, got)
+			for range 300 {
+				startCall(t, notes, "wait", nil, background)
+			}
+			settle(peer)
+			want := make([]int, 300)
+			for i := range want {
+				want[i] = hold
+			}
+			if got := callsOf(peer); !slices.Equal(got, want) {
+				t.Fatalf("calls = %v, want 300 calls of hold %d", got, hold)
+			}
+		})
+
+		// Ports "sends the calls parked while rebinding after the ack of the new bound: decoded by its indexes".
+		t.Run("sends the calls parked while rebinding after the ack of the new bound: decoded by its indexes", func(t *testing.T) {
+			n := narrow(t)
+			n.Peer.Send(&link.LoadingMessage{Hold: n.Holds[0]})
+			settle(n.Peer)
+			startCall(t, n.One, "wait", nil, background)
+			before := len(n.Peer.Received())
+			bindHold(t, n.Peer, n.Holds[0])
+			settle(n.Peer)
+			after := n.Peer.Received()[before:]
+			kinds := make([]string, len(after))
+			for i, message := range after {
+				kinds[i] = message.Kind()
+			}
+			requireStrings(t, kinds, []string{"ack", "call"})
+			if call := after[1].(*link.CallMessage); call.Hold != n.Holds[0] {
+				t.Fatalf("call hold = %d, want %d", call.Hold, n.Holds[0])
+			}
+		})
+
 		// Ports "rejects a call still waiting when its hold rebinds: unavailable (race 26)".
 		t.Run("rejects a call still waiting when its hold rebinds: unavailable (race 26)", func(t *testing.T) {
 			n := narrow(t)
@@ -1057,4 +1101,379 @@ func liveStateOf(ref *Reference) *RefState {
 	var state *RefState
 	ref.binding.loop.Run(func() { state = ref.State().Value() })
 	return state
+}
+
+// Ports the describe 'old work across hosts (decision "Reload restarts every affected object", `call.old`)' of consumer.test.ts.
+//
+// backCall is a provider on side whose `work` (after its gate) calls a dependent on the other host, which holds the provider
+// and calls its `x` back over the link: both reload at once while `work` runs. When raised, the reload raises the provider's
+// version (no `accepts`) and the dependent's new code needs it; dependentFirst reloads the dependent's host first and the
+// provider's 50 ms later.
+func backCall(t *testing.T, side string, raised, dependentFirst bool) (string, time.Duration) {
+	t.Helper()
+	address := func(on string) func(*delta.JsonObject) (contracts.Address, error) {
+		return func(*delta.JsonObject) (contracts.Address, error) {
+			if on == "server" {
+				return Server.Address(nil), nil
+			}
+			return Session.Address(jsonObject("id", "S1")), nil
+		}
+	}
+	other := map[string]string{"server": "worker", "worker": "server"}[side]
+	provider := mustContract(contracts.Remote("app.provider-"+side, contracts.RemoteDeclaration{
+		Version: 1, Params: contracts.Params{}, HostAddress: address(side),
+		Variants: []contracts.VariantEntry{contracts.Var("v", contracts.VariantDeclaration{Methods: []contracts.MethodEntry{
+			contracts.Meth("work", contracts.NewMethod(contracts.Schema{}, contracts.Str())),
+			contracts.Meth("x", contracts.NewMethod(contracts.Schema{}, contracts.Str())),
+		}})},
+	}))
+	providerV2 := mustContract(contracts.Evolve(provider, func(e *contracts.RemoteEditor) *contracts.RemoteEditor {
+		return e.AddState("v", "more", contracts.Str())
+	}))
+	dependent := mustContract(contracts.Remote("app.dependent-"+other, contracts.RemoteDeclaration{
+		Version: 1, Params: contracts.Params{}, HostAddress: address(other),
+		Variants: []contracts.VariantEntry{contracts.Var("v", contracts.VariantDeclaration{Methods: []contracts.MethodEntry{
+			contracts.Meth("ping", contracts.NewMethod(contracts.Schema{}, contracts.Str())),
+		}})},
+	}))
+	gates := make(chan *reloadGate, 1)
+	serve := func(h FacetHost, onSide, code string) error {
+		typ := provider
+		if raised && code == "v2" {
+			typ = providerV2
+		}
+		if onSide == side {
+			state := map[string]chord.Watchable[delta.JsonValue]{}
+			if typ == providerV2 {
+				state["more"] = constant("m")
+			}
+			return h.Serve(typ, func(*delta.JsonObject, data.Principal, Self) (contracts.Implementation, error) {
+				return contracts.Implementation{Variant: "v", Members: contracts.VariantImplementation{State: state, Methods: map[string]contracts.MethodFunction{
+					"work": func(_ delta.JsonValue, ctx context.Context) (delta.JsonValue, error) {
+						select {
+						case gate := <-gates:
+							gate.entered.fire()
+							gate.open.await(t, ctx)
+						default:
+						}
+						got, err := owCall(ctx.(Ctx), dependent, jsonObject(), "ping")
+						return code + " work -> " + got, err
+					},
+					"x": func(delta.JsonValue, context.Context) (delta.JsonValue, error) { return code + " x", nil },
+				}}}, nil
+			}, ServeOptions{})
+		}
+		return h.Serve(dependent, func(_ *delta.JsonObject, _ data.Principal, self Self) (contracts.Implementation, error) {
+			held := self.Get(typ, jsonObject())
+			return contracts.Implementation{Variant: "v", Members: contracts.VariantImplementation{Methods: map[string]contracts.MethodFunction{
+				"ping": func(_ delta.JsonValue, ctx context.Context) (delta.JsonValue, error) {
+					value, err := held.Call("x", nil, ctx)
+					text, _ := value.(string)
+					return code + " ping -> " + text, err
+				},
+			}}}, nil
+		}, ServeOptions{})
+	}
+	workerFacet := func(code string) Facet {
+		return DefineFacet(func(h FacetHost, _ FacetSelf) error {
+			if _, err := serveNotes(h, PlacedNotes); err != nil {
+				return err
+			}
+			return serve(h, "worker", code)
+		})
+	}
+	rel := relay(t, relayedOptions{
+		Trusted: true,
+		Server:  func(h FacetHost) error { return serve(h, "server", "v1") },
+		Worker:  func(h FacetHost) error { return serve(h, "worker", "v1") },
+	})
+	// The worker exists once a hold reached it.
+	_, err := rel.Tab.Get(background, PlacedNotes, jsonObject("session", "S1"), GetOptions{})
+	must(t, err)
+	key := Session.Address(jsonObject("id", "S1")).Key
+	rel.WorkerLoaded(t, key)
+	worker := rel.Worker(key)
+	host := rel.Server
+	if side == "worker" {
+		host = worker
+	}
+	options := RootOptions{Principal: workerPrincipal("S1")}
+	work := func() (any, error) {
+		return host.Root(func(ctx Ctx) (any, error) { return owCall(ctx, provider, jsonObject(), "work") }, background, options)
+	}
+	// A root keeps the dependent referenced (else it ends after each run, and the work would create it afresh).
+	held, kept, keptEnded := newSignal(), newSignal(), make(chan struct{})
+	var keptErr error
+	go func() {
+		defer close(keptEnded)
+		_, keptErr = host.Root(func(ctx Ctx) (any, error) {
+			if _, err := ctx.Get(dependent, jsonObject(), GetOptions{}); err != nil {
+				return nil, err
+			}
+			kept.fire()
+			held.await(t, ctx)
+			return nil, nil
+		}, background, options)
+	}()
+	select {
+	case <-kept:
+	case <-keptEnded:
+		t.Fatalf("the root keeping the dependent ended: %v", keptErr)
+	case <-time.After(30 * time.Second):
+		t.Fatalf("the root keeping the dependent never got it")
+	}
+	if got, err := work(); err != nil || got != "v1 work -> v1 ping -> v1 x" {
+		t.Fatalf("the first work = %v, %v, want \"v1 work -> v1 ping -> v1 x\"", got, err)
+	}
+	gate := newReloadGate()
+	gates <- gate
+	running := make(chan reloadOutcome, 1)
+	go func() { value, err := work(); running <- reloadOutcome{value: value, err: err} }()
+	gate.entered.wait(t)
+	reloadServer := func() ReloadReport {
+		return reloadMust(t)(rel.Server.Reload([]HostFacet{{Name: "@test/server", Facet: DefineFacet(func(h FacetHost, _ FacetSelf) error {
+			return serve(h, "server", "v2")
+		})}}, background, ReloadOptions{}))
+	}
+	reloadWorker := func() ReloadReport {
+		return reloadMust(t)(worker.Reload([]HostFacet{{Name: "@test/worker", Facet: workerFacet("v2")}}, background, ReloadOptions{}))
+	}
+	first, second := reloadServer, reloadWorker
+	if side == "server" {
+		first, second = reloadWorker, reloadServer
+	}
+	var reports []ReloadReport
+	if dependentFirst {
+		reports = append(reports, first())
+		time.Sleep(50 * time.Millisecond)
+		reports = append(reports, second())
+	} else {
+		done := make(chan ReloadReport, 2)
+		for _, reload := range []func() ReloadReport{first, second} {
+			go func() { done <- reload() }()
+		}
+		reports = append(reports, <-done, <-done)
+	}
+	for _, report := range reports {
+		if len(report.Failed) != 0 {
+			t.Fatalf("a reload failed %+v", report.Failed)
+		}
+	}
+	// Adapted: a condition barrier before the gate (no open old attempt), because Go's memory links deliver per link and
+	// not through one process-wide queue. Pi's memory link delivers by `queueMicrotask` (link.ts `MemoryLink.send`): one
+	// queue for every link of the process, so the seal of the dependent's old attempt (its successor's readiness needs a
+	// hold round trip that the reload started) is always ahead of a `ping` that is one hop behind the gate. Since the
+	// references of one host share a hold, `work`'s `ctx.get(Dependent)` joins the kept root's live hold and `ping` is
+	// that one hop; inside the drain window an old-flag call runs on the old attempt in Pi and here alike. The raised
+	// cases keep the old attempt open by design: no barrier there. Bounded: it fails with its own message.
+	if !raised {
+		dependentHost := rel.Server.(*chordHost)
+		if side == "server" {
+			dependentHost = worker.(*chordHost)
+		}
+		scopeEventually(t, "the dependent's old attempt sealed (its successor's requests ready, its calls drained)", func() bool {
+			sealed := true
+			dependentHost.loop().Run(func() {
+				for identity, object := range dependentHost.objects {
+					if containsText(identity, dependent.Name) && object.openOldAttempt() != nil {
+						sealed = false
+					}
+				}
+			})
+			return sealed
+		})
+	}
+	opened := time.Now()
+	gate.open.fire()
+	outcome := receive(t, running)
+	took := time.Since(opened)
+	held.fire()
+	<-keptEnded
+	if outcome.err != nil {
+		return "rejected: " + outcome.err.Error(), took
+	}
+	text, _ := outcome.value.(string)
+	return text, took
+}
+
+func TestOldWorkAcrossHostsABackCallFromTheDependentOnTheWorkerRunsOnTheServerProvidersOpenOldAttempt(t *testing.T) {
+	// Without the flag, `x` would wait for the provider's new attempt, which waits for this very call's drain.
+	answer, took := backCall(t, "server", false, false)
+	if answer != "v1 work -> v2 ping -> v1 x" || took > time.Second {
+		t.Fatalf("answer = %q after %v, want \"v1 work -> v2 ping -> v1 x\" within a second", answer, took)
+	}
+}
+
+func TestOldWorkAcrossHostsABackCallFromTheDependentOnTheServerRunsOnTheWorkerProvidersOpenOldAttempt(t *testing.T) {
+	answer, took := backCall(t, "worker", false, false)
+	if answer != "v1 work -> v2 ping -> v1 x" || took > time.Second {
+		t.Fatalf("answer = %q after %v, want \"v1 work -> v2 ping -> v1 x\" within a second", answer, took)
+	}
+}
+
+func TestOldWorkAcrossHostsTheProvidersVersionRaisedWhichTheDependentsNewCodeNeedsTheWorkRunsOnTheDependentsOldAttempt(t *testing.T) {
+	for _, side := range []string{"server", "worker"} {
+		answer, took := backCall(t, side, true, false)
+		// The dependent's successor waits for the provider's: its old attempt stays open for the work.
+		if answer != "v1 work -> v1 ping -> v1 x" || took > time.Second {
+			t.Fatalf("%s: answer = %q after %v, want \"v1 work -> v1 ping -> v1 x\" within a second", side, answer, took)
+		}
+	}
+}
+
+func TestOldWorkAcrossHostsTheSameWithTheDependentsHostReloadedFirstItsReadinessWaitsOutTheOtherHostsVersionRefusal(t *testing.T) {
+	for _, side := range []string{"server", "worker"} {
+		answer, took := backCall(t, side, true, true)
+		if answer != "v1 work -> v1 ping -> v1 x" || took > time.Second {
+			t.Fatalf("%s: answer = %q after %v, want \"v1 work -> v1 ping -> v1 x\" within a second", side, answer, took)
+		}
+	}
+}
+
+// Ports the describe 'cancelling one reference's calls on a shared hold (decision "References share one wire hold")' of
+// consumer.test.ts.
+
+// sharedCallers is Pi's `shared(calls)`: a client on a raw parent announcing a call window of calls, and two references
+// sharing one live hold.
+type sharedCallers struct {
+	peer *RawPeer
+	a, b *Reference
+	hold int
+}
+
+func sharedCallersOn(t testing.TB, calls int) *sharedCallers {
+	t.Helper()
+	client := newHost(t, HostOptions{OnError: func(HostError) {}})
+	mustLoad(t)(client.Load(nil, background))
+	near, far := link.MemoryLinkPair()
+	must(t, client.Connect(near, LinkOptions{Principal: serverPrincipal(), Codec: testCodec()}, background))
+	peer := newRawPeer(t, far, rawPeerOptions{Calls: calls})
+	peer.Next("hello")
+	a := mustHold(t, client, Notes, jsonObject("session", "S1"))
+	b := mustHold(t, client, Notes, jsonObject("session", "S1"))
+	hold := bindNext(t, peer)
+	waitLive(t, b)
+	return &sharedCallers{peer: peer, a: a, b: b, hold: hold}
+}
+
+// sharedWire is Pi's `wire(peer, texts)`: the calls, aborts and releases on the wire, as `call:<text>`, `abort:<text>`,
+// `release`.
+func sharedWire(t testing.TB, peer *RawPeer, texts map[int]string) []string {
+	t.Helper()
+	wire := []string{}
+	for _, message := range peer.Received() {
+		switch m := message.(type) {
+		case *link.CallMessage:
+			args, is := partValue(t, m.Args).(*delta.JsonObject)
+			if !is {
+				t.Fatalf("call %d has no object arguments", m.Call)
+			}
+			text, _ := args.Value("text").(string)
+			texts[m.Call] = text
+			wire = append(wire, "call:"+text)
+		case *link.AbortMessage:
+			wire = append(wire, "abort:"+texts[m.Call])
+		case *link.ReleaseMessage:
+			wire = append(wire, "release")
+		}
+	}
+	return wire
+}
+
+func sharedResult(t testing.TB, call int, value float64) *link.ResultMessage {
+	t.Helper()
+	part, err := link.JsonPart(value)
+	must(t, err)
+	return &link.ResultMessage{Call: call, Value: part}
+}
+
+// consumer.test.ts › cancelling one reference's calls on a shared hold (decision "References share one wire hold") › a
+// finite window: the released one's queued call leaves unsent, its sent one is aborted, the other's queued call goes out
+func TestCancellingOneReferencesCallsOnASharedHoldAFiniteWindowTheReleasedOnesQueuedCallLeavesUnsentItsSentOneIsAbortedTheOthersQueuedCallGoesOut(t *testing.T) {
+	s := sharedCallersOn(t, 1)
+	a1 := startCall(t, s.a, "add", jsonObject("text", "A1"), background)
+	a2 := startCall(t, s.a, "add", jsonObject("text", "A2"), background)
+	sibling := startCall(t, s.b, "add", jsonObject("text", "B1"), background)
+	// PiG's own: the order the released reference's calls reject in (Pi's case awaits them together): the waiting one
+	// (queue order), then the sent one.
+	var orderMu sync.Mutex
+	var order []string
+	loop := s.a.binding.loop
+	for tag, result := range map[string]*parkedCallResult{"A1": a1, "A2": a2} {
+		result.then(loop, func(any, error) {
+			orderMu.Lock()
+			order = append(order, tag)
+			orderMu.Unlock()
+		})
+	}
+	rhSync(t, s.peer)
+	texts := map[int]string{}
+	requireStrings(t, sharedWire(t, s.peer, texts), []string{"call:A1"})
+	s.a.Release()
+	rhSync(t, s.peer)
+	requireStrings(t, sharedWire(t, s.peer, texts), []string{"call:A1", "abort:A1", "call:B1"})
+	for _, result := range []*parkedCallResult{a1, a2} {
+		_, err := result.wait(background)
+		_ = requireChordError(t, err, data.CodeReleased, "")
+	}
+	rhWaitFor(t, func() bool { orderMu.Lock(); defer orderMu.Unlock(); return len(order) == 2 })
+	orderMu.Lock()
+	requireStrings(t, slices.Clone(order), []string{"A2", "A1"})
+	orderMu.Unlock()
+	var last *link.CallMessage
+	for _, message := range s.peer.Received() {
+		if call, is := message.(*link.CallMessage); is {
+			last = call
+		}
+	}
+	s.peer.Send(sharedResult(t, last.Call, 3))
+	value, err := sibling.wait(background)
+	must(t, err)
+	if value != float64(3) {
+		t.Fatalf("the sibling's call = %v, want 3", value)
+	}
+}
+
+// consumer.test.ts › cancelling one reference's calls on a shared hold (decision "References share one wire hold") ›
+// several sent calls are aborted newest first, a reply crossing the release is ignored, the last release sends release
+func TestCancellingOneReferencesCallsOnASharedHoldSeveralSentCallsAreAbortedNewestFirstAReplyCrossingTheReleaseIsIgnoredTheLastReleaseSendsRelease(t *testing.T) {
+	s := sharedCallersOn(t, 3)
+	type tracked struct {
+		tag    string
+		result *parkedCallResult
+	}
+	calls := []tracked{
+		{"A1", startCall(t, s.a, "add", jsonObject("text", "A1"), background)},
+		{"B1", startCall(t, s.b, "add", jsonObject("text", "B1"), background)},
+		{"A2", startCall(t, s.a, "add", jsonObject("text", "A2"), background)},
+		{"B2", startCall(t, s.b, "add", jsonObject("text", "B2"), background)},
+	}
+	rhSync(t, s.peer)
+	texts := map[int]string{}
+	requireStrings(t, sharedWire(t, s.peer, texts), []string{"call:A1", "call:B1", "call:A2"})
+	ids := map[string]int{}
+	for id, text := range texts {
+		ids[text] = id
+	}
+	s.a.Release()
+	// The provider answered A1 before it saw the abort: the reply crosses the release and is dropped here.
+	s.peer.Send(sharedResult(t, ids["A1"], 1))
+	rhSync(t, s.peer)
+	requireStrings(t, sharedWire(t, s.peer, texts), []string{"call:A1", "call:B1", "call:A2", "abort:A2", "abort:A1", "call:B2"})
+	s.peer.Send(sharedResult(t, ids["B1"], 2))
+	rhSync(t, s.peer)
+	s.b.Release()
+	settled := []string{}
+	for _, call := range calls {
+		if _, err := call.result.wait(background); err != nil {
+			settled = append(settled, call.tag+":"+string(chordOf(t, err).Code))
+		} else {
+			settled = append(settled, call.tag+":ok")
+		}
+	}
+	rhSync(t, s.peer)
+	requireStrings(t, sharedWire(t, s.peer, texts)[6:], []string{"release"})
+	// Each call settled once: the released one's with `released`, B2 by the last release.
+	slices.Sort(settled)
+	requireStrings(t, settled, []string{"A1:released", "A2:released", "B1:ok", "B2:released"})
 }

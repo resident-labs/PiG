@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"time"
+	"weak"
 
 	"github.com/MichaelKinsy/PiG/chord"
 	chordctx "github.com/MichaelKinsy/PiG/chord/context"
@@ -14,9 +15,11 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/documents"
 	"github.com/MichaelKinsy/PiG/chord/next/link"
 	"github.com/MichaelKinsy/PiG/chord/next/state"
+	"github.com/MichaelKinsy/PiG/chord/next/store"
+	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
-// Ports packages/chord/src/next/host/reference.ts
+// Ports packages/chord/src/host/reference.ts
 //
 // References (§7): what `get` and `hold` return, built from the contract's members, and its binding to the object:
 // counted as a reference, it follows the object's state, parks calls while loading, keeps the per-reference watches and
@@ -63,6 +66,14 @@ func (r *Reference) Member(name string) *ReferenceMember { return r.binding.memb
 
 // Keyed is the keyed member `name`, nil when the contract has none.
 func (r *Reference) Keyed(name string) *ReferenceKeyed { return r.binding.keyed[name] }
+
+// Queries is the named queries of the queries member `member` by name, nil when the contract has no such member.
+func (r *Reference) Queries(member string) map[string]*ReferenceQuery {
+	return r.binding.queries[member]
+}
+
+// Events is the event member `name`, nil when the contract has none.
+func (r *Reference) Events(name string) *ReferenceEvents { return r.binding.events[name] }
 
 // Variant is the variant its remote object bound last; bound is false before the first binding and for a local contract.
 // A released reference returns its end.
@@ -119,8 +130,14 @@ func (r *Reference) Release() {
 type target interface {
 	// label is the object in errors: its type, and its params key when it has params.
 	label() string
+	// kind is where it is: `local` for an object on this host, `remote` for one held over a link (another host decides what
+	// it serves).
+	kind() string
 	// state is its state as its references show it.
 	state() *RefState
+	// stateFor is its state as a reference of version and fingerprint sees it: on this host `live` also while a restart's
+	// open old attempt binds that version (decision "Reload restarts every affected object", rule 5); `state` over a link.
+	stateFor(version int, fingerprint string) *RefState
 	// hydrated is whether its state members have values: live once, for a remote object bound once.
 	hydrated() bool
 	// variant is the variant bound last; not bound for a local object and before the first binding.
@@ -137,9 +154,10 @@ type target interface {
 	hold(holder holder)
 	// unhold: holder was released.
 	unhold(holder holder)
-	// call calls a method of the live object for from, bound at version (an older one is mapped, Q10): the admission is
-	// the synchronous part of Pi's async call (in a section), the result settles later, in one.
-	call(method string, args any, ctx context.Context, from caller, version int) *parkedCallResult
+	// call calls a method of the live object for b (its caller, at its contract's version: an older one is mapped, Q10);
+	// over a link the call is the binding's own, cancelled with its release. The admission is the synchronous part of Pi's
+	// async call (in a section), the result settles later, in one.
+	call(method string, args any, b *binding, ctx context.Context, parent telemetry.TelemetrySpan) *parkedCallResult
 	// followed is what a reference of version follows for state member now (decision "References are the only
 	// indirection"): the live instance's member (a replica over a link), or nothing (`loading`, or `failed` with the
 	// cause's error), with the member a reference takes its last value from.
@@ -150,15 +168,22 @@ type target interface {
 	instance() any
 	// keyedMember is the keyed member's ultimate slot (slice 6a §12; only local objects have any).
 	keyedMember(member string) (*documents.KeyedSlot, error)
+	// queryMember is the named query `name` of queries member `member` of the live object (slice 14 §3.1; only local
+	// objects have any).
+	queryMember(member, name string) (*OwnQuery, error)
 	// keyedMapping is how a consumer of version reads keyed member's documents: mapped back to its version when older
 	// (slice 7b §7), nil when as they are; `contract_mismatch` when the provider refuses it.
 	keyedMapping(member string, version int) (contracts.Mapping, error)
 	// pinKey pins key of the keyed member on the live instance, loaded, as a consumer of version reads it (mapped when
 	// older); only a live local object has keyed members. It blocks, outside a section.
 	pinKey(member, key string, version int, ctx context.Context) (pinnedKey, error)
-	// retry is `ref.retry()`, as one step of walk: an attempt now if failed; an object parked on failed dependencies
-	// passes it on; ignored otherwise.
-	retry(walk *retryWalk)
+	// retry is `ref.retry()` from b, as one step of walk: an attempt now if failed; an object parked on failed
+	// dependencies passes it on; ignored otherwise. b is nil for a step no reference makes (a `retry` message, an
+	// object's own retry): Pi's local object takes the walk alone, and a Go interface method has one signature.
+	retry(walk *retryWalk, b *binding)
+	// generationOf is how many values the shared replica of state member took (a remote object's); false without one
+	// (and on this host, where members are no replicas).
+	generationOf(member string) (int, bool)
 	// pathTo is the chain of activation waits from this object to goal, both included (Q5); nil when there is none.
 	// visited keeps a search over shared dependencies linear in the waits.
 	pathTo(goal *chordObject, visited map[target]struct{}) []*chordObject
@@ -168,6 +193,8 @@ type target interface {
 // variant ("" is Pi's `undefined`). It is a pointer type, compared by identity.
 type attachable interface {
 	attachedVariant() string
+	// eventNode is event member member's node as a binding of version taps it; nil for a member its variant lacks.
+	eventNode(member string, version int) *eventNode
 }
 
 // followedKind is what a reference follows of its target for one state member.
@@ -176,6 +203,8 @@ type followedKind uint8
 const (
 	followedLive followedKind = iota
 	followedLacking
+	// followedDenied: an admission refused its caller (slice 14 §2.2): no value is kept, reads throw the error.
+	followedDenied
 	followedLoading
 	followedFailed
 )
@@ -313,10 +342,28 @@ type binding struct {
 	heldKeys *referenceKeys
 	// attached is the instance it attached to last: it takes last values only from that one.
 	attached attachable
+	// eventsOf are its events, for a contract with event members only; dropped at its end (it keeps no host).
+	eventsOf *bindingEvents
+	// unseen are the state members it has not seen since it joined a shared remote object, each with its replica's count
+	// of values then (decision "References share one wire hold"); one is seen once that count passes. Made at the join.
+	unseen map[string]int
+	// followers are who reads its object's named queries, each told when another instance is live (followInstance), in the
+	// order they asked.
+	followers []*instanceFollower
+	// followedInstance is the instance its followers were told of last, held weakly: an ended instance is kept by nothing
+	// here; followedSet is whether there is one (Pi's undefined).
+	followedInstance weak.Pointer[attempt]
+	followedSet      bool
+	// events are its event members, by name.
+	events map[string]*ReferenceEvents
+	// unlisted is whether presence lists leave it out: a restart's readiness bindings (`unlist`).
+	unlisted bool
 
 	members map[string]*ReferenceMember
 	keyed   map[string]*ReferenceKeyed
 	methods map[string]struct{}
+	// queries are its queries members' named queries, by member and name; made by the first variant with one.
+	queries map[string]map[string]*ReferenceQuery
 }
 
 var (
@@ -332,6 +379,7 @@ func newBinding(
 	dependent *chordObject,
 	from caller,
 	parkTimeout time.Duration,
+	events *hostEvents,
 ) *binding {
 	b := &binding{
 		loop: host.loop(), scheduler: host.scheduler, from: from, name: contract.Name, contractKind: contract.Kind,
@@ -343,12 +391,32 @@ func newBinding(
 	if err != nil {
 		panic(err)
 	}
+	b.events = map[string]*ReferenceEvents{}
 	for _, variant := range variants.All() {
+		// Event bookkeeping only for a contract with event members: others pay nothing for events per binding.
+		if variant.Events.Len() > 0 {
+			if b.eventsOf == nil {
+				b.eventsOf = &bindingEvents{host: events}
+			}
+			for _, member := range variant.Events.Keys() {
+				b.events[member] = &ReferenceEvents{binding: b, member: member}
+			}
+		}
 		for _, member := range variant.State.Keys() {
 			b.members[member] = &ReferenceMember{binding: b, member: member}
 		}
-		for _, member := range variant.Keyed.Keys() {
-			b.keyed[member] = &ReferenceKeyed{binding: b, member: member}
+		for member, declared := range variant.Keyed.All() {
+			b.keyed[member] = &ReferenceKeyed{binding: b, member: member, kind: declared.Key}
+		}
+		for member, listed := range variant.Queries.All() {
+			if b.queries == nil {
+				b.queries = map[string]map[string]*ReferenceQuery{}
+			}
+			named := make(map[string]*ReferenceQuery, listed.Args.Len())
+			for _, name := range listed.Args.Keys() {
+				named[name] = &ReferenceQuery{binding: b, member: member, name: name}
+			}
+			b.queries[member] = named
 		}
 		for _, member := range variant.Methods.Keys() {
 			b.methods[member] = struct{}{}
@@ -376,7 +444,8 @@ func (b *binding) principal() data.Principal { return b.from.principal }
 func (b *binding) refState() *RefState {
 	switch b.state.kind {
 	case bindingBound:
-		return b.state.target.state()
+		// A bound reference keeps its contract until it is released.
+		return b.state.target.stateFor(b.consumer.Version, b.consumer.Fingerprint)
 	case bindingWaiting:
 		if b.state.failure != nil {
 			return b.state.failure
@@ -388,6 +457,28 @@ func (b *binding) refState() *RefState {
 		return refLoading
 	}
 	return b.state.ended
+}
+
+// listed is whether presence lists show it (§19).
+func (b *binding) listed() bool { return !b.unlisted }
+
+// unlist keeps it out of presence lists, before it binds: a restart's readiness binding is no consumer of its own.
+func (b *binding) unlist() { b.unlisted = true }
+
+// hydratedNow is whether its members have values now: bound to an object that shows it live and has them.
+func (b *binding) hydratedNow() bool {
+	return b.state.kind == bindingBound && b.state.target.hydrated() && b.refState().Kind == RefStateLive
+}
+
+// untilState settles once done holds for the reference's state, checked now and at every change; rejects at its end or
+// ctx's abort.
+func (b *binding) untilState(done func(*RefState) bool, ctx context.Context) *keyedPromise[struct{}] {
+	return b.until(func(current *RefState) decision {
+		if done(current) {
+			return doneDecision
+		}
+		return waitDecision
+	}, ctx)
 }
 
 // target is the object it is bound to; nil while it is not bound.
@@ -430,9 +521,14 @@ func (b *binding) contract() contractRef {
 // bind binds to goal, which counts this binding as a reference; its members and keys follow what goal shows now (one
 // frame from their last values), and the reference takes its state.
 func (b *binding) bind(goal target) {
-	if b.state.kind != bindingUnbound {
-		return
+	if b.state.kind == bindingUnbound {
+		b.boundTo(goal)
 	}
+}
+
+// boundTo: counted by goal as a reference (with its state's batch and dependent): its members and keys follow what goal
+// shows now, and it is told.
+func (b *binding) boundTo(goal target) {
 	batch := b.state.batch
 	b.state = bindingState{kind: bindingBound, batch: batch, dependent: b.state.dependent, target: goal}
 	goal.hold(b)
@@ -445,8 +541,119 @@ func (b *binding) bind(goal target) {
 	b.moved()
 }
 
+// joined: it joined a shared remote object that was bound already: unseen are the members it has not seen, with their
+// replicas' counts of values now. Until a value arrives for one, it shows no last value of it from before the join (as on
+// a fresh failed snapshot), whether it is read meanwhile or not. A member it holds a value of its own for (a binding that
+// followed another object before) keeps its history.
+func (b *binding) joined(unseen []unseenMember) {
+	for _, each := range unseen {
+		member := each.member
+		source, found := b.sources.get(member)
+		if found && !source.unbound() {
+			continue
+		}
+		if b.unseen == nil {
+			b.unseen = map[string]int{}
+		}
+		b.unseen[member] = each.count
+		if found {
+			source.unseen(func() bool { return b.seen(member) })
+		}
+	}
+}
+
+// transfer moves it to goal keeping everything of its own (its reference, watches, subscriptions, waiters, calls, last
+// values, unseen members): a reference retrying alone after `too_large/part` (decision "References share one wire hold").
+// Its previous target let it go already; its members and keys follow goal, and it is told.
+func (b *binding) transfer(goal target) {
+	if b.state.kind == bindingBound {
+		b.boundTo(goal)
+	}
+}
+
 // following is whether its members or keys were used: `retarget` moves them (in a batch).
 func (b *binding) following() bool { return b.sources.len() > 0 || b.heldKeys != nil }
+
+// bindingEvents are a binding's events, for a contract with event members only: the host's events; the instance its
+// members tap and the counter value of its binding to it (`at`, taken whenever it attaches to another instance shown
+// live, used or not, so a subscription made later still gets what was emitted since; nil while it points at nothing);
+// its members' subscriptions and re-exposing nodes (`taps`, made by the first use).
+type bindingEvents struct {
+	host *hostEvents
+	at   *eventsAt
+	taps *referenceEventTaps
+}
+
+// retargetEvents: its event members follow current from the host's counter value now, when it is another instance than
+// they follow: only while it shows its object live (a failed instance's admitted commits still reach its members, never
+// its events).
+func (b *binding) retargetEvents(events *bindingEvents, current attachable) {
+	var instance attachable
+	if b.refState().Kind == RefStateLive {
+		instance = current
+	}
+	if events.at == nil {
+		if instance == nil {
+			return
+		}
+	} else if events.at.instance == instance {
+		return
+	}
+	if instance == nil {
+		events.at = nil
+	} else {
+		events.at = &eventsAt{instance: instance, boundAt: events.host.counter()}
+	}
+	if events.taps != nil {
+		events.taps.retarget(events.at)
+	}
+}
+
+// subscribeEvents subscribes listener to event member member at once, bound or not: it gets what this reference receives
+// while it is bound to an instance whose variant has the member. Fails `released` once released, and an aborted ctx's
+// cause.
+func (b *binding) subscribeEvents(member string, listener eventListener, ctx context.Context) (contracts.EventSubscription, error) {
+	if b.state.kind == bindingReleased {
+		return nil, b.state.ended.Error
+	}
+	taps := b.eventTaps()
+	return subscribe(
+		// Its contract has event members (member is one) and it is not released: it has its events.
+		b.eventsOf.host,
+		listener,
+		ctx,
+		func(s *subscription) { taps.subscribe(member, s) },
+		func(s *subscription) {
+			if b.eventsOf != nil && b.eventsOf.taps != nil {
+				b.eventsOf.taps.unsubscribe(member, s)
+			}
+		},
+	)
+}
+
+// forwardEvents feeds node (an object's member re-exposing event member member) what this reference receives, until
+// unforwardEvents; nothing for a released reference.
+func (b *binding) forwardEvents(member string, node *eventNode) {
+	if b.state.kind != bindingReleased {
+		b.eventTaps().forward(member, node)
+	}
+}
+
+// unforwardEvents stops feeding node.
+func (b *binding) unforwardEvents(member string, node *eventNode) {
+	if b.eventsOf != nil && b.eventsOf.taps != nil {
+		b.eventsOf.taps.unforward(member, node)
+	}
+}
+
+// eventTaps are its event taps, made by the first use at its version, tapped on the instance it points at.
+func (b *binding) eventTaps() *referenceEventTaps {
+	events := b.eventsOf
+	if events.taps == nil {
+		events.taps = newReferenceEventTaps(b.consumer.Version, events.at)
+	}
+	return events.taps
+}
 
 // retarget runs inside a batch when following: its members and keys follow what its object shows now
 // (`target.followed`): the live instance's members (moved there, one frame each), or their last values (one `failed`
@@ -458,6 +665,9 @@ func (b *binding) retarget() {
 	goal := b.state.target
 	version := b.consumer.Version
 	current := goal.attachable()
+	if b.eventsOf != nil {
+		b.retargetEvents(b.eventsOf, current)
+	}
 	if current != nil {
 		b.attached = current
 	} else if b.attached != nil {
@@ -475,6 +685,42 @@ func (b *binding) retarget() {
 	}
 	if b.heldKeys != nil {
 		b.heldKeys.follow(chordctx.Background())
+	}
+	b.toldOfInstance(goal.instance())
+}
+
+// instanceFollower is one follower of the instances of a binding's object.
+type instanceFollower struct{ moved func() }
+
+// toldOfInstance tells the readers of its object's named queries of another live instance (not of none: they keep their rows).
+func (b *binding) toldOfInstance(instance any) {
+	if len(b.followers) == 0 {
+		return
+	}
+	// A live instance is an attempt (a remote object has none).
+	live, ok := instance.(*attempt)
+	if !ok || live == nil || (b.followedSet && b.followedInstance.Value() == live) {
+		return
+	}
+	b.followedInstance, b.followedSet = weak.Make(live), true
+	for _, follower := range slices.Clone(b.followers) {
+		follower.moved()
+	}
+}
+
+// followInstance calls moved whenever its object has another live instance than the one it was told of last (a restart's
+// successor: the readers of its named queries read that one's, slice 14 §3.2), until the returned release. It runs in a
+// section.
+func (b *binding) followInstance(moved func()) (release func()) {
+	follower := &instanceFollower{moved: moved}
+	b.followers = append(b.followers, follower)
+	if goal := b.target(); goal != nil && !b.followedSet {
+		if live, ok := goal.instance().(*attempt); ok && live != nil {
+			b.followedInstance, b.followedSet = weak.Make(live), true
+		}
+	}
+	return func() {
+		b.followers = slices.DeleteFunc(b.followers, func(each *instanceFollower) bool { return each == follower })
 	}
 }
 
@@ -504,6 +750,13 @@ func (b *binding) removed(r removal) {
 	}, chordctx.Background())
 	// Its last values taken: it keeps no node of that instance (GC).
 	b.attached = nil
+	// Unbound: no events until it binds again (then from that binding's counter value, even to the same instance).
+	if events := b.eventsOf; events != nil {
+		events.at = nil
+		if events.taps != nil {
+			events.taps.retarget(nil)
+		}
+	}
 	b.state = bindingState{kind: bindingUnbound, batch: batch, dependent: dependent}
 	r.host.rewait(b, b.consumer, r.params, r.cause, r.ctx)
 }
@@ -597,13 +850,14 @@ func (b *binding) moved() {
 	}
 }
 
-// live resolves when the reference is live; rejects with a broken failure's error, or its end. Getters wait for it.
+// live resolves when the reference is live; rejects with a broken or denied failure's error (neither heals by waiting), or
+// its end. Getters wait for it.
 func (b *binding) live(ctx context.Context) *keyedPromise[struct{}] {
 	return b.until(func(current *RefState) decision {
 		if current.Kind == RefStateLive {
 			return doneDecision
 		}
-		if current.Kind == RefStateFailed && current.Cause.Kind == data.FailureBroken {
+		if current.Kind == RefStateFailed && (current.Cause.Kind == data.FailureBroken || current.Cause.Kind == data.FailureDenied) {
 			return decision{kind: decisionFailed, err: current.Cause.Error}
 		}
 		return waitDecision
@@ -612,7 +866,7 @@ func (b *binding) live(ctx context.Context) *keyedPromise[struct{}] {
 
 // hydrated resolves once the object's members have values; rejects when the reference fails or is released first.
 func (b *binding) hydrated(ctx context.Context) *keyedPromise[struct{}] {
-	if b.state.kind == bindingBound && b.state.target.hydrated() {
+	if b.hydratedNow() {
 		done := newKeyedPromise[struct{}](b.loop)
 		done.resolve(struct{}{})
 		return done
@@ -658,11 +912,33 @@ func (b *binding) memberSource(member string) (*referenceSource, error) {
 	}
 	source := newReferenceSource(b.state.batch, b.scheduler, b)
 	b.sources.set(member, source)
+	if _, is := b.unseen[member]; is {
+		source.unseen(func() bool { return b.seen(member) })
+	}
 	// New, nothing follows it yet: placing it needs no batch.
 	if b.state.kind == bindingBound {
 		place(source, b.state.target.followed(member, b.consumer.Version), b.attached)
 	}
 	return source, nil
+}
+
+// seen is whether member, unseen at its join, took a value since (its replica's count of values passed the one recorded
+// then, also across rebinds and a private retry's copies): from then on it is seen for good.
+func (b *binding) seen(member string) bool {
+	count, is := b.unseen[member]
+	if !is {
+		return true
+	}
+	goal := b.target()
+	if goal == nil {
+		return false
+	}
+	generation, has := goal.generationOf(member)
+	if !has || generation <= count {
+		return false
+	}
+	delete(b.unseen, member)
+	return true
 }
 
 // none is what a read of a member that never had a value fails with: `released`, the failure's error, or `not_ready`.
@@ -680,6 +956,15 @@ func (b *binding) keyedSlot(member string) (*documents.KeyedSlot, error) {
 		return nil, err
 	}
 	return goal.keyedMember(member)
+}
+
+// queryMember is the named query of the live object, as keyedSlot resolves a keyed member's slot.
+func (b *binding) queryMember(member, name string) (*OwnQuery, error) {
+	goal, err := b.boundTarget()
+	if err != nil {
+		return nil, err
+	}
+	return goal.queryMember(member, name)
 }
 
 // keyedMapping is how this reference reads keyed member's documents (`target.keyedMapping`), as keyedSlot resolves.
@@ -737,7 +1022,7 @@ func (b *binding) pinKey(member, key string, ctx context.Context) (pinnedKey, er
 func (b *binding) boundTarget() (target, error) {
 	switch b.state.kind {
 	case bindingBound:
-		if current := b.state.target.state(); current.Kind == RefStateFailed {
+		if current := b.refState(); current.Kind == RefStateFailed {
 			return nil, current.Cause.Error
 		}
 		return b.state.target, nil
@@ -761,48 +1046,90 @@ func notReady(message string) error {
 // watch is a watch of `member` that ends when this reference is released, through its member (`referenceSource`): opened
 // at once once it has a value (its last one while its object is not live, frames again when it is); before its first
 // value it waits for its object's (`firstValues`: through failures, until the reference ends or ctx aborts). It blocks,
-// outside a section.
+// outside a section, for a member that never had a value: Pi's `await ref.member.watch(ctx)`, whose watch is opened by the
+// microtask that resumes after `firstValues`, in the turn that bound the reference, whenever the caller resumes. The checks
+// and a member that has a value are synchronous, inside the caller's section if it is in one (a derive's compute is
+// refused by the batch, as a synchronous throw).
 func (b *binding) watch(member string, ctx context.Context) (*chord.Watch[delta.JsonValue], error) {
-	var err error
 	var source *referenceSource
+	var opened *keyedPromise[*chord.Watch[delta.JsonValue]]
+	var watch *chord.Watch[delta.JsonValue]
+	var err error
 	b.loop.Run(func() {
-		// Checked here too: a constant's own watch has no batch to check. A released reference fails below.
-		if b.state.kind != bindingReleased {
-			if err = b.state.batch.AssertOutside("watch"); err != nil {
-				return
-			}
+		if source, err = b.watchSource(member); err != nil {
+			return
 		}
-		source, err = b.memberSource(member)
+		if !source.unbound() {
+			watch, err = b.openMemberWatch(source, ctx)
+			return
+		}
+		opened = newKeyedPromise[*chord.Watch[delta.JsonValue]](b.loop)
+		b.openWhenBound(source, ctx, opened.settle)
 	})
-	if err != nil {
-		return nil, err
+	if opened == nil {
+		return watch, err
 	}
-	// Never had a value: it waits for its object's, as before the first binding.
-	var wait bool
-	b.loop.Run(func() { wait = source.unbound() })
-	if wait {
-		if err = b.awaitFirstValues(ctx); err != nil {
+	return opened.await(ctx)
+}
+
+// watchThen is `watch(member, ctx).then(then, then)` of Pi's `async watch`, called inside a section: then gets the watch, or
+// nil and the error, as a microtask of the loop. A member that never had a value waits for its object's (`await
+// firstValues`), and the watch is opened by the microtask that resumes after it: in the turn that bound the reference,
+// before any section a link's frame starts, so a frame that arrives later reaches the watch (a watch's value is the
+// member's when it was opened, and a listener gets only the frames after it). A caller that resumes from a goroutine of
+// its own opens it after whatever section came between, and that section's change is folded into the value it never reads.
+func (b *binding) watchThen(member string, ctx context.Context, then func(*chord.Watch[delta.JsonValue], error)) {
+	settled := func(watch *chord.Watch[delta.JsonValue], err error) { b.loop.Queue(func() { then(watch, err) }) }
+	source, err := b.watchSource(member)
+	if err != nil {
+		settled(nil, err)
+		return
+	}
+	if !source.unbound() {
+		settled(b.openMemberWatch(source, ctx))
+		return
+	}
+	b.openWhenBound(source, ctx, settled)
+}
+
+// watchSource is the synchronous start of Pi's `async watch`: the checks, and the member's source.
+func (b *binding) watchSource(member string) (*referenceSource, error) {
+	// Checked here too: a constant's own watch has no batch to check. A released reference fails below.
+	if b.state.kind != bindingReleased {
+		if err := b.state.batch.AssertOutside("watch"); err != nil {
 			return nil, err
 		}
 	}
-	var watch *chord.Watch[delta.JsonValue]
-	b.loop.Run(func() {
-		if watch, err = source.OpenWatch(ctx); err != nil {
-			return
-		}
-		watch, err = b.follow(watch)
-	})
+	return b.memberSource(member)
+}
+
+// openMemberWatch is `this.follow(source.openWatch(context))`.
+func (b *binding) openMemberWatch(source *referenceSource, ctx context.Context) (*chord.Watch[delta.JsonValue], error) {
+	watch, err := source.OpenWatch(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return watch, nil
+	return b.follow(watch)
+}
+
+// openWhenBound is `if (source.unbound) await this.firstValues(context)` and the open after it, for a member that never had
+// a value: it waits for its object's, as before the first binding. The microtask that resumes after the wait opens the
+// watch and calls then with it (or with the wait's error), still in that turn.
+func (b *binding) openWhenBound(source *referenceSource, ctx context.Context, then func(*chord.Watch[delta.JsonValue], error)) {
+	b.firstValues(ctx).then(func(_ struct{}, err error) {
+		if err != nil {
+			then(nil, err)
+			return
+		}
+		then(b.openMemberWatch(source, ctx))
+	})
 }
 
 // firstValues resolves once its object's members have values (its first binding, for a watch on a reference that never
 // had any); rejects only when the reference ends (released, revoked, its host closed) or ctx aborts: a failure is
 // waited through (Opus G3).
 func (b *binding) firstValues(ctx context.Context) *keyedPromise[struct{}] {
-	if b.state.kind == bindingBound && b.state.target.hydrated() {
+	if b.hydratedNow() {
 		done := newKeyedPromise[struct{}](b.loop)
 		done.resolve(struct{}{})
 		return done
@@ -845,8 +1172,8 @@ func (b *binding) follow(watch *chord.Watch[delta.JsonValue]) (*chord.Watch[delt
 		return nil, b.state.ended.Error
 	}
 	b.watches = append(b.watches, watch)
-	b.loop.Go(func() {
-		<-watch.Closed()
+	startTask(b.loop, func() {
+		parkedOn(watch.Closed())
 		b.loop.Run(func() {
 			if at := slices.Index(b.watches, watch); at >= 0 {
 				b.watches = slices.Delete(b.watches, at, at+1)
@@ -879,7 +1206,7 @@ func (b *binding) pinKeys(ctx context.Context) *keyedPromise[struct{}] {
 	}
 	done := newKeyedPromise[struct{}](b.loop)
 	ats := slices.Clone(b.ats)
-	b.loop.Go(func() {
+	startTask(b.loop, func() {
 		var err error
 		for _, at := range ats {
 			if err = at.pin(b, ctx); err != nil {
@@ -903,7 +1230,7 @@ func (b *binding) pinKeys(ctx context.Context) *keyedPromise[struct{}] {
 func (b *binding) retry(walk *retryWalk) {
 	switch b.state.kind {
 	case bindingBound:
-		b.state.target.retry(walk)
+		b.state.target.retry(walk, b)
 	case bindingRefused:
 		bind := b.state.bind
 		b.state = bindingState{kind: bindingUnbound, batch: b.state.batch, dependent: b.state.dependent}
@@ -946,6 +1273,16 @@ func (b *binding) end(err *data.ChordError) {
 	b.sources = keyedMap[*referenceSource]{}
 	b.heldKeys = nil
 	b.attached = nil
+	b.unseen = nil
+	// Its subscriptions end and its event members untap (taken out first: a stopping subscription finds none).
+	var eventTaps *referenceEventTaps
+	if b.eventsOf != nil {
+		eventTaps = b.eventsOf.taps
+	}
+	b.eventsOf = nil
+	if eventTaps != nil {
+		eventTaps.end()
+	}
 	if previous.kind != bindingReleased && (len(sources) > 0 || keys != nil) {
 		end := func() {
 			for _, source := range sources {
@@ -1022,7 +1359,7 @@ func (b *binding) send(method string, args any, ctx context.Context) *parkedCall
 	}
 	linked := withLinkedAbortSignal(b.calls, ctx)
 	out := newParkedCallResult()
-	goal.call(method, args, linked.context, b.from, b.consumer.Version).then(b.loop, func(value any, err error) {
+	goal.call(method, args, b, linked.context, chordctx.Telemetry(ctx)).then(b.loop, func(value any, err error) {
 		linked.release()
 		out.settle(value, err)
 	})
@@ -1069,7 +1406,7 @@ func (b *binding) until(decide func(*RefState) decision, ctx context.Context) *k
 			settle(context.Cause(ctx))
 			return promise
 		}
-		stop = context.AfterFunc(ctx, func() { b.loop.Run(func() { settle(context.Cause(ctx)) }) })
+		stop = onAbort(b.loop, ctx, func() { settle(context.Cause(ctx)) })
 	}
 	each.check()
 	return promise
@@ -1132,34 +1469,91 @@ func (m *ReferenceMember) Watch(ctx context.Context) (chord.WatchHandle[delta.Js
 	return watch, nil
 }
 
+// WatchThen is `member.watch(ctx).then(then, then)`, not awaited (Pi's followers of a held reference: `choice.pick.watch(ctx).then(start,
+// () => {})`): it returns at once, and then gets the watch, or nil and the error (the reference was released, or ctx
+// aborted, before its first value), as a microtask of the host's loop. For a reference not bound yet that is the turn that
+// binds it, before any section a link's frame starts, so every change of the member after that bind reaches the watch's
+// listener: a goroutine that calls Watch and starts the result opens it after whatever section came first, whose change the
+// watch then holds as its value, which a follower that only listens never reads. then runs inside a section of the loop: it
+// must not block, and nothing it calls may wait for the loop or for a watch to end. In particular it does not call the
+// watch's Stop: Stop waits for the watch to close, and a watch whose ctx was cancelled closes only after its abort entered the
+// loop, which the callback holds. A callback that must end the watch cancels its ctx or releases the reference instead.
+func (m *ReferenceMember) WatchThen(ctx context.Context, then func(watch chord.WatchHandle[delta.JsonValue], err error)) {
+	m.binding.loop.Run(func() {
+		m.binding.watchThen(m.member, ctx, func(watch *chord.Watch[delta.JsonValue], err error) {
+			if err != nil {
+				then(nil, err)
+				return
+			}
+			then(watch, nil)
+		})
+	})
+}
+
 // source is the provider's member: a source or a constant.
 func (m *ReferenceMember) source() (state.DeriveSource, error) { return m.binding.member(m.member) }
 
-// ReferenceKeyed is a keyed member of a reference (slice 6a §12): reads by key behave as calls (they wait while loading).
+// ReferenceKeyed is a keyed member of a reference (slice 6a §12): reads by key behave as calls (they wait while loading). A
+// host-keyed one takes addresses of its kind (checked: a trust boundary for callers) and reads the provider's slot by their
+// canonical keys.
 type ReferenceKeyed struct {
 	binding *binding
 	member  string
+	// kind is the host kind the member's keys are addresses of; nil for string keys.
+	kind *contracts.HostKind
 }
 
-// slot is the provider's slot: the ultimate provider's, through re-exposures (rule 22).
-func (k *ReferenceKeyed) slot() (*documents.KeyedSlot, error) {
-	var slot *documents.KeyedSlot
-	var err error
-	k.binding.loop.Run(func() { slot, err = k.binding.keyedSlot(k.member) })
-	return slot, err
+// key is the provider slot's key of a key the consumer gave: an address's canonical key, or the string itself.
+func (k *ReferenceKeyed) key(raw any) (string, error) {
+	if k.kind == nil {
+		text, isText := raw.(string)
+		if !isText {
+			return "", data.Invalid(data.ReasonArgs, k.member+": expected a string")
+		}
+		return text, nil
+	}
+	stored, fits := contracts.KeyOfAddress(k.kind, raw)
+	if !fits {
+		return "", data.Invalid(data.ReasonArgs, k.member+": expected an address of "+k.kind.Kind)
+	}
+	return store.StoredText(stored, k.member+": key")
+}
+
+// slot is the provider's slot and its current own access, read together in one loop section (rule 22).
+func (k *ReferenceKeyed) slot() (*documents.KeyedSlot, documents.Access, error) {
+	var resolved struct {
+		slot   *documents.KeyedSlot
+		access documents.Access
+		err    error
+	}
+	k.binding.loop.Run(func() {
+		resolved.slot, resolved.err = k.binding.keyedSlot(k.member)
+		if resolved.err == nil {
+			resolved.access = ownAccess(resolved.slot)
+		}
+	})
+	return resolved.slot, resolved.access, resolved.err
 }
 
 // keyedBinding is this member as another object re-exposing it has it: its keys held through this reference.
 func (k *ReferenceKeyed) keyedBinding() *keyedBinding {
-	return &keyedBinding{kind: keyedReexposed, binding: k.binding, member: k.member}
+	key := ""
+	if k.kind != nil {
+		key = k.kind.Kind
+	}
+	return &keyedBinding{kind: keyedReexposed, binding: k.binding, member: k.member, key: key}
 }
 
 // Get is the document at key, found false when absent. It blocks.
-func (k *ReferenceKeyed) Get(ctx context.Context, key string) (value delta.JsonValue, found bool, err error) {
+func (k *ReferenceKeyed) Get(ctx context.Context, raw any) (value delta.JsonValue, found bool, err error) {
+	key, err := k.key(raw)
+	if err != nil {
+		return nil, false, err
+	}
 	if err = k.binding.awaitHydrated(ctx); err != nil {
 		return nil, false, err
 	}
-	slot, err := k.slot()
+	slot, access, err := k.slot()
 	if err != nil {
 		return nil, false, err
 	}
@@ -1167,7 +1561,7 @@ func (k *ReferenceKeyed) Get(ctx context.Context, key string) (value delta.JsonV
 	if err != nil {
 		return nil, false, err
 	}
-	document, err := slot.Get(key, ownAccess(slot), ctx)
+	document, err := slot.Get(key, access, ctx)
 	if err != nil || document == nil {
 		return nil, false, err
 	}
@@ -1183,16 +1577,20 @@ func (k *ReferenceKeyed) Get(ctx context.Context, key string) (value delta.JsonV
 
 // Watch is a watch of the document at key across the object's attempts (it holds the key through the object), nil when
 // absent; it ends with this reference. It blocks.
-func (k *ReferenceKeyed) Watch(ctx context.Context, key string) (chord.WatchHandle[delta.JsonValue], error) {
+func (k *ReferenceKeyed) Watch(ctx context.Context, raw any) (chord.WatchHandle[delta.JsonValue], error) {
+	key, err := k.key(raw)
+	if err != nil {
+		return nil, err
+	}
 	b := k.binding
 	if err := b.awaitFirstValues(ctx); err != nil {
 		return nil, err
 	}
-	slot, err := k.slot()
+	slot, access, err := k.slot()
 	if err != nil {
 		return nil, err
 	}
-	document, err := slot.Get(key, ownAccess(slot), ctx)
+	document, err := slot.Get(key, access, ctx)
 	if err != nil || document == nil {
 		return nil, err
 	}
@@ -1223,8 +1621,8 @@ func (k *ReferenceKeyed) Watch(ctx context.Context, key string) (chord.WatchHand
 			err = openErr
 			return
 		}
-		b.loop.Go(func() {
-			<-opened.Closed()
+		startTask(b.loop, func() {
+			parkedOn(opened.Closed())
 			b.loop.Run(held.release)
 		})
 		watch, err = b.follow(opened)
@@ -1236,15 +1634,60 @@ func (k *ReferenceKeyed) Watch(ctx context.Context, key string) (chord.WatchHand
 }
 
 // At is `ref.member.at(key)`, in a factory only: the pinned key's values are the member's documents.
-func (k *ReferenceKeyed) At(key string) (*KeyedMemberAt, error) {
+func (k *ReferenceKeyed) At(raw any) (*KeyedMemberAt, error) {
+	key, err := k.key(raw)
+	if err != nil {
+		return nil, err
+	}
 	var at *KeyedMemberAt
-	var err error
 	k.binding.loop.Run(func() { at, err = k.binding.at(k.member, key) })
 	return at, err
 }
 
+// KeyedDocument is a document of a keyed member and its key.
+type KeyedDocument struct {
+	Key   string
+	Value delta.JsonValue
+}
+
+// Snapshot is every present document of this member and, registered before they are read, the observer of its later changes
+// (stop ends it). It is for the plugins bridge, which keeps a Node host's copy of a keyed member (Pi's plugins share the one
+// host, so Pi's ReferenceKeyed has no such call). It waits for the reference's first values and reads the provider's slot as
+// `Get` does; the observer is told of the slot's own commits, and of its end (`dropped`), after which the caller snapshots again
+// when the reference is live on the next instance. It blocks.
+func (k *ReferenceKeyed) Snapshot(ctx context.Context, observer documents.KeyObserver) (docs []KeyedDocument, stop func(), err error) {
+	if err = k.binding.awaitFirstValues(ctx); err != nil {
+		return nil, nil, err
+	}
+	slot, access, err := k.slot()
+	if err != nil {
+		return nil, nil, err
+	}
+	stop = slot.Observe(observer)
+	keys := slot.Keys(access, ctx)
+	defer keys.Close()
+	for {
+		key, ok, err := keys.Next(ctx)
+		if err != nil {
+			stop()
+			return nil, nil, err
+		}
+		if !ok {
+			return docs, stop, nil
+		}
+		value, found, err := k.Get(ctx, key)
+		if err != nil {
+			stop()
+			return nil, nil, err
+		}
+		if found {
+			docs = append(docs, KeyedDocument{Key: key, Value: value})
+		}
+	}
+}
+
 // ownAccess is how a consumer reads its provider's keyed documents as the provider's own code may: current version, own
-// token.
+// token. Called inside the host loop section.
 func ownAccess(slot *documents.KeyedSlot) documents.Access {
 	return documents.Access{Token: slot.Owner().Own(), Version: slot.Definition().Current().Version}
 }
@@ -1387,6 +1830,8 @@ func place(source *referenceSource, found followed, attached attachable) {
 		source.bind(found.source)
 	case followedLacking:
 		source.vanish(found.err, chordctx.Background())
+	case followedDenied:
+		source.deny(found.err, chordctx.Background())
 	case followedLoading:
 		if takesLast() {
 			source.bind(found.last)

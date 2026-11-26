@@ -3,6 +3,7 @@ package coding
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/MichaelKinsy/PiG/agent"
@@ -39,8 +40,8 @@ func (s *Session) ContinueRecovered(ctx context.Context, options ContinueOptions
 		}
 	}
 	messages := s.agent.Messages()
-	for i := len(messages) - 1; i >= 0; i-- {
-		assistant := messages[i].Assistant
+	for i, message := range slices.Backward(messages) {
+		assistant := message.Assistant
 		if assistant == nil {
 			continue
 		}

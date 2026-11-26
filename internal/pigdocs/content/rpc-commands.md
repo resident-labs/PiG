@@ -2,7 +2,7 @@
 
 # RPC commands
 
-This page lists the commands an RPC client writes to PiG on standard input, with example records and their responses. [RPC mode](rpc.md) describes how to start the process and frame records. The commands are those of Pi 1.5.0's `RpcCommand` union ([Pi's RPC command reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc-commands.md)), plus `get_extensions` (D101).
+This page lists the commands an RPC client writes to PiG on standard input, with example records and their responses. [RPC mode](rpc.md) describes how to start the process and frame records. The commands are those of Pi 1.6.0's `RpcCommand` union ([Pi's RPC command reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc-commands.md)), plus `get_extensions` (D101).
 
 ## Supported commands
 
@@ -39,7 +39,7 @@ This page lists the commands an RPC client writes to PiG on standard input, with
 | `get_fork_messages` | none | List user messages that can identify a fork point. |
 | `get_entries` | optional `since` | Read Session entries after an entry ID. |
 | `get_tree` | none | Read the Session entry tree and active leaf. |
-| `get_last_assistant_text` | none | Read the last assistant text, when present. |
+| `get_last_assistant_text` | none | Read the last assistant text, when present. Messages without text from an aborted or failed turn, or that only call tools, are skipped. |
 | `set_session_name` | `name` | Set the current Session name. |
 | `get_messages` | none | Read current Agent messages. |
 
@@ -184,7 +184,7 @@ PiG queues this message after the active turn settles. `queue_update` events rep
 {"id":"clear-1","type":"clear_queue"}
 ```
 
-PiG removes every queued steering and follow-up message. It writes a `queue_update` event with both queues empty, and then the response. The response data contains the text of the removed messages. Queued extension custom messages stay queued, because the response cannot return them. Pi 1.5.0 discards them (D135, [Pi #9886](https://github.com/earendil-works/pi/issues/9886)).
+PiG removes every queued steering and follow-up message. It writes a `queue_update` event with both queues empty, and then the response. The response data contains the text of the removed messages. Queued extension custom messages stay queued, because the response cannot return them. Pi 1.6.0 discards them (D135, [Pi #9886](https://github.com/earendil-works/pi/issues/9886)).
 
 ```json
 {"id":"clear-1","type":"response","command":"clear_queue","success":true,"data":{"steering":["Stop and inspect the parser first."],"followUp":["Then update the documentation."]}}
@@ -226,7 +226,7 @@ Get the complete tree:
 {"type":"get_tree"}
 ```
 
-Get the last assistant text:
+Get the last assistant text. Messages without text from an aborted or failed turn, or that only call tools, are skipped:
 
 ```json
 {"type":"get_last_assistant_text"}
@@ -260,7 +260,7 @@ Switch to an existing Session:
 
 PiG keeps the startup project Resources when the target Session uses a different working directory. Direct RPC Bash uses the target working directory. Built-in tools, project settings, context files, prompts, skills, themes, and the system prompt still use the startup project (D61).
 
-When standard input ends while a replacement is still running, PiG finishes it and writes its response before it exits. Pi 1.5.0 exits without that response (D146).
+When standard input ends while a replacement is still running, PiG finishes it and writes its response before it exits. Pi 1.6.0 exits without that response (D146).
 
 Fork before a user message:
 

@@ -18,6 +18,7 @@ import (
 
 	"github.com/MichaelKinsy/PiG/coding/piglet"
 	"github.com/MichaelKinsy/PiG/internal/perfgate"
+	"github.com/MichaelKinsy/PiG/internal/sizereport"
 	"github.com/MichaelKinsy/PiG/internal/testenv"
 )
 
@@ -43,6 +44,9 @@ func TestReleaseBinarySizeGate(t *testing.T) {
 				t.Fatal(err)
 			}
 			perfgate.Check(t, "binary.pig."+platform.goos+"_"+platform.goarch+".bytes", float64(info.Size()))
+			if t.Failed() {
+				t.Logf("the binary grew: find the package with `go run ./automation/ci/sizereport -goos %s -goarch %s -out after.tsv`, the same at the last good commit with -out before.tsv, and `-base before.tsv` for the difference; the chain of references that keeps a package: `-why <package>`. The cause goes; the ceiling does not move up", platform.goos, platform.goarch)
+			}
 		})
 	}
 }
@@ -92,11 +96,12 @@ func buildHeadless(t *testing.T, root, tags, goos, goarch string) string {
 	return out
 }
 
-// The word-segmentation dictionaries (internal/wordsegmenter/*_dictionary.bin, 6.3 MB) belong to the terminal editor and
+// The word-segmentation dictionaries (internal/wordsegmenter/*_dictionary.bin, 2.8 MB) belong to the terminal editor and
 // must not be linked into an embedder that draws no terminal. The size gate only notices when the program grows past its
 // ceiling; this checks the content: the build fails if any 64-byte slice of a dictionary appears in the headless binary.
 // (Linker deadcode keeps a go:embed blob only while the package's reader is reachable, so a partial copy cannot occur;
-// the check covers every offset of the binary against every 64-byte window of each dictionary.)
+// the check covers every offset of the binary against every 64-byte window of each dictionary.) A window of one repeated
+// byte (the run of equal word lengths in a dictionary's length table) is no part of the evidence: it occurs in any binary.
 func TestHeadlessEmbedLinksNoWordDictionaries(t *testing.T) {
 	root := testenv.ModuleRoot(t)
 	dictionaries, err := filepath.Glob(filepath.Join(root, "internal", "wordsegmenter", "*_dictionary.bin"))
@@ -126,11 +131,14 @@ func TestHeadlessEmbedLinksNoWordDictionaries(t *testing.T) {
 const dictionarySlice = 64
 
 // dictionarySliceIn finds the first offset of binary where a dictionarySlice-byte slice of dictionary starts, as the
-// offset in binary and the offset in dictionary; at is -1 when none appears. Every offset of dictionary is a start: the
-// slices are indexed by their first eight bytes.
+// offset in binary and the offset in dictionary; at is -1 when none appears. Every offset of dictionary is a start,
+// except a slice of one repeated byte: the slices are indexed by their first eight bytes.
 func dictionarySliceIn(binary, dictionary []byte) (offset, at int) {
 	index := make(map[uint64][]int, len(dictionary))
 	for i := 0; i+dictionarySlice <= len(dictionary); i++ {
+		if bytes.Count(dictionary[i:i+dictionarySlice], dictionary[i:i+1]) == dictionarySlice {
+			continue
+		}
 		key := binaryLE(dictionary[i:])
 		index[key] = append(index[key], i)
 	}
@@ -145,3 +153,38 @@ func dictionarySliceIn(binary, dictionary []byte) (offset, at int) {
 }
 
 func binaryLE(b []byte) uint64 { return binary.LittleEndian.Uint64(b) }
+
+// The image of a plugin mount (D614) is drawn by the terminal view client: subprocess.NewMountSurface gives the surface
+// the builder of the image's component, and behind that builder are the half-block cells and the Kitty placeholder rows;
+// the pixels come from MountImages.Decode, which the terminal view client sets to photonimage.Decode, so package subprocess
+// imports no Go decoder. A program that makes no mount surface links none of them. The size gate only notices when the program grows past its ceiling; this
+// reads the symbol table of the embed, plain and with the strip tags, built unstripped (the code is the same), and names
+// what is linked and should not be, with its bytes.
+func TestHeadlessEmbedLinksNoMountImage(t *testing.T) {
+	root := testenv.ModuleRoot(t)
+	const host = "github.com/MichaelKinsy/PiG/coding/extension/host/subprocess."
+	decoders := []string{"image/jpeg", "image/gif", "compress/lzw"}
+	drawing := []string{"halfBlockRows", "halfBlockPixels", "writeKittyVirtualImage", "kittyPlaceholderRows", "kittyDiacritics", "(*mountImage).Render", "(*MountImages).prepare"}
+	for _, variant := range headlessVariants() {
+		for _, platform := range releasePlatforms {
+			t.Run(variant.name+"_"+platform.goos+"_"+platform.goarch, func(t *testing.T) {
+				build := sizereport.Build{Root: root, Package: "./examples/headless", GOOS: platform.goos, GOARCH: platform.goarch, Tags: variant.tags}
+				symbols, err := build.Symbols(t.Context(), t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				linked := sizereport.Sum(symbols).File
+				for _, pkg := range decoders {
+					if linked[pkg] > 0 {
+						t.Errorf("the headless embed links %s (%d bytes of symbols), which only the image of a mount surface is decoded with. Its initializer registers the decoder, so the package is linked whole as soon as a package of the embed imports it: a decoder reaches the half-block drawing as MountImages.Decode (set by the terminal view client), not by an import of this package", pkg, linked[pkg])
+					}
+				}
+				for _, symbol := range symbols {
+					if name, ok := strings.CutPrefix(symbol.Name, host); ok && slices.Contains(drawing, name) {
+						t.Errorf("the headless embed links subprocess.%s (%d bytes), which only the image of a mount surface draws with; the reference that keeps it must be a value that only subprocess.NewMountSurface sets", name, symbol.Size)
+					}
+				}
+			})
+		}
+	}
+}

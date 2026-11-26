@@ -99,12 +99,15 @@ func TestToolRecovery(t *testing.T) {
 		taskId := trToolTaskId(t, harness)
 		mustClose(t, harness)
 
-		harness, root = trOpen(t, path, setup)
+		// The reopened Harness runs nothing until Resume, and what Resume starts runs on its own goroutine, where upstream's
+		// reads come first: the stored record is read before the Resume.
+		harness, root = openChat(t, tkOpenSqlite(t, path), setup)
 		record := tkTaskRecord(t, harness, taskId)
 		wantCheckpoint := map[string]any{"phase": "execute", "arguments": map[string]any{}, "replay": "unsafe"}
 		if record.State.Checkpoint == nil || !reflect.DeepEqual(plainObject(*record.State.Checkpoint), wantCheckpoint) {
 			t.Fatalf("checkpoint %v, want %v", record.State.Checkpoint, wantCheckpoint)
 		}
+		harness.Resume()
 		submission, err := harness.Submission(testContext, id)
 		if err != nil || submission == nil {
 			t.Fatalf("Submission %v %v", submission, err)
@@ -296,12 +299,12 @@ func TestToolRecovery(t *testing.T) {
 		addTool(t, setup.Registry, trTool("work", tlNoContent))
 		reached := deferred()
 		var observed atomicCounter
-		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{AfterTools: func(ctx context.Context, _ durable.EntryId, _ []durable.EntryId, _ HookApi) error {
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{AfterTools: func(ctx context.Context, _ durable.EntryId, _ []durable.EntryId, _ HookApi) (*HookTasks, error) {
 			if observed.add() == 1 {
 				reached.resolve()
-				return abortedBy(ctx)
+				return nil, abortedBy(ctx)
 			}
-			return nil
+			return nil, nil
 		}})
 		setup.Faux.SetResponses([]ai.FauxResponseStep{trCall("work", "c1"), tlDone()})
 		harness, root := trOpen(t, path, setup)

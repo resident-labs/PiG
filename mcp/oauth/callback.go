@@ -88,8 +88,11 @@ type OAuthCallbackServer struct {
 	renderPage  func(OAuthCallbackPage) string
 
 	mu      sync.Mutex
+	closed  bool
 	pending map[string]*pendingCallback
 	done    chan struct{}
+	// fresh holds accepted connections that have not sent a request yet (a browser's preconnect).
+	fresh map[net.Conn]struct{}
 }
 
 // ListenOAuthCallbackServer starts the server.
@@ -131,8 +134,9 @@ func ListenOAuthCallbackServer(options OAuthCallbackServerOptions) (*OAuthCallba
 		renderPage:  options.RenderPage,
 		pending:     map[string]*pendingCallback{},
 		done:        make(chan struct{}),
+		fresh:       map[net.Conn]struct{}{},
 	}
-	s.server = &http.Server{Handler: http.HandlerFunc(s.handle), ReadHeaderTimeout: 30 * time.Second}
+	s.server = &http.Server{Handler: http.HandlerFunc(s.handle), ReadHeaderTimeout: 30 * time.Second, ConnState: s.trackConn}
 	go func() {
 		defer close(s.done)
 		_ = s.server.Serve(listener)
@@ -150,6 +154,10 @@ func (s *OAuthCallbackServer) WaitForCallback(ctx context.Context, state string,
 		only = path[0]
 	}
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return OAuthCallback{}, errors.New("OAuth callback server closed")
+	}
 	if _, ok := s.pending[state]; ok {
 		s.mu.Unlock()
 		return OAuthCallback{}, errors.New("OAuth state is already pending")
@@ -175,13 +183,22 @@ func (s *OAuthCallbackServer) WaitForCallback(ctx context.Context, state string,
 	case r := <-entry.result:
 		return r.callback, r.err
 	case <-ctx.Done():
+		// Go mechanic: Pi's wait has no signal. A wait that ends with its context frees its state, so the same state can wait again.
+		s.mu.Lock()
+		if s.pending[state] == entry {
+			delete(s.pending, state)
+		}
+		s.mu.Unlock()
+		entry.timer.Stop()
 		return OAuthCallback{}, context.Cause(ctx)
 	}
 }
 
 // Close rejects every pending wait and stops the server.
+// Pi 63ea042ce closes every connection; Go closes the ones that never sent a request and leaves the others to Shutdown. A wait begun after Close fails at once (Pi's waits forever), and a wait that ends with its context frees its state.
 func (s *OAuthCallbackServer) Close() error {
 	s.mu.Lock()
+	s.closed = true
 	pending := s.pending
 	s.pending = map[string]*pendingCallback{}
 	s.mu.Unlock()
@@ -189,6 +206,10 @@ func (s *OAuthCallbackServer) Close() error {
 		entry.timer.Stop()
 		entry.result <- callbackResult{err: errors.New("OAuth callback server closed")}
 	}
+	// Ports packages/mcp/src/oauth/callback.ts close() after 63ea042ce: a browser may keep an unused connection open (a preconnect or a spare
+	// keep-alive socket), and Shutdown waits for a connection that never sent a request. Idle and in-flight connections keep Shutdown's
+	// handling, so a callback response being written is not cut off.
+	s.dropFreshConnections()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	err := s.server.Shutdown(ctx)
@@ -197,6 +218,30 @@ func (s *OAuthCallbackServer) Close() error {
 	}
 	<-s.done
 	return nil
+}
+
+// trackConn records connections that have not sent a request yet.
+func (s *OAuthCallbackServer) trackConn(conn net.Conn, state http.ConnState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if state == http.StateNew {
+		s.fresh[conn] = struct{}{}
+		return
+	}
+	delete(s.fresh, conn)
+}
+
+// dropFreshConnections closes every connection that has not sent a request yet.
+func (s *OAuthCallbackServer) dropFreshConnections() {
+	s.mu.Lock()
+	conns := make([]net.Conn, 0, len(s.fresh))
+	for conn := range s.fresh {
+		conns = append(conns, conn)
+	}
+	s.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
 }
 
 func (s *OAuthCallbackServer) reply(w http.ResponseWriter, status int, page OAuthCallbackPage) {

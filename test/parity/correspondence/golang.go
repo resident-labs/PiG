@@ -71,13 +71,20 @@ type goFunctionCallerSpec struct {
 	path     string
 	caller   string
 	callee   string
+	// A compaction route is a direct return that forwards ctx, with the wrapper's mode fixed when present.
+	returns      bool
+	liveBranch   bool
+	lastArgument string
 }
 
 func addGoFunctionCallers(ctx context.Context, root, repositoryPrefix, targetCommit string, functions []Function) error {
 	specs := []goFunctionCallerSpec{
-		// upstream: agent-session.ts:2633-2661 (_runDefaultCompaction is the one caller of the lower-level compact(), for manual and automatic compaction).
-		{function: "compact", path: "coding/session_summarization_auth.go", caller: "runDefaultCompaction", callee: "compaction.Compact"},
-		{function: "generateTurnPrefixSummary", path: "internal/codingagent/compaction/compaction.go", caller: "Compact", callee: "generateTurnPrefixSummary"},
+		// Manual and automatic session compaction use the standalone route when the Dyna live route does not apply.
+		{function: "compact", path: "coding/session_summarization_auth.go", caller: "runDefaultCompaction", callee: "compaction.CompactStandalone", returns: true},
+		{path: "coding/session_summarization_auth.go", caller: "runDefaultCompaction", callee: "compaction.CompactLive", returns: true, liveBranch: true},
+		{function: "compact", path: "internal/codingagent/compaction/compaction.go", caller: "Compact", callee: "compact", returns: true, lastArgument: "false"},
+		{function: "compact", path: "internal/codingagent/compaction/compaction.go", caller: "CompactStandalone", callee: "compact", returns: true, lastArgument: "true"},
+		{function: "generateTurnPrefixSummary", path: "internal/codingagent/compaction/compaction.go", caller: "compact", callee: "generateTurnPrefixSummary"},
 		{function: "mergeSettings", path: "internal/codingagent/settings.go", caller: "Load", callee: "mergeSettings"},
 		{function: "setProjectTrusted", path: "coding/cli/cli_runtime_build.go", caller: "buildResources", callee: "services.SettingsManager().SetProjectTrusted"},
 		{function: "reload", path: "internal/codingagent/interactive_commands.go", caller: "buildSlashContext", callee: "m.opts.SettingsManager.Reload"},
@@ -92,7 +99,7 @@ func addGoFunctionCallers(ctx context.Context, root, repositoryPrefix, targetCom
 	}
 	for _, spec := range specs {
 		function := indexed[spec.function]
-		if function == nil {
+		if function == nil && spec.function != "" {
 			return fmt.Errorf("Go correspondence caller target %s not found", spec.function)
 		}
 		file, source, files, err := parseGoFile(ctx, root, repositoryPrefix, targetCommit, spec.path)
@@ -104,15 +111,48 @@ func addGoFunctionCallers(ctx context.Context, root, repositoryPrefix, targetCom
 			return fmt.Errorf("%s: correspondence caller %s not found", spec.path, spec.caller)
 		}
 		var matches []*ast.CallExpr
-		ast.Inspect(caller.Body, func(node ast.Node) bool {
-			call, ok := node.(*ast.CallExpr)
-			if ok && goNodeSource(source, files, call.Fun) == spec.callee {
-				matches = append(matches, call)
+		if spec.returns {
+			statements := caller.Body.List
+			if spec.liveBranch {
+				statements = nil
+				for _, statement := range caller.Body.List {
+					branch, ok := statement.(*ast.IfStmt)
+					if ok && branch.Init != nil && goNodeSource(source, files, branch.Init) == "live, ok := s.liveCompactionRequest(model)" && goNodeSource(source, files, branch.Cond) == "ok" {
+						statements = append(statements, branch.Body.List...)
+					}
+				}
 			}
-			return true
-		})
-		if len(matches) == 0 {
-			return fmt.Errorf("%s#%s has 0 calls to %s, want at least one", spec.path, spec.caller, spec.callee)
+			for _, statement := range statements {
+				ret, ok := statement.(*ast.ReturnStmt)
+				if !ok || len(ret.Results) != 1 {
+					continue
+				}
+				call, ok := ret.Results[0].(*ast.CallExpr)
+				if !ok || goNodeSource(source, files, call.Fun) != spec.callee || len(call.Args) == 0 || goNodeSource(source, files, call.Args[0]) != "ctx" {
+					continue
+				}
+				if spec.lastArgument == "" || goNodeSource(source, files, call.Args[len(call.Args)-1]) == spec.lastArgument {
+					matches = append(matches, call)
+				}
+			}
+			if len(matches) != 1 {
+				return fmt.Errorf("%s#%s has %d matching returns of %s, want one", spec.path, spec.caller, len(matches), spec.callee)
+			}
+		} else {
+			ast.Inspect(caller.Body, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if ok && goNodeSource(source, files, call.Fun) == spec.callee {
+					matches = append(matches, call)
+				}
+				return true
+			})
+			if len(matches) == 0 {
+				return fmt.Errorf("%s#%s has 0 calls to %s, want at least one", spec.path, spec.caller, spec.callee)
+			}
+		}
+		if function == nil {
+			// CompactLive is a separate Dyna path, not a caller of the shared standalone compaction body.
+			continue
 		}
 		// A reviewed caller can reach the same callee on several branches. Retain every site in AST order, including identical expressions at different positions.
 		for _, call := range matches {
@@ -154,7 +194,7 @@ func extractGoCompactionFunctions(ctx context.Context, root, repositoryPrefix, t
 	if err != nil {
 		return nil, err
 	}
-	wanted := map[string]string{"Compact": "compact", "generateTurnPrefixSummary": "generateTurnPrefixSummary"}
+	wanted := map[string]string{"compact": "compact", "generateTurnPrefixSummary": "generateTurnPrefixSummary"}
 	functions := make([]Function, 0, len(wanted))
 	for _, declaration := range file.Decls {
 		function, ok := declaration.(*ast.FuncDecl)
@@ -164,6 +204,11 @@ func extractGoCompactionFunctions(ctx context.Context, root, repositoryPrefix, t
 		normalizedName, wantedFunction := wanted[function.Name.Name]
 		if !wantedFunction {
 			continue
+		}
+		if normalizedName == "compact" {
+			if err := validateGoSummaryBinding(function, source, files); err != nil {
+				return nil, fmt.Errorf("%s#compact: %w", relativePath, err)
+			}
 		}
 		cancellationInputs := []string{}
 		for _, field := range function.Type.Params.List {
@@ -187,6 +232,58 @@ func extractGoCompactionFunctions(ctx context.Context, root, repositoryPrefix, t
 	}
 	slices.SortFunc(functions, func(left, right Function) int { return strings.Compare(left.ID, right.ID) })
 	return functions, nil
+}
+
+// validateGoSummaryBinding proves the local call mapped to Pi's generateSummaryWithUsage uses the normal generator, or the single request in standalone mode.
+func validateGoSummaryBinding(function *ast.FuncDecl, source []byte, files *token.FileSet) error {
+	const name = "generateSummary"
+	assignment := func(node ast.Node, operation token.Token, rhs string) *ast.Ident {
+		assign, ok := node.(*ast.AssignStmt)
+		if !ok || assign.Tok != operation || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 || goNodeSource(source, files, assign.Rhs[0]) != rhs {
+			return nil
+		}
+		ident, ok := assign.Lhs[0].(*ast.Ident)
+		if !ok || ident.Name != name {
+			return nil
+		}
+		return ident
+	}
+	statements := function.Body.List
+	for index, statement := range statements {
+		binding := assignment(statement, token.DEFINE, "GenerateSummaryWithUsageUsing")
+		if binding == nil || index+1 == len(statements) {
+			continue
+		}
+		branch, ok := statements[index+1].(*ast.IfStmt)
+		if !ok || branch.Init != nil || branch.Else != nil || len(branch.Body.List) != 1 || goNodeSource(source, files, branch.Cond) != "standalone" {
+			break
+		}
+		override := assignment(branch.Body.List[0], token.ASSIGN, "generateSummaryChunk")
+		if override == nil {
+			break
+		}
+		// Every other occurrence must be a call after the binding and override, not a shadow or reassignment.
+		allowed := map[*ast.Ident]bool{binding: true, override: true}
+		var unexpected *ast.Ident
+		ast.Inspect(function, func(node ast.Node) bool {
+			switch node := node.(type) {
+			case *ast.CallExpr:
+				if ident, ok := node.Fun.(*ast.Ident); ok && ident.Name == name && ident.Pos() > branch.End() {
+					allowed[ident] = true
+				}
+			case *ast.Ident:
+				if node.Name == name && !allowed[node] && unexpected == nil {
+					unexpected = node
+				}
+			}
+			return unexpected == nil
+		})
+		if unexpected != nil {
+			return fmt.Errorf("unexpected use of %s at %s", name, files.Position(unexpected.Pos()))
+		}
+		return nil
+	}
+	return fmt.Errorf("%s must bind GenerateSummaryWithUsageUsing and switch to generateSummaryChunk only in standalone mode", name)
 }
 
 func extractGoSettingsManagerFunctions(ctx context.Context, root, repositoryPrefix, targetCommit string) ([]Function, error) {

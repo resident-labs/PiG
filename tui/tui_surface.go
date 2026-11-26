@@ -187,14 +187,12 @@ func NewTuiSurfaceWithSize(session frontend.Session, cols, rows int, onApplyErro
 
 func newTuiSurface(out io.Writer, session frontend.Session, onApplyError func(error)) *TuiSurface {
 	t := &TuiSurface{
-		tuiBase: tuiBase{
-			out:                out,
-			terminalBackground: &terminalBackgroundQueries{},
-			showHardwareCursor: os.Getenv("PI_HARDWARE_CURSOR") == "1",
-			now:                time.Now,
-			afterFunc: func(d time.Duration, fn func()) stoppableTimer {
-				return time.AfterFunc(d, fn)
-			},
+		out:                stdoutWriter(out),
+		terminalBackground: &terminalBackgroundQueries{},
+		showHardwareCursor: os.Getenv("PI_HARDWARE_CURSOR") == "1",
+		now:                time.Now,
+		afterFunc: func(d time.Duration, fn func()) stoppableTimer {
+			return time.AfterFunc(d, fn)
 		},
 		session:        session,
 		statusTerminal: newSurfaceTerminal(session),
@@ -202,7 +200,7 @@ func newTuiSurface(out io.Writer, session frontend.Session, onApplyError func(er
 		onApplyError:   onApplyError,
 		surfaceMain:    newSurfaceMain(),
 	}
-	t.render = t.doRender
+	t.render = t.drawFrame
 	t.mountedRoots = t.getMountedRoots
 	return t
 }
@@ -243,7 +241,7 @@ func (t *TuiSurface) SetTerminalColorSchemeNotifications(enabled bool) {
 	t.input.schemeNotifications = enabled
 	t.input.mu.Unlock()
 	t.mu.Lock()
-	stopped := t.stopped
+	stopped := t.stopped.Load()
 	t.mu.Unlock()
 	if !stopped {
 		writeColorSchemeNotifications(t.terminal, enabled)
@@ -293,10 +291,11 @@ func (t *TuiSurface) Start() {
 	t.mu.Lock()
 	resume := t.suspended
 	t.suspended = false
-	t.stopped = false
+	t.stopped.Store(false)
 	t.started = true
 	t.resend = true
 	t.mu.Unlock()
+	t.continues.begin()
 	if t.colorSchemeNotificationsEnabled() {
 		writeColorSchemeNotifications(t.terminal, true)
 	}
@@ -314,10 +313,13 @@ func (t *TuiSurface) Stop() { t.StopWithOptions(StopOptions{}) }
 // PreserveScreen changes nothing. The components stop reporting their
 // invalidations, and a later start rebuilds every node.
 func (t *TuiSurface) StopWithOptions(StopOptions) {
+	defer t.continues.end()
 	t.mu.Lock()
-	wasStopped := t.stopped
-	t.stopped = true
+	wasStopped := t.stopped.Load()
+	t.stopped.Store(true)
 	t.started = false
+	t.pendingWidth = 0
+	t.pendingHeight = 0
 	t.cancelPendingRenderLocked()
 	t.forgetMain()
 	t.mu.Unlock()
@@ -339,12 +341,12 @@ func (t *TuiSurface) StopWithOptions(StopOptions) {
 // nothing before Start, after Stop, or while suspended.
 func (t *TuiSurface) Suspend() {
 	t.mu.Lock()
-	if !t.started || t.stopped {
+	if !t.started || t.stopped.Load() {
 		t.mu.Unlock()
 		return
 	}
 	t.suspended = true
-	t.stopped = true
+	t.stopped.Store(true)
 	t.cancelPendingRenderLocked()
 	t.mu.Unlock()
 	// The terminal's light/dark reports stop while another program owns
@@ -354,6 +356,7 @@ func (t *TuiSurface) Suspend() {
 	}
 	t.statusTerminal.pause()
 	t.session.Suspend()
+	t.continues.end()
 }
 
 // Resume tells the session that PiG owns the terminal again and draws what
@@ -378,10 +381,11 @@ func (t *TuiSurface) Resume() {
 	t.mu.Lock()
 	render := t.started
 	if render {
-		t.stopped = false
+		t.stopped.Store(false)
 	}
 	t.mu.Unlock()
 	if render {
+		t.continues.begin()
 		t.Render()
 	}
 }
@@ -434,15 +438,17 @@ func regionWidth(cols, width int) int {
 	return cols
 }
 
+// drawFrame is the surface's frame: gate says which frame started it (frameGate). It reports whether the frame began.
+//
 //perf:hot
-func (t *TuiSurface) doRender() {
+func (t *TuiSurface) drawFrame(gate frameGate) bool {
 	mainCols, dockCols := t.session.Columns()
 	t.lockFrame()
-	if t.stopped || !t.started {
+	if t.stopped.Load() || !t.started || t.frameSupersededLocked(gate) {
 		t.unlockFrame()
-		return
+		return false
 	}
-	t.lastRenderAt = t.now()
+	t.frameBeganLocked()
 	t.updateSize()
 	columns, rows := t.size()
 	width, height := max(1, columns), max(1, rows)
@@ -479,7 +485,15 @@ func (t *TuiSurface) doRender() {
 	t.hasRendered = true
 	t.prevWidth, t.prevHeight = width, height
 	t.prevMainCols, t.prevDockCols = mainCols, dockCols
-	onWidth, onHeight := t.onWidthChange, t.onHeightChange
+	// Queued in the frame that saw the size, so the callbacks follow the renders' order; they run off the frame, where they may re-enter the TUI.
+	changedWidth, changedHeight := 0, 0
+	if widthChanged {
+		changedWidth = width
+	}
+	if heightChanged {
+		changedHeight = height
+	}
+	t.queueGeometryLocked(changedWidth, changedHeight)
 	session, onApplyError := t.session, t.onApplyError
 	t.unlockFrame()
 
@@ -488,14 +502,7 @@ func (t *TuiSurface) doRender() {
 			onApplyError(err)
 		}
 	}
-	if widthChanged && onWidth != nil {
-		//portlint:allow golifetime fire-and-forget resize hook (Go-only, no tui.ts counterpart), the same hand-off as tui.go's render; it runs after unlockFrame so the callback can re-enter the TUI
-		go onWidth(width)
-	}
-	if heightChanged && onHeight != nil {
-		//portlint:allow golifetime fire-and-forget resize hook (Go-only, no tui.ts counterpart), the same hand-off as tui.go's render; it runs after unlockFrame so the callback can re-enter the TUI
-		go onHeight(height)
-	}
+	return true
 }
 
 // pig additive (D91): a frame carries the palette of the theme PiG draws

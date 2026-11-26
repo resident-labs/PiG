@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
 )
 
 // ─── Canned responses for compaction / branch summarization ──────────────────
@@ -174,13 +176,22 @@ func (p *TestFauxProvider) Stream(ctx context.Context, transcript TranscriptCont
 			builder.done(StopReasonStop, nil, "")
 			return
 		}
-		if strings.Contains(lastText, "Trigger: retryable provider error") {
-			if _, loaded := testFauxRetryState.LoadOrStore("retryable-provider-error", true); !loaded {
-				// test/parity/testdata/test-faux-provider.ts:531-535 sets the error state on its output, then pushes `start` and `error`.
+		// A retryable trigger fails its first request with the provider's wording and answers the retry. "Connection closed." is the gateway
+		// drop Pi 9b88b94e2 (#12093) added to the retryable wordings.
+		retryableError, retryableKey := "", ""
+		switch {
+		case strings.Contains(lastText, "Trigger: retryable provider error"):
+			retryableError, retryableKey = "please retry your request", "retryable-provider-error"
+		case strings.Contains(lastText, "Trigger: connection closed provider error"):
+			retryableError, retryableKey = "Connection closed.", "connection-closed-provider-error"
+		}
+		if retryableKey != "" {
+			if _, loaded := testFauxRetryState.LoadOrStore(retryableKey, true); !loaded {
+				// test/parity/testdata/test-faux-provider.ts sets the error state on its output, then pushes `start` and `error`.
 				builder.partial.StopReason = StopReasonError
-				builder.partial.ErrorMessage = "please retry your request"
+				builder.partial.ErrorMessage = retryableError
 				builder.start()
-				builder.fail(StopReasonError, errors.New("please retry your request"))
+				builder.fail(StopReasonError, errors.New(retryableError))
 				return
 			}
 			builder.textDelta("retry-ok")
@@ -188,20 +199,17 @@ func (p *TestFauxProvider) Stream(ctx context.Context, transcript TranscriptCont
 			return
 		}
 
+		initialSummary := isTestFauxLiveCompaction(lastText) || strings.Contains(lastText, "Create a structured context checkpoint summary")
 		slowCompactionProbe := os.Getenv("TEST_FAUX_SLOW_COMPACTION") == "1" &&
-			(strings.Contains(lastText, "Create a concise checkpoint of the user's request and the progress shown above.") ||
-				strings.Contains(lastText, "Create a structured context checkpoint summary") ||
+			(initialSummary || strings.Contains(lastText, "Create a concise checkpoint of the user's request and the progress shown above.") ||
 				strings.Contains(lastText, "NEW conversation messages to incorporate into the existing summary"))
-		slowOverflowSummary := os.Getenv("TUI_LIVE_PROBE") == "1" &&
-			strings.Contains(lastText, "Create a structured context checkpoint summary") ||
-			strings.Contains(lastText, "Create a structured context checkpoint summary") &&
-				strings.Contains(historyText(messages), "Trigger: overflow error with queued message")
+		slowOverflowSummary := initialSummary && (os.Getenv("TUI_LIVE_PROBE") == "1" ||
+			strings.Contains(historyText(messages), "Trigger: overflow error with queued message"))
 		// TEST_FAUX_HOLD_COMPACTION holds a /compact summary until the run is
 		// cancelled, so a probe of the in-progress screen captures a steady
 		// state instead of racing a fixed delay. test/parity/testdata/
 		// test-faux-provider.ts does the same for Pi.
-		if os.Getenv("TEST_FAUX_HOLD_COMPACTION") == "1" &&
-			strings.Contains(lastText, "Create a structured context checkpoint summary") {
+		if os.Getenv("TEST_FAUX_HOLD_COMPACTION") == "1" && initialSummary {
 			builder.start()
 			testFauxWait(turn, ctx, -1)
 			builder.fail(StopReasonAborted, errors.New("This operation was aborted"))
@@ -300,6 +308,11 @@ func (p *TestFauxProvider) reserveToolCallIDs(sessionID string, messages []Messa
 	return last + 1
 }
 
+// isTestFauxLiveCompaction matches the beginning of P16's LIVE_SUMMARIZATION_PROMPT, including requests with additional focus.
+func isTestFauxLiveCompaction(text string) bool {
+	return strings.HasPrefix(text, "Stop working on the task now. Do not call tools. Your context window is full, so the conversation above is about to be replaced by a summary that you write now.")
+}
+
 func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []testFauxToolCall) {
 	if len(msgs) == 0 {
 		// The pinned Pi provider reads an empty list as an empty last message and answers it as an unhandled request (test/parity/testdata/test-faux-provider.ts classify).
@@ -317,9 +330,15 @@ func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []tes
 		}
 	}
 
-	// Compaction summarization: triggered by /compact or auto-compaction.
-	// The summarization prompt contains this verbatim string from
-	// compaction.go SUMMARIZATION_PROMPT / UPDATE_SUMMARIZATION_PROMPT.
+	// Live and standalone requests get the same canned summary for paired scenarios.
+	if isTestFauxLiveCompaction(lastText) {
+		// An RPC probe distinguishes a live request from a standalone fallback.
+		if strings.HasSuffix(lastText, "\n\nAdditional focus: RPC_LIVE_SUMMARY_PROBE") {
+			return "text", "RPC live compaction summary", nil
+		}
+		return "text", testFauxSummaryResponse, nil
+	}
+	// Standalone compaction.go SUMMARIZATION_PROMPT / UPDATE_SUMMARIZATION_PROMPT.
 	if strings.Contains(lastText, "Create a structured context checkpoint summary") ||
 		strings.Contains(lastText, "NEW conversation messages to incorporate into the existing summary") {
 		return "text", testFauxSummaryResponse, nil
@@ -402,13 +421,10 @@ func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []tes
 	}
 
 	if strings.Contains(lastText, "Run: extension argument coercion") {
-		return "tool", "", []testFauxToolCall{{Name: "coercion_probe", Args: map[string]any{
-			"native": map[string]any{"integer": "2.9", "flag": "TRUE", "array": "3", "optional": nil},
-			"plain":  map[string]any{"integer": "2", "flag": "true", "optional": nil},
-		}}}
+		return "tool", "", []testFauxToolCall{{Name: "coercion_probe", ArgsJSON: `{"native":{"integer":"2.9","flag":"TRUE","array":"3","optional":null},"plain":{"integer":"2","flag":"true","optional":null}}`}}
 	}
 	if strings.Contains(lastText, "Run: noncanonical read") {
-		return "tool", "", []testFauxToolCall{{Name: "read", ArgsJSON: `{"extra":true,"limit":null,"offset":"2","path":"parity-read-target.txt"}`}}
+		return "tool", "", []testFauxToolCall{{Name: "read", ArgsJSON: `{"path":"parity-read-target.txt","offset":"2","limit":null,"extra":true}`}}
 	}
 
 	// Read tool parity.
@@ -418,7 +434,7 @@ func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []tes
 
 	// Write tool parity.
 	if strings.Contains(lastText, "Run: write parity-write-output.txt") {
-		return "tool", "", []testFauxToolCall{{Name: "write", ArgsJSON: `{"content":"hello from faux\nline two\n","path":"parity-write-output.txt"}`}}
+		return "tool", "", []testFauxToolCall{{Name: "write", ArgsJSON: `{"path":"parity-write-output.txt","content":"hello from faux\nline two\n"}`}}
 	}
 
 	// Same-file write+edit batch parity. Upstream runs both calls in the
@@ -426,29 +442,17 @@ func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []tes
 	// order for the edit to observe the freshly-written content.
 	if strings.Contains(lastText, "Run: write then edit parity-batched-target.txt") {
 		return "tool", "", []testFauxToolCall{
-			{Name: "write", ArgsJSON: `{"content":"REPLACE_ME\n","path":"parity-batched-target.txt"}`},
-			{
-				Name: "edit",
-				Args: map[string]any{
-					"path": "parity-batched-target.txt",
-					"edits": []map[string]any{{
-						"oldText": "REPLACE_ME",
-						"newText": "DONE",
-					}},
-				},
-			},
+			{Name: "write", ArgsJSON: `{"path":"parity-batched-target.txt","content":"REPLACE_ME\n"}`},
+			{Name: "edit", ArgsJSON: `{"path":"parity-batched-target.txt","edits":[{"oldText":"REPLACE_ME","newText":"DONE"}]}`},
 		}
 	}
 
 	// Extension tool and built-in write and edit on one file in one parallel batch: file-mutation-queue.ts is shared by the built-in tools and every extension.
 	if strings.Contains(lastText, "Run: parallel extension file mutation") {
 		return "tool", "", []testFauxToolCall{
-			{Name: "write", ArgsJSON: `{"content":"base\n","path":"parity-parallel-mutation-target.txt"}`},
-			{Name: "patch_file", ArgsJSON: `{"line":"patched-A","path":"parity-parallel-mutation-target.txt"}`},
-			{Name: "edit", Args: map[string]any{
-				"path":  "parity-parallel-mutation-target.txt",
-				"edits": []map[string]any{{"oldText": "base", "newText": "BASE"}},
-			}},
+			{Name: "write", ArgsJSON: `{"path":"parity-parallel-mutation-target.txt","content":"base\n"}`},
+			{Name: "patch_file", ArgsJSON: `{"path":"parity-parallel-mutation-target.txt","line":"patched-A"}`},
+			{Name: "edit", ArgsJSON: `{"path":"parity-parallel-mutation-target.txt","edits":[{"oldText":"base","newText":"BASE"}]}`},
 		}
 	}
 
@@ -529,7 +533,7 @@ func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []tes
 	if strings.Contains(lastText, "Run: compact reads") {
 		return "tool", "", []testFauxToolCall{
 			{Name: "read", ArgsJSON: `{"path":"skills/demo-skill/SKILL.md"}`},
-			{Name: "read", ArgsJSON: `{"limit":1,"offset":2,"path":"AGENTS.md"}`},
+			{Name: "read", ArgsJSON: `{"path":"AGENTS.md","offset":2,"limit":1}`},
 			{Name: "read", ArgsJSON: `{"path":"notes.txt"}`},
 		}
 	}
@@ -544,20 +548,28 @@ func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []tes
 
 	// Grep tool parity.
 	if strings.Contains(lastText, "Run: grep hello") {
-		return "tool", "", []testFauxToolCall{{Name: "grep", ArgsJSON: `{"path":"parity-read-target.txt","pattern":"hello"}`}}
+		return "tool", "", []testFauxToolCall{{Name: "grep", ArgsJSON: `{"pattern":"hello","path":"parity-read-target.txt"}`}}
 	}
 
 	// Find results are echoed, not replaced with a success token: a failed search must fail the scenario.
-	if strings.Contains(lastText, "Run: find txt files") || strings.Contains(lastText, "Run: find path glob") || strings.Contains(lastText, "Run: find scoped ignores") {
+	if strings.Contains(lastText, "Run: find txt files") || strings.Contains(lastText, "Run: find path glob") || strings.Contains(lastText, "Run: find dot slash glob") || strings.Contains(lastText, "Run: find anchored glob") || strings.Contains(lastText, "Run: find scoped ignores") {
 		pattern := "*.txt"
-		if strings.Contains(lastText, "Run: find path glob") {
+		switch {
+		case strings.Contains(lastText, "Run: find path glob"):
 			pattern = "src/**/*.spec.ts"
-		} else if strings.Contains(lastText, "Run: find scoped ignores") {
+		case strings.Contains(lastText, "Run: find dot slash glob"):
+			pattern = "./src/**/*.spec.ts"
+		case strings.Contains(lastText, "Run: find anchored glob"):
+			pattern = "{src,parent}/**/*.spec.ts"
+		case strings.Contains(lastText, "Run: find scoped ignores"):
 			pattern = "**/*.txt"
 		}
+		// The pattern is written as JSON text whatever it holds (the fixture's order is pattern, path).
+		raw, _ := json.Marshal(pattern)
+		quoted, _ := jsonstringify.Canonicalize(raw)
 		return "tool", "", []testFauxToolCall{{
-			Name: "find",
-			Args: map[string]any{"pattern": pattern, "path": "."},
+			Name:     "find",
+			ArgsJSON: `{"pattern":` + string(quoted) + `,"path":"."}`,
 		}}
 	}
 
@@ -568,7 +580,12 @@ func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []tes
 
 	// Edit tool parity.
 	if strings.Contains(lastText, "Run: edit parity-edit-target.txt") {
-		return "tool", "", []testFauxToolCall{{Name: "edit", ArgsJSON: `{"newText":"REPLACED","oldText":"REPLACE_ME","path":"parity-edit-target.txt"}`}}
+		return "tool", "", []testFauxToolCall{{Name: "edit", ArgsJSON: `{"path":"parity-edit-target.txt","oldText":"REPLACE_ME","newText":"REPLACED"}`}}
+	}
+
+	// A short line, then one line that alone overflows the bash tool's rolling tail and ends the output with its newline (Pi 935f0ac0ccfc, #12092).
+	if strings.Contains(lastText, "Run: bash long last line") {
+		return "tool", "", []testFauxToolCall{{Name: "bash", ArgsJSON: `{"command":"echo short; head -c 219000 /dev/zero | tr '\\0' x; echo END"}`}}
 	}
 
 	// Long-output bash tool parity (exercises visual-truncate.ts via bash.ts collapse hint).
@@ -683,7 +700,7 @@ func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []tes
 		if strings.Contains(currentUserText, "Run: grep hello") {
 			return "text", "found", nil
 		}
-		if strings.Contains(currentUserText, "Run: find txt files") || strings.Contains(currentUserText, "Run: find path glob") || strings.Contains(currentUserText, "Run: find scoped ignores") {
+		if strings.Contains(currentUserText, "Run: find txt files") || strings.Contains(currentUserText, "Run: find path glob") || strings.Contains(currentUserText, "Run: find dot slash glob") || strings.Contains(currentUserText, "Run: find anchored glob") || strings.Contains(currentUserText, "Run: find scoped ignores") {
 			// fd traversal order is unspecified; upstream's find regression tests sort the paths too.
 			paths := strings.Split(lastText, "\n")
 			slices.Sort(paths)
@@ -700,6 +717,10 @@ func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []tes
 		}
 		if strings.Contains(currentUserText, "Run: tui live tool") {
 			return "text", "LIVE-TOOL-DONE", nil
+		}
+		if strings.Contains(currentUserText, "Run: bash long last line") {
+			// The tool's result is the answer, so the kept end of the line and the notice under it are what the scenario compares.
+			return "text", lastText, nil
 		}
 		if strings.Contains(currentUserText, "Run: bash long output") {
 			return "text", "ran", nil
@@ -846,4 +867,15 @@ func messageImages(message Message) []ImageContent {
 		}
 	}
 	return images
+}
+
+// TestFauxInput is the input of the harness model faux-1 as test/parity/testdata/test-faux-provider.ts declares it: text and
+// image, or text only under TEST_FAUX_TEXT_ONLY=1 (the scenarios of a read under a model without image input). The switch
+// changes only the model's input.
+func TestFauxInput() []string {
+	//perf:ok read once per registration of the harness provider (coding/services.go registerHarnessTestFaux, the only caller), the moment test/parity/testdata/test-faux-provider.ts:727 reads process.env; a value kept for the process would outlive a test's Setenv
+	if os.Getenv("TEST_FAUX_TEXT_ONLY") == "1" {
+		return []string{"text"}
+	}
+	return []string{"text", "image"}
 }

@@ -350,7 +350,7 @@ func (runtime *ModelRuntime) ResolveModel(ctx context.Context, model *ai.Model, 
 	if target == nil {
 		return ModelRoute{}, fmt.Errorf("%s, which is not a physical model.", routed)
 	}
-	if !runtime.hasConfiguredAuth(target.ProviderMeta.ProviderID) {
+	if !runtime.HasConfiguredAuth(target.ProviderMeta.ProviderID) {
 		return ModelRoute{}, fmt.Errorf("%s, which has no credentials.", routed)
 	}
 	return ModelRoute{Model: target, ThinkingLevel: ai.ClampThinkingLevel(target, route.ThinkingLevel), State: route.State}, nil
@@ -443,18 +443,30 @@ func (s *Session) modelForMessage(message *agent.AssistantMessage) *ai.Model {
 	return nil
 }
 
-// recordSelection records the selection on the current branch when the branch implies another one, so a resume restores it. Tree navigation can leave the latest `model_change` on another branch; responses cannot record a virtual selection because they name physical models.
+// recordSelection records the live model and thinking level on the current branch, so a resume restores them.
 //
-// upstream: agent-session.ts:587-597 (_recordSelection)
+// upstream: agent-session.ts _recordSelection
 func (s *Session) recordSelection() {
-	if s.inner == nil || s.modelRuntime == nil {
+	in := s.inner.Load()
+	if in == nil {
 		return
 	}
+	branch := in.GetContextBranch()
+	if s.modelRuntime != nil {
+		s.recordModelSelection(branch)
+	}
+	s.recordThinkingLevel(branch)
+}
+
+// recordModelSelection records the model on the current branch when the branch implies another one. Tree navigation can leave the latest `model_change` on another branch; responses cannot record a virtual selection because they name physical models.
+//
+// upstream: agent-session.ts:587-597 (_recordModelSelection)
+func (s *Session) recordModelSelection(branch []icodingagent.SessionEntry) {
 	model := s.Model()
 	if model == nil {
 		return
 	}
-	recorded := GetBranchSelection(s.inner.GetContextBranch(), s.modelRuntime.GetModel)
+	recorded := GetBranchSelection(branch, s.modelRuntime.GetModel)
 	if recorded == nil || (recorded.Provider == providerID(model) && recorded.ModelID == model.ID) {
 		return
 	}
@@ -462,7 +474,45 @@ func (s *Session) recordSelection() {
 	if !IsVirtualModel(model) && (recordedModel == nil || !IsVirtualModel(recordedModel)) {
 		return
 	}
-	_, _ = s.inner.AppendModelChange(providerID(model), model.ID)
+	_, _ = s.inner.Load().AppendModelChange(providerID(model), model.ID)
+}
+
+// recordThinkingLevel records the thinking level on the current branch when the branch implies another one (#11451). Tree navigation can leave the latest `thinking_level_change` on another branch. The recorded level is compared after clamping to the current model, so a level clamped on resume (for example `xhigh` running as `high`) is not recorded over the requested one.
+//
+// upstream: agent-session.ts _recordThinkingLevel
+func (s *Session) recordThinkingLevel(branch []icodingagent.SessionEntry) {
+	recorded, found := recordedThinkingLevel(branch)
+	if !found {
+		return
+	}
+	effective := ai.ClampThinkingLevel(s.Model(), recorded)
+	if effective == s.ThinkingLevel() {
+		return
+	}
+	_, _ = s.inner.Load().AppendThinkingLevelChange(string(s.ThinkingLevel()))
+}
+
+// recordedThinkingLevel is the level of the last `thinking_level_change` entry of branch that holds one, and whether there is such an entry.
+// A session's own entry holds the level its record decodes to, so it is read from the entry: every agent run asks, and decoding the record
+// allocated the level again each time. An entry of any other shape is read from its record, and skipped when the record holds no level.
+func recordedThinkingLevel(branch []icodingagent.SessionEntry) (ai.ModelThinkingLevel, bool) {
+	for _, b := range slices.Backward(branch) {
+		if b.Base().Type != "thinking_level_change" {
+			continue
+		}
+		if typed, ok := b.(icodingagent.ThinkingLevelEntry); ok {
+			return ai.ModelThinkingLevel(typed.ThinkingLevel), true
+		}
+		var entry struct {
+			ThinkingLevel string `json:"thinkingLevel"`
+		}
+		// upstream: packages/coding-agent/src/core/session-manager.ts:loadEntriesFromFile
+		if json.Unmarshal(b.Raw(), &entry) != nil {
+			continue
+		}
+		return ai.ModelThinkingLevel(entry.ThinkingLevel), true
+	}
+	return "", false
 }
 
 // routeRequest routes the request of a virtual selection. The selection stays in agent state; only this request uses the routed model. Only messages the user wrote start a turn; extension messages can follow them, for example from before_agent_start.
@@ -483,7 +533,8 @@ func (s *Session) routeRequest(ctx context.Context, model *ai.Model, thinking ai
 	case userTurn:
 		reason = ModelRouteReasonUser
 	}
-	options := ResolveModelOptions{Reason: reason, ThinkingLevel: thinking, State: GetVirtualModelState(s.inner.GetContextBranch(), providerID(model), model.ID)}
+	in := s.inner.Load()
+	options := ResolveModelOptions{Reason: reason, ThinkingLevel: thinking, State: GetVirtualModelState(in.GetContextBranch(), providerID(model), model.ID)}
 	if failed != nil {
 		response := failed.LLMMessage()
 		options.Failed = &response
@@ -494,8 +545,8 @@ func (s *Session) routeRequest(ctx context.Context, model *ai.Model, thinking ai
 	}
 	if route.State != nil && !bytes.Equal(route.State, options.State) {
 		data := VirtualModelStateData{Provider: providerID(model), ModelID: model.ID, State: route.State}
-		if id, err := s.inner.AppendCustomEntry(VirtualModelStateEntry, data); err == nil {
-			if entry, ok := s.inner.GetEntry(id); ok {
+		if id, err := in.AppendCustomEntry(VirtualModelStateEntry, data); err == nil {
+			if entry, ok := in.GetEntry(id); ok {
 				s.emitEvent(agent.EntryAppendedEvent{Entry: entry.Raw()})
 			}
 		}
@@ -515,13 +566,6 @@ func (p unroutedProvider) ID() string { return p.id }
 func (unroutedProvider) Close() error { return nil }
 func (p unroutedProvider) Stream(context.Context, ai.TranscriptContext, ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
 	return nil, fmt.Errorf("Virtual model %s/%s must be routed before streaming", p.model.ProviderMeta.ProviderID, p.model.ID)
-}
-
-// hasConfiguredAuth is [ModelRuntime.HasConfiguredAuth] for the routing and extension setModel gates; a provider that needs no auth passes.
-//
-// upstream: model-runtime.ts:543-545 (hasConfiguredAuth)
-func (runtime *ModelRuntime) hasConfiguredAuth(providerID string) bool {
-	return runtime.HasConfiguredAuth(providerID) || !modelRuntimeRequiresAuth(providerID)
 }
 
 // syncVirtualCatalog republishes the availability snapshot after a virtual-model change and refreshes it in the background, as upstream's register and unregister do (`updateModelSnapshot(); void refresh({allowNetwork:false})`).

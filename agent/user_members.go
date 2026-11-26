@@ -51,6 +51,9 @@ func NewUserMessage(content ai.UserContent, timestamp int64, members map[string]
 // ValidateUserMembers refuses a member that names the message's own role, content or timestamp, or that is not JSON. A
 // session checks its input's members with it before input handlers see the input.
 func ValidateUserMembers(members map[string]json.RawMessage) error {
+	if len(members) == 0 {
+		return nil
+	}
 	for _, name := range slices.Sorted(maps.Keys(members)) {
 		if name == "role" || name == "content" || name == "timestamp" {
 			return fmt.Errorf("user message member %q is the message's own", name)

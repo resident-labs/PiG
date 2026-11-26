@@ -6,19 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"syscall"
 	"testing"
 	"time"
 )
-
-// processCPU is the CPU time, user and system, the process has used.
-func processCPU(tb testing.TB) time.Duration {
-	var usage syscall.Rusage
-	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &usage); err != nil {
-		tb.Fatal(err)
-	}
-	return time.Duration(usage.Utime.Nano() + usage.Stime.Nano())
-}
 
 // BenchmarkOpenRealSession opens the session file LW_OPEN_SESSION names (for example a `sessionscale gen -profile p1` or `longsession gen`
 // fixture, or a copy of a real session) the way resume does, and reports the CPU time the open used (cpu-ns/op) and the heap the opened
@@ -108,4 +98,40 @@ func BenchmarkTreeFirstSearchRealSession(b *testing.B) {
 	b.ReportMetric(float64(treeCPU.Nanoseconds())/n, "first-paint-cpu-ns")
 	b.ReportMetric(float64(query.Nanoseconds())/n, "query-ns")
 	b.ReportMetric(float64(queryCPU.Nanoseconds())/n, "query-cpu-ns")
+}
+
+// BenchmarkColdContextRead times the first GetContextBranch of a freshly opened session, which decodes every record of the context: the read a /tree
+// navigation and the repaint that follows it make (D270). LW_OPEN_SESSION names the file; run it with -cpu 1,4,16 to see the parallel split by record bytes.
+func BenchmarkColdContextRead(b *testing.B) {
+	path := os.Getenv("LW_OPEN_SESSION")
+	if path == "" {
+		b.Skip("LW_OPEN_SESSION names no session file")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	dir := filepath.Dir(path)
+	b.SetBytes(info.Size())
+	b.ReportAllocs()
+	var cpu time.Duration
+	for b.Loop() {
+		b.StopTimer()
+		session, err := NewSessionManagerWithDir(dir, dir).Open(path)
+		if err != nil {
+			b.Fatal(err)
+		}
+		runtime.GC()
+		start := processCPU(b)
+		b.StartTimer()
+		entries := session.GetContextBranch()
+		b.StopTimer()
+		cpu += processCPU(b) - start
+		runtime.KeepAlive(entries)
+		if session.snapshot != nil {
+			session.snapshot.close()
+		}
+		b.StartTimer()
+	}
+	b.ReportMetric(float64(cpu.Nanoseconds())/float64(b.N), "cpu-ns/op")
 }

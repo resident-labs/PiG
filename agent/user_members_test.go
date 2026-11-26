@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -21,7 +22,7 @@ func TestUserMessageMembersAreRecordedAndNotSent(t *testing.T) {
 	if err := reread.UnmarshalJSON(recorded); err != nil {
 		t.Fatal(err)
 	}
-	if again, _ := reread.MarshalJSON(); string(again) != string(recorded) {
+	if again, _ := reread.MarshalJSON(); !bytes.Equal(again, recorded) {
 		t.Fatalf("reread %s", again)
 	}
 	sent, err := json.Marshal(message.User.LLMMessage())

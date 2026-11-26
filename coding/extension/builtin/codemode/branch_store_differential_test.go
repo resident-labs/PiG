@@ -35,12 +35,12 @@ func TestReviewCacheConcurrent(t *testing.T) {
 }
 
 func TestReviewCacheDifferential(t *testing.T) {
-	for seed := int64(0); seed < 20; seed++ {
+	for seed := range int64(20) {
 		r := rand.New(rand.NewSource(seed))
 		m := &measuredBranch{s: codingagent.NewSession("review", t.TempDir())}
 		c := &branchStoreCache{}
 		var ids []string
-		for step := 0; step < 500; step++ {
+		for step := range 500 {
 			var err error
 			switch r.Intn(8) {
 			case 0, 1, 2:

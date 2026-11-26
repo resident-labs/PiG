@@ -8,7 +8,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"unicode/utf8"
 
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
@@ -60,10 +59,10 @@ func Highlight(code string, options HighlightOptions) (string, error) {
 	// pig additive (D92): a Piglet that strips syntax-highlight highlights as highlight.js does with no language registered.
 	if highlightStripped() {
 		out, err := highlightPlain(code, options)
-		return terminalText(out), err
+		return jsstring.Canonical(out), err
 	}
 	out, err := highlightWith(highlightRegistry(), code, options)
-	return terminalText(out), err
+	return jsstring.Canonical(out), err
 }
 
 func highlightWith(registry highlightEngine, code string, options HighlightOptions) (string, error) {
@@ -87,6 +86,18 @@ func getScopeFromSpanTag(tag string) (string, bool) {
 	classValue, ok := spanClassValue(tag)
 	if !ok || classValue == "" {
 		return "", false
+	}
+	// Fast path: highlight.js usually emits a single ASCII class like "hljs-keyword".
+	hasSpace := false
+	for i := 0; i < len(classValue); i++ {
+		c := classValue[i]
+		if c <= ' ' || c >= 0x80 {
+			hasSpace = true
+			break
+		}
+	}
+	if !hasSpace {
+		return strings.CutPrefix(classValue, highlightClassPrefix)
 	}
 	for _, className := range splitJSWhitespace(classValue) {
 		if scope, ok := strings.CutPrefix(className, highlightClassPrefix); ok {
@@ -146,43 +157,18 @@ func splitJSWhitespace(text string) []string {
 	return append(parts, text[start:])
 }
 
-// formatter is a theme[scope] property read, true when the value is truthy. The theme is an object literal: an own property shadows Object.prototype even when it is undefined (a nil entry), and a scope naming an Object.prototype member finds that member. syntax-highlight.ts calls it as a strict-mode function with an undefined receiver: Object(text) is a String wrapper that concatenation reads back as text, toString returns "[object Undefined]", isPrototypeOf returns false for a string, __proto__ is an object, and the other members throw a TypeError.
+// pig divergence (D645): Pi's getScopeFormatter (packages/coding-agent/src/utils/syntax-highlight.ts:102) reads theme[scope] on a plain object, returning Object.prototype.constructor for reasonml's hljs-constructor instead of falling back to theme.default (visible since Pi 562da75f9).
+// formatter is the theme's own entry for scope, true when it holds a formatter; a nil entry is an own property set to undefined. A scope that names a member of Object.prototype (highlight.js's reasonml grammar emits `constructor`) has no entry unless the theme sets one, like any other scope.
 func (theme HighlightTheme) formatter(scope string) (HighlightFormatter, bool) {
-	if f, ok := theme[scope]; ok {
-		return f, f != nil
-	}
-	switch scope {
-	case "constructor":
-		return func(text string) string { return text }, true
-	case "toString":
-		return func(string) string { return "[object Undefined]" }, true
-	case "isPrototypeOf":
-		return func(string) string { return "false" }, true
-	case "toLocaleString":
-		return throwHighlightThemeError("Object.prototype.toLocaleString called on null or undefined"), true
-	case "__proto__":
-		return throwHighlightThemeError("formatter is not a function"), true
-	case "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__", "hasOwnProperty", "propertyIsEnumerable", "valueOf":
-		return throwHighlightThemeError("Cannot convert undefined or null to object"), true
-	}
-	return nil, false
+	f := theme[scope]
+	return f, f != nil
 }
 
-func throwHighlightThemeError(message string) HighlightFormatter {
-	return func(string) string { panic(highlightThemeError{message}) }
-}
-
-// isHighlightThemeThrow reports whether err is what a theme formatter throws: the TypeError of a formatter read from Object.prototype, or the Error of theme.fg for a token the theme lacks.
+// isHighlightThemeThrow reports whether err is what a theme formatter throws: the Error of theme.fg for a token the theme lacks.
 func isHighlightThemeThrow(err error) bool {
-	var typeError highlightThemeError
 	var unknownColor unknownThemeColorError
-	return errors.As(err, &typeError) || errors.As(err, &unknownColor)
+	return errors.As(err, &unknownColor)
 }
-
-// highlightThemeError is the TypeError a theme formatter read from Object.prototype throws.
-type highlightThemeError struct{ message string }
-
-func (e highlightThemeError) Error() string { return e.message }
 
 func getScopeFormatter(scope string, theme HighlightTheme) (HighlightFormatter, bool) {
 	if f, ok := theme.formatter(scope); ok {
@@ -234,23 +220,24 @@ func isSpanOpenTagStart(html string, index int) bool {
 }
 
 // RenderHighlightedHtml renders highlight.js HTML as text: each run of text takes the formatter of its innermost mapped scope, or the theme's default, and HTML character references are decoded.
+// The text keeps JavaScript's UTF-16 units: highlight.js can split a surrogate pair between two scopes, and the lone halves stay lone (measured as nothing, as Pi measures them) until the terminal write encodes them. Halves that end up side by side take the ordinary spelling of the pair.
 func RenderHighlightedHtml(html string, theme HighlightTheme) string {
 	out, err := renderHighlightedHTML(html, theme)
 	if err != nil {
 		panic(err)
 	}
-	return terminalText(out)
-}
-
-// terminalText is a JavaScript string as Node writes it to a terminal: UTF-8, each lone surrogate replaced by U+FFFD. Highlighting keeps JavaScript's UTF-16 code units (WTF-8) until this boundary, because highlight.js can split a surrogate pair between two scopes.
-func terminalText(text string) string {
-	if utf8.ValidString(text) {
-		return text
-	}
-	return string(jsstring.ToUTF8(text))
+	return jsstring.Canonical(out)
 }
 
 func renderHighlightedHTML(html string, theme HighlightTheme) (output string, err error) {
+	output, _, err = renderHighlightedHTMLFrom(theme, nil, nil, html)
+	return output, err
+}
+
+// renderHighlightedHTMLFrom is renderHighlightedHTML for the HTML that parts join to, none of which ends inside a tag or a character reference, and which starts inside the spans of open, outermost first; it also returns the spans open where the HTML ends. HTML cut after a tag or a line break renders as its two parts do, the second from the spans the first leaves open: a formatter takes the text between two tags line by line.
+// When cliTheme is non-nil (passed explicitly by internal Theme-backed callers, never inferred from HighlightTheme), fgAnsi affixes are written straight into out without per-token string allocations once every cliHighlightTokens key is confirmed present on cliTheme.
+// pig additive (D112): see hlCacheMax. A streamed code block is rendered from where its highlighting resumes (highlightResumable).
+func renderHighlightedHTMLFrom(theme HighlightTheme, cliTheme *Theme, open []scopeEntry, parts ...string) (output string, scopes []scopeEntry, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			thrown, ok := recovered.(error)
@@ -260,58 +247,191 @@ func renderHighlightedHTML(html string, theme HighlightTheme) (output string, er
 			err = thrown
 		}
 	}()
+	totalLen := 0
+	for _, part := range parts {
+		totalLen += len(part)
+	}
 	var out, textBuffer strings.Builder
-	var scopes []scopeEntry
+	if totalLen > 0 {
+		out.Grow(totalLen * 2)
+	}
+	var scopesBuf [8]scopeEntry
+	if len(open) <= len(scopesBuf) {
+		scopes = append(scopesBuf[:0], open...)
+	} else {
+		scopes = slices.Clone(open)
+	}
+	// Confirm cliTheme defines every cliHighlightTokens key in fgAnsi so an unknown token
+	// still falls through to theme formatters and raises t.Fg's unknown-color panic.
+	if cliTheme != nil {
+		for i := range cliHighlightTokens {
+			if _, ok := cliTheme.fgAnsi[cliHighlightTokens[i].token]; !ok {
+				cliTheme = nil
+				break
+			}
+		}
+	}
+	lookupCLIAffix := func(scope string) (openSeq, closeSeq string, ok bool) {
+		lookup := func(name string) (string, string, bool) {
+			for i := range cliHighlightTokens {
+				if cliHighlightTokens[i].class == name {
+					tok := cliHighlightTokens[i].token
+					ansi := cliTheme.fgAnsi[tok]
+					if cliTheme.dimTokens[tok] {
+						return ansi + "\x1b[2m", "\x1b[22;39m", true
+					}
+					return ansi, SGRFgReset, true
+				}
+			}
+			return "", "", false
+		}
+		if o, c, found := lookup(scope); found {
+			return o, c, true
+		}
+		if before, _, cut := strings.Cut(scope, "."); cut {
+			if o, c, found := lookup(before); found {
+				return o, c, true
+			}
+		}
+		if before, _, cut := strings.Cut(scope, "-"); cut {
+			if o, c, found := lookup(before); found {
+				return o, c, true
+			}
+		}
+		return "", "", false
+	}
+	activeCLIAffix := func() (openSeq, closeSeq string, ok bool) {
+		for _, sc := range slices.Backward(scopes) {
+			if !sc.defined {
+				continue
+			}
+			if o, c, found := lookupCLIAffix(sc.scope); found {
+				return o, c, true
+			}
+			base := sc.scope
+			if before, _, cut := strings.Cut(base, "."); cut {
+				base = before
+			} else if before, _, cut := strings.Cut(base, "-"); cut {
+				base = before
+			}
+			if base == "emphasis" || base == "strong" || base == "link" {
+				return "", "", false
+			}
+		}
+		ansi := cliTheme.fgAnsi["text"]
+		if cliTheme.dimTokens["text"] {
+			return ansi + "\x1b[2m", "\x1b[22;39m", true
+		}
+		return ansi, SGRFgReset, true
+	}
+	writeFormatted := func(text string) {
+		if text == "" {
+			return
+		}
+		if cliTheme != nil {
+			if openSeq, closeSeq, ok := activeCLIAffix(); ok {
+				// Each non-empty line takes the formatter on its own, so a token that spans lines (a multiline string or comment) keeps its color on every line after a terminal wraps or splits the output (#10143).
+				for lineStart := 0; ; {
+					nl := strings.IndexByte(text[lineStart:], '\n')
+					lineEnd := len(text)
+					if nl >= 0 {
+						lineEnd = lineStart + nl
+					}
+					if lineStart > 0 {
+						out.WriteByte('\n')
+					}
+					if line := text[lineStart:lineEnd]; line != "" {
+						out.WriteString(openSeq)
+						out.WriteString(line)
+						out.WriteString(closeSeq)
+					}
+					if nl < 0 {
+						break
+					}
+					lineStart = lineEnd + 1
+				}
+				return
+			}
+		}
+		if f, ok := getActiveFormatter(scopes, theme); ok {
+			// Each non-empty line takes the formatter on its own, so a token that spans lines (a multiline string or comment) keeps its color on every line after a terminal wraps or splits the output (#10143).
+			for lineStart := 0; ; {
+				nl := strings.IndexByte(text[lineStart:], '\n')
+				lineEnd := len(text)
+				if nl >= 0 {
+					lineEnd = lineStart + nl
+				}
+				if lineStart > 0 {
+					out.WriteByte('\n')
+				}
+				if line := text[lineStart:lineEnd]; line != "" {
+					out.WriteString(f(line))
+				}
+				if nl < 0 {
+					break
+				}
+				lineStart = lineEnd + 1
+			}
+		} else {
+			out.WriteString(text)
+		}
+	}
 	flushText := func() {
 		if textBuffer.Len() == 0 {
 			return
 		}
-		if f, ok := getActiveFormatter(scopes, theme); ok {
-			// Each non-empty line takes the formatter on its own, so a token that spans lines (a multiline string or comment) keeps its color on every line after a terminal wraps or splits the output (#10143).
-			for i, line := range strings.Split(textBuffer.String(), "\n") {
-				if i > 0 {
-					out.WriteByte('\n')
-				}
-				if line != "" {
-					out.WriteString(f(line))
-				}
-			}
-		} else {
-			out.WriteString(textBuffer.String())
-		}
+		writeFormatted(textBuffer.String())
 		textBuffer.Reset()
 	}
-	for index := 0; index < len(html); {
-		if isSpanOpenTagStart(html, index) {
-			if tagEnd := strings.IndexByte(html[index+5:], '>'); tagEnd >= 0 {
-				tagEnd += index + 5
-				flushText()
-				scope, ok := getScopeFromSpanTag(html[index : tagEnd+1])
-				scopes = append(scopes, scopeEntry{scope, ok})
-				index = tagEnd + 1
-				continue
+	for partIdx, html := range parts {
+		for index := 0; index < len(html); {
+			if html[index] == '<' {
+				if isSpanOpenTagStart(html, index) {
+					if tagEnd := strings.IndexByte(html[index+5:], '>'); tagEnd >= 0 {
+						tagEnd += index + 5
+						flushText()
+						scope, ok := getScopeFromSpanTag(html[index : tagEnd+1])
+						scopes = append(scopes, scopeEntry{scope, ok})
+						index = tagEnd + 1
+						continue
+					}
+				}
+				if strings.HasPrefix(html[index:], "</span>") {
+					flushText()
+					if len(scopes) > 0 {
+						scopes = scopes[:len(scopes)-1]
+					}
+					index += len("</span>")
+					continue
+				}
+			}
+			if html[index] == '&' {
+				if text, length, ok := decodeHTMLEntityAt(html, index); ok {
+					textBuffer.WriteString(text)
+					index += length
+					continue
+				}
+			}
+			runStart := index
+			index++
+			for index < len(html) && html[index] != '<' && html[index] != '&' {
+				index++
+			}
+			atTag := index < len(html) && html[index] == '<' && (strings.HasPrefix(html[index:], "</span>") || (isSpanOpenTagStart(html, index) && strings.IndexByte(html[index+5:], '>') >= 0))
+			if textBuffer.Len() == 0 && (atTag || index == len(html) && partIdx == len(parts)-1) {
+				writeFormatted(html[runStart:index])
+			} else {
+				textBuffer.WriteString(html[runStart:index])
 			}
 		}
-		if strings.HasPrefix(html[index:], "</span>") {
-			flushText()
-			if len(scopes) > 0 {
-				scopes = scopes[:len(scopes)-1]
-			}
-			index += len("</span>")
-			continue
-		}
-		if html[index] == '&' {
-			if text, length, ok := decodeHTMLEntityAt(html, index); ok {
-				textBuffer.WriteString(text)
-				index += length
-				continue
-			}
-		}
-		textBuffer.WriteByte(html[index])
-		index++
 	}
 	flushText()
-	return out.String(), nil
+	if len(scopes) == 0 {
+		scopes = nil
+	} else if &scopes[0] == &scopesBuf[0] {
+		scopes = slices.Clone(scopes)
+	}
+	return out.String(), scopes, nil
 }
 
 // decodeHTMLEntityAt ports utils/html.ts decodeHtmlEntityAt: the reference ends at the next semicolon within 16 UTF-16 code units. length is in bytes of html.
@@ -409,6 +529,7 @@ func jsParseInt(text string, radix int) float64 {
 
 // cliHighlightTokens are the theme color tokens theme.ts buildCliHighlightTheme gives the highlight.js classes that take a color, in its order.
 var cliHighlightTokens = [...]struct{ class, token string }{
+	{"default", "text"},
 	{"keyword", "syntaxKeyword"},
 	{"built_in", "syntaxType"},
 	{"literal", "syntaxNumber"},
@@ -450,6 +571,42 @@ func cliHighlightTheme(t *Theme) HighlightTheme {
 // HighlightCode highlights code for the active theme and returns its lines, as theme.ts highlightCode does, which getMarkdownTheme().highlightCode is too. Code in a language highlight.js does not support, and code highlight.js fails on, take the mdCodeBlock color.
 func HighlightCode(code, lang string) []string {
 	return highlightCodeLines(code, lang)
+}
+
+// WarmHighlight highlights code for the active theme as HighlightCode does and discards the lines. HighlightCode of a longer
+// text that starts with code then continues from the state this leaves, instead of highlighting from the first line, so a
+// caller whose text streams in can pay for the whole text a step at a time and not all at once when the text is complete.
+// The lines are not kept in the memo: each warm-up is a new text that nothing asks for again, and kept lines would fill the
+// memo's budget, whose reset also drops the resume state.
+// It reports whether such a state is held; false means the text cannot resume (a language highlight.js lacks, a build without
+// syntax highlighting, or code the engine cannot resume over), so a caller that warms as the text grows stops warming.
+// pig additive (D112): the lines HighlightCode returns are the same with or without a warm-up; only when they are computed differs.
+func WarmHighlight(code, lang string) bool {
+	if highlightStripped() {
+		return false
+	}
+	t := ActiveTheme()
+	hlMu.Lock()
+	if t != hlTheme {
+		// The active theme changed: drop the colors cached for the old one, as highlightCodeLines does.
+		resetHighlightCacheLocked()
+		hlTheme = t
+	}
+	hlMu.Unlock()
+	highlightResumable(highlightRegistry(), code, lang, t, true)
+	return highlightResumeHeld(code, lang, t)
+}
+
+// ReleaseWarmHighlight drops the UTF-16 units that WarmHighlight of code, and of the texts code starts with, kept for a longer text
+// to continue from. A caller that warms a text as it grows calls it with the last text it warmed when no longer text will follow (the
+// text is complete, or its owner ended), so the units of a warm-up that ended after the text's last draw, or that no draw took, are
+// not held until later warm-ups push their state out. The resume states stay, and so do the lines HighlightCode returns.
+// pig additive (D112): only when the units are freed moves.
+func ReleaseWarmHighlight(code, lang string) {
+	if highlightStripped() {
+		return
+	}
+	releaseHighlightUnits(code, lang)
 }
 
 // HighlightEpoch is what HighlightCode's lines depend on besides its arguments: the active theme and the highlight.js
@@ -517,7 +674,7 @@ func highlightCodeLines(code, lang string) []string {
 	generation := hlGeneration
 	hlMu.Unlock()
 
-	out, ok := highlightResumable(highlightRegistry(), code, lang, t)
+	out, ok := highlightResumable(highlightRegistry(), code, lang, t, false)
 	if !ok {
 		out = highlightCodeUncached(highlightRegistry(), code, lang, t)
 	}
@@ -536,18 +693,30 @@ func storeHighlightLocked(key hlKey, out []string) {
 	if size > hlCacheMaxBytes {
 		return
 	}
+	// A code block that is streamed stores a longer prefix per frame, and each replaces the entry before it, so those keys are not copied, or streaming a block of n bytes would copy O(n) bytes per frame more (TestScalingStreamedCodeBlockHighlight). The key of the frame that ends up staying is copied when the stream ends, below.
+	streamed := false
 	if last := hlLast; last.lang == key.lang && strings.HasPrefix(key.code, last.code) {
 		if lines, ok := hlCache[last]; ok {
 			delete(hlCache, last)
 			hlCacheBytes -= hlEntrySize(last, lines)
+			streamed = true
 		}
+	}
+	// Any other key must not hold the text it was sliced from: the code of a fence is a part of a chunk that the block lexer copied the document's strings to, and a memo entry would keep the whole chunk, which hlEntrySize does not count.
+	if !streamed {
+		// The block that was streamed before this one is complete: its key, the last of its frames, keeps the text it was sliced from until it has its own.
+		if lines, ok := hlCache[hlLast]; ok && hlLastShared {
+			delete(hlCache, hlLast)
+			hlCache[hlKey{lang: strings.Clone(hlLast.lang), code: strings.Clone(hlLast.code)}] = lines
+		}
+		key = hlKey{lang: strings.Clone(key.lang), code: strings.Clone(key.code)}
 	}
 	if len(hlCache) >= hlCacheMax || hlCacheBytes+size > hlCacheMaxBytes {
 		resetHighlightCacheLocked()
 	}
 	hlCache[key] = out
 	hlCacheBytes += size
-	hlLast = key
+	hlLast, hlLastShared = key, streamed
 }
 
 // hlKey memoizes highlighted lines for the active theme and loaded languages.
@@ -570,8 +739,9 @@ var (
 	hlGeneration int
 	hlCache      = map[hlKey][]string{}
 	hlCacheBytes int
-	// hlLast is the entry stored last, which the next prefix of a streamed block replaces.
-	hlLast hlKey
+	// hlLast is the entry stored last, which the next prefix of a streamed block replaces. hlLastShared reports that its key was stored without a copy of its strings, which the next store that does not continue the block makes.
+	hlLast       hlKey
+	hlLastShared bool
 )
 
 // hlEntrySize is the bytes a memo entry retains: the code held by its key and the highlighted lines.
@@ -587,7 +757,7 @@ func hlEntrySize(key hlKey, lines []string) int {
 func resetHighlightCacheLocked() {
 	clear(hlCache)
 	hlCacheBytes = 0
-	hlLast = hlKey{}
+	hlLast, hlLastShared = hlKey{}, false
 	resetHighlightResumesLocked()
 }
 
@@ -596,12 +766,17 @@ func highlightCodeUncached(registry highlightEngine, code, lang string, t *Theme
 	if lang == "" || !registry.SupportsLanguage(lang) {
 		return codeBlockLines(code, t)
 	}
-	highlighted, err := highlightWith(registry, code, HighlightOptions{Language: lang, IgnoreIllegals: true, Theme: cliHighlightTheme(t)})
+	html, err := registry.Highlight(code, lang, true)
 	if err != nil {
 		// theme.ts highlightCode: `catch { return code.split("\n").map((line) => theme.fg("mdCodeBlock", line)); }`.
 		return codeBlockLines(code, t)
 	}
-	return strings.Split(terminalText(highlighted), "\n")
+	highlighted, _, err := renderHighlightedHTMLFrom(cliHighlightTheme(t), t, nil, html)
+	if err != nil {
+		// theme.ts highlightCode: `catch { return code.split("\n").map((line) => theme.fg("mdCodeBlock", line)); }`.
+		return codeBlockLines(code, t)
+	}
+	return strings.Split(jsstring.Canonical(highlighted), "\n")
 }
 
 func codeBlockLines(code string, t *Theme) []string {
@@ -614,12 +789,18 @@ func codeBlockLines(code string, t *Theme) []string {
 
 // LanguageFromPath returns the highlight language for a file path, or "" when none maps, as theme.ts getLanguageFromPath does: the extension is the text after the path's last dot, or the whole path when it has none, lowercased as String.prototype.toLowerCase does.
 func LanguageFromPath(path string) string {
-	ext := path[strings.LastIndexByte(path, '.')+1:]
+	ext := pathExtension(path)
 	if ext == "" {
 		return ""
 	}
+	// pig divergence (D645): Pi's extToLang is a plain object, so for the extensions `constructor` and `__proto__` its lookup returns a member inherited from Object.prototype, highlightCode throws for that value, and the read and write cards fall back to the generic card. Here such a path has no language, like any other unknown extension.
+	return extToLang()[ext]
+}
+
+// pathExtension is getLanguageFromPath's `filePath.split(".").pop()?.toLowerCase()`.
+func pathExtension(path string) string {
 	// strings.ToLower maps U+0130 to "i"; toLowerCase maps it to "i\u0307" (SpecialCasing.txt). Every other character lowercases to the same ASCII letters in both.
-	return extToLang()[strings.ToLower(strings.ReplaceAll(ext, "\u0130", "i\u0307"))]
+	return strings.ToLower(strings.ReplaceAll(path[strings.LastIndexByte(path, '.')+1:], "\u0130", "i\u0307"))
 }
 
 // extToLang is getLanguageFromPath's extension table, built on first use, not on every start.
@@ -638,6 +819,10 @@ var extToLang = sync.OnceValue(func() map[string]string {
 		"java":       "java",
 		"kt":         "kotlin",
 		"swift":      "swift",
+		"dart":       "dart",
+		"groovy":     "groovy",
+		"gradle":     "groovy",
+		"nix":        "nix",
 		"c":          "c",
 		"h":          "c",
 		"cpp":        "cpp",

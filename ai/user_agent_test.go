@@ -5,7 +5,7 @@ package ai
 // value, upstream-specific configured-header precedence, and format. Ordinary
 // providers allow a configured override; Codex forces the product identity.
 // Anthropic's own default/override/OAuth-exception cases (Q3: OAuth requests
-// keep claude-cli/2.1.280 regardless of a configured header) are
+// keep claude-cli/2.1.322 regardless of a configured header) are
 // TestAnthropicClientUserAgent in anthropic_oauth_test.go. This file covers
 // openai-completions, openai-responses (and its azure/codex delegates),
 // google-generative-ai (and its vertex delegate), and mistral-conversations.
@@ -208,6 +208,10 @@ func userAgentProviderCases(t *testing.T) []userAgentProviderCase {
 func TestProviderDefaultUserAgent(t *testing.T) {
 	want := FormatUserAgent(nil)
 	for _, tc := range userAgentProviderCases(t) {
+		if !BuiltAPI(API(tc.name)) {
+			// A build with this API's pig_strip tag has no provider for the row.
+			continue
+		}
 		t.Run(tc.name, func(t *testing.T) {
 			var header http.Header
 			provider := tc.build(sseClient(&header, tc.sse))
@@ -280,6 +284,10 @@ func TestProviderUserAgentOverridePrecedence(t *testing.T) {
 			sse: userAgentMistralSSE,
 		},
 	} {
+		if api, _, _ := strings.Cut(tc.name, " "); !BuiltAPI(API(api)) {
+			// A build with this API's pig_strip tag has no provider for the row.
+			continue
+		}
 		t.Run(tc.name, func(t *testing.T) {
 			var header http.Header
 			provider := tc.build(sseClient(&header, tc.sse), map[string]string{"User-Agent": "model-client"})

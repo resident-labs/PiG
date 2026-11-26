@@ -28,6 +28,21 @@ func readPinned(t *testing.T, parts ...string) []byte {
 	return data
 }
 
+// What the vendored files are compared with is the pinned release plus the post-release fixes the release line carries
+// (automation/gen/pi-post-release-backports.mjs, applied to the installed packages by automation/pin/oracle.py). An installed Pi that
+// lacks a fix, or holds it twice, would make every comparison against it wrong, so the generator checks each file it covers.
+func TestPinnedPiPackagesCarryTheRecordedFixesOnce(t *testing.T) {
+	packages := make([]string, 0, 3)
+	for _, name := range []string{"pi-ai", "pi-coding-agent", "pi-tui"} {
+		dist := pinnedPackageDist[name]
+		packages = append(packages, name+"="+filepath.Join(append([]string{pinnedPiPackages}, dist[:len(dist)-1]...)...))
+	}
+	script := filepath.Join("..", "..", "..", "..", "automation", "gen", "pi-post-release-backports.mjs")
+	if out, err := exec.Command("node", append([]string{script, "--verify-packages"}, packages...)...).CombinedOutput(); err != nil {
+		t.Fatalf("the installed Pi does not carry the post-release fixes once (run make parity-deps): %v\n%s", err, out)
+	}
+}
+
 // The bundled TypeBox must be the release the pinned Pi depends on.
 func TestVendoredTypeBoxMatchesThePinnedDependency(t *testing.T) {
 	var manifest struct {
@@ -68,6 +83,9 @@ var vendoredImportRewrites = map[string][2]string{
 		`import { arr, bool, nul, num, opt, str, union, } from "../../pi-schema/index.js";`},
 	"pi-ai/providers/model-schema.js": {`import { arr, int, nul, num, oneOf, opt, str, union, } from "@earendil-works/pi-schema";`,
 		`import { arr, int, nul, num, oneOf, opt, str, union, } from "../../pi-schema/index.js";`},
+	"pi-ai/api/openai-completions.impl.js": {`import OpenAI from "openai";`, `import OpenAI from "../../../openai-sdk-absent.mjs";`},
+	"pi-ai/api/google-shared.js": {`import { FinishReason, FunctionCallingConfigMode, ThinkingLevel as GoogleSdkThinkingLevel, } from "@google/genai";`,
+		`import { FinishReason, FunctionCallingConfigMode, ThinkingLevel as GoogleSdkThinkingLevel, } from "../../../google-genai-enums.mjs";`},
 	"pi-ai/telemetry.js": {`import { createTypedMetrics, createTypedSpanStarter, defineTelemetrySchema, NOOP_TELEMETRY_CONTEXT, NOOP_TELEMETRY_METRICS, } from "@earendil-works/pi-telemetry";`,
 		`import { createTypedMetrics, createTypedSpanStarter, defineTelemetrySchema, NOOP_TELEMETRY_CONTEXT, NOOP_TELEMETRY_METRICS, } from "../pi-telemetry/index.js";`},
 	"pi-coding-agent/utils/shell.js": {`import { getBinDir } from "../config.js";`,
@@ -88,6 +106,21 @@ var vendoredSettingsManagerRewrites = [][2]string{
 		`import { CONFIG_DIR_NAME, getAgentDir } from "../../../pig-config.mjs";`},
 }
 
+// vendoredAPIReexports lists the values a bridge stub also re-exports from
+// Pi's own module of the implementation (vendoredAPIModules), so that
+// `@earendil-works/pi-ai/api/<api>` exports them as under Pi.
+var vendoredAPIReexports = map[string]string{
+	"openai-completions": `export { convertMessages } from "./openai-completions.impl.js";` + "\n",
+	"pi-messages":        `export { PiMessagesResponseError } from "./pi-messages.impl.js";` + "\n",
+}
+
+// vendoredBridgeHelperImports and vendoredBridgeHelperExports are what the openai-codex-responses stub adds: its three Codex WebSocket helpers come from the bridge, which reaches the Go cache of
+// the provider-bridge child (Pi's keep them in process-local maps).
+var vendoredBridgeHelperImports = map[string]string{"openai-codex-responses": ", bridgeCodexWebSocketHelpers"}
+var vendoredBridgeHelperExports = map[string]string{
+	"openai-codex-responses": "export const { closeOpenAICodexWebSocketSessions, getOpenAICodexWebSocketDebugStats, resetOpenAICodexWebSocketDebugStats } = bridgeCodexWebSocketHelpers();\n",
+}
+
 // vendoredBridgeStubs are pi-ai's builtin API implementations, which import
 // vendor SDKs; each is a stub that loads PiG's bridge to its host providers.
 var vendoredBridgeStubs = func() map[string]string {
@@ -98,10 +131,19 @@ var vendoredBridgeStubs = func() map[string]string {
 	for _, api := range []string{"anthropic-messages", "azure-openai-responses", "bedrock-converse-stream", "google-generative-ai", "google-vertex",
 		"mistral-conversations", "openai-codex-responses", "openai-completions", "openai-responses", "pi-messages"} {
 		stubs["pi-ai/api/"+api+".js"] = "// PiG: the " + api + " implementation runs in PiG's host (D74); see automation/gen/vendor-pi-dist.sh.\n" +
-			"import { bridgeApi } from \"../../../pi-ai-bridge.mjs\";\nexport const { stream, streamSimple } = bridgeApi(\"" + api + "\");\n"
+			"import { bridgeApi" + vendoredBridgeHelperImports[api] + " } from \"../../../pi-ai-bridge.mjs\";\n" + vendoredAPIReexports[api] +
+			"export const { stream, streamSimple } = bridgeApi(\"" + api + "\");\n" + vendoredBridgeHelperExports[api]
 	}
 	return stubs
 }()
+
+// vendoredAPIModules are Pi's own modules of the builtin API implementations the stubs re-export from, and google-shared: each is the pinned file
+// (the value, relative to pi-ai/dist) with at most the one import line of a vendor SDK replaced (vendoredImportRewrites), pinned by the manifest's hash of the source.
+var vendoredAPIModules = map[string]string{
+	"pi-ai/api/pi-messages.impl.js":        "api/pi-messages.js",
+	"pi-ai/api/openai-completions.impl.js": "api/openai-completions.js",
+	"pi-ai/api/google-shared.js":           "api/google-shared.js",
+}
 
 // validation.js rewrites its two pi-schema imports.
 var vendoredValidationRewrites = [][2]string{
@@ -226,7 +268,11 @@ func TestVendoredPiDistMatchesThePinnedPackage(t *testing.T) {
 		if pkg == "pi-tui" && strings.HasPrefix(file, "native/") {
 			want = readPinned(t, append(append([]string{}, dist[:len(dist)-1]...), strings.Split(file, "/")...)...)
 		} else {
-			want = readPinned(t, append(append([]string{}, dist...), strings.Split(file, "/")...)...)
+			source := file
+			if piFile, ok := vendoredAPIModules[rel]; ok {
+				source = piFile
+			}
+			want = readPinned(t, append(append([]string{}, dist...), strings.Split(source, "/")...)...)
 		}
 		if rel == "pi-tui/utils.js" {
 			declaration := regexp.MustCompile(`(?m)^const rgiEmojiRegex = (.+);$`).FindSubmatch(want)
@@ -272,6 +318,13 @@ func TestVendoredPiDistMatchesThePinnedPackage(t *testing.T) {
 		}
 		if rel == "pi-tui/components/markdown.js" {
 			rewrites = append(rewrites, [2]string{`import markedCjkFriendly from "marked-cjk-friendly";`, `import markedCjkFriendly from "../../../marked-cjk-friendly/dist/index.js";`})
+		}
+		if rel == "pi-tui/terminal-image.js" {
+			// automation/gen/vendor-pi-startup-seams.mjs: the module loads with every start, so the width module its image-line extent reads waits for the first measurement (shims/pi-tui-utils-lazy.mjs). The seam replaces the whole import statement.
+			rewrites = append(rewrites, [2]string{`import { visibleWidth } from "./utils.js";`, `import { visibleWidth } from "../../pi-tui-utils-lazy.mjs";`})
+			if n := bytes.Count(want, []byte(`"./utils.js"`)); n != 1 {
+				t.Errorf("pinned %s names utils.js %d times, want the visibleWidth import alone: update automation/gen/vendor-pi-startup-seams.mjs", rel, n)
+			}
 		}
 		if rel == "pi-ai/utils/validation.js" {
 			rewrites = append(rewrites, vendoredValidationRewrites...)

@@ -5,15 +5,17 @@
 // a local type that the plugins serve. Each is answered with one reply, as every control request is, and runs with the
 // request's context (the Go side's abort aborts it). `unwatch` and `release` are notifications (no reply). Node to Go,
 // unrequested and in the order they happen on the one channel: `frame` (one call of a watch's listener), `watchEnd` (the
-// watch ended, and why) and `state` (a reference's state changed).
+// watch ended, and why) and `state` (a reference's state changed). The events of the two hosts cross as `event` and `ack`
+// messages in both directions (events.mjs).
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
-import { ChordError } from "@earendil-works/chord/next";
+import { ChordError } from "@earendil-works/chord";
 import { contractOf, operations as contractOperations } from "./contracts.mjs";
+import { createEvents } from "./events.mjs";
 import { createProxies } from "./proxy.mjs";
 import { decodeValue, encodeValue } from "./wire.mjs";
 
 /** The specifier the Go core facets' proxy scripts import their host package by (plugins_node_bridged.go's `bridgePackage`). */
-export const GO_PACKAGE = "@earendil-works/chord/next/go";
+export const GO_PACKAGE = "@earendil-works/chord/go";
 
 /** A reference's state as data: its kind and the fields of that kind (the causes and errors as ChordError data). */
 function wireState(state) {
@@ -42,6 +44,8 @@ export function createBridge({ port, wireError, host }) {
 	const watches = new Map();
 	/** The keys the Go side pinned, by the id the Go side chose. */
 	const pins = new Map();
+	/** The events that cross between the two hosts (events.mjs): the Go side's `event` and `ack` messages come to it. */
+	const events = createEvents({ port, host });
 
 	function entry(handle) {
 		const found = handles.get(handle);
@@ -81,13 +85,26 @@ export function createBridge({ port, wireError, host }) {
 		const contract = contractOf(request.contract);
 		if (contract.kind !== "local") throw new Error(`${contract.name}: only a local type is held through the control channel`);
 		const options = request.readyTimeout === undefined ? undefined : { readyTimeout: request.readyTimeout };
-		const reference = await target.get(contract, request.params, context, options);
+		// `hold` (NodeHost.Hold) is a reference at once, `get` one once its object is live.
+		const reference = request.hold === true ? target.hold(contract, request.params, context, options) : await target.get(contract, request.params, context, options);
 		// The handle is the Go side's: it registered the reference before it sent this request.
 		const { handle } = request;
+		// Tapped as soon as this side has the reference, before anything is awaited: what its event members receive from now
+		// on goes to the Go side, listener there or not, as a hold over a link is tapped when it binds (events.mjs `tap`).
+		// `request.events` are the type's event members in the order the Go side indexes them (none for a type without any). A released reference forwards
+		// nothing more (Pi host/reference.ts:605-611, `forwardEvents`: "nothing for a released reference"), so its release is its untap.
+		events.tap(reference, handle, request.events);
 		const held = { reference, members: request.contract.normal.members, state: undefined };
 		handles.set(handle, held);
 		// The state's changes follow in order, numbered from 1 (the reply shows change 0): the Go side keeps the latest.
-		held.state = await reference.state.watch(BACKGROUND_CONTEXT);
+		try {
+			held.state = await reference.state.watch(BACKGROUND_CONTEXT);
+		} catch (error) {
+			// The request fails, so the Go side forgets the handle and releases nothing: nothing may stay tapped or held for it.
+			handles.delete(handle);
+			reference.release();
+			throw error;
+		}
 		const state = wireState(held.state.value);
 		afterReply(() => {
 			let seq = 0;
@@ -217,6 +234,8 @@ export function createBridge({ port, wireError, host }) {
 	let nextAsk = 0;
 	/** The observers of the Go host's watches, by the id this side chose, which the frames of the Go side name. */
 	const observers = new Map();
+	/** The copies of the Go host's keyed members, by the id this side chose, which the `mirrorDoc` and `mirrorReset` frames name. */
+	const copies = new Map();
 
 	/**
 	 * Requests `event` of the Go host (`{ event, id, ... }`, answered by `{ op: "bridgeAnswer", id, ok, result | error }`) with
@@ -260,7 +279,7 @@ export function createBridge({ port, wireError, host }) {
 	return {
 		operations: { ...contractOperations, get, value, watch, pin, call },
 		/** The host package of the Go core facets' proxies (`GO_PACKAGE`), answered to the scripts that import it. */
-		hostPackage: createProxies({ ask, tell, watches: observers }),
+		hostPackage: createProxies({ ask, tell, watches: observers, mirrors: copies, sinks: events.sinks, fatal: (error) => port.control({ event: "fatal", error: wireError(error) }) }),
 		/**
 		 * Handles a control message that is no request of `operations`: a notification of the Go side (no id, no reply), or
 		 * what the Go side sends for a request it serves for this side (an answer, a frame or the end of a watch of the Go
@@ -281,6 +300,19 @@ export function createBridge({ port, wireError, host }) {
 					observer?.end(error === undefined ? { kind } : { kind, error: errorOf(error) });
 					return true;
 				}
+				case "mirrorDoc":
+					if (message.retired === true) copies.get(message.mirror)?.retire(message.key);
+					else copies.get(message.mirror)?.put(message.key, decodeValue(message.value));
+					return true;
+				case "mirrorReset":
+					copies.get(message.mirror)?.reset(message.docs.map(({ key, value }) => ({ key, value: decodeValue(value) })));
+					return true;
+				case "event":
+					events.receive(message);
+					return true;
+				case "ack":
+					events.acked(message.events);
+					return true;
 			}
 			const notification = notifications[message.op];
 			if (notification === undefined) return false;

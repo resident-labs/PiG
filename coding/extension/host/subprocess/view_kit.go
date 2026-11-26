@@ -52,6 +52,16 @@ type viewSurface struct {
 	// terminalRows is the terminal's height in rows, 0 when unknown; an
 	// editor's visible line count follows it (nil: an in-memory surface).
 	terminalRows func() int
+	// rowBudget is the rows the surface is drawn with when its owner cuts it, 0 or nil for no cut; a grid draws fewer
+	// chip lines to fit it (nil: a D107 surface).
+	rowBudget func() int
+	// mountImages draws the image nodes of a mount's surface (nil: a D107 surface, whose image is Pi's component).
+	mountImages *MountImages
+	// buildMountImage returns the component of an image node of a mount's surface (nil: a D107 surface). Only
+	// NewMountSurface sets it. The builder calls it as a value and not by name: a call by name links the component and
+	// its drawing (the half-block cells, the Kitty placeholder rows) into every program that builds a view, also one
+	// that makes no mount surface (test/perfgate TestHeadlessEmbedLinksNoMountImage).
+	buildMountImage func(b *viewBuilder, n *ViewNode, img *viewImage, fallback func(string) string) tui.Component
 
 	frame     *viewFrame
 	instances map[string]*viewInstance
@@ -68,9 +78,20 @@ type viewSurface struct {
 	mouseTarget   *tui.TuiMouseDispatchTarget
 	mouseReleased bool
 	loaderGen     uint64
+	// draws counts the times the surface was drawn (Render, FrontendView). A loader is animated while its surface is drawn: its timer is
+	// armed again only when the surface was drawn since it was armed. loadersParked is set when a timer ended because nothing had drawn
+	// the surface, and the next draw starts the loaders again. loaderTimers counts the surface's armed loader timers.
+	draws         uint64
+	loadersParked bool
+	loaderTimers  int
 	// cardChanged reports that a tool card drew again on its own since the
 	// surface last counted a revision.
 	cardChanged atomic.Bool
+	// defaultFocus is the id of the node that takes the keys when a frame names none, and unfocused reports that the
+	// surface does not hold the keyboard focus, so no node draws as focused. Only a plugin mount's surface sets them
+	// (ui_view_surface.go); the zero values are a D107 surface, which holds the focus whenever it is shown.
+	defaultFocus string
+	unfocused    bool
 	// disposers dispose the components of the frames the surface built
 	// that no later frame keeps (tool cards without an id); they run
 	// outside s.mu by the next accept or close.
@@ -257,6 +278,21 @@ func (s *viewSurface) close() {
 	}
 }
 
+// animates reports an open, authoritative surface whose loaders the host advances on its own.
+func (s *viewSurface) animates() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.frame == nil || s.frame.lines != nil {
+		return false
+	}
+	for _, l := range s.frame.loaders {
+		if len(l.loader.Frames) > 1 {
+			return true
+		}
+	}
+	return false
+}
+
 // Render returns the lines the terminal draws at width.
 func (s *viewSurface) Render(width int) []string {
 	s.mu.Lock()
@@ -268,6 +304,7 @@ func (s *viewSurface) Render(width int) []string {
 	if f.lines != nil {
 		return slices.Clone(f.lines)
 	}
+	s.drawnLocked()
 	if s.cardChanged.Swap(false) {
 		s.rev++
 	}
@@ -416,6 +453,7 @@ func (s *viewSurface) FrontendView(width int) *frontend.View {
 		return nil
 	}
 	if f.lines == nil {
+		s.drawnLocked()
 		if s.cardChanged.Swap(false) {
 			s.rev++
 		}
@@ -728,13 +766,20 @@ func (s *viewSurface) buildLocked(f *viewFrame, base *tui.Theme) error {
 	f.tree = tree
 	if f.payload.Focus != "" {
 		f.focus = s.instances[f.payload.Focus]
+	} else if inst := s.instances[s.defaultFocus]; inst != nil && (inst.list != nil || inst.settings != nil || viewWidgetFocusable(inst.kind)) {
+		f.focus = inst
 	}
+	s.focusWidgetsLocked(f)
+	return nil
+}
+
+// focusWidgetsLocked tells each widget of f whether it draws as focused.
+func (s *viewSurface) focusWidgetsLocked(f *viewFrame) {
 	for _, inst := range s.instances {
 		if inst.widget != nil {
-			inst.widget.setFocused(inst == f.focus || inst.sent != nil && inst.sent.Focused)
+			inst.widget.setFocused(!s.unfocused && (inst == f.focus || inst.sent != nil && inst.sent.Focused))
 		}
 	}
-	return nil
 }
 
 func (b *viewBuilder) fgFn(token string) func(string) string {
@@ -882,7 +927,11 @@ func (b *viewBuilder) build(n *ViewNode, out *frontend.ViewNode) (tui.Component,
 		if fallback == nil {
 			fallback = identity
 		}
-		c = tui.NewImage(img.b64, n.MimeType, tui.ImageTheme{FallbackColor: fallback}, opts, nil)
+		if build := b.s.buildMountImage; build != nil {
+			c = build(b, n, img, fallback)
+		} else {
+			c = tui.NewImage(img.b64, n.MimeType, tui.ImageTheme{FallbackColor: fallback}, opts, nil)
+		}
 	case ViewKindLoader:
 		c = b.loader(n, out)
 	case ViewKindUserMessage:
@@ -1133,9 +1182,11 @@ func (b *viewBuilder) loader(n *ViewNode, out *frontend.ViewNode) tui.Component 
 }
 
 // startLoadersLocked animates the frame's loaders (host-owned, §4.4): one
-// owned timer per loader, stopped by the next frame or close.
+// owned timer per loader, stopped by the next frame or close, and not armed
+// again once nothing draws the surface (scheduleLoaderLocked).
 func (s *viewSurface) startLoadersLocked() {
 	s.loaderGen++
+	s.loadersParked = false
 	if s.frame == nil || s.frame.lines != nil || !viewLoaderAnimation.Load() {
 		return
 	}
@@ -1144,24 +1195,47 @@ func (s *viewSurface) startLoadersLocked() {
 		if len(l.loader.Frames) <= 1 {
 			continue
 		}
-		s.scheduleLoader(gen, l)
+		s.scheduleLoaderLocked(gen, l)
 	}
 }
 
-func (s *viewSurface) scheduleLoader(gen uint64, l *viewLoader) {
+// drawnLocked counts a draw of the surface and starts the loaders that stopped because nothing drew it. They start before the draw is
+// counted, so their first tick sees it. s.mu is held.
+func (s *viewSurface) drawnLocked() {
+	if s.loadersParked {
+		s.startLoadersLocked()
+	}
+	s.draws++
+}
+
+// scheduleLoaderLocked arms one tick of a loader. The tick advances the loader, asks for a repaint and arms the next tick, but only when
+// the surface was drawn since this one was armed: a surface has no owner that closes it when the component that shows it leaves the
+// screen (a renderer's view goes with its transcript component, which a rebuilt transcript drops without a call), and a timer that armed
+// itself for ever kept the dropped view, its repaint callback and its connection, one for every time the transcript was rebuilt. A
+// surface that is drawn asks for the next draw with every tick, so its loaders run on; one that nothing draws has no timer after one
+// interval, and drawing it again starts them (drawnLocked). s.mu is held.
+func (s *viewSurface) scheduleLoaderLocked(gen uint64, l *viewLoader) {
+	drawn := s.draws
+	s.loaderTimers++
 	time.AfterFunc(l.interval, func() {
 		s.mu.Lock()
+		s.loaderTimers--
 		if s.closed || s.loaderGen != gen {
+			s.mu.Unlock()
+			return
+		}
+		if s.draws == drawn {
+			s.loadersParked = true
 			s.mu.Unlock()
 			return
 		}
 		l.loader.Tick()
 		s.rev++
 		repaint := s.repaint
+		s.scheduleLoaderLocked(gen, l)
 		s.mu.Unlock()
 		if repaint != nil {
 			repaint()
 		}
-		s.scheduleLoader(gen, l)
 	})
 }

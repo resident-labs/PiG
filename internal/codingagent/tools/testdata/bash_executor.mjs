@@ -1,18 +1,19 @@
-// Run the installed Pi's executeBashWithOperations (core/bash-executor.ts) over scripted BashOperations: each scenario delivers byte chunks to onData, optionally aborts the signal after one of them, and then resolves an exit code or throws. Reports every onChunk call, the result, the full-output file Pi wrote (read after Pi's stream closed), and what was thrown.
+// Run the installed Pi's executeBashWithOperations (core/bash-executor.ts) over scripted BashOperations: each scenario delivers byte chunks to onData, optionally aborts the signal after one of them, and then resolves an exit code or throws. Reports every onChunk call, the result, the full-output file Pi wrote, and what was thrown.
 import fs, { existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { once } from "node:events";
 import { syncBuiltinESMExports } from "node:module";
 import { pathToFileURL } from "node:url";
-// Pi's executor ends its output stream without awaiting it, so the file is complete only once the stream has closed. Record the streams Pi opens to wait for that, instead of guessing from the file's size.
-const outputStreams = [];
+const root = realpathSync(new URL("../../../../extensions/sdk-ts/node_modules/@earendil-works/pi-coding-agent/", import.meta.url)) + "/";
+if (JSON.parse(readFileSync(root + "package.json", "utf8")).version !== process.argv[2]) throw new Error("Wrong Pi oracle version");
+// Pi writes its spill file through an fs.WriteStream it never hands back and ends without waiting for it: record the streams, so the file is read only once Pi's stream has closed. A size that stops changing is no proof of that: libuv on Windows writes the buffers of one writev one WriteFile at a time, and a write thread that is descheduled between two of them leaves a prefix standing for longer than any poll interval.
+const spills = [];
 const createWriteStream = fs.createWriteStream;
 fs.createWriteStream = (...args) => {
-  const stream = createWriteStream.apply(fs, args);
-  outputStreams.push(stream);
+  const stream = createWriteStream(...args);
+  spills.push(stream);
   return stream;
 };
 syncBuiltinESMExports();
-const root = realpathSync(new URL("../../../../extensions/sdk-ts/node_modules/@earendil-works/pi-coding-agent/", import.meta.url)) + "/";
-if (JSON.parse(readFileSync(root + "package.json", "utf8")).version !== process.argv[2]) throw new Error("Wrong Pi oracle version");
 const { executeBashWithOperations } = await import(pathToFileURL(root + "dist/core/bash-executor.js"));
 let input = "";
 process.stdin.setEncoding("utf8");
@@ -21,7 +22,6 @@ const results = [];
 for (const scenario of JSON.parse(input)) {
   const controller = new AbortController();
   const chunks = [];
-  outputStreams.length = 0;
   const operations = {
     exec: async (command, cwd, options) => {
       if (scenario.abortAfter === -1) controller.abort();
@@ -33,18 +33,25 @@ for (const scenario of JSON.parse(input)) {
       return { exitCode: scenario.exitCode };
     },
   };
-  let out;
+  let result;
+  let failure;
   try {
-    const result = await executeBashWithOperations("cmd", "/cwd", operations, { onChunk: (c) => chunks.push(c), signal: scenario.useSignal ? controller.signal : undefined });
+    result = await executeBashWithOperations("cmd", "/cwd", operations, { onChunk: (c) => chunks.push(c), signal: scenario.useSignal ? controller.signal : undefined });
+  } catch (error) {
+    failure = { error };
+  }
+  // Pi ends its spill stream without waiting for it: the file is complete only once the stream has closed.
+  await Promise.all(spills.splice(0).map((stream) => (stream.closed ? undefined : once(stream, "close"))));
+  let out;
+  if (failure) {
+    out = { chunks, thrown: String(failure.error && failure.error.message) };
+  } else {
     let file = null;
     if (result.fullOutputPath !== undefined) {
-      for (const stream of outputStreams) await new Promise((resolve) => (stream.closed ? resolve() : (stream.once("close", resolve), stream.once("error", resolve))));
       file = existsSync(result.fullOutputPath) ? readFileSync(result.fullOutputPath, "utf8") : "<missing>";
       rmSync(result.fullOutputPath, { force: true });
     }
     out = { chunks, output: result.output, exitCode: result.exitCode ?? null, cancelled: result.cancelled, truncated: result.truncated, file };
-  } catch (error) {
-    out = { chunks, thrown: String(error && error.message) };
   }
   results.push(out);
 }

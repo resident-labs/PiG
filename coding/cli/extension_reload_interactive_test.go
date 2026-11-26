@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/MichaelKinsy/PiG/internal/testbudget"
+	"github.com/MichaelKinsy/PiG/internal/testenv"
 )
 
 // An extension's `await ctx.reload()` in the TUI of the real binary: the same log as the headless modes (TestExtensionReloadIsWiredInEveryHeadlessMode), where the old instance's command resolves after the reload and the new instance's session_start sees the reloaded state. Interactive quits through its own shutdown, so the log ends at "returned".
@@ -21,10 +22,11 @@ func TestExtensionReloadResolvesInInteractiveMode(t *testing.T) {
 		t.Skip("builds the pig binary and extensions")
 	}
 	binary := buildPigBinaryForSignalTest(t)
-	for _, language := range []string{"node", "go"} {
+	for _, language := range []string{"node", "go", "python", "rust", "lisp"} {
 		t.Run(language, func(t *testing.T) {
 			extension := writeReloadProbe(t, language)
 			home, cwd, sessionDir := t.TempDir(), t.TempDir(), t.TempDir()
+			testenv.DisableGoTelemetryForChild(t, home)
 			agentDir := filepath.Join(home, "pig")
 			if err := os.MkdirAll(agentDir, 0o755); err != nil {
 				t.Fatal(err)
@@ -33,7 +35,7 @@ func TestExtensionReloadResolvesInInteractiveMode(t *testing.T) {
 				t.Fatal(err)
 			}
 			logPath := filepath.Join(t.TempDir(), "reload.log")
-			env := []string{"HOME=" + home, "PIG_HOME=" + filepath.Join(home, ".pig"), "PIG_CODING_AGENT_DIR=" + agentDir, "PIG_TEST_FAUX=1", "PIG_TEST_FAUX_SCENARIO=parity-basic", "PIG_OFFLINE=1", "RELOAD_PROBE_LOG=" + logPath, "TERM=xterm-256color"}
+			env := []string{rustHome("CARGO_HOME", ".cargo"), rustHome("RUSTUP_HOME", ".rustup"), "HOME=" + home, "PIG_HOME=" + filepath.Join(home, ".pig"), "PIG_CODING_AGENT_DIR=" + agentDir, "PIG_TEST_FAUX=1", "PIG_TEST_FAUX_SCENARIO=parity-basic", "PIG_OFFLINE=1", "RELOAD_PROBE_LOG=" + logPath, "TERM=xterm-256color"}
 			master, slave := openPTY(t, 40, 160)
 			ctx, cancel := context.WithTimeout(t.Context(), testbudget.Wait(t))
 			defer cancel()

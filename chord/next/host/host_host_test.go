@@ -131,7 +131,7 @@ func constant(value delta.JsonValue) chord.Watchable[delta.JsonValue] {
 	return Expose(state.NewConstant(value))
 }
 
-// pi: packages/chord/src/next/host/host.ts
+// pi: packages/chord/src/host/host.ts
 // --- host.test.ts ---------------------------------------------------------------------------------------------------
 
 var (
@@ -233,7 +233,16 @@ func startLoad(host Host, facets ...HostFacet) <-chan error {
 		_, err := host.Load(facets, background)
 		done <- err
 	}()
-	return done
+	// `host.load(...)` runs synchronously up to its first await: the host is loading (or `load` failed) when it returns.
+	h := host.(*chordHost)
+	for {
+		var started bool
+		h.enter(func() { started = h.state != hostNew })
+		if started || len(done) > 0 {
+			return done
+		}
+		runtime.Gosched()
+	}
 }
 
 // notDone fails unless the load has not returned.
@@ -273,8 +282,8 @@ func failedMessages(failed []PluginFailure) [][2]string {
 	return out
 }
 
-// Mirrors "load › leaves out and reports invalid and duplicate plugin names and double serves (the later); refuses a second load".
-func TestHostLoadLeavesOutAndReportsInvalidAndDuplicatePluginNamesAndDoubleServesTheLaterRefusesASecondLoad(t *testing.T) {
+// Mirrors "load › leaves out and reports duplicate plugin names and double serves (the later); refuses a second load".
+func TestHostLoadLeavesOutAndReportsDuplicatePluginNamesAndDoubleServesTheLaterRefusesASecondLoad(t *testing.T) {
 	empty := DefineFacet(func(FacetHost, FacetSelf) error { return nil })
 	info := DefineFacet(func(h FacetHost, _ FacetSelf) error { return serveInfoFactory(h, nil) })
 	loadedFailed := func(facets []HostFacet) [][2]string {
@@ -283,9 +292,6 @@ func TestHostLoadLeavesOutAndReportsInvalidAndDuplicatePluginNamesAndDoubleServe
 		must(t, err)
 		closeHosts(t, host)
 		return failedMessages(report.Failed)
-	}
-	if got, want := loadedFailed([]HostFacet{{Name: "Bad Name", Facet: empty}}), [][2]string{{"Bad Name", `"Bad Name" is not a valid plugin name`}}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("failed = %v, want %v", got, want)
 	}
 	twice := []HostFacet{{Name: "a", Facet: empty}, {Name: "a", Facet: empty}}
 	if got, want := loadedFailed(twice), [][2]string{{"a", `plugin "a" is loaded twice`}}; !reflect.DeepEqual(got, want) {
@@ -316,21 +322,59 @@ func TestHostLoadLeavesOutAndReportsInvalidAndDuplicatePluginNamesAndDoubleServe
 	}
 }
 
-// Mirrors "load › makes a get before it resolves wait for it".
-func TestHostLoadMakesAGetBeforeItResolvesWaitForIt(t *testing.T) {
+// Mirrors "load › throws for an invalid plugin name before it changes anything; the host loads afterwards (decision (d))".
+func TestHostLoadThrowsForAnInvalidPluginNameBeforeItChangesAnythingTheHostLoadsAfterwardsDecisionD(t *testing.T) {
+	empty := DefineFacet(func(FacetHost, FacetSelf) error { return nil })
+	info := DefineFacet(func(h FacetHost, _ FacetSelf) error { return serveInfoFactory(h, nil) })
 	host := newHost(t, HostOptions{OnError: noopOnError})
-	defer closeHosts(t, host)
-	got := make(chan *Reference, 1)
-	go func() {
-		ref, err := host.Get(background, hostInfo, jsonObject(), GetOptions{})
-		must(t, err)
-		got <- ref
-	}()
-	awaitUnbound(t, host)
-	mustLoad(t)(host.Load([]HostFacet{{Name: "a", Facet: DefineFacet(func(h FacetHost, _ FacetSelf) error { return serveInfoFactory(h, nil) })}}, background))
-	if title := memberOf(t, <-got, "title"); title != "t" {
+	_, err := host.Load([]HostFacet{{Name: "@app/info", Facet: info}, {Name: "tui:core", Facet: empty}}, background)
+	if err == nil || err.Error() != `"tui:core" is not a valid plugin name` {
+		t.Fatalf("load = %v, want \"tui:core\" is not a valid plugin name", err)
+	}
+	// Nothing was staged or published: the same host loads the fixed set.
+	if report := mustLoad(t)(host.Load([]HostFacet{{Name: "@app/info", Facet: info}}, background)); len(report.Failed) != 0 {
+		t.Fatalf("failed = %v, want none", report.Failed)
+	}
+	_, err = host.Reload([]HostFacet{{Name: "Bad Name", Facet: empty}}, background, ReloadOptions{})
+	if err == nil || err.Error() != `"Bad Name" is not a valid plugin name` {
+		t.Fatalf("reload = %v, want \"Bad Name\" is not a valid plugin name", err)
+	}
+	// The reload changed nothing: the loaded plugin still serves.
+	if title := memberOf(t, mustGet(t, host, hostInfo, jsonObject()), "title"); title != "t" {
 		t.Fatalf("title = %v, want t", title)
 	}
+	closeHosts(t, host)
+}
+
+// Mirrors "load › is called first: get, hold, registry and a root's ctx.get throw not_ready before it (decision (a))".
+func TestHostLoadIsCalledFirstGetHoldRegistryAndARootsCtxGetThrowNotReadyBeforeItDecisionA(t *testing.T) {
+	names, err := registries.DefineRegistry[any, any]("app.names", registries.DefineRegistryOptions{Version: 1})
+	must(t, err)
+	host := newHost(t, HostOptions{OnError: noopOnError})
+	fix := "the host has not loaded; call host.load first (a host with nothing to load calls load([]))"
+	wantNotReady := func(what string, err error, message string) {
+		t.Helper()
+		chordErr, ok := data.IsChordErrorCode(err, data.CodeNotReady)
+		if !ok || (message != "" && chordErr.Message != message) {
+			t.Fatalf("%s = %v, want not_ready %q", what, err, message)
+		}
+	}
+	_, err = host.Get(background, hostInfo, jsonObject(), GetOptions{})
+	wantNotReady("get", err, "app.info: "+fix)
+	_, err = host.Hold(background, hostInfo, jsonObject(), GetOptions{})
+	wantNotReady("hold", err, "app.info: "+fix)
+	_, err = host.Registry(background, names, GetOptions{})
+	wantNotReady("registry", err, "registry app.names: "+fix)
+	_, err = host.Root(func(ctx Ctx) (any, error) { return ctx.Get(hostInfo, jsonObject(), GetOptions{}) }, background, RootOptions{})
+	wantNotReady("root ctx.get", err, "")
+	// A client with nothing to load calls `load([])`: then its requests wait as any does.
+	mustLoad(t)(host.Load(nil, background))
+	held, err := host.Hold(background, hostInfo, jsonObject(), GetOptions{})
+	must(t, err)
+	if state := refStateOf(held); state.Kind != RefStateFailed || state.Cause.Kind != data.FailureWaiting {
+		t.Fatalf("hold state = %+v, want failed waiting", state)
+	}
+	closeHosts(t, host)
 }
 
 // Mirrors "the start barrier › resolves once every host-lifetime object had its first outcome; a failed one is reported and retried".
@@ -643,18 +687,11 @@ func TestHostStartupAcrossHostsPlacesAHoldArrivingBeforeThePublicationHereNotOve
 		Hold: 0, Type: PlacedNotes.Name, Version: PlacedNotes.Version, Fingerprint: PlacedNotes.Fingerprint, Params: params,
 		Address: link.WireAddress{Kind: "session", Params: jsonObject("id", "S1")},
 	})
-	mine, err := worker.Hold(background, PlacedNotes, jsonObject("session", "S1"), GetOptions{})
-	must(t, err)
 	transported(a, b, c, d)
-	if kind := refStateOf(mine).Kind; kind != RefStateLoading {
-		t.Fatalf("state = %s, want loading", kind)
-	}
 	mustLoad(t)(worker.Load([]HostFacet{{Name: "@test/w", Facet: DefineFacet(func(h FacetHost, _ FacetSelf) error { _, err := serveNotes(h, PlacedNotes); return err })}}, background))
 	if bound := child.Next("bound").(*link.BoundMessage); bound.Holds[0].Hold != 0 {
 		t.Fatalf("bound hold = %d, want 0", bound.Holds[0].Hold)
 	}
-	transported(a, b, c, d)
-	awaitRefState(t, "live", mine, func(s *RefState) bool { return s.Kind == RefStateLive })
 	if kinds := parent.Kinds(); !reflect.DeepEqual(kinds, []string{"hello"}) {
 		t.Fatalf("parent kinds = %v, want [hello]", kinds)
 	}
@@ -787,21 +824,6 @@ func awaitUnboundOrObject(t testing.TB, host Host) {
 	}
 }
 
-// Mirrors "deadlines of gets › include the wait for load".
-func TestHostDeadlinesOfGetsIncludeTheWaitForLoad(t *testing.T) {
-	loop := newScopeLoop()
-	host := newHost(t, HostOptions{OnError: noopOnError, loop: loop})
-	defer closeHosts(t, host)
-	waiting := make(chan error, 1)
-	go func() {
-		_, err := host.Get(background, hostInfo, jsonObject(), GetOptions{ReadyTimeout: new(100 * time.Millisecond)})
-		waiting <- err
-	}()
-	awaitUnbound(t, host)
-	loop.AdvanceAsync(100)
-	wantChordError(t, <-waiting, data.CodeUnavailable, "", "app.info: did not become live within 100 ms")
-}
-
 // Mirrors "deadlines of gets › are per getter: the first to pass releases only its own reference, the attempt goes on for the other".
 func TestHostDeadlinesOfGetsArePerGetter(t *testing.T) {
 	loop := newScopeLoop()
@@ -856,7 +878,7 @@ var hostOuter = mustContract(declareLocal("app.outer", contracts.LocalDeclaratio
 
 // Mirrors "close › ends every object, the last to go live first, and rejects new calls".
 //
-// Pi: packages/chord/test/next/host/host.test.ts:520 (ends every object, the last to go live first, and rejects new calls)
+// Pi: packages/chord/test/host/host.test.ts:520 (ends every object, the last to go live first, and rejects new calls)
 func TestHostCloseEndsEveryObjectTheLastToGoLiveFirstAndRejectsNewCalls(t *testing.T) {
 	host, _ := loaded(t, func(h FacetHost, _ FacetSelf) error {
 		if err := serveInfoFactory(h, nil); err != nil {
@@ -905,25 +927,18 @@ func TestHostCloseEndsEveryObjectTheLastToGoLiveFirstAndRejectsNewCalls(t *testi
 	}
 }
 
-// Mirrors "close › fails a get waiting for load".
-func TestHostCloseFailsAGetWaitingForLoad(t *testing.T) {
-	host := newHost(t, HostOptions{OnError: noopOnError})
-	got := make(chan error, 1)
-	go func() { _, err := host.Get(background, hostInfo, jsonObject(), GetOptions{}); got <- err }()
-	awaitUnbound(t, host)
-	must(t, host.Close(background))
-	wantChordError(t, <-got, data.CodeReleased, data.ReasonClosed, "the host is closed")
-}
-
 // Mirrors "close › ends every object at once: calls fail released before any close ran".
 //
-// Pi: packages/chord/test/next/host/host.test.ts:548 (ends every object at once: calls fail released before any close ran)
+// Pi: packages/chord/test/host/host.test.ts:548 (ends every object at once: calls fail released before any close ran)
 func TestHostCloseEndsEveryObjectAtOnceCallsFailReleasedBeforeAnyCloseRan(t *testing.T) {
 	closing := make(chan struct{})
 	host, _ := loaded(t, func(h FacetHost, _ FacetSelf) error {
 		return h.Serve(hostCounter, func(_ *delta.JsonObject, self Self) (contracts.Implementation, error) {
 			self.Open(func(context.Context) (any, error) { return nil, nil },
-				func(any, NativeCloseReason, context.Context) error { <-closing; return nil })
+				func(_ any, _ NativeCloseReason, ctx context.Context) error {
+					_, _ = chordctx.Receive(context.WithoutCancel(ctx), closing)
+					return nil
+				})
 			implementation := impl("count", constant(float64(1)))
 			implementation.Members.Methods = map[string]contracts.MethodFunction{"bump": func(delta.JsonValue, context.Context) (delta.JsonValue, error) { return nil, nil }}
 			return implementation, nil
@@ -970,7 +985,10 @@ func TestHostCloseJoinsAnEndingRunningInTheBackground(t *testing.T) {
 	host, _ := loaded(t, func(h FacetHost, _ FacetSelf) error {
 		return h.Serve(hostSvc, func(params *delta.JsonObject, self Self) (contracts.Implementation, error) {
 			self.Open(func(context.Context) (any, error) { return nil, nil },
-				func(any, NativeCloseReason, context.Context) error { <-closing; return nil })
+				func(_ any, _ NativeCloseReason, ctx context.Context) error {
+					_, _ = chordctx.Receive(context.WithoutCancel(ctx), closing)
+					return nil
+				})
 			return impl("n", constant(params.Value("id"))), nil
 		}, ServeOptions{})
 	}, loadedOptions{})
@@ -991,7 +1009,7 @@ func TestHostCloseJoinsAnEndingRunningInTheBackground(t *testing.T) {
 
 // Mirrors "close › closes object by object, a dependent before its dependencies".
 //
-// Pi: packages/chord/test/next/host/host.test.ts:605 (closes object by object, a dependent before its dependencies)
+// Pi: packages/chord/test/host/host.test.ts:605 (closes object by object, a dependent before its dependencies)
 func TestHostCloseClosesObjectByObjectADependentBeforeItsDependencies(t *testing.T) {
 	view := mustContract(declareLocal("app.view", contracts.LocalDeclaration{
 		Version: 1, Params: contracts.Params{contracts.Prop("id", contracts.Int())},
@@ -1033,24 +1051,40 @@ func TestHostCloseClosesObjectByObjectADependentBeforeItsDependencies(t *testing
 
 // Mirrors "close, its order and its races › returns one closing to every caller: a second close waits for the first".
 //
-// Pi: packages/chord/test/next/host/host.test.ts:646 (returns one closing to every caller: a second close waits for the first)
+// Pi: packages/chord/test/host/host.test.ts:646 (returns one closing to every caller: a second close waits for the first)
 func TestHostCloseReturnsOneClosingToEveryCaller(t *testing.T) {
 	closing := make(chan struct{})
-	host, _ := loaded(t, func(h FacetHost, _ FacetSelf) error {
+	closeBegan := make(chan struct{})
+	host, errs := loaded(t, func(h FacetHost, _ FacetSelf) error {
 		return h.Serve(hostCounter, func(_ *delta.JsonObject, self Self) (contracts.Implementation, error) {
 			self.Open(func(context.Context) (any, error) { return nil, nil },
-				func(any, NativeCloseReason, context.Context) error { <-closing; return nil })
-			return impl("count", constant(float64(1))), nil
+				func(_ any, _ NativeCloseReason, ctx context.Context) error {
+					close(closeBegan)
+					_, err := chordctx.Receive(ctx, closing)
+					return err
+				})
+			implementation := impl("count", constant(float64(1)))
+			implementation.Members.Methods = map[string]contracts.MethodFunction{"bump": func(delta.JsonValue, context.Context) (delta.JsonValue, error) { return nil, nil }}
+			return implementation, nil
 		}, ServeOptions{})
 	}, loadedOptions{})
+	// The counter is live (`load` returns at its first outcome) and its native open: a counter that failed to activate has no native
+	// to close, and there is nothing for either caller to wait for.
+	if got := failures(errs.All()); len(got) != 0 {
+		t.Fatalf("the counter failed to activate: %v", got)
+	}
 	first := make(chan error, 1)
 	second := make(chan error, 1)
 	go func() { first <- host.Close(background) }()
 	go func() { second <- host.Close(background) }()
+	// Pi's `await flushed()` runs the closes to where they wait: the native's close, held on `closing`, has started.
+	<-closeBegan
 	turn(host)
 	select {
 	case <-second:
 		t.Fatal("a second close returned before the first")
+	case <-first:
+		t.Fatal("a close returned before the native's close was released")
 	default:
 	}
 	close(closing)
@@ -1068,9 +1102,9 @@ func TestHostCloseTearsDownWhatAFailedDependentHoldsWithCloseAndWaitsForIt(t *te
 	var closes seenList[string]
 	host, _ := loaded(t, func(h FacetHost, _ FacetSelf) error {
 		if err := h.Serve(hostSvc, func(params *delta.JsonObject, self Self) (contracts.Implementation, error) {
-			self.Open(func(context.Context) (any, error) { return nil, nil }, func(_ any, reason NativeCloseReason, _ context.Context) error {
+			self.Open(func(context.Context) (any, error) { return nil, nil }, func(_ any, reason NativeCloseReason, ctx context.Context) error {
 				closes.add("svc " + string(reason.Kind))
-				<-closing
+				_, _ = chordctx.Receive(context.WithoutCancel(ctx), closing)
 				return nil
 			})
 			return impl("n", constant(params.Value("id"))), nil
@@ -1533,19 +1567,6 @@ func TestHostRegistryEndsAWaitingHostRegistryAtTheCloseWithReleasedClosed(t *tes
 	}
 }
 
-// Mirrors "› ends one still waiting for the publication at the close".
-func TestHostRegistryEndsOneStillWaitingForThePublicationAtTheClose(t *testing.T) {
-	host := newHost(t, HostOptions{OnError: noopOnError})
-	waiting := make(chan error, 1)
-	go func() {
-		_, err := host.Registry(background, absentRegistry, GetOptions{ReadyTimeout: new(time.Minute)})
-		waiting <- err
-	}()
-	turn(host)
-	must(t, host.Close(background))
-	wantChordError(t, <-waiting, data.CodeReleased, data.ReasonClosed, "")
-}
-
 var (
 	hereKind        = mustKind(contracts.NewHostKind("app-here"))
 	elsewhereKind   = mustKind(contracts.NewHostKind("app-elsewhere"))
@@ -1690,82 +1711,16 @@ func TestHostAcquiringInvalidParamsAtOnceALocalTypeNotServedHereHoldWaitsGetReje
 	if state.Kind != RefStateFailed || state.Cause.Kind != data.FailureWaiting || state.Cause.Error.Message != "app.info is not served here" || state.RetryAt != nil {
 		t.Fatalf("state = %+v, want failed waiting: app.info is not served here", state)
 	}
+	armed := loop.TimerCount()
 	got := make(chan error, 1)
 	go func() {
 		_, err := host.Get(background, hostInfo, jsonObject(), GetOptions{ReadyTimeout: new(5 * time.Millisecond)})
 		got <- err
 	}()
-	// The getter's deadline timer is set in the section that made its reference.
-	scopeEventually(t, "the getter's deadline timer was set", func() bool { return loop.TimerCount() > 0 })
+	// The getter's deadline timer is set in the section that made its reference (the unbound clock's is armed already).
+	scopeEventually(t, "the getter's deadline timer was set", func() bool { return loop.TimerCount() > armed })
 	loop.AdvanceAsync(5)
 	wantChordError(t, <-got, data.CodeUnavailable, "", "app.info is not served here")
-}
-
-// Mirrors "acquiring › before load resolved: hold is loading, get waits; once it resolved both bind, or an unserved type waits".
-func TestHostAcquiringBeforeLoadResolvedHoldIsLoadingGetWaits(t *testing.T) {
-	loop := newScopeLoop()
-	host := newHost(t, HostOptions{OnError: noopOnError, loop: loop})
-	defer closeHosts(t, host)
-	held, err := host.Hold(background, hostInfo, jsonObject(), GetOptions{})
-	must(t, err)
-	unserved, err := host.Hold(background, hostPage, jsonObject("id", float64(1)), GetOptions{})
-	must(t, err)
-	got := make(chan *Reference, 1)
-	go func() {
-		ref, err := host.Get(background, hostInfo, jsonObject(), GetOptions{})
-		must(t, err)
-		got <- ref
-	}()
-	refused := make(chan error, 1)
-	go func() {
-		_, err := host.Get(background, hostPage, jsonObject("id", float64(1)), GetOptions{ReadyTimeout: new(50 * time.Millisecond)})
-		refused <- err
-	}()
-	scopeEventually(t, "both getters wait", func() bool { return len(indexedBindings(host)) >= 4 })
-	for _, ref := range []*Reference{held, unserved} {
-		if kind := refStateOf(ref).Kind; kind != RefStateLoading {
-			t.Fatalf("state before the load = %s, want loading", kind)
-		}
-	}
-	mustLoad(t)(host.Load([]HostFacet{{Name: "@test/app", Facet: DefineFacet(func(h FacetHost, _ FacetSelf) error { return serveInfoFactory(h, nil) })}}, background))
-	turn(host)
-	awaitRefState(t, "held live", held, func(s *RefState) bool { return s.Kind == RefStateLive })
-	if title := memberOf(t, <-got, "title"); title != "t" {
-		t.Fatalf("title = %v, want t", title)
-	}
-	state := awaitRefState(t, "unserved waits", unserved, func(s *RefState) bool { return s.Kind == RefStateFailed })
-	if state.Cause.Kind != data.FailureWaiting || state.Cause.Error.Message != "app.page is not served here" || state.RetryAt != nil {
-		t.Fatalf("state = %+v, want failed waiting: app.page is not served here", state)
-	}
-	loop.AdvanceAsync(50)
-	wantChordError(t, <-refused, data.CodeUnavailable, "", "app.page is not served here")
-}
-
-// Mirrors "acquiring › invalid params before load resolved: hold throws and get rejects invalid/params at once (audit, 7a)".
-func TestHostAcquiringInvalidParamsBeforeLoadResolvedHoldThrowsAndGetRejectsInvalidParamsAtOnce(t *testing.T) {
-	host := newHost(t, HostOptions{OnError: noopOnError})
-	if _, err := host.Hold(background, hostPage, jsonObject("id", "x"), GetOptions{}); err == nil || !strings.Contains(err.Error(), "params") {
-		t.Fatalf("hold = %v, want an error naming params", err)
-	}
-	_, err := host.Get(background, hostPage, jsonObject("id", "x"), GetOptions{})
-	wantChordError(t, err, data.CodeInvalid, data.ReasonParams, "")
-	mustLoad(t)(host.Load(nil, background))
-	closeHosts(t, host)
-}
-
-// Mirrors "acquiring › a hold released before load resolved makes nothing once it did".
-func TestHostAcquiringAHoldReleasedBeforeLoadResolvedMakesNothingOnceItDid(t *testing.T) {
-	var factories atomic.Int32
-	host := newHost(t, HostOptions{OnError: noopOnError})
-	ref, err := host.Hold(background, hostPage, jsonObject("id", float64(1)), GetOptions{})
-	must(t, err)
-	ref.Release()
-	mustLoad(t)(host.Load([]HostFacet{{Name: "@test/app", Facet: DefineFacet(func(h FacetHost, _ FacetSelf) error { return servePage(h, func() { factories.Add(1) }) })}}, background))
-	turn(host)
-	must(t, host.Close(background))
-	if got := factories.Load(); got != 0 {
-		t.Fatalf("factory runs = %d, want 0", got)
-	}
 }
 
 // Mirrors "acquiring › through transient failures: hold is failed with retryAt, then loading; get waits, then rejects with the last cause".
@@ -2115,7 +2070,7 @@ func TestHostStoreReportsStorageFailedOnceAndClosesTheHostTheAppStillClosesTheSt
 	errs := &hostErrors{}
 	host := newHost(t, HostOptions{Store: st, OnError: errs.push})
 	mustLoad(t)(host.Load(nil, background))
-	fence := store.CommitFence{Admit: func() bool { return true }, Adopt: func(int64, []int64) error { return nil }}
+	fence := store.CommitFence{Admit: func() bool { return true }, Adopt: func(int64, []int64, int) error { return nil }}
 	// A failed `COMMIT`: an unknown outcome (D4).
 	fail("COMMIT")
 	for range 2 {
@@ -2304,24 +2259,23 @@ func TestHostReloadTheAPIAnAbortBeforeTheCommitRejectsAbortedAndChangesNothing(t
 }
 
 // Mirrors "reload: the API › an abort after the commit rejects aborted naming what the commit applied, which stands".
+// Pi hooks its batch's commit; here the abort lands in the commit's own batch: the first attempt of an added host-lifetime
+// object runs there, and its factory aborts the context.
 func TestHostReloadTheAPIAnAbortAfterTheCommitRejectsAbortedNamingWhatTheCommitAppliedWhichStands(t *testing.T) {
 	host := newHost(t, HostOptions{OnError: noopOnError})
 	defer closeHosts(t, host)
 	mustLoad(t)(host.Load([]HostFacet{{Name: "@app/info", Facet: infoFacet("a")}, {Name: "@app/gone", Facet: emptyFacet()}}, background))
 	info := mustGet(t, host, hostInfo, jsonObject())
 	aborting, cancel := chordctx.WithCancel(background)
-	// The abort lands right after the commit, while the reload waits for its report: the swapped object's new factory
-	// runs after the commit's batch (its second run: the first is staging's).
-	var runs atomic.Int32
-	changed := DefineFacet(func(h FacetHost, _ FacetSelf) error {
-		return h.Serve(hostInfo, func(*delta.JsonObject, Self) (contracts.Implementation, error) {
-			if runs.Add(1) == 2 {
-				cancel(errors.New("stop"))
-			}
-			return impl("title", constant("b")), nil
+	// The abort lands right after the commit, while the reload waits for its report.
+	changed := infoFacet("b")
+	added := DefineFacet(func(h FacetHost, _ FacetSelf) error {
+		return h.Serve(hostAborter, func(*delta.JsonObject, Self) (contracts.Implementation, error) {
+			cancel(errors.New("stop"))
+			return impl("n", constant(1.0)), nil
 		}, ServeOptions{})
 	})
-	_, err := host.Reload([]HostFacet{{Name: "@app/info", Facet: changed}, {Name: "@app/new", Facet: emptyFacet()}}, aborting, ReloadOptions{})
+	_, err := host.Reload([]HostFacet{{Name: "@app/info", Facet: changed}, {Name: "@app/new", Facet: added}}, aborting, ReloadOptions{})
 	chordErr, ok := data.IsChordError(err)
 	if !ok || chordErr.Code != data.CodeAborted {
 		t.Fatalf("reload = %v, want aborted", err)
@@ -2332,16 +2286,23 @@ func TestHostReloadTheAPIAnAbortAfterTheCommitRejectsAbortedNamingWhatTheCommitA
 			t.Fatalf("committed.%s = %v, want %v", name, got, want)
 		}
 	}
-	turn(host)
-	if title := memberOf(t, info, "title"); title != "b" {
-		t.Fatalf("title = %v, want b", title)
-	}
+	// Restarted: the new attempt goes live once the old one ended.
+	scopeEventually(t, "the commit stands: the restarted object shows the new code", func() bool {
+		value, err := info.Member("title").Value()
+		return err == nil && value == "b"
+	})
 }
 
+// hostAborter is a host-lifetime type whose factory the tests above use to abort a reload's context from inside its commit.
+var hostAborter = mustContract(declareLocal("app.aborter", contracts.LocalDeclaration{
+	Version: 1, Params: contracts.Params{},
+	Members: []contracts.LocalEntry{contracts.Mem("n", contracts.Int())},
+}))
+
 // Own test (Pi's `#report` waits for no listener, and `host.reload` may be called from a watch callback): the watch
-// listener of a reference of the reloaded type calls `Reload` itself, from the delivery its first reload's commit
-// scheduled. A report that waited for every delivery to finish would wait for that listener, which waits for the first
-// reload to end: neither returns.
+// listener of a reference of a removed type calls `Reload` itself, from the delivery its first reload's commit scheduled
+// (the reference's member waits for the type). A report that waited for every delivery to finish would wait for that
+// listener, which waits for the first reload to end: neither returns.
 func TestHostReloadAWatchListenerMayCallReloadItself(t *testing.T) {
 	host := newHost(t, HostOptions{OnError: noopOnError})
 	defer closeHosts(t, host)
@@ -2355,7 +2316,10 @@ func TestHostReloadAWatchListenerMayCallReloadItself(t *testing.T) {
 	}
 	inner := make(chan result, 1)
 	var once sync.Once
-	watch.Start(func(context.Context, chord.WatchCall[delta.JsonValue]) error {
+	watch.Start(func(_ context.Context, call chord.WatchCall[delta.JsonValue]) error {
+		if call.Kind != chord.WatchCallFailed {
+			return nil
+		}
 		once.Do(func() {
 			report, err := host.Reload([]HostFacet{{Name: "@app/info", Facet: infoFacet("c")}}, background, ReloadOptions{})
 			inner <- result{report, err}
@@ -2364,29 +2328,33 @@ func TestHostReloadAWatchListenerMayCallReloadItself(t *testing.T) {
 	})
 	outer := make(chan result, 1)
 	go func() {
-		report, err := host.Reload([]HostFacet{{Name: "@app/info", Facet: infoFacet("b")}}, background, ReloadOptions{})
+		report, err := host.Reload(nil, background, ReloadOptions{})
 		outer <- result{report, err}
 	}()
 	for name, done := range map[string]chan result{"the reload": outer, "the reload the listener called": inner} {
 		select {
 		case got := <-done:
 			must(t, got.err)
-			if !reflect.DeepEqual(got.report.Plugins.Changed, []string{"@app/info"}) {
-				t.Fatalf("%s: changed = %v, want [@app/info]", name, got.report.Plugins.Changed)
+			plugins := got.report.Plugins
+			if name == "the reload" && !reflect.DeepEqual(plugins.Removed, []string{"@app/info"}) {
+				t.Fatalf("%s: removed = %v, want [@app/info]", name, plugins.Removed)
+			}
+			if name != "the reload" && !reflect.DeepEqual(plugins.Added, []string{"@app/info"}) {
+				t.Fatalf("%s: added = %v, want [@app/info]", name, plugins.Added)
 			}
 		case <-time.After(10 * time.Second):
 			t.Fatalf("%s did not return", name)
 		}
 	}
-	turn(host)
-	if title := memberOf(t, info, "title"); title != "c" {
-		t.Fatalf("title = %v, want c", title)
-	}
+	scopeEventually(t, "the type served again", func() bool {
+		value, err := info.Member("title").Value()
+		return err == nil && value == "c"
+	})
 }
 
-// Own test (Pi's `#report`: "`context`'s abort ends only this wait"): a listener of the reloaded object's reference is
-// still running (busy, not waiting) when the context aborts; the reload does not wait for it to return and rejects
-// `aborted` naming what the commit applied.
+// Own test (Pi's `#report`: "`context`'s abort ends only this wait"): a listener of a removed type's reference is still
+// running (busy, not waiting) when the context aborts; the reload does not wait for it to return and rejects `aborted`
+// naming what the commit applied.
 func TestHostReloadAnAbortEndsTheReportsWaitForAListenerStillRunning(t *testing.T) {
 	host := newHost(t, HostOptions{OnError: noopOnError})
 	defer closeHosts(t, host)
@@ -2399,7 +2367,7 @@ func TestHostReloadAnAbortEndsTheReportsWaitForAListenerStillRunning(t *testing.
 	running := make(chan struct{})
 	var once sync.Once
 	watch.Start(func(_ context.Context, call chord.WatchCall[delta.JsonValue]) error {
-		if call.Value == "b" {
+		if call.Kind == chord.WatchCallFailed {
 			once.Do(func() { close(running) })
 			for !release.Load() {
 				runtime.Gosched()
@@ -2410,7 +2378,7 @@ func TestHostReloadAnAbortEndsTheReportsWaitForAListenerStillRunning(t *testing.
 	aborting, cancel := chordctx.WithCancel(background)
 	done := make(chan error, 1)
 	go func() {
-		_, err := host.Reload([]HostFacet{{Name: "@app/info", Facet: infoFacet("b")}}, aborting, ReloadOptions{})
+		_, err := host.Reload(nil, aborting, ReloadOptions{})
 		done <- err
 	}()
 	<-running
@@ -2422,8 +2390,8 @@ func TestHostReloadAnAbortEndsTheReportsWaitForAListenerStillRunning(t *testing.
 			t.Fatalf("reload = %v, want aborted", err)
 		}
 		committed, _ := chordErr.Details.(*delta.JsonObject).Value("committed").(*delta.JsonObject)
-		if got, _ := committed.Value("changed").([]any); !reflect.DeepEqual(got, []any{"@app/info"}) {
-			t.Fatalf("committed.changed = %v, want [@app/info]", got)
+		if got, _ := committed.Value("removed").([]any); !reflect.DeepEqual(got, []any{"@app/info"}) {
+			t.Fatalf("committed.removed = %v, want [@app/info]", got)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the abort did not end the reload's wait for a running listener")
@@ -2431,7 +2399,8 @@ func TestHostReloadAnAbortEndsTheReportsWaitForAListenerStillRunning(t *testing.
 }
 
 // Pi's report runs the listeners of the batch the reload committed to the end of their synchronous part before it reads the
-// context: a watcher of a reference that left `live` aborts the context from its callback, and the reload rejects `aborted`.
+// context: a watcher of a reference that left `live` (its type removed) aborts the context from its callback, and the reload
+// rejects `aborted`.
 func TestHostReloadAListenerThatAbortsTheContextFromItsCallbackEndsTheReportAborted(t *testing.T) {
 	// One processor: the listener yields while it works, so a report that did not wait for it would read the context first.
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
@@ -2443,7 +2412,7 @@ func TestHostReloadAListenerThatAbortsTheContextFromItsCallbackEndsTheReportAbor
 	must(t, err)
 	aborting, cancel := chordctx.WithCancel(background)
 	watch.Start(func(_ context.Context, call chord.WatchCall[delta.JsonValue]) error {
-		if call.Value == "b" {
+		if call.Kind == chord.WatchCallFailed {
 			// A slow synchronous part: a report that read the context before it ran would succeed.
 			for range 200 {
 				runtime.Gosched()
@@ -2452,7 +2421,7 @@ func TestHostReloadAListenerThatAbortsTheContextFromItsCallbackEndsTheReportAbor
 		}
 		return nil
 	})
-	_, err = host.Reload([]HostFacet{{Name: "@app/info", Facet: infoFacet("b")}}, aborting, ReloadOptions{})
+	_, err = host.Reload(nil, aborting, ReloadOptions{})
 	chordErr, ok := data.IsChordError(err)
 	if !ok || chordErr.Code != data.CodeAborted {
 		t.Fatalf("reload = %v, want aborted", err)
@@ -2489,13 +2458,11 @@ func TestHostReloadTheAPIReportsASetupsOrAFactorysThrowAsFailedNamingThePluginWh
 	if got, want := failedMessages(report.Failed), [][2]string{{"@app/other", `plugin "@app/other": app.info is served twice (plugin "@app/info")`}}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("failed = %v, want %v", got, want)
 	}
-	turn(host)
-	if title := memberOf(t, info, "title"); title != "b" {
-		t.Fatalf("title = %v, want b", title)
-	}
-	if state := refStateOf(info); state.Kind != RefStateLive {
-		t.Fatalf("state = %+v, want live", state)
-	}
+	// Restarted: the new attempt goes live once the old one ended.
+	scopeEventually(t, "the restarted object shows the new code live", func() bool {
+		value, err := info.Member("title").Value()
+		return err == nil && value == "b" && refStateOf(info).Kind == RefStateLive
+	})
 }
 
 // Mirrors "reload: the commit (slice 7b §3) › serves added types, drops removed ones and their presence lists, and wakes requests per name".
@@ -2811,7 +2778,7 @@ func TestHostReportsABatchAndARegistryFailureToOnErrorWithTheirOwnFields(t *test
 	// The reload changes the title: its frame is the one the failing listener gets.
 	_, err = host.Reload([]HostFacet{{Name: "@app/info", Facet: infoFacet("b")}, {Name: "@app/names", Facet: registry}}, background, ReloadOptions{})
 	must(t, err)
-	_, _ = host.Registry(background, registries.Registry[any, any](names), GetOptions{})
+	_, _ = host.Registry(background, registries.Registry[any, any](names), GetOptions{ReadyTimeout: new(10 * time.Millisecond)})
 
 	eventually(t, "a listener_error and a registry_failed are reported", func() bool {
 		var kinds []HostErrorKind
@@ -2833,5 +2800,344 @@ func TestHostReportsABatchAndARegistryFailureToOnErrorWithTheirOwnFields(t *test
 		default:
 			t.Fatalf("unexpected report %+v", reported)
 		}
+	}
+}
+
+// Ports the describe 'bind: remote references sharing one wire hold (decision "References share one wire hold")' of
+// host.test.ts.
+
+// host.test.ts › bind: remote references sharing one wire hold (decision "References share one wire hold") › one hold per
+// type, version, fingerprint, params and placed address; escaped parts never collide
+func TestBindRemoteReferencesSharingOneWireHoldOneHoldPerTypeVersionFingerprintParamsAndPlacedAddressEscapedPartsNeverCollide(t *testing.T) {
+	rig := rawProvider(t, rawLinkedOptions{})
+	keyed := func(version float64, member string, address func() contracts.Address) *contracts.Contract {
+		return mustContract(contracts.Remote("app.keyed", contracts.RemoteDeclaration{
+			Version:     version,
+			Params:      contracts.Params{contracts.Prop("a", contracts.Str()), contracts.Prop("b", contracts.Str())},
+			HostAddress: func(*delta.JsonObject) (contracts.Address, error) { return address(), nil },
+			Variants: []contracts.VariantEntry{contracts.Var("v", contracts.VariantDeclaration{
+				State: []contracts.Property{contracts.Prop(member, contracts.Int())},
+			})},
+		}))
+	}
+	onServer := func() contracts.Address { return Server.Address(nil) }
+	keyedType := keyed(1, "n", onServer)
+	params := func(a, b string) *delta.JsonObject { return jsonObject("a", a, "b", b) }
+	mustHold(t, rig.Client, keyedType, params("x", "y"))
+	mustHold(t, rig.Client, keyedType, params("x", "y"))
+	if got := holdsAt(t, rig.Peer); got != 1 {
+		t.Fatalf("holds of one key = %d, want 1", got)
+	}
+	// Another version, another fingerprint, another address (`hostAddress` is not in the fingerprint): one each.
+	mustHold(t, rig.Client, keyed(2, "n", onServer), params("x", "y"))
+	mustHold(t, rig.Client, keyed(1, "m", onServer), params("x", "y"))
+	elsewhere := keyed(1, "n", func() contracts.Address { return Session.Address(jsonObject("id", "elsewhere")) })
+	if elsewhere.Fingerprint != keyedType.Fingerprint {
+		t.Fatalf("fingerprints differ: %s, %s", elsewhere.Fingerprint, keyedType.Fingerprint)
+	}
+	mustHold(t, rig.Client, elsewhere, params("x", "y"))
+	if got := holdsAt(t, rig.Peer); got != 3 {
+		t.Fatalf("holds of another version, fingerprint and address = %d, want 3", got)
+	}
+	// Separators, backslashes and NUL moved between params: all apart.
+	split := [][2]string{{"x|", "y"}, {"x", "|y"}, {"x\\", "y"}, {"x", "\\y"}, {"x\x00", "y"}, {"x", "\x00y"}}
+	for _, each := range split {
+		mustHold(t, rig.Client, keyedType, params(each[0], each[1]))
+	}
+	if got := holdsAt(t, rig.Peer); got != len(split) {
+		t.Fatalf("holds of split params = %d, want %d", got, len(split))
+	}
+}
+
+// host.test.ts › bind: remote references sharing one wire hold (decision "References share one wire hold") › one hold per
+// caller: equal principal JSON shares, another field order, another principal or none holds anew
+//
+// Go form: Pi's root does not await its `ctx.get`; here the root's `ctx.Get` blocks (nothing binds the hold) until the
+// test cancels the roots' context, and the test waits for every getter's binding where Pi's turn order has it.
+func TestBindRemoteReferencesSharingOneWireHoldOneHoldPerCallerEqualPrincipalJSONSharesAnotherFieldOrderAnotherPrincipalOrNoneHoldsAnew(t *testing.T) {
+	rig := rawProvider(t, rawLinkedOptions{})
+	ctx, cancel := context.WithCancel(background)
+	var holding sync.WaitGroup
+	as := func(options RootOptions) {
+		holding.Go(func() {
+			_, _ = rig.Client.Root(func(ctx Ctx) (any, error) {
+				_, _ = ctx.Get(Notes, jsonObject("session", "S1"), GetOptions{})
+				return nil, nil
+			}, ctx, options)
+		})
+	}
+	bound := func(n int) {
+		t.Helper()
+		rhWaitFor(t, func() bool { bindings, _ := remoteBindings(rig.Client); return bindings == n })
+	}
+	as(RootOptions{Principal: guestPrincipal("S1")})
+	as(RootOptions{Principal: guestPrincipal("S1")})
+	bound(2)
+	if got := holdsAt(t, rig.Peer); got != 1 {
+		t.Fatalf("holds of two equal principals = %d, want 1", got)
+	}
+	// Field order is part of the principal's JSON as the wire carries it.
+	as(RootOptions{Principal: jsonObject("session", "S1", "kind", "guest")})
+	as(RootOptions{Principal: guestPrincipal("S2")})
+	as(RootOptions{Anonymous: true})
+	bound(5)
+	if got := holdsAt(t, rig.Peer); got != 3 {
+		t.Fatalf("holds of another field order, another principal and none = %d, want 3", got)
+	}
+	cancel()
+	holding.Wait()
+}
+
+// sharingOther is another consumer of the relay's server: a host connected to it as an owner's tab.
+func sharingOther(t testing.TB, rel *relayed) (Host, []*link.MemoryLink) {
+	t.Helper()
+	other := newHost(t, HostOptions{OnError: func(HostError) {}})
+	mustLoad(t)(other.Load(nil, background))
+	near, far := link.MemoryLinkPair()
+	must(t, rel.Server.Accept(near, LinkOptions{Principal: ownerPrincipal(), Codec: testCodec()}, background))
+	must(t, other.Connect(far, LinkOptions{Principal: serverPrincipal(), Codec: testCodec()}, background))
+	return other, []*link.MemoryLink{near, far}
+}
+
+// host.test.ts › bind: remote references sharing one wire hold (decision "References share one wire hold") › one hold per
+// caller's incarnation: ctx.get for two calls of one tab shares, for another tab's holds anew
+func TestBindRemoteReferencesSharingOneWireHoldOneHoldPerCallersIncarnationCtxGetForTwoCallsOfOneTabSharesForAnotherTabsHoldsAnew(t *testing.T) {
+	opener := mustContract(contracts.Remote("app.opener", contracts.RemoteDeclaration{
+		Version: 1, Params: contracts.Params{},
+		HostAddress: func(*delta.JsonObject) (contracts.Address, error) { return Server.Address(nil), nil },
+		Variants: []contracts.VariantEntry{contracts.Var("v", contracts.VariantDeclaration{
+			Methods: []contracts.MethodEntry{contracts.Meth("open", contracts.NewMethod(contracts.Schema{}, contracts.Int()))},
+		})},
+	}))
+	gate := newSignal()
+	var opened atomic.Int32
+	rel := relay(t, relayedOptions{Server: func(h FacetHost) error {
+		return h.Serve(opener, func(*delta.JsonObject, data.Principal, Self) (contracts.Implementation, error) {
+			return contracts.Implementation{Variant: "v", Members: contracts.VariantImplementation{Methods: map[string]contracts.MethodFunction{
+				"open": func(_ delta.JsonValue, ctx context.Context) (delta.JsonValue, error) {
+					if _, err := ctx.(Ctx).Get(PlacedNotes, jsonObject("session", "S1"), GetOptions{}); err != nil {
+						return nil, err
+					}
+					opened.Add(1)
+					gate.await(t, ctx)
+					return float64(1), nil
+				},
+			}}}, nil
+		}, ServeOptions{})
+	}})
+	other, pair := sharingOther(t, rel)
+	tabOpener := mustGet(t, rel.Tab, opener, jsonObject())
+	another := mustGet(t, other, opener, jsonObject())
+	open := func(ref *Reference) *rhAsync[delta.JsonValue] {
+		return rhGo(func() (delta.JsonValue, error) { return ref.Call("open", nil, background) })
+	}
+	calls := []*rhAsync[delta.JsonValue]{open(tabOpener), open(tabOpener)}
+	rhWaitFor(t, func() bool { return opened.Load() == 2 })
+	rel.Transported()
+	key := Session.Address(jsonObject("id", "S1")).Key
+	rel.WorkerLoaded(t, key)
+	worker := rel.Worker(key)
+	if got := rhActivityReferences(t, worker); got != 1 {
+		t.Fatalf("the worker's references for two calls of one tab = %v, want 1", got)
+	}
+	calls = append(calls, open(another))
+	rhWaitFor(t, func() bool { return opened.Load() == 3 })
+	rel.Transported()
+	transported(pair...)
+	if got := rhActivityReferences(t, worker); got != 2 {
+		t.Fatalf("the worker's references with another tab's call = %v, want 2", got)
+	}
+	gate.fire()
+	for index, call := range calls {
+		if value := call.must(t); value != float64(1) {
+			t.Fatalf("call %d = %v, want 1", index, value)
+		}
+	}
+}
+
+// host.test.ts › bind: remote references sharing one wire hold (decision "References share one wire hold") › self.get
+// references hold on their own: while activating, once live, and on a re-hold
+//
+// Go form: the dependent's member re-exposes the remote member (Expose) where Pi derives its value; the hold is the
+// `self.get`'s either way.
+func TestBindRemoteReferencesSharingOneWireHoldSelfGetReferencesHoldOnTheirOwnWhileActivatingOnceLiveAndOnAReHold(t *testing.T) {
+	user := mustContract(contracts.Local("app.notes-user", contracts.LocalDeclaration{
+		Version: 1, Params: contracts.Params{}, Members: []contracts.LocalEntry{contracts.Mem("count", contracts.Int())},
+	}))
+	client := newHost(t, HostOptions{OnError: func(HostError) {}})
+	mustLoad(t)(client.Load([]HostFacet{{Name: "@test/user", Facet: DefineFacet(func(h FacetHost, _ FacetSelf) error {
+		return h.Serve(user, func(_ *delta.JsonObject, self Self) (contracts.Implementation, error) {
+			notes := self.Get(Notes, jsonObject("session", "S1"))
+			return contracts.Implementation{Members: contracts.VariantImplementation{
+				State: map[string]chord.Watchable[delta.JsonValue]{"count": Expose(notes.Member("count"))},
+			}}, nil
+		}, ServeOptions{})
+	})}}, background))
+	peer := rawParent(t, client, link.PartLimits{})
+	shared := mustHold(t, client, Notes, jsonObject("session", "S1"))
+	held := mustHold(t, client, user, jsonObject())
+	for range 2 {
+		bindHold(t, peer, peer.Next("hold").(*link.HoldMessage).Hold)
+	}
+	waitLive(t, shared)
+	waitLive(t, held)
+	// A reference made now joins the host's own hold, not the dependent's.
+	mustHold(t, client, Notes, jsonObject("session", "S1"))
+	if got := holdsAt(t, peer); got != 0 {
+		t.Fatalf("holds of a joining reference = %d, want 0", got)
+	}
+	peer.Close()
+	next := rhNextParent(t, client)
+	if got := holdsAt(t, next); got != 2 {
+		t.Fatalf("re-holds on the next link = %d, want 2", got)
+	}
+}
+
+// host.test.ts › bind: remote references sharing one wire hold (decision "References share one wire hold") › a relay
+// forwards two downstream holds of the same key as two upstream holds
+func TestBindRemoteReferencesSharingOneWireHoldARelayForwardsTwoDownstreamHoldsOfTheSameKeyAsTwoUpstreamHolds(t *testing.T) {
+	rel := relay(t, relayedOptions{})
+	other, pair := sharingOther(t, rel)
+	mustGet(t, rel.Tab, PlacedNotes, jsonObject("session", "S1"))
+	mustGet(t, rel.Tab, PlacedNotes, jsonObject("session", "S1"))
+	mustGet(t, other, PlacedNotes, jsonObject("session", "S1"))
+	key := Session.Address(jsonObject("id", "S1")).Key
+	rel.WorkerLoaded(t, key)
+	rel.Transported()
+	transported(pair...)
+	if got := rhActivityReferences(t, rel.Worker(key)); got != 2 {
+		t.Fatalf("the worker's references = %v, want 2 (one per downstream hold)", got)
+	}
+}
+
+// host.test.ts › bind: remote references sharing one wire hold (decision "References share one wire hold") › revocation
+// ends every reference sharing a hold, and the next one holds anew
+func TestBindRemoteReferencesSharingOneWireHoldRevocationEndsEveryReferenceSharingAHoldAndTheNextOneHoldsAnew(t *testing.T) {
+	client := newHost(t, HostOptions{
+		RevokedBy: RevokedBy[delta.JsonValue](func(principal data.Principal) ([]delta.JsonValue, error) {
+			if principalKind(principal) == "guest" {
+				return []delta.JsonValue{principal.Value("session")}, nil
+			}
+			return nil, nil
+		}),
+		OnError: func(HostError) {},
+	})
+	mustLoad(t)(client.Load(nil, background))
+	peer := rawParent(t, client, link.PartLimits{})
+	open := newSignal()
+	var mu sync.Mutex
+	var ended []string
+	var watching atomic.Int32
+	guest := guestPrincipal("S1")
+	scope := func(name string) *rhAsync[struct{}] {
+		return rhGo(func() (struct{}, error) {
+			_, _ = client.Root(func(ctx Ctx) (any, error) {
+				notes, err := ctx.Get(Notes, jsonObject("session", "S1"), GetOptions{})
+				if err != nil {
+					return nil, err
+				}
+				watch, err := notes.State().Watch(background)
+				if err != nil {
+					return nil, err
+				}
+				go func() {
+					<-watch.Closed()
+					mu.Lock()
+					ended = append(ended, name)
+					mu.Unlock()
+				}()
+				watching.Add(1)
+				open.await(t, ctx)
+				return nil, nil
+			}, background, RootOptions{Principal: guest})
+			return struct{}{}, nil
+		})
+	}
+	scopes := []*rhAsync[struct{}]{scope("a")}
+	bindHold(t, peer, peer.Next("hold").(*link.HoldMessage).Hold)
+	scopes = append(scopes, scope("b"))
+	rhWaitFor(t, func() bool { return watching.Load() == 2 })
+	if got := holdsAt(t, peer); got != 0 {
+		t.Fatalf("holds of the second scope = %d, want 0", got)
+	}
+	must(t, client.Revoke("S1", background))
+	rhWaitFor(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(ended) == 2 })
+	rhSync(t, peer)
+	mu.Lock()
+	got := slices.Clone(ended)
+	mu.Unlock()
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"a", "b"}) {
+		t.Fatalf("ended = %v, want [a b]", got)
+	}
+	if releases := takenOf(peer, "release"); releases != 1 {
+		t.Fatalf("releases = %d, want 1", releases)
+	}
+	scopes = append(scopes, scope("c"))
+	peer.Next("hold")
+	if more := holdsAt(t, peer); more != 0 {
+		t.Fatalf("holds of the scope after the revocation = %d more, want the one", more)
+	}
+	open.fire()
+	for _, each := range scopes {
+		each.must(t)
+	}
+}
+
+// PiG's own (Pi keeps the sharing tables in a WeakMap by path; here the table is a field of its path, each entry taken
+// out by its object): make and release rounds leave no entry and no holder, a non-last release keeps the entry, and a
+// reference made in the very turn of the last release takes a new hold with a new id, after the old one's release.
+func TestBindRemoteTheSharingTableIsEmptyAfterMakeAndReleaseRoundsAReferenceMadeInTheTurnOfTheLastReleaseHoldsAnew(t *testing.T) {
+	rig := rawProvider(t, rawLinkedOptions{})
+	client := rig.Client.(*chordHost)
+	session := jsonObject("session", "S1")
+	previous := -1
+	for round := range 5 {
+		a := mustHold(t, rig.Client, Notes, session)
+		b := mustHold(t, rig.Client, Notes, session)
+		id := rig.Peer.Next("hold").(*link.HoldMessage).Hold
+		if id <= previous {
+			t.Fatalf("round %d: hold %d, want a new id above %d", round, id, previous)
+		}
+		var c *Reference
+		entries := []int{}
+		hostTurn(rig.Client, func() {
+			entries = append(entries, len(client.parent.shared))
+			a.Release()
+			entries = append(entries, len(client.parent.shared))
+			b.Release()
+			entries = append(entries, len(client.parent.shared))
+			c = mustHold(t, rig.Client, Notes, session)
+			entries = append(entries, len(client.parent.shared))
+		})
+		if !slices.Equal(entries, []int{1, 1, 0, 1}) {
+			t.Fatalf("round %d: table entries = %v, want [1 1 0 1]", round, entries)
+		}
+		rhSync(t, rig.Peer)
+		kinds := []string{}
+		for _, kind := range rig.Peer.Kinds() {
+			if kind == "release" || kind == "hold" {
+				kinds = append(kinds, kind)
+			}
+		}
+		if !slices.Equal(kinds, []string{"release", "hold"}) {
+			t.Fatalf("round %d: wire = %v, want [release hold]", round, kinds)
+		}
+		if released := rig.Peer.Next("release").(*link.ReleaseMessage).Hold; released != id {
+			t.Fatalf("round %d: released %d, want %d", round, released, id)
+		}
+		next := rig.Peer.Next("hold").(*link.HoldMessage).Hold
+		if next <= id {
+			t.Fatalf("round %d: the reference made in the releasing turn holds %d, want a new id above %d", round, next, id)
+		}
+		previous = next
+		c.Release()
+		rhSync(t, rig.Peer)
+		if released := rig.Peer.Next("release").(*link.ReleaseMessage).Hold; released != next {
+			t.Fatalf("round %d: released %d, want %d", round, released, next)
+		}
+	}
+	if bindings, entries := remoteBindings(rig.Client); bindings != 0 || entries != 0 {
+		t.Fatalf("after the rounds: %d bindings, %d table entries, want none", bindings, entries)
 	}
 }

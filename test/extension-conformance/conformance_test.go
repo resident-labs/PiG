@@ -73,6 +73,7 @@ type recording struct {
 	ActionCalls             []string            `json:"action_calls"`
 	SessionEventNotify      []string            `json:"session_event_notify"`
 	AgentBeforeSettle       string              `json:"agent_before_settle"`
+	AgentBeforeSettleDrafts string              `json:"agent_before_settle_drafts"`
 	ProjectTrustDecision    string              `json:"project_trust_decision"`
 	ProjectTrustErrors      []string            `json:"project_trust_errors"`
 	RegisteredToolNames     []string            `json:"registered_tool_names"`
@@ -102,6 +103,19 @@ type recording struct {
 // conformanceHostInfo is the host configuration every harness host sends its extensions in PIG_EXT_HOST_INFO; the zero value sends nothing.
 // TestConformance_HostConfigurationAgreesAcrossSDKs sets it for its run (that test is not parallel, so it owns the value while it runs).
 var conformanceHostInfo subprocess.HostInfo
+
+// conformanceCellRegistry, when set, is the cell registry every harness host joins (TestConformance_SharedCellsIsolatePerHostInstances sets it for its run; that test is not parallel, so it owns the value while it runs). nil keeps each host's cells to itself.
+var conformanceCellRegistry *subprocess.CellRegistry
+
+// conformanceCellCwd, when set beside conformanceCellRegistry, is the working directory every harness host runs in: a registry shares a process only between Hosts of one cwd.
+var conformanceCellCwd string
+
+func harnessHostCwd(t *testing.T) string {
+	if conformanceCellCwd != "" {
+		return conformanceCellCwd
+	}
+	return t.TempDir()
+}
 
 type harness struct {
 	runner  *inproc.Runner
@@ -159,10 +173,23 @@ type conformanceLinesComponent struct {
 // conformanceWidthComponent renders one line naming the width it is drawn at.
 type conformanceWidthComponent struct {
 	line func(width int) string
+	// drawn is the line Render returned last: what a later run of the card's renderer reads as lastComponent.
+	drawn string
 }
 
-func (c *conformanceWidthComponent) Render(width int) []string { return []string{c.line(width)} }
-func (*conformanceWidthComponent) Invalidate()                 {}
+func (c *conformanceWidthComponent) Render(width int) []string {
+	c.drawn = c.line(width)
+	return []string{c.drawn}
+}
+
+// lastDrawn is the line the component the card's renderer returned before drew, or "none" on the card's first run: Pi's ToolRenderContext.lastComponent.
+func lastDrawn(previous extension.Component) string {
+	if component, ok := previous.(*conformanceWidthComponent); ok && component.drawn != "" {
+		return component.drawn
+	}
+	return "none"
+}
+func (*conformanceWidthComponent) Invalidate() {}
 
 func (c *conformanceLinesComponent) Render(int) []string { return append([]string(nil), c.lines...) }
 func (*conformanceLinesComponent) Invalidate()           {}
@@ -229,6 +256,10 @@ func TestConformance_TransportsMatch(t *testing.T) {
 		}
 		if !strings.HasPrefix(got.AgentBeforeSettle, "agent_before_settle:completed:") {
 			t.Errorf("%s: agent_before_settle = %q", tc.name, got.AgentBeforeSettle)
+		}
+		// A handler's null and omitted draft members reach the host, and the next handler, as written (wantBoundaryDrafts).
+		if got.AgentBeforeSettleDrafts != wantBoundaryDrafts {
+			t.Errorf("%s: agent_before_settle drafts = %q, want %q", tc.name, got.AgentBeforeSettleDrafts, wantBoundaryDrafts)
 		}
 		if got.ProjectTrustDecision != "yes" {
 			t.Errorf("%s: project_trust decision = %q, want yes", tc.name, got.ProjectTrustDecision)
@@ -693,7 +724,7 @@ func captureRecording(t *testing.T, h *harness) recording {
 		t.Fatalf("tool_is_error result type = %T, want agent.AgentToolResult", softResult)
 	}
 
-	*h.notify = nil
+	h.ui.ClearRecorded()
 	h.ui.ClearStatuses()
 	cmd, ok := findCommand(h.runner, "ping")
 	if !ok {
@@ -733,13 +764,13 @@ func captureRecording(t *testing.T, h *harness) recording {
 		t.Fatalf("status command: %v", err)
 	}
 	waitFor(t, func() bool { return len(h.ui.Recorded()) > 0 && len(h.ui.Statuses()) > 0 })
-	commandNotify := append([]string(nil), (*h.notify)...)
+	commandNotify := append([]string(nil), h.ui.Recorded()...)
 	statusUpdates := h.ui.Statuses()
 
 	statusBurst := captureStatusBurst(ctx, t, h)
 
 	// The paged-log read runs before append_entry below: the harness serves a fixed three-entry log and records appends without adding them, while Pi's pi.appendEntry adds the entry to the log the next read sees (agent-session.ts:3406-3411), as the Node runtime now does.
-	*h.notify = nil
+	h.ui.ClearRecorded()
 	sessionLogCtx := ctx
 	if h.host == nil {
 		cc := h.runner.CreateCommandContext()
@@ -752,8 +783,8 @@ func captureRecording(t *testing.T, h *harness) recording {
 	if err := sessionLogCmd.Handler(sessionLogCtx, ""); err != nil {
 		t.Fatalf("session-log-probe command: %v", err)
 	}
-	waitFor(t, func() bool { return len(*h.notify) > 0 })
-	sessionLogProbe := (*h.notify)[0]
+	waitFor(t, func() bool { return len(h.ui.Recorded()) > 0 })
+	sessionLogProbe := h.ui.Recorded()[0]
 
 	*h.actions = nil
 	for _, name := range []string{"send_message", "send_message_default", "send_message_no_turn", "send_user_message", "set_session_name", "append_entry"} {
@@ -767,7 +798,7 @@ func captureRecording(t *testing.T, h *harness) recording {
 	}
 	waitFor(t, func() bool { return len(*h.actions) >= 6 })
 	actionCalls := append([]string(nil), (*h.actions)...)
-	*h.notify = nil
+	h.ui.ClearRecorded()
 	loginCmd, ok := findCommand(h.runner, "login-probe")
 	if !ok {
 		t.Fatal("login-probe command not registered")
@@ -780,7 +811,7 @@ func captureRecording(t *testing.T, h *harness) recording {
 	loginDefinition := loginDefinitions[0]
 	loginError := h.ui.Recorded()[0]
 
-	*h.notify = nil
+	h.ui.ClearRecorded()
 	spriteCmd, ok := findCommand(h.runner, "sprite-probe")
 	if !ok {
 		t.Fatal("sprite-probe command not registered")
@@ -793,7 +824,7 @@ func captureRecording(t *testing.T, h *harness) recording {
 	spriteDefinition := h.ui.SpriteDefinitions()[0]
 	spriteError := h.ui.Recorded()[recordedBefore]
 
-	*h.notify = nil
+	h.ui.ClearRecorded()
 	if _, err := h.runner.Emit(ctx, extension.SessionStartEvent{Type: "session_start", Reason: "startup"}); err != nil {
 		t.Fatalf("session_start emit: %v", err)
 	}
@@ -815,13 +846,13 @@ func captureRecording(t *testing.T, h *harness) recording {
 	if _, err := h.runner.Emit(ctx, extension.TurnEndEvent{Type: "turn_end", Message: wireAgentMessage(map[string]any{"role": "assistant", "content": []any{}}), MessageEntryID: "assistant-entry", ToolResultEntryIds: []string{"tool-entry"}}); err != nil {
 		t.Fatalf("turn_end emit: %v", err)
 	}
-	waitFor(t, func() bool { return len(*h.notify) >= 7 })
-	sessionEventNotify := append([]string(nil), (*h.notify)...)
+	waitFor(t, func() bool { return len(h.ui.Recorded()) >= 7 })
+	sessionEventNotify := append([]string(nil), h.ui.Recorded()...)
 
-	*h.notify = nil
+	h.ui.ClearRecorded()
 	var boundaryErrors []*extension.ExtensionError
 	removeBoundaryListener := h.runner.AddErrorListener(func(err *extension.ExtensionError) { boundaryErrors = append(boundaryErrors, err) })
-	boundary, err := h.runner.EmitBoundary(ctx, &extension.AgentBeforeSettleEvent{Type: "agent_before_settle", BoundaryState: extension.BoundaryState{Outcome: extension.AgentActivityCompleted}},
+	boundary, err := h.runner.EmitBoundary(ctx, &extension.AgentBeforeSettleEvent{Type: "agent_before_settle", Outcome: extension.AgentActivityCompleted},
 		func(entries []extension.SessionBoundaryDraft) (extension.BoundaryContextPreview, error) {
 			return extension.BoundaryContextPreview{
 				ContextEntries: make([]extension.ProjectedSessionEntry, len(entries)),
@@ -835,11 +866,13 @@ func captureRecording(t *testing.T, h *harness) recording {
 	if len(boundaryErrors) != 1 {
 		t.Fatalf("boundary must surface only the deliberate handler failure: %+v", boundaryErrors)
 	}
-	if !boundary.Valid || !boundary.Continue || len(boundary.Entries) != 1 || boundary.Entries[0].CustomType != "conformance-boundary" {
+	if !boundary.Valid || !boundary.Continue || len(boundary.Entries) != 6 || boundary.Entries[0].CustomType != "conformance-boundary" {
 		t.Fatalf("boundary mutation/error/result chain: %+v", boundary)
 	}
-	waitFor(t, func() bool { return len(*h.notify) > 0 })
-	agentBeforeSettle := fmt.Sprintf("%s:result=%d:%t", (*h.notify)[0], len(boundary.Entries), boundary.Continue)
+	waitFor(t, func() bool { return len(h.ui.Recorded()) > 1 })
+	agentBeforeSettle := fmt.Sprintf("%s:result=%d:%t", h.ui.Recorded()[0], len(boundary.Entries), boundary.Continue)
+	// The drafts as the host decoded them, after the handler's own report of the drafts it was handed: a null member and an absent one stay apart both ways.
+	agentBeforeSettleDrafts := boundaryDraftsLine(t, h.ui.Recorded()[1], boundary.Entries)
 
 	projectTrust, projectTrustErrors, err := inproc.EmitProjectTrust(h.runner, ctx, extension.ProjectTrustEvent{
 		Type: "project_trust",
@@ -861,7 +894,7 @@ func captureRecording(t *testing.T, h *harness) recording {
 	// reads both and notifies a deterministic summary. The inproc baseline
 	// dispatches command handlers directly, so attach a CommandContext
 	// (the subprocess SDKs build their own Context over the wire).
-	*h.notify = nil
+	h.ui.ClearRecorded()
 	probeCmd, ok := findCommand(h.runner, "context-probe")
 	if !ok {
 		t.Fatal("context-probe command not registered")
@@ -874,8 +907,8 @@ func captureRecording(t *testing.T, h *harness) recording {
 	if err := probeCmd.Handler(probeCtx, ""); err != nil {
 		t.Fatalf("context-probe command: %v", err)
 	}
-	waitFor(t, func() bool { return len(*h.notify) > 0 })
-	contextProbe := (*h.notify)[0]
+	waitFor(t, func() bool { return len(h.ui.Recorded()) > 0 })
+	contextProbe := h.ui.Recorded()[0]
 
 	// Each dialog reports ui_prompt_start/ui_prompt_end without awaiting
 	// handlers, so the reports arrive alongside the command's own summary.
@@ -982,25 +1015,43 @@ func captureRecording(t *testing.T, h *harness) recording {
 		// A value no SDK defaults to: an SDK that drops the field renders duration=none.
 		DurationMs: new(int64(4200)),
 	}
+	probeResult := agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "out"}}, Details: map[string]any{"k": "v"}}
+	isProbeLine := func(line string) bool { return strings.HasPrefix(line, "toolrender:") }
 	renderCall, ok := renderProbe.RenderCall(json.RawMessage(`{"topic":"alpha"}`), nil, renderContext).(interface{ Render(int) []string })
 	if !ok {
 		t.Fatal("renderCall did not return a component")
 	}
-	var toolRenderer []string
-	waitFor(t, func() bool {
-		lines := renderCall.Render(72)
-		return len(lines) == 1 && lines[0] == "toolrender:call:alpha:partial=false:calls=1:width=72"
-	})
-	toolRenderer = append(toolRenderer, renderCall.Render(72)...)
-	renderResult, ok := renderProbe.RenderResult(agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "out"}}, Details: map[string]any{"k": "v"}}, extension.ToolRenderResultOptions{Expanded: true}, nil, renderContext).(interface{ Render(int) []string })
+	callLine := expectRenderedLine(t, renderCall, isProbeLine, "toolrender:call:alpha:partial=false:calls=1:width=72:last=none")
+	toolRenderer := []string{callLine}
+	renderResult, ok := renderProbe.RenderResult(probeResult, extension.ToolRenderResultOptions{Expanded: true}, nil, renderContext).(interface{ Render(int) []string })
 	if !ok {
 		t.Fatal("renderResult did not return a component")
 	}
-	waitFor(t, func() bool {
-		lines := renderResult.Render(72)
-		return len(lines) == 1 && lines[0] == "toolrender:result:out:v:expanded=true:calls=1:width=72:duration=4200"
-	})
-	toolRenderer = append(toolRenderer, renderResult.Render(72)...)
+	resultLine := expectRenderedLine(t, renderResult, isProbeLine, "toolrender:result:out:v:expanded=true:calls=1:width=72:duration=4200:last=none")
+	toolRenderer = append(toolRenderer, resultLine)
+
+	// ToolRenderContext.lastComponent: a second run of each phase on the same card receives what that phase's renderer returned on the first
+	// (tool-execution.ts hands the card's callRendererComponent and resultRendererComponent back). Each last= is a line no SDK's fallback (an
+	// absent component reads "none") produces, and the call and result slots are separate: a swapped slot reads the other phase's line. The second
+	// runs change an input (expanded, topic) so that their own line is told from the first run's, which the same component still shows until the
+	// answer arrives; a wrong last= then fails with both lines at once.
+	renderContext.LastComponent = renderResult.(extension.Component)
+	renderResultAgain, ok := renderProbe.RenderResult(probeResult, extension.ToolRenderResultOptions{Expanded: false}, nil, renderContext).(interface{ Render(int) []string })
+	if !ok {
+		t.Fatal("second renderResult did not return a component")
+	}
+	resultAgain := expectRenderedLine(t, renderResultAgain, func(line string) bool { return strings.Contains(line, ":expanded=false:") },
+		"toolrender:result:out:v:expanded=false:calls=1:width=72:duration=4200:last="+resultLine)
+	toolRenderer = append(toolRenderer, resultAgain)
+	renderContext.LastComponent = renderCall.(extension.Component)
+	renderCallAgain, ok := renderProbe.RenderCall(json.RawMessage(`{"topic":"beta"}`), nil, renderContext).(interface{ Render(int) []string })
+	if !ok {
+		t.Fatal("second renderCall did not return a component")
+	}
+	callAgain := expectRenderedLine(t, renderCallAgain, func(line string) bool { return strings.HasPrefix(line, "toolrender:call:beta:") },
+		"toolrender:call:beta:partial=false:calls=2:width=72:last="+callLine)
+	toolRenderer = append(toolRenderer, callAgain)
+	renderContext.LastComponent = nil
 
 	argumentCompletions := commandArgumentCompletions(t, h.runner, "complete_probe", " a", "zz")
 
@@ -1019,6 +1070,7 @@ func captureRecording(t *testing.T, h *harness) recording {
 		ActionCalls:             actionCalls,
 		SessionEventNotify:      sessionEventNotify,
 		AgentBeforeSettle:       agentBeforeSettle,
+		AgentBeforeSettleDrafts: agentBeforeSettleDrafts,
 		ProjectTrustDecision:    projectTrustDecision,
 		ProjectTrustErrors:      projectTrustErrorMessages,
 		RegisteredToolNames:     registeredToolNames,
@@ -1192,10 +1244,26 @@ func registerInprocSprite(ui extension.UIContext, owner string, definition exten
 	return nil
 }
 
+// inprocSharedTool is one of the shared-cells tools of the in-process fixture; its answer is run's text.
+func inprocSharedTool(name, description, schema string, run func(json.RawMessage) string) extension.RegisteredTool {
+	return extension.RegisteredTool{
+		Definition: extension.ToolDefinition{
+			Name: name, Description: description, Parameters: json.RawMessage(schema),
+			Execute: func(_ context.Context, _ string, params json.RawMessage, _ extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+				return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: run(params)}}}, nil
+			},
+		},
+		Source: inprocFixtureName,
+	}
+}
+
 func makeInprocFixture(ui extension.UIContext, actions *[]string) extension.Extension {
 	var termUnsub func()
 	var abortObserved atomic.Bool
 	var inprocStartedCalls atomic.Int64
+	var sharedCalls atomic.Int64
+	var sharedMu sync.Mutex
+	var sharedHeard []string
 	update := func(onUpdate extension.AgentToolUpdateCallback, text string) {
 		if cb := onUpdate; cb != nil {
 			cb(agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: text}}})
@@ -1203,11 +1271,13 @@ func makeInprocFixture(ui extension.UIContext, actions *[]string) extension.Exte
 	}
 	flags := conformanceFlagDeclarations()
 	schemaRejected := testfixture.ReferenceToolSchemaRejected()
+	clickCards := &inprocClickCards{}
 	return extension.Extension{
 		Flags:        flags,
 		Path:         "inproc-conformance-fixture",
 		ResolvedPath: "inproc-conformance-fixture",
 		MessageRenderers: map[string]extension.MessageRenderer{
+			"conformance-click-message": clickCards.messageRenderer,
 			// Test fixture, Pi 9376c8d1 (#4748): KeyText and KeyHint on the message options. The content is the keybinding id.
 			"keyhints-message": func(message extension.CustomMessage, options extension.MessageRenderOptions, _ extension.Theme) extension.Component {
 				id, _ := message.Content.(string)
@@ -1223,6 +1293,7 @@ func makeInprocFixture(ui extension.UIContext, actions *[]string) extension.Exte
 			},
 		},
 		EntryRenderers: map[string]extension.EntryRenderer{
+			"conformance-click-entry": clickCards.entryRenderer,
 			// Test fixture, Pi 9376c8d1 (#4748): KeyText and KeyHint on the entry options. The data is the keybinding id.
 			"keyhints-entry": func(entry extension.CustomEntry, options extension.EntryRenderOptions, _ extension.Theme) extension.Component {
 				id, _ := entry.Data.(string)
@@ -1232,9 +1303,9 @@ func makeInprocFixture(ui extension.UIContext, actions *[]string) extension.Exte
 				return &conformanceLinesComponent{lines: []string{fmt.Sprintf("entryrenderer:%v:expanded=%t:width=72", entry.Data, options.Expanded)}}
 			},
 		},
-		MarkdownTransformer: func(markdown string, context extension.MarkdownTransformContext) string {
+		MarkdownTransformer: extension.NewMarkdownTransformerRegistration(func(markdown string, context extension.MarkdownTransformContext) string {
 			return fmt.Sprintf("md:%s:%s:streaming=%t:width=%d", markdown, context.MessageType, context.IsStreaming, context.AvailableWidth)
-		},
+		}, []extension.MarkdownMessageType{extension.MarkdownMessageUser, extension.MarkdownMessageAssistant, extension.MarkdownMessageAssistantThinking, extension.MarkdownMessageCustom, extension.MarkdownMessageSummary, extension.MarkdownMessageChangelog}),
 		ToolRenderers: []extension.ToolRendererResolver{func(tool string, next func() *extension.ToolRenderers) *extension.ToolRenderers {
 			line := func(prefix string) extension.ToolRenderCallFunc {
 				return func(args json.RawMessage, _ extension.Theme, _ extension.ToolRenderContext) extension.Component {
@@ -1283,20 +1354,22 @@ func makeInprocFixture(ui extension.UIContext, actions *[]string) extension.Exte
 						state["calls"] = calls + 1
 						var input map[string]any
 						_ = json.Unmarshal(args, &input)
+						last := lastDrawn(render.LastComponent)
 						return &conformanceWidthComponent{line: func(width int) string {
-							return fmt.Sprintf("toolrender:call:%v:partial=%t:calls=%d:width=%d", input["topic"], render.IsPartial, calls+1, width)
+							return fmt.Sprintf("toolrender:call:%v:partial=%t:calls=%d:width=%d:last=%s", input["topic"], render.IsPartial, calls+1, width, last)
 						}}
 					},
 					RenderResult: func(result extension.AgentToolResult, options extension.ToolRenderResultOptions, _ extension.Theme, render extension.ToolRenderContext) extension.Component {
 						value := result
 						details, _ := value.Details.(map[string]any)
 						calls := render.State.(map[string]any)["calls"]
+						last := lastDrawn(render.LastComponent)
 						return &conformanceWidthComponent{line: func(width int) string {
 							duration := "none"
 							if render.DurationMs != nil {
 								duration = fmt.Sprint(*render.DurationMs)
 							}
-							return fmt.Sprintf("toolrender:result:%v:%v:expanded=%t:calls=%v:width=%d:duration=%s", value.Text(), details["k"], options.Expanded, calls, width, duration)
+							return fmt.Sprintf("toolrender:result:%v:%v:expanded=%t:calls=%v:width=%d:duration=%s:last=%s", value.Text(), details["k"], options.Expanded, calls, width, duration, last)
 						}}
 					},
 				},
@@ -1328,6 +1401,19 @@ func makeInprocFixture(ui extension.UIContext, actions *[]string) extension.Exte
 							return agent.AgentToolResult{}, err
 						}
 						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: strings.Repeat("a", params.N)}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			// lone_decl: the declaration of testfixture/fixture.go, whose text holds a lone UTF-16 surrogate
+			// (TestConformance_ToolDeclarationLoneSurrogatesAgreeAcrossSDKs): every transport registers it, so this baseline does too.
+			"lone_decl": {
+				Definition: extension.ToolDefinition{
+					Name:        "lone_decl",
+					Description: "D[\xed\xa0\xbd]",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{"K[\ude00\ud83d]":{"type":"string","description":"PD[\ud83d]","enum":["E[\ude00]"],"default":"DF[\ud83d]"}}}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "lone"}}}, nil
 					},
 				},
 				Source: inprocFixtureName,
@@ -1411,6 +1497,55 @@ func makeInprocFixture(ui extension.UIContext, actions *[]string) extension.Exte
 				},
 				Source: inprocFixtureName,
 			},
+			// The two probes of TestToolAbortKeepsTheToolsHostCalls run in the SDK fixtures; the in-process baseline lists them so every transport registers the same tools.
+			"signal_host_probe": {
+				Definition: extension.ToolDefinition{
+					Name:        "signal_host_probe",
+					Description: "Await host dialogs across the abort",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			// session_actions_tool exists here only so the transports' tool lists match this reference. The SDK fixtures call the command-only session actions through the tool's context
+			// and report the refusals. An in-process tool's context is *extension.Context (FromContext, coding/extension/context.go:413), which has no such member: WaitForIdle, NewSession,
+			// Fork, NavigateTree, SwitchSession and Reload are methods of *CommandContext only (context.go:492-566), so the probe cannot be written here. The tool answers with an error that
+			// says so, and never with an empty success that a row could take for a report.
+			"session_actions_tool": {
+				Definition: extension.ToolDefinition{
+					Name:        "session_actions_tool",
+					Description: "Call the session actions through the tool's context",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{}, errors.New("session_actions_tool: the in-process fixture does not implement the probe; it is registered only so the transports' tool lists match")
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"aborted_entry_probe": {
+				Definition: extension.ToolDefinition{
+					Name:        "aborted_entry_probe",
+					Description: "Report the signal a tool starts with",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"signal_nested_probe": {
+				Definition: extension.ToolDefinition{
+					Name:        "signal_nested_probe",
+					Description: "Run abort_tool as a nested tool call",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
 			"rich_tool": {
 				Definition: extension.ToolDefinition{
 					Name:        "rich_tool",
@@ -1483,6 +1618,22 @@ func makeInprocFixture(ui extension.UIContext, actions *[]string) extension.Exte
 				},
 				Source: inprocFixtureName,
 			},
+			"counter": inprocSharedTool("counter", "This instance's call count", `{"type":"object","properties":{}}`, func(json.RawMessage) string { return strconv.Itoa(int(sharedCalls.Add(1))) }),
+			"ping": inprocSharedTool("ping", "Emit on the shared-cells channel", `{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}`, func(params json.RawMessage) string {
+				var input struct {
+					Name string `json:"name"`
+				}
+				_ = json.Unmarshal(params, &input)
+				sharedMu.Lock()
+				sharedHeard = append(sharedHeard, input.Name)
+				sharedMu.Unlock()
+				return "pinged"
+			}),
+			"received": inprocSharedTool("received", "What this instance heard on shared-cells", `{"type":"object","properties":{}}`, func(json.RawMessage) string {
+				sharedMu.Lock()
+				defer sharedMu.Unlock()
+				return "received=" + strings.Join(sharedHeard, ",")
+			}),
 			"prepared_tool": {
 				Definition: extension.ToolDefinition{
 					Name:        "prepared_tool",
@@ -1557,6 +1708,17 @@ func makeInprocFixture(ui extension.UIContext, actions *[]string) extension.Exte
 					Name:        "mutation_order_probe",
 					Description: "Take the file mutation queue in the first statement and append a tag to the file",
 					Parameters:  json.RawMessage(`{"type":"object","properties":{"file":{"type":"string"},"tag":{"type":"string"}}}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "mutation-done"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"mutation_order_ctx_probe": {
+				Definition: extension.ToolDefinition{
+					Name:        "mutation_order_ctx_probe",
+					Description: "Make getter calls, take the file mutation queue through the context and append a tag to the file",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{"file":{"type":"string"},"tag":{"type":"string"},"calls":{"type":"number"}}}`),
 					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
 						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "mutation-done"}}}, nil
 					},
@@ -1860,7 +2022,26 @@ func makeInprocFixture(ui extension.UIContext, actions *[]string) extension.Exte
 							return err
 						}
 					}
-					return recordUserContent(actions, content, "followUp")
+					return recordUserContent(actions, content, "followUp", nil)
+				},
+			},
+			"send_user_message_delivery": {
+				Name:        "send_user_message_delivery",
+				Description: "Send a user message with the delivery named by the argument",
+				Handler: func(_ context.Context, args string) error {
+					deliverAs := args
+					if args == "absent" {
+						deliverAs = ""
+					}
+					return recordUserContent(actions, "delivery-"+args, deliverAs, nil)
+				},
+			},
+			"send_user_message_expand": {
+				Name:        "send_user_message_expand",
+				Description: "Send a user message with expandPromptTemplates set to the argument",
+				Handler: func(_ context.Context, args string) error {
+					expand := args == "true"
+					return recordUserContent(actions, "expand-user", "followUp", &expand)
 				},
 			},
 			"set_session_name": {
@@ -2461,9 +2642,55 @@ func makeInprocFixture(ui extension.UIContext, actions *[]string) extension.Exte
 					if len(event.Entries) != 2 || len(event.Context.ContextEntries) != 2 || event.Entries[0].CustomType != "kept" || event.Entries[1].CustomType != "before-error" {
 						return nil, errors.New("lost boundary mutation or preview")
 					}
-					entries := []extension.SessionBoundaryDraft{{Type: "custom", CustomType: "conformance-boundary"}}
+					// One draft with a null replacement, one without the member, and a compaction that keeps nothing.
+					entries := []extension.SessionBoundaryDraft{
+						{Type: "custom", CustomType: "conformance-boundary"},
+						{Type: "context_edit", TargetID: "conformance-failed-attempt"},
+						{Type: "context_edit", TargetID: "conformance-omitted-member", ReplacementUndefined: true},
+						{Type: "compaction", Summary: "conformance-summary", Details: map[string]any{"format": "conformance-checkpoint"}, UsageNull: true},
+						// A data, a details and (above) a usage member written as null: Pi's file holds each as null.
+						{Type: "custom", CustomType: "conformance-null-data", Data: json.RawMessage("null")},
+						{Type: "custom_message", CustomType: "conformance-null-details", Content: "x", Details: json.RawMessage("null")},
+					}
 					continued := true
 					return extension.BoundaryResult{Entries: &entries, Continue: &continued}, nil
+				},
+				func(args ...any) (any, error) {
+					event := args[0].(*extension.AgentBeforeSettleEvent)
+					if len(event.Entries) != 6 {
+						return nil, fmt.Errorf("boundary result reached the next handler as %d entries", len(event.Entries))
+					}
+					replacement := func(draft extension.SessionBoundaryDraft) string {
+						switch {
+						case draft.ReplacementUndefined:
+							return "absent"
+						case len(draft.Replacement) == 0 || string(draft.Replacement) == "null":
+							return "null"
+						}
+						return "value"
+					}
+					firstKept := "null"
+					if event.Entries[3].FirstKeptEntryID != nil {
+						firstKept = "value"
+					}
+					details, _ := event.Entries[3].Details.(map[string]any)
+					member := func(value any) string {
+						if value == nil {
+							return "absent"
+						}
+						if raw, ok := value.(json.RawMessage); ok && string(raw) == "null" {
+							return "null"
+						}
+						return "value"
+					}
+					usage := "absent"
+					if event.Entries[3].UsageNull {
+						usage = "null"
+					} else if event.Entries[3].Usage != nil {
+						usage = "value"
+					}
+					ui.Notify(fmt.Sprintf("agent_before_settle_drafts:%d:%s:%s:%s:%v:%s:%s:%s:%s", len(event.Entries), replacement(event.Entries[1]), replacement(event.Entries[2]), firstKept, details["format"], member(event.Entries[0].Data), usage, member(event.Entries[4].Data), member(event.Entries[5].Details)), "info")
+					return nil, nil
 				},
 			},
 			"session_start": {
@@ -2591,6 +2818,8 @@ var wantUIPromptEvents = []string{
 
 // recordingUI records notifications and mutable UI values used by the conformance fixtures.
 type recordingUI struct {
+	// theme is the active theme a test publishes as the UI's (Theme); without it the UI has none.
+	theme func() extension.Theme
 	// runOverlay replaces RunRemoteOverlay when a test supplies its own mounted-overlay behaviour.
 	runOverlay func(extension.RemoteOverlayOptions, extension.RemoteOverlayHost, func(extension.RemoteOverlayHandle)) (any, bool)
 	// showOverlay answers ShowRemoteOverlay (a factory's tui.showOverlay) when a test supplies it; without it the UI shows none.
@@ -2626,6 +2855,12 @@ type recordingUI struct {
 	recordMu sync.Mutex
 	// calls holds the working, paste, editor-text and tools-expanded calls the host forwarded, in arrival order.
 	calls []string
+	// surfaces holds the title and widget calls the host forwarded, in arrival order.
+	surfaces []string
+	// applyDelay is how long a notify, status, title, widget or editor-text call takes to apply, a consumer that is slow to write (a terminal, a pipe).
+	applyDelay atomic.Int64
+	// stall holds every effect call at its apply until the gate's release channel closes: a consumer that is blocked.
+	stall atomic.Pointer[stallGate]
 }
 
 func newRecordingUI(notify, status *[]string) *recordingUI {
@@ -2655,6 +2890,7 @@ func (u *recordingUI) Input(ctx context.Context, title, _ string, _ extension.Ex
 }
 
 func (u *recordingUI) Notify(message, level string) {
+	u.slow()
 	defer hostEffects.notify()
 	u.recordMu.Lock()
 	defer u.recordMu.Unlock()
@@ -2718,6 +2954,7 @@ func (u *recordingUI) terminalInputVerdict(data string) (extension.TerminalInput
 	return handler(context.Background(), data), true
 }
 func (u *recordingUI) SetStatus(key, text string) {
+	u.slow()
 	defer hostEffects.notify()
 	u.recordMu.Lock()
 	defer u.recordMu.Unlock()
@@ -2767,7 +3004,8 @@ func (u *recordingUI) SetHiddenThinkingLabel(label string) {
 func (u *recordingUI) ClearHiddenThinkingLabel() { u.recordCall("hiddenThinkingLabel:<default>") }
 func (u *recordingUI) SetWidgetFactory(string, extension.WidgetFactory, *extension.ExtensionWidgetOptions) {
 }
-func (u *recordingUI) SetWidget(string, []string, *extension.ExtensionWidgetOptions) {
+func (u *recordingUI) SetWidget(key string, lines []string, _ *extension.ExtensionWidgetOptions) {
+	u.recordSurface1("widget:" + key + ":" + strings.Join(lines, "|"))
 }
 func (u *recordingUI) SetFooter(build extension.FooterFactory) {
 	factory := frameOf(build, 3)
@@ -2868,12 +3106,60 @@ func (u *recordingUI) LoginDefinitions() []string {
 	defer u.recordMu.Unlock()
 	return append([]string(nil), u.logins...)
 }
-func (u *recordingUI) SetTitle(string) {}
+func (u *recordingUI) SetTitle(title string) { u.recordSurface1("title:" + title) }
+
+// slow models a consumer that is slow to apply an effect: the call returns once it applied it.
+func (u *recordingUI) slow() {
+	if gate := u.stall.Load(); gate != nil {
+		gate.enter()
+	}
+	if delay := u.applyDelay.Load(); delay > 0 {
+		time.Sleep(time.Duration(delay))
+	}
+}
+
+// stallGate holds the effect calls of a recordingUI: entered closes when the first call is held, open lets every held call apply. A test that fails while the gate is closed opens it
+// from its cleanup, so the harness's shutdown does not wait for a consumer that nobody will release.
+type stallGate struct {
+	entered  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+	openOnce sync.Once
+}
+
+func newStallGate() *stallGate {
+	return &stallGate{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (g *stallGate) enter() {
+	g.once.Do(func() { close(g.entered) })
+	<-g.release
+}
+
+// open lets every held call apply, and every later one; it may be called more than once.
+func (g *stallGate) open() { g.openOnce.Do(func() { close(g.release) }) }
+
+// recordSurface1 keeps a title or widget call. Surfaces returns the calls so far.
+func (u *recordingUI) recordSurface1(call string) {
+	u.slow()
+	defer hostEffects.notify()
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	u.surfaces = append(u.surfaces, call)
+}
+
+// Surfaces returns a copy of the title and widget calls seen so far.
+func (u *recordingUI) Surfaces() []string {
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	return append([]string(nil), u.surfaces...)
+}
 func (u *recordingUI) Custom(context.Context, extension.CustomFactory, *extension.CustomOptions) (any, error) {
 	return "gamma", nil
 }
 func (u *recordingUI) PasteToEditor(text string) { u.recordCall("paste:" + text) }
 func (u *recordingUI) SetEditorText(text string) {
+	u.slow()
 	u.recordMu.Lock()
 	defer u.recordMu.Unlock()
 	u.editorText = text
@@ -2905,9 +3191,14 @@ func (u *recordingUI) installedEditor() extension.RemoteEditor {
 	return u.editor
 }
 func (u *recordingUI) GetEditorComponent() extension.EditorFactory { return nil }
-func (u *recordingUI) Theme() extension.Theme                      { return nil }
-func (u *recordingUI) GetAllThemes() []extension.ThemeMeta         { return nil }
-func (u *recordingUI) GetTheme(string) (extension.Theme, error)    { return nil, nil }
+func (u *recordingUI) Theme() extension.Theme {
+	if u.theme != nil {
+		return u.theme()
+	}
+	return nil
+}
+func (u *recordingUI) GetAllThemes() []extension.ThemeMeta      { return nil }
+func (u *recordingUI) GetTheme(string) (extension.Theme, error) { return nil, nil }
 func (u *recordingUI) SetTheme(extension.ThemeSelection) extension.SetThemeResult {
 	return extension.SetThemeResult{Success: true}
 }
@@ -3019,9 +3310,10 @@ func makeSubprocessGoHarness(t *testing.T) *harness {
 	bridge.SetNotifyFunc(ui.RecordNotify)
 	bridge.SetActions(conformanceActions(actions))
 
-	h := subprocess.NewHost(t.TempDir())
+	h := subprocess.NewHost(harnessHostCwd(t))
 	h.SetMode(harnessHostMode())
 	h.SetHostInfo(conformanceHostInfo)
+	h.ShareCells(conformanceCellRegistry)
 	h.SetUIBridge(bridge)
 	wire := observeWire(t, h)
 
@@ -3058,9 +3350,10 @@ func makeFusedGoHarness(t *testing.T) *harness {
 	bridge.SetNotifyFunc(ui.RecordNotify)
 	bridge.SetActions(conformanceActions(actions))
 
-	host := subprocess.NewHost(t.TempDir())
+	host := subprocess.NewHost(harnessHostCwd(t))
 	host.SetMode(harnessHostMode())
 	host.SetHostInfo(conformanceHostInfo)
+	host.ShareCells(conformanceCellRegistry)
 	host.SetUIBridge(bridge)
 	wire := observeWire(t, host)
 	// A Piglet Binary installs the host's parsers before any fused factory runs (fusepack.Register).
@@ -3153,7 +3446,7 @@ func conformanceActions(actions *[]string) *subprocess.HostCallbacks {
 			return nil
 		},
 		SendUserMessage: func(content any, opts subprocess.SendUserMessageOptions) error {
-			return recordUserContent(actions, content, opts.DeliverAs)
+			return recordUserContent(actions, content, opts.DeliverAs, opts.ExpandPromptTemplates)
 		},
 		SetSessionName: func(name string) error {
 			*actions = append(*actions, "setSessionName:"+name)
@@ -3161,16 +3454,28 @@ func conformanceActions(actions *[]string) *subprocess.HostCallbacks {
 		},
 		GetThinkingLevel: func() string { return conformanceThinkingLevel },
 		GetCommands:      func() []subprocess.CommandInfo { return conformanceHostCommands },
-		SetModel: func(_ context.Context, model string) (bool, error) {
+		SetModel: func(_ context.Context, object *ai.Model) (bool, error) {
+			model := modelSpec(object)
 			*actions = append(*actions, "setModel:"+model)
 			return model == conformanceKnownModel, nil
 		},
+		ResolveModel: specModel,
 		AppendEntry: func(customType string, data any, _ *subprocess.DirectEntryAppend) error {
+			if customType == "effect_probe_fails" {
+				return errors.New("append refused")
+			}
 			*actions = append(*actions, fmt.Sprintf("appendEntry:%s:%v", customType, data))
 			return nil
 		},
-		SetLabel: func(entryID, label string) error {
-			*actions = append(*actions, "setLabel:"+entryID+":"+label)
+		SetLabel: func(entryID string, label *string, null bool) error {
+			text := "undefined"
+			switch {
+			case label != nil:
+				text = *label
+			case null:
+				text = "null"
+			}
+			*actions = append(*actions, "setLabel:"+entryID+":"+text)
 			return nil
 		},
 	}
@@ -3193,9 +3498,10 @@ func makeSubprocessNodeHarness(t *testing.T) *harness {
 	bridge.SetNotifyFunc(ui.RecordNotify)
 	bridge.SetActions(conformanceActions(actions))
 
-	h := subprocess.NewHost(t.TempDir())
+	h := subprocess.NewHost(harnessHostCwd(t))
 	h.SetMode(harnessHostMode())
 	h.SetHostInfo(conformanceHostInfo)
+	h.ShareCells(conformanceCellRegistry)
 	h.SetUIBridge(bridge)
 	wire := observeWire(t, h)
 
@@ -3223,6 +3529,11 @@ func makeSubprocessNodeHarness(t *testing.T) *harness {
 // is to force real packed-cell hosting so the conformance suite's Node cases
 // prove packed and isolated are observationally identical, not just isolated.
 func makeSubprocessNodePackedHarness(t *testing.T) *harness {
+	return makeSubprocessNodePackedHarnessWithPeer(t, "export default function () {}\n")
+}
+
+// makeSubprocessNodePackedHarnessWithPeer is makeSubprocessNodePackedHarness with the source of the peer extension the node-sdk-fixture shares its cell with.
+func makeSubprocessNodePackedHarnessWithPeer(t *testing.T, peerSource string) *harness {
 	t.Helper()
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Fatalf("node is required for SDK conformance: %v", err)
@@ -3231,7 +3542,7 @@ func makeSubprocessNodePackedHarness(t *testing.T) *harness {
 	modRoot := findModuleRoot(t)
 	path := filepath.Join(modRoot, "test", "extension-conformance", "testdata", "node-sdk-fixture", "main.mjs")
 	peer := filepath.Join(t.TempDir(), "node-cell-peer.mjs")
-	if err := os.WriteFile(peer, []byte("export default function () {}\n"), 0o600); err != nil {
+	if err := os.WriteFile(peer, []byte(peerSource), 0o600); err != nil {
 		t.Fatalf("write Node cell peer fixture: %v", err)
 	}
 	notify := &[]string{}
@@ -3243,9 +3554,10 @@ func makeSubprocessNodePackedHarness(t *testing.T) *harness {
 	bridge.SetNotifyFunc(ui.RecordNotify)
 	bridge.SetActions(conformanceActions(actions))
 
-	h := subprocess.NewHost(t.TempDir())
+	h := subprocess.NewHost(harnessHostCwd(t))
 	h.SetMode(harnessHostMode())
 	h.SetHostInfo(conformanceHostInfo)
+	h.ShareCells(conformanceCellRegistry)
 	h.SetUIBridge(bridge)
 	wire := observeWire(t, h)
 
@@ -3257,6 +3569,38 @@ func makeSubprocessNodePackedHarness(t *testing.T) *harness {
 		t.Fatalf("packed Node LoadAll: %d loaded, %v", len(exts), errs)
 	}
 
+	runner := inproc.NewRunner(exts, t.TempDir())
+	bridge.SetUIPromptScope(runner)
+	return &harness{runner: runner, host: h, notify: notify, status: status, actions: actions, ui: ui, bridge: bridge, wire: wire}
+}
+
+// makeSubprocessNodeLoneCellHarness loads the node-sdk-fixture through Host.LoadAll with no peer, so a Host of a shared registry runs it as the only Node realm of its process and keeps its pi.events listeners in that process's own bus.
+func makeSubprocessNodeLoneCellHarness(t *testing.T) *harness {
+	t.Helper()
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Fatalf("node is required for SDK conformance: %v", err)
+	}
+	path := filepath.Join(findModuleRoot(t), "test", "extension-conformance", "testdata", "node-sdk-fixture", "main.mjs")
+	notify := &[]string{}
+	status := &[]string{}
+	actions := &[]string{}
+	ui := newRecordingUI(notify, status)
+	bridge := subprocess.NewUIBridge(hostEffects.notify)
+	bridge.SetUIContext(ui)
+	bridge.SetNotifyFunc(ui.RecordNotify)
+	bridge.SetActions(conformanceActions(actions))
+
+	h := subprocess.NewHost(harnessHostCwd(t))
+	h.SetMode(harnessHostMode())
+	h.SetHostInfo(conformanceHostInfo)
+	h.ShareCells(conformanceCellRegistry)
+	h.SetUIBridge(bridge)
+	wire := observeWire(t, h)
+
+	exts, errs := h.LoadAll(context.Background(), []subprocess.ExtConfig{{Name: "node-sdk-fixture", Source: path, Enabled: true, RuntimeKind: "subprocess", RuntimeLanguage: "node", EntrypointKind: "factory", SDKName: "pi-node"}})
+	if len(errs) != 0 || len(exts) != 1 {
+		t.Fatalf("lone Node LoadAll: %d loaded, %v", len(exts), errs)
+	}
 	runner := inproc.NewRunner(exts, t.TempDir())
 	bridge.SetUIPromptScope(runner)
 	return &harness{runner: runner, host: h, notify: notify, status: status, actions: actions, ui: ui, bridge: bridge, wire: wire}
@@ -3276,9 +3620,10 @@ func makeSubprocessPythonHarness(t *testing.T) *harness {
 	bridge.SetNotifyFunc(ui.RecordNotify)
 	bridge.SetActions(conformanceActions(actions))
 
-	h := subprocess.NewHost(t.TempDir())
+	h := subprocess.NewHost(harnessHostCwd(t))
 	h.SetMode(harnessHostMode())
 	h.SetHostInfo(conformanceHostInfo)
+	h.ShareCells(conformanceCellRegistry)
 	h.SetUIBridge(bridge)
 	wire := observeWire(t, h)
 
@@ -3311,9 +3656,10 @@ func makeSubprocessRustHarness(t *testing.T) *harness {
 	bridge.SetNotifyFunc(ui.RecordNotify)
 	bridge.SetActions(conformanceActions(actions))
 
-	h := subprocess.NewHost(t.TempDir())
+	h := subprocess.NewHost(harnessHostCwd(t))
 	h.SetMode(harnessHostMode())
 	h.SetHostInfo(conformanceHostInfo)
+	h.ShareCells(conformanceCellRegistry)
 	h.SetUIBridge(bridge)
 	wire := observeWire(t, h)
 
@@ -3436,6 +3782,25 @@ func awaitCondition(ctx context.Context, cond func() bool) bool {
 // waitFor waits until pred holds. An extension's work only gets slower when
 // the machine is loaded, so the wait ends at the test's hang bound
 // (testbudget), never at a fixed wall-clock deadline.
+// expectRenderedLine waits until the component has drawn a line that arrived accepts, then compares that line with want: a wrong value fails with
+// both lines at once, not as a wait that ran out. It returns the line.
+func expectRenderedLine(t *testing.T, component interface{ Render(int) []string }, arrived func(line string) bool, want string) string {
+	t.Helper()
+	var got string
+	waitFor(t, func() bool {
+		lines := component.Render(72)
+		if len(lines) != 1 || !arrived(lines[0]) {
+			return false
+		}
+		got = lines[0]
+		return true
+	})
+	if got != want {
+		t.Fatalf("rendered line:\n got %q\nwant %q", got, want)
+	}
+	return got
+}
+
 func waitFor(t *testing.T, pred func() bool) {
 	t.Helper()
 	if !awaitCondition(testbudget.Context(t), pred) {
@@ -3791,9 +4156,9 @@ func TestConformance_Geometry(t *testing.T) {
 
 			var got string
 			pollUntilConformance(t, "geometry never reported", func() bool {
-				*h.notify = (*h.notify)[:0]
+				h.ui.ClearRecorded()
 				runConformanceCommand(t, h, "report_geometry")
-				for _, n := range *h.notify {
+				for _, n := range h.ui.Recorded() {
 					if strings.HasPrefix(n, "geometry:") {
 						got = n
 						return true

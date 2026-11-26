@@ -11,7 +11,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -840,6 +839,23 @@ func TestDefaultLoaderPromptPathRejectionKeepsReloadedSkills(t *testing.T) {
 
 // dyna patch P9: the context of ReloadWith ends a Package install. The npm process is killed, the reload returns the context's error at once, and no process is left running.
 func TestDefaultLoaderEndsAnInstallWithItsContext(t *testing.T) {
+	for _, mode := range []struct {
+		name      string
+		output    PackageCommandOutput
+		temporary bool
+	}{
+		{"configured, inherited", PackageCommandOutputInherit, false},
+		{"configured, captured", PackageCommandOutputCapture, false},
+		{"temporary, captured", PackageCommandOutputCapture, true},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			checkDefaultLoaderEndsAnInstallWithItsContext(t, mode.output, mode.temporary)
+		})
+	}
+}
+
+func checkDefaultLoaderEndsAnInstallWithItsContext(t *testing.T, output PackageCommandOutput, temporary bool) {
+	t.Helper()
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node is not on PATH")
@@ -850,12 +866,19 @@ func TestDefaultLoaderEndsAnInstallWithItsContext(t *testing.T) {
 	root := t.TempDir()
 	pidFile, script := filepath.Join(root, "pid"), filepath.Join(root, "npm.cjs")
 	writeResource(t, script, "if (process.argv.includes('install')) {\n  require('node:fs').writeFileSync(process.argv[2], String(process.pid));\n  setTimeout(() => {}, 60000);\n}\n")
-	settings, err := json.Marshal(map[string]any{"npmCommand": []string{node, script, pidFile, "--", "npm"}, "packages": []string{"npm:hung-pkg"}})
+	settingsValues := map[string]any{"npmCommand": []string{node, script, pidFile, "--", "npm"}}
+	options := DefaultResourceLoaderOptions{CWD: f.cwd, AgentDir: f.agentDir, PackageCommandOutput: output}
+	if temporary {
+		options.AdditionalExtensionPaths = []string{"npm:hung-pkg"}
+	} else {
+		settingsValues["packages"] = []string{"npm:hung-pkg"}
+	}
+	settings, err := json.Marshal(settingsValues)
 	if err != nil {
 		t.Fatal(err)
 	}
 	writeResource(t, filepath.Join(f.agentDir, "settings.json"), string(settings))
-	loader := NewDefaultResourceLoader(DefaultResourceLoaderOptions{CWD: f.cwd, AgentDir: f.agentDir})
+	loader := NewDefaultResourceLoader(options)
 	t.Cleanup(loader.Close)
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
@@ -874,11 +897,7 @@ func TestDefaultLoaderEndsAnInstallWithItsContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := process.Signal(syscall.Signal(0)); err == nil {
+	if loaderProcessAlive(t, pid) {
 		t.Fatalf("npm (pid %d) is still running", pid)
 	}
 }
@@ -886,6 +905,9 @@ func TestDefaultLoaderEndsAnInstallWithItsContext(t *testing.T) {
 // dyna patch P9: the git half. Whichever process of a git Package's install hangs (the clone, the checkout of its ref, or
 // the install of its dependencies) ends with the reload's context, and the reload fails with the context's error.
 func TestDefaultLoaderEndsAGitInstallWithItsContext(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX shell scripts as fake git and npm commands")
+	}
 	for _, hung := range []string{"clone", "checkout", "dependencies"} {
 		t.Run(hung, func(t *testing.T) {
 			f := newResourceLoaderFixture(t)
@@ -937,7 +959,7 @@ func TestDefaultLoaderEndsAGitInstallWithItsContext(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := syscall.Kill(pid, 0); err == nil {
+			if loaderProcessAlive(t, pid) {
 				t.Fatalf("the %s (pid %d) is still running", hung, pid)
 			}
 		})

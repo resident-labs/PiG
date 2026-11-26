@@ -1184,7 +1184,7 @@ function styleTextWithAnsi(text, fgAnsi, bgAnsi, options) {
 __name(styleTextWithAnsi, "styleTextWithAnsi");
 
 // pi-dist/pi-tui/components/box.js
-import { dispatchMouseEvent } from "../tui.js";
+import { dispatchMouseToChildLines, renderChildLines } from "../tui.js";
 import { flattenLines, visibleWidth } from "../utils.js";
 var Box = class {
   static {
@@ -1196,7 +1196,7 @@ var Box = class {
   bgFn;
   // Cache for rendered output
   cache;
-  mouseLayout;
+  childLines;
   constructor(paddingX = 1, paddingY = 1, bgFn) {
     this.paddingX = paddingX;
     this.paddingY = paddingY;
@@ -1226,10 +1226,7 @@ var Box = class {
   }
   invalidateCache() {
     this.cache = void 0;
-  }
-  matchCache(width, childLines, bgSample) {
-    const cache = this.cache;
-    return !!cache && cache.width === width && cache.bgSample === bgSample && cache.childLines.length === childLines.length && cache.childLines.every((line, i) => line === childLines[i]);
+    this.childLines = void 0;
   }
   invalidate() {
     this.invalidateCache();
@@ -1243,21 +1240,8 @@ var Box = class {
     const contentX = event.x - this.paddingX;
     if (contentY < 0 || contentX < 0 || contentX >= contentWidth)
       return void 0;
-    const mouseChildren = this.mouseLayout?.width === contentWidth ? this.mouseLayout.children : this.children.map((component) => ({ component, height: component.render(contentWidth).length }));
-    let childY = 0;
-    for (const { component: child, height: childHeight } of mouseChildren) {
-      if (contentY >= childY && contentY < childY + childHeight) {
-        return dispatchMouseEvent(child, {
-          ...event,
-          x: contentX,
-          y: contentY - childY,
-          width: contentWidth,
-          height: childHeight
-        });
-      }
-      childY += childHeight;
-    }
-    return void 0;
+    const layout = this.childLines?.width === contentWidth ? this.childLines : renderChildLines(this.children, contentWidth, void 0);
+    return dispatchMouseToChildLines(layout, { ...event, x: contentX, y: contentY, width: contentWidth });
   }
   render(width) {
     if (this.children.length === 0) {
@@ -1265,22 +1249,15 @@ var Box = class {
     }
     const contentWidth = Math.max(1, width - this.paddingX * 2);
     const leftPad = " ".repeat(this.paddingX);
-    const childLines = [];
-    const mouseChildren = [];
-    for (const child of this.children) {
-      const lines = child.render(contentWidth);
-      mouseChildren.push({ component: child, height: lines.length });
-      for (const line of lines) {
-        childLines.push(line);
-      }
-    }
-    this.mouseLayout = { width: contentWidth, children: mouseChildren };
+    this.childLines = renderChildLines(this.children, contentWidth, this.childLines);
+    const childLines = this.childLines.lines;
     if (childLines.length === 0) {
       return [];
     }
     const bgSample = this.bgFn ? this.bgFn("test") : void 0;
-    if (this.matchCache(width, childLines, bgSample)) {
-      return this.cache.lines;
+    const cache = this.cache;
+    if (cache?.childLines === childLines && cache.width === width && cache.bgSample === bgSample) {
+      return cache.lines;
     }
     const result = [];
     for (let i = 0; i < this.paddingY; i++) {
@@ -2104,8 +2081,9 @@ var Editor = class {
     const trimmed = text.trim();
     if (!trimmed)
       return;
-    if (this.history.length > 0 && this.history[0] === trimmed)
-      return;
+    const existing = this.history.indexOf(trimmed);
+    if (existing !== -1)
+      this.history.splice(existing, 1);
     this.history.unshift(trimmed);
     if (this.history.length > 100) {
       this.history.pop();
@@ -2371,13 +2349,15 @@ var Editor = class {
       if (kb.matches(data, "tui.select.confirm")) {
         const selected = this.autocompleteList.getSelectedItem();
         if (selected && this.autocompleteProvider) {
+          const beforeCursor = (this.state.lines[this.state.cursorLine] || "").slice(0, this.state.cursorCol);
+          const submitsCommand = this.autocompletePrefix.startsWith("/") && this.isInSlashCommandNameContext(beforeCursor);
           this.pushUndoSnapshot();
           this.lastAction = null;
           const result = this.autocompleteProvider.applyCompletion(this.state.lines, this.state.cursorLine, this.state.cursorCol, selected, this.autocompletePrefix);
           this.state.lines = result.lines;
           this.state.cursorLine = result.cursorLine;
           this.setCursorCol(result.cursorCol);
-          if (this.autocompletePrefix.startsWith("/")) {
+          if (submitsCommand) {
             this.cancelAutocomplete();
           } else {
             this.cancelAutocomplete();
@@ -2834,7 +2814,7 @@ var Editor = class {
           const x = Number(idGroup);
           if (x <= targetId)
             return fullMatch;
-          return `[paste #${x - 1}${suffixGroup}]`;
+          return `[paste #${x - 1}${suffixGroup ?? ""}]`;
         }));
       }
       line = this.state.lines[this.state.cursorLine] || "";
@@ -3390,6 +3370,10 @@ var Editor = class {
   isInSlashCommandContext(textBeforeCursor) {
     return this.isSlashMenuAllowed() && textBeforeCursor.trimStart().startsWith("/");
   }
+  // A slash command name is being typed: "/mo", not "/model cla" or "/open /tm".
+  isInSlashCommandNameContext(textBeforeCursor) {
+    return this.isInSlashCommandContext(textBeforeCursor) && !textBeforeCursor.trimStart().includes(" ");
+  }
   // Autocomplete methods
   /**
    * Find the best autocomplete item index for the given prefix.
@@ -3442,7 +3426,7 @@ var Editor = class {
       return;
     const currentLine = this.state.lines[this.state.cursorLine] || "";
     const beforeCursor = currentLine.slice(0, this.state.cursorCol);
-    if (this.isInSlashCommandContext(beforeCursor) && !beforeCursor.trimStart().includes(" ")) {
+    if (this.isInSlashCommandNameContext(beforeCursor)) {
       this.handleSlashCommandCompletion();
     } else {
       this.forceFileAutocomplete(true);
@@ -5723,6 +5707,30 @@ function trimPartialClosingFences(tokens) {
   token.text = token.text.slice(0, -lastLine.length).replace(/\n$/, "");
 }
 __name(trimPartialClosingFences, "trimPartialClosingFences");
+var HTML_COMMENT_REGEX = /<!--[\s\S]*?(?:-->|$)/g;
+function stripHtmlComments(html) {
+  return html.replace(HTML_COMMENT_REGEX, "");
+}
+__name(stripHtmlComments, "stripHtmlComments");
+function removeHtmlCommentBlocks(tokens) {
+  for (let i = tokens.length - 1; i >= 0; i--) {
+    const token = tokens[i];
+    if (token.type === "list") {
+      for (const item of token.items)
+        removeHtmlCommentBlocks(item.tokens);
+    } else if (token.type === "blockquote") {
+      removeHtmlCommentBlocks(token.tokens ?? []);
+    } else if (token.type === "html" && stripHtmlComments(token.raw).trim() === "") {
+      tokens.splice(i, 1);
+      if (tokens[i]?.type === "space" && (i === 0 || tokens[i - 1]?.type === "space")) {
+        tokens.splice(i, 1);
+      } else if (i === tokens.length && tokens[i - 1]?.type === "space") {
+        tokens.splice(--i, 1);
+      }
+    }
+  }
+}
+__name(removeHtmlCommentBlocks, "removeHtmlCommentBlocks");
 var markdownParser = new Marked();
 markdownParser.setOptions({
   tokenizer: new MarkdownTokenizer()
@@ -5801,6 +5809,7 @@ var Markdown = class {
     if (!tokens) {
       tokens = markdownParser.lexer(normalizedText);
       trimPartialClosingFences(tokens);
+      removeHtmlCommentBlocks(tokens);
       this.cachedTokens = new WeakRef({ source: normalizedText, tokens });
     }
     const reuseBlocks = Object.keys(tokens.links).length === 0;
@@ -5843,7 +5852,8 @@ var Markdown = class {
     const rightMargin = " ".repeat(this.paddingX);
     const bgFn = this.defaultTextStyle?.bgColor;
     const lines = [];
-    for (const line of this.renderToken(token, contentWidth, nextTokenType)) {
+    const tokenLines = this.renderToken(token, contentWidth, nextTokenType).flatMap((line) => isImageLine(line) ? line.split("\n") : [line]);
+    for (const line of tokenLines) {
       if (isImageLine(line)) {
         lines.push(line);
         continue;
@@ -6072,7 +6082,7 @@ var Markdown = class {
         break;
       case "html":
         if ("raw" in token && typeof token.raw === "string") {
-          lines.push(this.applyDefaultStyle(token.raw.trim()));
+          lines.push(this.applyDefaultStyle(stripHtmlComments(token.raw).trim()));
         }
         break;
       case "space":
@@ -6093,7 +6103,13 @@ var Markdown = class {
       const segments = text.split("\n");
       return segments.map((segment) => applyText(segment)).join("\n");
     }, "applyTextWithNewlines");
-    for (const token of tokens) {
+    let dropLeadingSpace = false;
+    for (let i = 0; i < tokens.length; i++) {
+      let token = tokens[i];
+      if (dropLeadingSpace && token.type === "text" && !token.tokens?.length && /^[ \t]/.test(token.text)) {
+        token = { ...token, text: token.text.replace(/^[ \t]+/, "") };
+      }
+      dropLeadingSpace = false;
       switch (token.type) {
         case "latex": {
           const latexToken = token;
@@ -6151,7 +6167,9 @@ var Markdown = class {
           break;
         }
         case "html":
-          if ("raw" in token && typeof token.raw === "string") {
+          if (token.raw.startsWith("<!--")) {
+            dropLeadingSpace = i === 0 || /[ \t]$/.test(tokens[i - 1].raw);
+          } else {
             result += applyTextWithNewlines(token.raw);
           }
           break;
@@ -6379,7 +6397,7 @@ var Markdown = class {
 };
 
 // pi-dist/pi-tui/components/mouse-region.js
-import { dispatchMouseEvent as dispatchMouseEvent2 } from "../tui.js";
+import { dispatchMouseEvent } from "../tui.js";
 var MouseRegion = class {
   static {
     __name(this, "MouseRegion");
@@ -6394,7 +6412,7 @@ var MouseRegion = class {
     return this.child.render(width);
   }
   handleMouse(event) {
-    const childResult = dispatchMouseEvent2(this.child, event);
+    const childResult = dispatchMouseEvent(this.child, event);
     return childResult ?? this.onMouse(event);
   }
   invalidate() {
@@ -6773,8 +6791,11 @@ var SettingsList = class {
     } else if (kb.matches(data, "tui.select.cancel")) {
       this.onCancel();
     } else if (this.searchEnabled && this.searchInput) {
+      const previousQuery = this.searchInput.getValue();
       this.searchInput.handleInput(data);
-      this.applyFilter(this.searchInput.getValue());
+      const query = this.searchInput.getValue();
+      if (query !== previousQuery)
+        this.applyFilter(query);
     }
   }
   getDisplayItems() {
@@ -8107,7 +8128,7 @@ function renderCached(context, component, width) {
   }
   let lines = widths.get(safeWidth);
   if (!lines) {
-    lines = component.render(safeWidth);
+    lines = context.reusableOutput?.get(component)?.get(safeWidth) ?? component.render(safeWidth);
     widths.set(safeWidth, lines);
   }
   return lines;
@@ -8361,12 +8382,14 @@ function paintBox(box, screen, totalWidth) {
   paintScrollbar(box, screen, totalWidth);
 }
 __name(paintBox, "paintBox");
-function renderLayoutFrame(root, width, height, requestRender) {
+function renderLayoutFrame(root, width, height, requestRender, reusableOutput) {
   const safeWidth = Math.max(1, Math.floor(width));
   const safeHeight = Math.max(1, Math.floor(height));
+  const renderCache = /* @__PURE__ */ new Map();
   const context = {
     viewport: { width: safeWidth, height: safeHeight },
-    renderCache: /* @__PURE__ */ new Map(),
+    renderCache,
+    reusableOutput,
     requestRender,
     primaryScrollView: void 0
   };
@@ -8383,7 +8406,8 @@ function renderLayoutFrame(root, width, height, requestRender) {
     width: safeWidth,
     height: safeHeight,
     lines,
-    ...context.primaryScrollView === void 0 ? {} : { primaryScrollView: context.primaryScrollView }
+    ...context.primaryScrollView === void 0 ? {} : { primaryScrollView: context.primaryScrollView },
+    renderCache
   };
 }
 __name(renderLayoutFrame, "renderLayoutFrame");
@@ -8437,7 +8461,7 @@ __name(getScrollViewsAt, "getScrollViewsAt");
 
 // pi-dist/pi-tui/tui-alt-screen.js
 import { deleteAllKittyImages, deleteAllKittyPlacements, deleteKittyImage, getCapabilities as getCapabilities3, getKittyImagePlacement, getKittyImagePlacementRows, isImageLine as isImageLine3, setCapabilities } from "../terminal-image.js";
-import { Container as Container3, CURSOR_MARKER as CURSOR_MARKER4, compositeTuiLine as compositeTuiLine3, dispatchMouseEvent as dispatchMouseEvent3, retargetMouseEvent, TuiBase, VIEWPORT_TUI } from "../tui.js";
+import { Container as Container3, CURSOR_MARKER as CURSOR_MARKER4, compositeTuiLine as compositeTuiLine3, dispatchMouseEvent as dispatchMouseEvent2, retargetMouseEvent, TuiBase, VIEWPORT_TUI } from "../tui.js";
 import { extractAnsiCode as extractAnsiCode2, getGraphemeCellRange as getGraphemeCellRange2, getOsc8LinkAtColumn, getWordSegmenter as getWordSegmenter3, sliceByColumn as sliceByColumn4, stripTerminalSequences as stripTerminalSequences2, truncateToWidth as truncateToWidth8, visibleWidth as visibleWidth13 } from "../utils.js";
 
 // pi-dist/pi-tui/wheel-scroll.js
@@ -8777,15 +8801,15 @@ var TuiAltScreen = class extends TuiBase {
   }
   scrollBy(lines) {
     this.getPrimaryScrollView().scrollBy(lines);
-    this.requestRender();
+    this.requestViewRender();
   }
   scrollToTop() {
     this.getPrimaryScrollView().scrollToStart();
-    this.requestRender();
+    this.requestViewRender();
   }
   scrollToBottom() {
     this.getPrimaryScrollView().scrollToEnd();
-    this.requestRender();
+    this.requestViewRender();
   }
   scrollToPrompt(direction) {
     if (!this.currentLayout)
@@ -8798,7 +8822,7 @@ var TuiAltScreen = class extends TuiBase {
       if (!OSC133_PROMPT_START.test(lines[row] ?? ""))
         continue;
       scrollView.scrollTo(row);
-      this.requestRender();
+      this.requestViewRender();
       return;
     }
   }
@@ -9124,7 +9148,7 @@ var TuiAltScreen = class extends TuiBase {
       if (getLayoutNode(box.component) && box.component.handleMouse === Container3.prototype.handleMouse)
         continue;
       visited.add(box.component);
-      const result = dispatchMouseEvent3(box.component, {
+      const result = dispatchMouseEvent2(box.component, {
         ...event,
         x: event.screenX - box.rect.x,
         y: event.screenY - box.rect.y,
@@ -9146,7 +9170,7 @@ var TuiAltScreen = class extends TuiBase {
     return result.render ?? (focusChanged || event.type === "press" || event.type === "click" || event.type === "drag" || event.type === "wheel");
   }
   dispatchMouseToTarget(event, target) {
-    return dispatchMouseEvent3(target.component, retargetMouseEvent(event, target));
+    return dispatchMouseEvent2(target.component, retargetMouseEvent(event, target));
   }
   getComponentClickCount(target, x, y) {
     const now = Date.now();
@@ -9270,7 +9294,7 @@ var TuiAltScreen = class extends TuiBase {
     if (remaining !== 0 && !seen.has(primary))
       primary.scrollBy(remaining);
     this.updateScrollbarHover(event.x, event.y);
-    this.requestRender();
+    this.requestViewRender();
   }
   parseSgrMouseEvent(data) {
     const match = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/.exec(data);
@@ -9516,7 +9540,7 @@ var TuiAltScreen = class extends TuiBase {
     const point = this.getScrollSelectionPoint(scrollView, pointer.x, pointer.y);
     if (point)
       this.updateSelectionFocus(point);
-    this.requestRender();
+    this.requestViewRender();
   }
   stopSelectionAutoScroll() {
     if (this.selectionAutoScrollTimer) {
@@ -9860,9 +9884,12 @@ var TuiAltScreen = class extends TuiBase {
     const width = Math.max(1, this.terminal.columns);
     const height = Math.max(1, this.terminal.rows);
     const root = this.layoutRoot ?? this.implicitScrollView;
-    let nextLayout = renderLayoutFrame(root, width, height, () => this.requestRender());
+    const requestViewRender = /* @__PURE__ */ __name(() => this.requestViewRender(), "requestViewRender");
+    const reusableOutput = this.contentChanged ? void 0 : this.currentLayout?.renderCache;
+    this.contentChanged = false;
+    let nextLayout = renderLayoutFrame(root, width, height, requestViewRender, reusableOutput);
     if (this.refreshSearch(nextLayout)) {
-      nextLayout = renderLayoutFrame(root, width, height, () => this.requestRender());
+      nextLayout = renderLayoutFrame(root, width, height, requestViewRender, nextLayout.renderCache);
     }
     let screen = this.resolveFakeCursors(nextLayout.lines.map((line) => line.replace(OSC133_ZONE_PREFIX2, "")));
     screen = this.applySearchHighlights(screen, nextLayout);
@@ -9881,8 +9908,7 @@ var TuiAltScreen = class extends TuiBase {
     const fullRedraw = this.previousScreen.length === 0 || this.previousScreenWidth !== width || this.previousScreenHeight !== height;
     const changedRows = screen.map((line, row) => line !== this.previousScreen[row]);
     const imageAnchorsNeedRedraw = screen.some((line, row) => changedRows[row] && (isImageLine3(line) || isImageLine3(this.previousScreen[row] ?? "")));
-    const isWezTerm = Boolean(process.env.WEZTERM_PANE) || process.env.TERM_PROGRAM?.toLowerCase() === "wezterm";
-    const imageCellsNeedRedraw = !imageAnchorsNeedRedraw && isWezTerm && this.imageProtocol === "kitty" && changedRows.some(Boolean) && screen.some((line, row) => {
+    const imageCellsNeedRedraw = !imageAnchorsNeedRedraw && this.imageProtocol === "kitty" && changedRows.some(Boolean) && screen.some((line, row) => {
       const placementRows = getKittyImagePlacementRows(line);
       if (placementRows === void 0)
         return false;
@@ -9899,8 +9925,11 @@ var TuiAltScreen = class extends TuiBase {
     let buffer = BEGIN_SYNCHRONIZED_OUTPUT;
     if (fullRedraw) {
       this.fullRedrawCount += 1;
-      const clearImages = this.imageProtocol === "kitty" && hadUploadedKittyImages ? deleteAllKittyPlacements() : this.deleteKittyImages();
-      buffer += `${clearImages}\x1B[2J`;
+      if (this.imageProtocol === "kitty" && hadUploadedKittyImages) {
+        buffer += deleteAllKittyPlacements();
+      } else {
+        buffer += `${this.deleteKittyImages()}\x1B[2J`;
+      }
     } else if (imagesNeedRedraw) {
       if (this.imageProtocol === "iterm2")
         buffer += "\x1B[2J";
@@ -9908,7 +9937,7 @@ var TuiAltScreen = class extends TuiBase {
         buffer += deleteAllKittyPlacements();
     }
     buffer += preparedKittyScreen.evictedImageDeletion;
-    const drawKittyImagesLast = redrawImages && this.imageProtocol === "kitty" && screen.some(isImageLine3) && isWezTerm;
+    const drawKittyImagesLast = redrawImages && this.imageProtocol === "kitty" && screen.some(isImageLine3);
     if (drawKittyImagesLast) {
       for (let row = 0; row < height; row++) {
         if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row])

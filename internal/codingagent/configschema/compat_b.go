@@ -16,6 +16,7 @@ func AnthropicMessagesCompatSchema() *Schema {
 		Optional("supportsMidConvoEffort", Boolean(D("Whether the exact model transport supports effort-only system messages and thinking binding controls."), Default(false))),
 		optionalCompatBoolean("supportsMidConvoSystemMessages", D("Whether the exact model accepts system-role messages inside the conversation. When false, later system messages are folded into the top-level system prompt."), Default(false)),
 		Optional("supportsMidConvoToolChanges", Boolean(D("Whether the exact model accepts mid-conversation tool_addition and tool_removal blocks. Requires supportsMidConvoSystemMessages."), Default(false))),
+		optionalCompatBoolean("supportsMessageThreads", D("Whether the endpoint supports Anthropic message threads, which let a request with a session id send only the new messages and continue from the previous reply. Default: true for a baseUrl on api.anthropic.com, false otherwise. Set true for gateways that forward the thread request field.")),
 		Optional("allowedFallbackModels", Array(AnthropicAllowedFallbackModelSchema(), Opt{"maxItems", 3}, D("Models Anthropic accepts for server-side refusal fallback, with local pricing metadata for returned fallback responses. When absent or empty, callers must omit fallbacks; Anthropic rejects the field for models with no permitted fallback targets."))),
 	}, D("Compatibility settings for Anthropic Messages-compatible APIs."), Opt{"additionalProperties", true})
 }
@@ -29,7 +30,15 @@ func BedrockCompatSchema() *Schema {
 func MistralConversationsCompatSchema() *Schema {
 	return OpenObject([]Prop{
 		optionalCompatBoolean("supportsMidConvoSystemMessages", D("Whether the exact model accepts system messages after the conversation has started. When false, later system messages are folded into the leading system message."), Default(false)),
+		optionalCompatBoolean("supportsStrictMode", D("Whether the model supports strict (schema-constrained) function tools."), Default(false)),
 	}, D("Compatibility settings for the Mistral chat API."), Opt{"additionalProperties", true})
+}
+
+// GoogleCompatSchema is compat-schema.ts GoogleCompatSchema (Pi fe8a6f5dc, #12371).
+func GoogleCompatSchema() *Schema {
+	return OpenObject([]Prop{
+		optionalCompatBoolean("supportsStrictMode", D("Whether the model enforces strict tools through Gemini's VALIDATED function-calling mode. Default: true for model IDs containing gemini-3 or a later version, such as gemini-3-pro or vendor-gemini-4-argon, false otherwise. Set true for Gemini 3+ models served under IDs without the version.")),
+	}, D("Compatibility settings for the Google Generative AI and Vertex APIs."), Opt{"additionalProperties", true})
 }
 
 // SystemOneCompatSchema is compat-schema.ts SystemOneCompatSchema.
@@ -46,7 +55,8 @@ func ProviderCompatSchema() *Schema {
 		optionalCompatBoolean("supportsDeveloperRole", D("Whether the provider supports the developer role instead of system. Defaults are API-specific.")),
 		optionalCompatBoolean("supportsMidConvoSystemMessages", D("Whether the exact model accepts system or developer messages after the conversation has started. When false, later system messages are folded into the leading system message."), Default(false)),
 		optionalSessionAffinityFormat(D("Session-affinity header format. Defaults are API-specific or auto-detected.")),
-		optionalCompatBoolean("supportsMidConvoEffort", D("Whether thinking level changes are sent inside the conversation instead of changing the request's effort, so a change keeps the prompt cache. Used by the anthropic-messages and openai-responses APIs."), Default(false)),
+		optionalPromptCacheKeyMode(D("Controls the prompt_cache_key request field for openai-completions and openai-responses: auto keeps each API's default, enabled sends it whenever caching is active, disabled never sends it. Default: auto.")),
+		optionalCompatBoolean("supportsMidConvoEffort", D("Whether thinking level changes are sent inside the conversation instead of changing the request's effort, so a change keeps the prompt cache. Used by the anthropic-messages, openai-responses, and openai-codex-responses APIs."), Default(false)),
 		optionalCompatBoolean("supportsLongCacheRetention", D("Whether the provider supports long prompt cache retention. Defaults are API-specific or auto-detected.")),
 		optionalCompatBoolean("supportsStrictMode", D("Whether the provider supports strict tool schemas. Defaults are API-specific.")),
 		optionalCompatBoolean("supportsOpenAIGrammarTools", D("Whether the provider supports OpenAI custom tools with Lark or regex grammar formats. When false, grammar-constrained tools fall back to normal function tools."), Default(false)),
@@ -127,6 +137,8 @@ func CompatSchemasByApi() []CompatSchemaEntry {
 		{"anthropic-messages", "AnthropicMessagesCompatSchema"},
 		{"bedrock-converse-stream", "BedrockCompatSchema"},
 		{"mistral-conversations", "MistralConversationsCompatSchema"},
+		{"google-generative-ai", "GoogleCompatSchema"},
+		{"google-vertex", "GoogleCompatSchema"},
 		{"typesafe-system-one", "SystemOneCompatSchema"},
 		{"cloudflare-workers-ai-system-one", "SystemOneCompatSchema"},
 	}
@@ -144,6 +156,8 @@ func compatSchemaNamed(name string) *Schema {
 		return BedrockCompatSchema()
 	case "MistralConversationsCompatSchema":
 		return MistralConversationsCompatSchema()
+	case "GoogleCompatSchema":
+		return GoogleCompatSchema()
 	case "SystemOneCompatSchema":
 		return SystemOneCompatSchema()
 	}

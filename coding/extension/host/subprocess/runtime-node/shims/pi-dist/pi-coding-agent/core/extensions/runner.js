@@ -200,6 +200,11 @@ export class ExtensionRunner {
     constructor(extensions, runtime, cwd, sessionManager, modelRegistry) {
         this.extensions = extensions;
         this.runtime = runtime;
+        // A handler still running when its session is replaced must not report into the replacement's UI.
+        this.runtime.reportError = (error) => {
+            if (!this.staleMessage)
+                this.emitError(error);
+        };
         this.uiContext = noOpUIContext;
         this.cwd = cwd;
         this.sessionManager = sessionManager;
@@ -535,8 +540,16 @@ export class ExtensionRunner {
         }
         return undefined;
     }
+    /** Markdown transformers in extension load order; each one leaves Markdown of unregistered surfaces unchanged. */
     getMarkdownTransformers() {
-        return this.extensions.flatMap((ext) => (ext.markdownTransformer ? [ext.markdownTransformer] : []));
+        return this.extensions.flatMap((ext) => {
+            if (!ext.markdownTransformer)
+                return [];
+            const { transformer, messageTypes } = ext.markdownTransformer;
+            return [
+                (markdown, context) => (messageTypes.has(context.messageType) ? transformer(markdown, context) : markdown),
+            ];
+        });
     }
     /** Renderers of calls to `toolName`: extension resolvers in load order, then `base`. */
     resolveToolRenderers(toolName, base) {

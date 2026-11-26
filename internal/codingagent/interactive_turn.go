@@ -14,6 +14,7 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
 	"github.com/MichaelKinsy/PiG/internal/imageprocessing"
+	"github.com/MichaelKinsy/PiG/internal/jsloop"
 	"github.com/MichaelKinsy/PiG/internal/pigstrip"
 	"github.com/MichaelKinsy/PiG/tui"
 	"github.com/MichaelKinsy/PiG/tui/widthx"
@@ -30,13 +31,6 @@ func isUserBashCommand(text string) bool {
 }
 
 func (m *InteractiveMode) handleSubmitWithImages(ctx context.Context, prompt string, images []ai.ImageContent) {
-	// Defensive drain for messages restored after a failed compaction-queue
-	// delivery. Normal compaction completion flushes immediately, including the
-	// WillRetry path that steers into the imminent retry turn.
-	if !m.isCompacting && len(m.compactionQueue) > 0 {
-		m.flushCompactionQueue(ctx, false)
-	}
-
 	// Queue model-bound inputs during compaction, but let local
 	// slash commands and bash run immediately. Upstream's onSubmit handles its
 	// builtin command if-chain (/model, /session, /fork, /tree, /new, ...) and
@@ -125,7 +119,7 @@ func (m *InteractiveMode) promptUserInput(ctx context.Context, text string, imag
 			behavior = "followUp"
 		}
 	}
-	submission := inputPreflight{
+	m.dispatchSubmission(inputPreflight{
 		ctx:       ctx,
 		text:      text,
 		images:    images,
@@ -135,11 +129,39 @@ func (m *InteractiveMode) promptUserInput(ctx context.Context, text string, imag
 		streaming: streaming,
 		source:    source,
 		session:   m.opts.SessionHandle,
+	})
+}
+
+// queueUserInput is upstream _queueUserInput, which steer() and followUp() call: the input handlers see the text with the streaming behavior sampled
+// while a run is active, skill commands and prompt templates expand, and the text is queued as a steering message, or as a follow-up with followUp,
+// whether or not a run is active. A prompt rejected on the way is reported like promptUserInput's.
+func (m *InteractiveMode) queueUserInput(ctx context.Context, text string, images []ai.ImageContent, followUp bool, source extension.InputSource) {
+	behavior := ""
+	if m.runStreaming() {
+		behavior = "steer"
+		if followUp {
+			behavior = "followUp"
+		}
 	}
+	m.dispatchSubmission(inputPreflight{
+		ctx:       ctx,
+		text:      text,
+		images:    images,
+		followUp:  followUp,
+		expand:    true,
+		queueOnly: true,
+		behavior:  behavior,
+		source:    source,
+		session:   m.opts.SessionHandle,
+	})
+}
+
+// dispatchSubmission runs a submission's input handlers on the strategy interactive_input_preflight.go describes.
+func (m *InteractiveMode) dispatchSubmission(submission inputPreflight) {
 	// The synchronous path must not overtake, or clear, a dispatch still in
 	// flight (handlers can be unloaded by /reload while one runs).
 	if !m.inputHandlersRegistered() && !m.preflightPending() {
-		text, images, handled, err := m.runInputHandlers(ctx, text, images, source, behavior)
+		text, images, handled, err := m.runInputHandlers(submission.ctx, submission.text, submission.images, submission.source, submission.behavior)
 		m.finishPreflight(submission, inputPreflightResult{text: text, images: images, handled: handled, err: err})
 		return
 	}
@@ -241,9 +263,6 @@ func (m *InteractiveMode) emitAgentSettledEvent() {
 }
 
 // emitAgentSettledFor dispatches agent_settled with aborted, whether the run ended because it was aborted (upstream agent-session.ts _emitAgentSettled reads _agentRunAbortRequested).
-// The actions the handlers deferred start after the last handler returned, unless exit is requested: the quit settles the interrupted run on the owner loop (settleRunAtQuit) and
-// waits for the Session to be idle, so a run started now would hold the quit for a whole provider turn. Pi's quit does not wait for the run at all (1.5.0 agent-session-runtime.ts
-// dispose, interactive-mode.ts shutdown ends in process.exit(0)): the deferred message is dropped, and nothing of it reaches a provider or the session file.
 func (m *InteractiveMode) emitAgentSettledFor(runner *inproc.Runner, aborted bool) {
 	m.settledMu.Lock()
 	m.emittingAgentSettled = true
@@ -256,9 +275,6 @@ func (m *InteractiveMode) emitAgentSettledFor(runner *inproc.Runner, aborted boo
 	deferred := m.deferredSettledActions
 	m.deferredSettledActions = nil
 	m.settledMu.Unlock()
-	if m.requestExit.Load() {
-		return
-	}
 	for _, action := range deferred {
 		action()
 	}
@@ -321,6 +337,7 @@ func (m *InteractiveMode) startTurn(ctx context.Context, prompt string, images [
 			// runCtx so cleanup still applies after an aborted turn; it is
 			// dropped only when the whole session is shutting down.
 			m.runOnMain(m.runCtx, func() {
+				turnEnd := m.beginTurnEnd()
 				if m.runGen == gen {
 					m.isIdle = true
 					m.idleCollectArmed.Store(true) // pig additive (D172): arm the idle collection at run end
@@ -328,8 +345,8 @@ func (m *InteractiveMode) startTurn(ctx context.Context, prompt string, images [
 					m.statusLine.SetWorking(false)
 					m.stopWorkingLoader() // belt-and-suspenders: ensure loader is removed on abort
 				}
-				m.updatePendingMessagesDisplay() // clear stale queue indicators
-				m.tuiInst.Render()
+				m.rebuildPendingMessages() // clear stale queue indicators
+				m.paintTurnEnd(turnEnd)
 			})
 			// Upstream prompt() throws before _runAgentPrompt, so a rejected
 			// prompt has no agent_settled.
@@ -358,7 +375,7 @@ func (m *InteractiveMode) startTurn(ctx context.Context, prompt string, images [
 			}
 			m.emitAgentSettledFor(runner, aborted)
 			// upstream: interactive-mode.ts handleEvent reports the Session's agent_settled event; interactive mode here drives settlement itself.
-			m.runOnMain(m.runCtx, func() { m.programStatusReporter().HandleEvent(agent.AgentSettledEvent{Aborted: aborted}) })
+			m.runOnMain(m.runCtx, func() { m.handleAgentEvent(agent.AgentSettledEvent{Aborted: aborted}) })
 		}()
 		// agent-session.ts:1673-1691 validates the model and its auth before
 		// the compaction check and before_agent_start. interactive-mode.ts
@@ -366,9 +383,10 @@ func (m *InteractiveMode) startTurn(ctx context.Context, prompt string, images [
 		if userPrompt {
 			if err := m.validatePromptModelAuth(runCtx); err != nil {
 				rejected = true
+				markPromptRejected(ctx)
 				_ = m.settleTurn(runCtx, err)
 				if runCtx.Err() == nil {
-					m.runOnMain(m.runCtx, func() { m.showError(err.Error()) })
+					m.runOnMain(m.runCtx, func() { m.rejectPrompt(ctx, err) })
 				}
 				return
 			}
@@ -390,9 +408,15 @@ func (m *InteractiveMode) startTurn(ctx context.Context, prompt string, images [
 		if userPrompt {
 			err = m.prepareRunPrompt(runCtx, runner, gen, extension.UserPromptTrigger(prompt, images))
 			rejected = err != nil
+			if rejected {
+				markPromptRejected(ctx)
+			}
 		} else if custom != nil {
 			err = m.prepareRunPrompt(runCtx, runner, gen, extension.CustomMessageTrigger(*custom))
 			rejected = err != nil
+			if rejected {
+				markPromptRejected(ctx)
+			}
 		}
 
 		// The user prompt, assistant messages, and tool results are all persisted
@@ -407,9 +431,12 @@ func (m *InteractiveMode) startTurn(ctx context.Context, prompt string, images [
 		// Only the run's own cancellation (Esc or shutdown) is silent; any
 		// other error, a deadline from elsewhere included, is shown.
 		if err != nil && runCtx.Err() == nil {
-			m.showTurnError(err)
+			if rejected {
+				m.runOnMain(m.runCtx, func() { m.rejectPrompt(ctx, err) })
+			} else {
+				m.showTurnError(err)
+			}
 		}
-		m.runOnMain(m.runCtx, func() { m.tuiInst.Render() })
 	}()
 }
 
@@ -434,7 +461,8 @@ func (m *InteractiveMode) checkPromptCompaction(ctx context.Context) {
 // compaction, and only queued input continues the run.
 func (m *InteractiveMode) runAgentPrompt(ctx context.Context, start func(context.Context) ([]agent.AgentMessage, error)) ([]agent.AgentMessage, error) {
 	if m.opts.SessionHandle != nil {
-		return m.opts.SessionHandle.RunAgentPrompt(ctx, start)
+		// The run reports the tasks of Pi's event loop it executes, so the frames keep to their bounds (handleAgentEvent).
+		return m.opts.SessionHandle.RunAgentPrompt(jsloop.WithTasks(ctx), start)
 	}
 	messages, err := start(ctx)
 	for err == nil && ctx.Err() == nil && m.agent.HasQueuedMessages() {
@@ -487,19 +515,122 @@ func (m *InteractiveMode) settleTurnWithPrompt(ctx context.Context, err error, f
 	}
 }
 
+// promptLoopSubmit is run()'s `await this.session.prompt(text)` for one text of the prompt loop (the initial messages and the main loop). It submits the text
+// like handleSubmit; an extension command the text starts is the one the loop awaits: it takes no further prompt until the command returned.
+func (m *InteractiveMode) promptLoopSubmit(ctx context.Context, text string, images []ai.ImageContent) {
+	m.takeStartedCommand()
+	m.handleSubmitWithImages(ctx, text, images)
+	returned := m.takeStartedCommand()
+	if returned == nil {
+		return
+	}
+	m.queueMu.Lock()
+	m.promptCommand = returned
+	m.queueMu.Unlock()
+	// Wakes the owner loop, which takes the next prompt only after it saw the command return.
+	m.afterExtensionCommand(returned, func() {})
+}
+
+// startExtensionCommand runs an extension command, off the owner loop because its handler may wait on the user and its IPC must not block the loop that
+// routes the user's keys. It uses the runner's command context and error channel, as Session command dispatch does. The caller that awaits the command, as
+// Pi awaits session.prompt() on one, takes the channel that closes when it returns with takeStartedCommand.
+func (m *InteractiveMode) startExtensionCommand(runner *inproc.Runner, name, args string) {
+	baseCtx := m.runCtx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	returned := make(chan struct{})
+	m.queueMu.Lock()
+	m.startedCommand = returned
+	m.queueMu.Unlock()
+	go func() {
+		defer close(returned)
+		runner.ExecuteCommand(baseCtx, name, args)
+	}()
+}
+
+// takeStartedCommand returns the channel that closes when the extension command started last returns, nil when none was started since the last call.
+func (m *InteractiveMode) takeStartedCommand() <-chan struct{} {
+	m.queueMu.Lock()
+	defer m.queueMu.Unlock()
+	returned := m.startedCommand
+	m.startedCommand = nil
+	return returned
+}
+
+// dispatchExtensionCommand runs text as a slash command and returns the channel that closes when the extension command it started returns, nil when it
+// started none.
+func (m *InteractiveMode) dispatchExtensionCommand(ctx context.Context, text string) <-chan struct{} {
+	m.takeStartedCommand()
+	m.dispatchSlash(ctx, text)
+	return m.takeStartedCommand()
+}
+
+// afterExtensionCommand runs fn on the owner loop once the extension command whose channel is returned has returned. It runs nothing when the mode stops first.
+func (m *InteractiveMode) afterExtensionCommand(returned <-chan struct{}, fn func()) {
+	ctx := m.backgroundCtx
+	if ctx == nil {
+		ctx = m.runCtx
+	}
+	// A mode that never ran has no context: the wait then ends only when the command returns, and runOnMain posts without a cancellation source.
+	var stopped <-chan struct{}
+	if ctx != nil {
+		stopped = ctx.Done()
+	}
+	m.backgroundTasks.Go(func() {
+		select {
+		case <-returned:
+			m.runOnMain(ctx, fn)
+		case <-stopped:
+		}
+	})
+}
+
+// promptCommandPending reports whether the extension command the prompt loop submitted is still running.
+func (m *InteractiveMode) promptCommandPending() bool {
+	m.queueMu.Lock()
+	returned := m.promptCommand
+	m.queueMu.Unlock()
+	if returned == nil {
+		return false
+	}
+	select {
+	case <-returned:
+		return false
+	default:
+		return true
+	}
+}
+
+// waitForPromptCommand blocks until the extension command the prompt loop submitted has returned, or ctx ends.
+func (m *InteractiveMode) waitForPromptCommand(ctx context.Context) error {
+	m.queueMu.Lock()
+	returned := m.promptCommand
+	m.queueMu.Unlock()
+	if returned == nil {
+		return nil
+	}
+	select {
+	case <-returned:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // submitInitialMessages sends each message as its own prompt after the
-// previous run settles, as upstream awaits session.prompt for every entry of
-// initialMessages before the interactive loop. It runs off the owner loop and
-// stops when ctx ends.
+// previous run settles and the previous extension command returns, as upstream
+// awaits session.prompt for every entry of initialMessages before the
+// interactive loop. It runs off the owner loop and stops when ctx ends.
 func (m *InteractiveMode) submitInitialMessages(ctx context.Context, messages []string) {
 	for _, message := range messages {
-		if m.waitForIdle(ctx) != nil {
+		if m.waitForPromptCommand(ctx) != nil || m.waitForIdle(ctx) != nil {
 			return
 		}
 		submitted := make(chan struct{})
 		if m.postToMain(ctx, func() {
 			defer close(submitted)
-			m.handleSubmit(ctx, message)
+			m.promptLoopSubmit(ctx, message, nil)
 		}) != nil {
 			return
 		}
@@ -543,15 +674,20 @@ func waitForSessionIdle(ctx context.Context, settled <-chan struct{}, session In
 // showTurnError surfaces a failed run on the main loop.
 func (m *InteractiveMode) showTurnError(err error) {
 	// Upstream shows the error text through showError; it never starts a login from it.
-	message := err.Error()
-	if errors.Is(err, agent.ErrNoModelSelected) {
-		// prompt() throws formatNoModelSelectedMessage(), with login and /model guidance, instead of a bare error.
-		message = FormatNoModelSelectedMessage()
-	}
+	message := turnErrorMessage(err)
 	m.runOnMain(m.runCtx, func() {
 		m.showError(message)
 		m.tuiInst.Render()
 	})
+}
+
+// turnErrorMessage is the text of a prompt's error.
+func turnErrorMessage(err error) string {
+	if errors.Is(err, agent.ErrNoModelSelected) {
+		// prompt() throws formatNoModelSelectedMessage(), with login and /model guidance, instead of a bare error.
+		return FormatNoModelSelectedMessage()
+	}
+	return err.Error()
 }
 
 // handleBashCommand owns the awaited user_bash dispatch, execution and persistence off the input loop. UI mutations return to the owner loop; hook failure never falls back to local execution.
@@ -584,11 +720,12 @@ func (m *InteractiveMode) handleBashCommand(ctx context.Context, command string,
 			block = tui.NewBashExecutionComponent(command, m.tuiInst, excludeFromContext, m.outputPad)
 			m.toolMu.Lock()
 			m.bashOrder = append(m.bashOrder, block)
-			// upstream: interactive-mode.ts:3871,7009,7037 never call setExpanded on a new BashExecutionComponent; it starts collapsed.
+			// The block starts in the current expand state.
+			block.SetExpanded(m.toolsExpanded)
 			m.toolMu.Unlock()
 			if deferred {
-				// Upstream shows a command started during a run in the pending-message area and keeps it there until
-				// the next prompt submitted while idle moves it into the chat (flushPendingBashComponents).
+				// Upstream shows a command started during a run in the pending-message area and keeps it there until the
+				// run settles or the next prompt submitted while idle moves it into the chat (flushPendingBashComponents).
 				m.pendingBashBlocksMu.Lock()
 				m.pendingBashBlocks = append(m.pendingBashBlocks, block)
 				m.pendingBashBlocksMu.Unlock()
@@ -696,7 +833,7 @@ func (m *InteractiveMode) finishUserBash(ctx context.Context, handle Interactive
 }
 
 // flushPendingBashBlocks moves the commands started during a run from the pending-message area into the chat
-// (interactive-mode.ts flushPendingBashComponents). Upstream calls it only for a prompt submitted while idle.
+// (interactive-mode.ts flushPendingBashComponents). Upstream calls it for a prompt submitted while idle and when the run settles.
 func (m *InteractiveMode) flushPendingBashBlocks() {
 	m.pendingBashBlocksMu.Lock()
 	pending := m.pendingBashBlocks

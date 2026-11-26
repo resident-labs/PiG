@@ -1,0 +1,4 @@
+### Fixed
+
+- Keep attachment resize results in the recorded queue entry when the user message has custom members. <!-- fix: 46ebfe33436f16431df29201a19a78e034ebbb94 --> <!-- cause: Queue delivery replaced the typed image content but retained the original JSON source to preserve the custom members. --> <!-- tests: TestSessionResizesImagesInQueuedSteeringAndFollowUpMessages, TestReplaceContentBlocksKeepsRetainedUserMembers -->
+- Release the old request snapshot on session replacement, and show streamed progress during live compaction without changing Escape cancellation. <!-- fix: 46ebfe33436f16431df29201a19a78e034ebbb94 --> <!-- cause: The live compaction path retained its last request across session replacement and skipped the standalone summarizer's progress reader. --> <!-- tests: TestReplaceInnerReleasesTheNumberedMessages, TestCompactionLineShowsElapsedTimeAndStreamedTokens, TestCompactionEscapeDuringTheStreamLeavesNothingRunning -->

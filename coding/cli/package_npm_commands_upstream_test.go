@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/noderealpath"
 	"github.com/MichaelKinsy/PiG/internal/packagemanager"
 	"github.com/MichaelKinsy/PiG/tui"
 )
@@ -20,7 +21,7 @@ import (
 // filepath.EvalSymlinks would return the long form npm is never given.
 func realPathSync(t *testing.T, path string) string {
 	t.Helper()
-	resolved, err := codingagent.RealPathSync(path)
+	resolved, err := noderealpath.Sync(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +187,7 @@ func TestPackagePnpmManagedResolutionOriginal(t *testing.T) {
 	}
 	pkg := filepath.Join(f.agent, "npm", "node_modules", "pnpm-pkg")
 	for range 2 {
-		_, missing := packagemanager.EnsureConfiguredPackagesInstalled(f.cwd, f.settings.AgentDir(), f.settings)
+		_, missing := ensureConfiguredPackagesInstalled(f.cwd, f.settings.AgentDir(), f.settings)
 		if len(missing) > 0 {
 			t.Fatal(missing)
 		}
@@ -239,7 +240,7 @@ func TestPackagePnpmLegacyResolutionOriginal(t *testing.T) {
 				if err := f.settings.SetPackages([]codingagent.PackageSource{{Source: "npm:pnpm-pkg"}}); err != nil {
 					t.Fatal(err)
 				}
-				_, missing := packagemanager.EnsureConfiguredPackagesInstalled(f.cwd, f.settings.AgentDir(), f.settings)
+				_, missing := ensureConfiguredPackagesInstalled(f.cwd, f.settings.AgentDir(), f.settings)
 				if len(missing) > 0 {
 					t.Fatal(missing)
 				}

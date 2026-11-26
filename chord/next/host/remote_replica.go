@@ -8,7 +8,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/state"
 )
 
-// Ports packages/chord/src/next/remote/replica.ts. Replicas (§7, §22): a state member of a remote reference on the
+// Ports packages/chord/src/remote/replica.ts. Replicas (§7, §22): a state member of a remote reference on the
 // consumer, built from the snapshot and then changed by the provider's ops, decoded with the member's own Delta decoder
 // and applied without validation or copy (`ApplyImmutable` shares structure); replaced by the snapshot of each re-hold.
 
@@ -53,7 +53,14 @@ type replica struct {
 	retired bool
 	// retiredWhileFailed is a retirement that reached it while failed: its next value carries the flag.
 	retiredWhileFailed bool
+	// generation is how many values it took (its first value included, one per adoption: a snapshot's, a change's, a
+	// recovery's): a reference joining a shared remote object sees a member it found failed or missing once this passes
+	// the count it found.
+	generation int
 }
+
+// forked is what a fork is made with before it takes its original's state.
+var forked = memberSnapshot{kind: "value", value: nil}
 
 var _ state.SourceHandle = (*replica)(nil)
 
@@ -64,9 +71,19 @@ func newReplica(batch *state.Batch, snapshot memberSnapshot) *replica {
 		r.state = replicaState{kind: replicaFailed, err: state.HandedOut(snapshot.err)}
 	} else {
 		r.state = replicaState{kind: replicaValue, value: snapshot.value}
+		r.generation = 1
 	}
 	r.Init(batch, r)
 	return r
+}
+
+// fork is a copy of it for another remote object of the same reference (a private retry after `too_large/part`): its
+// state, last good value and count, a fresh decoder (that object's next snapshot resets it).
+func (r *replica) fork(batch *state.Batch) *replica {
+	fork := newReplica(batch, forked)
+	fork.state = r.state
+	fork.generation = r.generation
+	return fork
 }
 
 // Value is its value; a failed or ended member returns its error.
@@ -129,6 +146,7 @@ func (r *replica) decode(wire any) (delta.JsonValue, []delta.Op, error) {
 func (r *replica) adopt(value delta.JsonValue, ops []delta.Op, retired bool) {
 	flagged := retired || r.retiredWhileFailed
 	r.state = replicaState{kind: replicaValue, value: value}
+	r.generation++
 	r.ops = ops
 	r.retired = flagged
 	r.retiredWhileFailed = false

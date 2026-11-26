@@ -20,8 +20,8 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/sqlite"
 )
 
-// pi: packages/chord/src/next/host/reference-keys.ts
-// Ports packages/chord/test/next/host/reference-keys.test.ts: the keys a reference holds (slice 6a §12; decision
+// pi: packages/chord/src/host/reference-keys.ts
+// Ports packages/chord/test/host/reference-keys.test.ts: the keys a reference holds (slice 6a §12; decision
 // "References are the only indirection" (4)): its key watches and factory pins of an object's keyed members, holding
 // their last values while it is failed (one `failed` call), pinned again on its next instance once that is live (one
 // frame), released once. Every case serves objects through a whole host.
@@ -1033,10 +1033,7 @@ func TestReferenceKeysKeysAcrossARestartAndAFailedRePinACommitAdmittedToAWatched
 	reloaded := make(chan error, 1)
 	go func() {
 		_, err := host.Reload([]HostFacet{{Name: "@test/app", Facet: kmServeKeys(handles, func(ctx context.Context) error {
-			select {
-			case <-opening:
-			case <-ctx.Done():
-			}
+			_, _ = chordctx.Receive(ctx, opening)
 			return nil
 		})}}, background, ReloadOptions{})
 		reloaded <- err
@@ -1059,6 +1056,8 @@ type fakeInstance struct {
 }
 
 func (*fakeInstance) attachedVariant() string { return "" }
+
+func (*fakeInstance) eventNode(string, int) *eventNode { return nil }
 
 // fakeKeysTarget is the object a reference's keys pin on: one live instance at a time, whose `pinKey` fails once when
 // asked (Pi replaces the key slot's `persistence.read` once).
@@ -1172,7 +1171,7 @@ type gatedInstance struct {
 }
 
 func newGatedInstance(source state.DeriveSource) *gatedInstance {
-	return &gatedInstance{fakeInstance: fakeInstance{source: source}, entered: make(chan struct{}), loaded: make(chan struct{})}
+	return &gatedInstance{source: source, entered: make(chan struct{}), loaded: make(chan struct{})}
 }
 
 // let loads the instance's pin.

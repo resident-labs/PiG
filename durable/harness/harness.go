@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/MichaelKinsy/PiG/ai"
+	chordctx "github.com/MichaelKinsy/PiG/chord/context"
 	"github.com/MichaelKinsy/PiG/durable"
 	"github.com/MichaelKinsy/PiG/durable/env"
 	"github.com/MichaelKinsy/PiG/durable/session"
@@ -283,6 +284,31 @@ func (harness *harnessImpl) AbortTask(ctx context.Context, id durable.TaskId) (s
 	return harness.tasks.Abort(ctx, id, false)
 }
 
+// SignalErased is tx.SignalErased in a commit of its own (harness.ts signal): scheduling is enabled first, so a host that
+// arms its recovery wakeup does so before the delivery, as before Submit.
+func (harness *harnessImpl) SignalErased(ctx context.Context, taskId durable.TaskId, token durable.AnySignalSource, key string, value durable.JsonValue) (durable.SignalResult, error) {
+	if err := harness.tasks.TryResume(); err != nil {
+		return "", err
+	}
+	result, err := harness.Commit(ctx, func(tx durable.Tx) (any, error) {
+		return tx.SignalErased(taskId, token, key, value)
+	})
+	if err != nil {
+		return "", err
+	}
+	return result.(durable.SignalResult), nil
+}
+
+// Signal is `harness.signal(taskId, token, key, value, context)`: tx.Signal in a commit of its own, delivering value to
+// task taskId under key. Enables scheduling. Checks nothing about the caller. A value that is no JSON is answered invalid.
+func Signal[T any](ctx context.Context, harness Harness, taskId durable.TaskId, token durable.SignalToken[T], key string, value T) (durable.SignalResult, error) {
+	encoded, err := durable.ToJsonValue(value)
+	if err != nil {
+		return durable.SignalInvalid, nil
+	}
+	return harness.SignalErased(ctx, taskId, token, key, encoded)
+}
+
 func (harness *harnessImpl) WaitForTask(ctx context.Context, id durable.TaskId) (durable.SettledTask[durable.JsonValue], error) {
 	if err := harness.tasks.TryResume(); err != nil {
 		return durable.SettledTask[durable.JsonValue]{}, err
@@ -541,10 +567,11 @@ func (submission *boundSubmission) Abort(ctx context.Context) (durable.Submissio
 	return submission.inner.Abort(submission.bound.bind(ctx))
 }
 
-// withSignal returns ctx additionally cancelled with signal's cause, as chord's withAbortSignal.
+// withSignal returns ctx additionally cancelled with signal's cause, as chord's withAbortSignal: inside the cancel function of a
+// signal of chord/context, before it returns. The link is dropped when either aborts; the result has no release of its own,
+// as chord's has none.
 func withSignal(ctx context.Context, signal context.Context) context.Context {
-	merged, release := linkedChild(ctx, signal)
-	context.AfterFunc(merged, release)
+	merged, _ := chordctx.WithAbortSignalCancel(ctx, signal)
 	return merged
 }
 
@@ -633,8 +660,17 @@ func newHarness(ctx context.Context, storage durable.Storage, options HarnessOpt
 	now := SafeNow(options.Now, func(err error, info durable.ReportInfo) { harness.report(context.Background(), err, info) })
 	harness.SessionImpl = session.NewSessionImpl(storage, session.Hooks{
 		ConversationCreated: harness.conversationCreated,
-		// Join task invocations after admission is sealed and before Storage closes; writes no task outcome.
-		BeforeClose: func() { harness.tasks.Join() },
+		// Join task invocations after admission is sealed and before Storage closes, then release the pi-ai resources of the provider
+		// sessions they used, so none close while in use or outlive the Harness; writes no task outcome. A failing cleanup is reported and
+		// leaves Storage's closing alone (harness.ts beforeClose).
+		BeforeClose: func() {
+			harness.tasks.Join()
+			for _, sessionId := range harness.tasks.providerSessionIds.drain() {
+				if err := ai.CleanupSessionResources(sessionId); err != nil {
+					harness.report(context.Background(), err, durable.ReportInfo{Kind: durable.ReportHostError, Callback: durable.HostCallbackModels})
+				}
+			}
+		},
 		// The ownership memberships a commit's task changes write, from the scheduler's index.
 		MembershipKeys:  func(tx *session.Transaction) ([]string, error) { return harness.tasks.MembershipKeys(tx) },
 		Report:          harness.report,
@@ -668,8 +704,10 @@ func newHarness(ctx context.Context, storage durable.Storage, options HarnessOpt
 		},
 		Report:         harness.report,
 		LimitsRestarts: func(kind string) bool { return limitsRestarts[kind] },
+		KeepsAbandoned: keepsChildren,
+		Gated:          gatedCall,
 		SettleOutcome:  SettleSchedulerOutcome,
-		WithdrawInputs: WithdrawQueuedInputs,
+		WithdrawInputs: WithdrawAbortedInputs,
 		Conversation: func(callCtx context.Context, id durable.ConversationId, binding InvocationBinding) (durable.ConversationHandle, error) {
 			record, err := harness.ReadOnLineCtx(callCtx, func(line durable.Storage) (any, error) { return line.Conversation(callCtx, id) })
 			if err != nil {

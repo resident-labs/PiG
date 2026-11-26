@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import itertools
 import json
-import sys
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from . import host_helpers
+from ._diagnostic import diagnose
 
 if TYPE_CHECKING:
     from . import Context, Extension
@@ -29,8 +29,9 @@ class EventBus:
     ``on`` returns an idempotent unsubscribe function. A handler runs in a
     request of its own, so it may call ``emit`` while the host waits for its
     answer (EventEmitter is synchronous and reentrant). A handler's error fails
-    only that delivery: the host reports it as ``Event handler error`` and the
-    emitter and the other listeners are unaffected (event-bus.ts:24-30).
+    only that delivery: the host reports it as an error of this extension (event
+    ``events:<channel>``, as Pi reports it) and the emitter and the other
+    listeners are unaffected (event-bus.ts:24-30, loader.ts ``on``).
     """
 
     def __init__(self, extension: Extension, ctx: Context | None = None):
@@ -146,7 +147,7 @@ class _EventBusHub:
             try:
                 self._call("events.off", {"handlerId": sub.id}, None)
             except Exception as exc:  # noqa: BLE001 - upstream's unsubscribe cannot fail; report it
-                print(f"extension: pi.events unsubscribe {sub.channel!r}: {exc}", file=sys.stderr)
+                diagnose(f"extension: pi.events unsubscribe {sub.channel!r}: {exc}" + "\n")
 
         return unsubscribe
 

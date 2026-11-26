@@ -163,6 +163,15 @@ func addTool(t *testing.T, registry harness.Registry, tool *durable.ToolRegistra
 	}
 }
 
+// addNamespaced installs an extension that brings tools in a code mode namespace (Pi's `defineExtension({ name, namespace,
+// tools })`); without tools it is a namespace waiting for them (an MCP server not signed in yet).
+func addNamespaced(t *testing.T, registry harness.Registry, name string, namespace durable.ToolNamespace, tools ...*durable.ToolRegistration) {
+	t.Helper()
+	if err := registry.Install(&durable.Extension{Name: name, Namespace: &namespace, Tools: tools}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 const parametersSchema = `{"type":"object","properties":{"text":{"type":"string"},"id":{"type":"number"}}}`
 
 // tool is the test tools' shape: Parameters {text?, id?}.
@@ -172,8 +181,8 @@ func tool(name string, execute func(ctx context.Context, args toolArgs, api dura
 		panic(err)
 	}
 	return harness.DefineTool(durable.ToolRegistration{
-		ToolSchema: ai.ToolSchema{Name: name, Description: name, Parameters: parameters},
-		Replay:     replay,
+		Name: name, Description: name, Parameters: parameters,
+		Replay: replay,
 		Execute: func(ctx context.Context, args any, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			decoded, err := durable.FromJsonValue[toolArgs](args)
 			if err != nil {

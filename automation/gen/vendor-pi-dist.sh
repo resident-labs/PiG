@@ -42,10 +42,11 @@ copy() {
   done
 }
 
+# The installed oracle already carries the post-release backports (automation/pin/oracle.py applies them when it builds the oracle), so the copies below inherit them: verify before anything is deleted, never apply them a second time.
+node "$root/automation/gen/pi-post-release-backports.mjs" --verify-packages "pi-ai=$ai" "pi-coding-agent=$agent" "pi-mcp=$mcp" "pi-tui=$tui" || { echo "vendor-pi-dist: the installed Pi does not carry the post-release backports exactly once; run make parity-deps (pin.py install-oracle --force)" >&2; exit 1; }
+
 # The oracle builds are read-only, and cp keeps their modes: make what an earlier run copied owner-writable so rm can remove it.
-for stale in "$dist" "$shims/yaml" "$shims/get-east-asian-width" "$shims/partial-json" "$shims/marked" "$shims/marked-cjk-friendly" "$shims/highlight.js" "$shims/jiti" "$shims/ignore" "$shims/diff"; do
-  if [ -e "$stale" ]; then chmod -R u+w "$stale"; fi
-done
+if [ -e "$shims" ]; then chmod -R u+w "$shims"; fi # every copy, including the third-party packages the dependency vendoring wrote and removes again below
 rm -rf "$dist" "$shims/yaml" "$shims/get-east-asian-width" "$shims/partial-json" "$shims/marked" "$shims/marked-cjk-friendly" "$shims/highlight.js" "$shims/jiti" "$shims/ignore" "$shims/diff"
 mkdir -p "$dist" "$shims/yaml" "$shims/get-east-asian-width" "$shims/partial-json/dist" "$shims/marked/lib" "$shims/marked-cjk-friendly/dist" "$shims/highlight.js" "$shims/jiti" "$shims/ignore" "$shims/diff"
 printf '{\n  "type": "module"\n}\n' >"$dist/package.json"
@@ -74,24 +75,21 @@ while IFS= read -r file; do
 done < <(cd "$schema/dist" && find . -name '*.js' | sed 's#^\./##' | sort)
 
 # pi-ai: the whole release (its compat entry is what Pi serves for the pi-ai
-# root), except the builtin API implementations, which are bridge stubs.
-bridged_apis="anthropic-messages azure-openai-responses bedrock-converse-stream google-generative-ai google-vertex mistral-conversations openai-codex-responses openai-completions openai-responses pi-messages"
-sdk_only="google-shared"
+# root), except the builtin API implementations and google-shared, which vendor-pi-ai-apis.mjs writes: bridge stand-ins
+# plus the Pi modules they re-export from (D74).
+own_apis=$(node "$root/automation/gen/vendor-pi-ai-apis.mjs" --names)
 (cd "$ai/dist" && find . \( -name '*.js' -o -path './providers/data/*.json' \) | sed 's#^\./##' | sort) | while read -r file; do
   case "$file" in
     utils/json-parse.js | api/openrouter-images.js) continue ;;
   esac
   name=${file#api/}
   name=${name%.js}
-  if [ "$file" = "api/$name.js" ] && [[ " $bridged_apis $sdk_only " == *" $name "* ]]; then
+  if [ "$file" = "api/$name.js" ] && [[ " $own_apis " == *" $name "* ]]; then
     continue
   fi
   copy "$ai/dist" "$dist/pi-ai" "$file"
 done
-for api in $bridged_apis; do
-  printf '// PiG: the %s implementation runs in PiG'"'"'s host (D74); see automation/gen/vendor-pi-dist.sh.\nimport { bridgeApi } from "../../../pi-ai-bridge.mjs";\nexport const { stream, streamSimple } = bridgeApi("%s");\n' "$api" "$api" >"$dist/pi-ai/api/$api.js"
-done
-printf '// PiG: image generation has no host provider (D74); see automation/gen/vendor-pi-dist.sh.\nimport { bridgeImages } from "../../../pi-ai-bridge.mjs";\nexport const generateImages = bridgeImages("openrouter-images");\n' >"$dist/pi-ai/api/openrouter-images.js"
+node "$root/automation/gen/vendor-pi-ai-apis.mjs" "$shims" "$ai" "$agent/node_modules/@google/genai"
 sed 's#^\(import .* from \)"@earendil-works/pi-telemetry";$#\1"../pi-telemetry/index.js";#' "$ai/dist/telemetry.js" >"$dist/pi-ai/telemetry.js"
 sed 's#^import { parse as partialParse } from "partial-json";$#import { parse as partialParse } from "../../../partial-json/dist/index.js";#' \
   "$ai/dist/utils/json-parse.js" >"$dist/pi-ai/utils/json-parse.js"
@@ -104,8 +102,9 @@ while IFS= read -r file; do
     prefix="$prefix/.."
     case "$rest" in */*) rest=${rest%/*} ;; *) break ;; esac
   done
-  sed -i -e "s#\(from \)\"@earendil-works/pi-schema\";\$#\1\"$prefix/pi-schema/index.js\";#" \
+  sed -i.bak -e "s#\(from \)\"@earendil-works/pi-schema\";\$#\1\"$prefix/pi-schema/index.js\";#" \
     -e "s#\(from \)\"@earendil-works/pi-schema/formats\";\$#\1\"$prefix/pi-schema/formats/index.js\";#" "$dist/pi-ai/$file"
+  rm -f "$dist/pi-ai/$file.bak"
 done < <(cd "$dist/pi-ai" && grep -lE 'from "@earendil-works/pi-schema(/formats)?";$' -r . --include=*.js | sed 's#^\./##' | sort)
 
 # Every other copied pi-ai module that imports typebox (any a later Pi adds) reaches the vendored typebox shims by its own depth.
@@ -116,9 +115,10 @@ while IFS= read -r file; do
     prefix="$prefix/.."
     case "$rest" in */*) rest=${rest%/*} ;; *) break ;; esac
   done
-  sed -i -e "s#^\(import .* from \)\"typebox\";\$#\1\"$prefix/typebox.mjs\";#" \
+  sed -i.bak -e "s#^\(import .* from \)\"typebox\";\$#\1\"$prefix/typebox.mjs\";#" \
     -e "s#^\(import .* from \)\"typebox/value\";\$#\1\"$prefix/typebox-value.mjs\";#" \
     -e "s#^\(import .* from \)\"typebox/compile\";\$#\1\"$prefix/typebox-compile.mjs\";#" "$dist/pi-ai/$file"
+  rm -f "$dist/pi-ai/$file.bak"
 done < <(cd "$dist/pi-ai" && grep -lE '^import .* from "typebox(/value|/compile)?";$' -r . --include=*.js | sed 's#^\./##' | sort)
 
 
@@ -151,7 +151,7 @@ node "$root/automation/gen/vendor-pi-closure.mjs" "$shims" "$(cat <<JSON
     "semver": "semver/index.js",
     "minimatch": "minimatch/dist/esm/index.js",
     "hosted-git-info": "hosted-git-info/lib/index.js",
-    "grok-mermaid": "grok-mermaid/dist/index.js",
+    "lovely-mermaid": "lovely-mermaid/dist/index.js",
     "@silvia-odwyer/photon-node": "photon-node/photon_rs.js",
     "typebox": "typebox.mjs",
     "typebox/value": "typebox-value.mjs",
@@ -167,7 +167,7 @@ JSON
 )"
 
 # Third-party packages the vendored modules import.
-for dependency in chalk undici semver minimatch hosted-git-info grok-mermaid proper-lockfile quickjs-wasi; do
+for dependency in chalk undici semver minimatch hosted-git-info lovely-mermaid proper-lockfile quickjs-wasi; do
   rm -rf "${shims:?}/$dependency"
   node "$root/automation/gen/vendor-node-dependencies.mjs" "$agent/node_modules/$dependency/package.json" "$shims/$dependency"
 done
@@ -244,8 +244,8 @@ node "$root/automation/gen/bundle-pi-sdk.mjs" "$shims"
 node "$root/automation/gen/vendor-pi-package-roots.mjs" "$shims" "$agent"
 node "$root/automation/gen/vendor-node-manifest.mjs" "$shims" "$agent"
 
-# Leave the copies owner-writable too, so the next run (and a checkout cleanup) can remove them; u+w changes no content.
-chmod -R u+w "$dist" "$shims/yaml" "$shims/get-east-asian-width" "$shims/partial-json" "$shims/marked" "$shims/marked-cjk-friendly" "$shims/highlight.js" "$shims/jiti" "$shims/ignore" "$shims/diff"
+# Leave every copy owner-writable, so the next run (and a checkout cleanup) can remove it; u+w changes no content.
+chmod -R u+w "$shims"
 
 version() { node -p "require('$1/package.json').version"; }
 echo "vendored Pi $(version "$agent") dist modules, yaml $(version "$yaml"), get-east-asian-width $(version "$eaw"), partial-json $(version "$pjson"), marked $(version "$marked"), marked-cjk-friendly $(version "$markedCjk"), highlight.js $(version "$hljs"), jiti $(version "$jiti"), ignore $(version "$ignore") and diff $(version "$jsdiff") into $shims"

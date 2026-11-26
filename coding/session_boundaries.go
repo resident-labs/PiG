@@ -63,6 +63,9 @@ func (s *Session) handleAgentEvent(ctx context.Context, event agent.AgentEvent) 
 				s.notifyAgentEventListeners(update)
 				s.publishQueueEvent(update)
 			}
+			if err := s.normalizeDeliveredImages(event); err != nil {
+				return err
+			}
 		}
 	case agent.AgentStartEvent:
 		s.boundaryTurnIndex = 0
@@ -87,8 +90,8 @@ func (s *Session) handleAgentEvent(ctx context.Context, event agent.AgentEvent) 
 	if end, ok := event.(agent.MessageEndEvent); ok {
 		persistErr = s.persistMessage(end.Message)
 	}
-	// Publish after persistence but before pending custom messages. Later Agent subscribers observe the completed Session transaction.
-	s.emitPublishedEvent(event)
+	// Publish after persistence but before pending custom messages. Later Agent subscribers observe the completed Session transaction. A run that reports its tasks publishes within their bounds (publishAgentEvent).
+	s.publishAgentEvent(event)
 	if persistErr != nil {
 		return persistErr
 	}
@@ -112,6 +115,7 @@ func (s *Session) dispatchTurnEndBoundary(ctx context.Context, event agent.TurnE
 	if runner == nil || !runner.HasHandlers(icodingagent.EventTurnEnd) {
 		return false, nil
 	}
+	s.endEventTask()
 	event = s.turnEndWithEntryIDs(event)
 	for i := range event.ToolResults {
 		s.rememberMessageEntry(agent.AgentMessage{ToolResult: &event.ToolResults[i]}, event.ToolResultEntryIDs[i])
@@ -133,6 +137,15 @@ func (s *Session) dispatchTurnEndBoundary(ctx context.Context, event agent.TurnE
 	// Upstream emitBoundary takes no abort signal, so an aborted run's turns
 	// still reach turn_end handlers.
 	dispatchCtx, wire := boundarywire.WithSessionCache(context.WithoutCancel(ctx), &s.boundaryEncodings)
+	// The turn's message and tool results are the messages message_end carried: an extension process hands its handler the objects it held for them.
+	dispatchCtx = extension.WithMessageSequences(dispatchCtx, func() []uint64 {
+		sequences := make([]uint64, 1+len(event.ToolResults))
+		sequences[0] = s.messageSeqs.Known(event.Message)
+		for i := range event.ToolResults {
+			sequences[1+i] = s.messageSeqs.Known(agent.AgentMessage{ToolResult: &event.ToolResults[i]})
+		}
+		return sequences
+	})
 	result, err := runner.EmitBoundary(dispatchCtx, base, func(drafts []extension.SessionBoundaryDraft) (extension.BoundaryContextPreview, error) {
 		return s.recordedBoundaryContext(wire, drafts, icodingagent.EventTurnEnd)
 	})
@@ -170,7 +183,7 @@ func (s *Session) runBeforeSettleBoundary(ctx context.Context) (bool, error) {
 	s.runState.isBeforeSettle = true
 	s.runState.mu.Unlock()
 	defer func() { s.runState.mu.Lock(); s.runState.isBeforeSettle = false; s.runState.mu.Unlock() }()
-	base := &extension.AgentBeforeSettleEvent{Type: icodingagent.EventAgentBeforeSettle, BoundaryState: extension.BoundaryState{Outcome: s.lastActivityOutcome}}
+	base := &extension.AgentBeforeSettleEvent{Type: icodingagent.EventAgentBeforeSettle, Outcome: s.lastActivityOutcome}
 	dispatchCtx, wire := boundarywire.WithSessionCache(ctx, &s.boundaryEncodings)
 	result, err := runner.EmitBoundary(dispatchCtx, base, func(drafts []extension.SessionBoundaryDraft) (extension.BoundaryContextPreview, error) {
 		return s.recordedBoundaryContext(wire, drafts, icodingagent.EventAgentBeforeSettle)
@@ -211,7 +224,7 @@ func (s *Session) commitBoundaryDrafts(drafts []extension.SessionBoundaryDraft) 
 	if err != nil {
 		return err
 	}
-	appended, err := applyBoundaryDrafts(s.inner, drafts, head, tools)
+	appended, err := applyBoundaryDrafts(s.inner.Load(), drafts, head, tools)
 	if err != nil {
 		return err
 	}
@@ -223,12 +236,13 @@ func (s *Session) commitBoundaryDrafts(drafts []extension.SessionBoundaryDraft) 
 }
 
 func (s *Session) createBoundaryPreviewManager(drafts []extension.SessionBoundaryDraft) (*icodingagent.Session, error) {
+	in := s.inner.Load()
 	var branch []icodingagent.SessionEntry
-	if leaf := s.inner.GetLeafID(); leaf != nil {
+	if leaf := in.GetLeafID(); leaf != nil {
 		// The preview walks parent links, so it takes the whole branch.
-		branch = s.inner.GetBranch(*leaf)
+		branch = in.GetBranch(*leaf)
 	}
-	preview := icodingagent.NewBranchSession(s.inner.GetHeader(), branch)
+	preview := icodingagent.NewBranchSession(in.GetHeader(), branch)
 	head, tools, err := s.compactionHead()
 	if err != nil {
 		return nil, err
@@ -242,13 +256,23 @@ func (s *Session) createBoundaryPreviewManager(drafts []extension.SessionBoundar
 // boundaryProjection is the projection of a preview manager holding the session's branch and then drafts (agent-session.ts _buildBoundaryContext). With no drafts the preview holds exactly the branch, whose entries keep their ids and parent links, so its projection is the session's own and the copy is skipped. That projection's messages are the session's own objects, as Pi's are: the caller reads them and never modifies them.
 func (s *Session) boundaryProjection(drafts []extension.SessionBoundaryDraft) (icodingagent.SessionProjection, error) {
 	if len(drafts) == 0 {
-		return s.inner.BuildSessionProjectionView(), nil
+		return s.inner.Load().BuildSessionProjectionView(), nil
 	}
 	preview, err := s.createBoundaryPreviewManager(drafts)
 	if err != nil {
 		return icodingagent.SessionProjection{}, err
 	}
 	return preview.BuildSessionProjection(), nil
+}
+
+// draftCustomMessage is the members of a custom_message draft as a custom message holds them: a draft written without display or content has no such member
+// (agent-session.ts _applyBoundaryDrafts passes draft.content and draft.display on as they are).
+func draftCustomMessage(draft extension.SessionBoundaryDraft) map[string]any {
+	custom := map[string]any{"customType": draft.CustomType, "content": draft.Content, "details": draft.Details}
+	if display := draft.DisplayMember(); display != nil {
+		custom["display"] = display
+	}
+	return custom
 }
 
 // applyBoundaryDrafts appends the drafts to manager. A compaction draft's head holds head, nil keeping the current system
@@ -262,8 +286,12 @@ func applyBoundaryDrafts(manager *icodingagent.Session, drafts []extension.Sessi
 		case "custom":
 			id, err = manager.AppendCustomEntry(draft.CustomType, draft.Data)
 		case "custom_message":
-			id, err = manager.AppendCustomMessageEntry(draft.CustomType, draft.Content, draft.Display, draft.Details)
+			id, err = manager.AppendCustomMessage(draftCustomMessage(draft))
 		case "context_edit":
+			if draft.ReplacementUndefined {
+				// upstream: session-manager.ts:1371-1379 (appendContextEdit rejects a replacement that is not null and has no content: undefined is one).
+				return nil, icodingagent.ErrContextEditReplacement
+			}
 			var replacement *icodingagent.ContextEditReplacement
 			if raw := bytes.TrimSpace(draft.Replacement); len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
 				replacement = &icodingagent.ContextEditReplacement{}
@@ -278,7 +306,7 @@ func applyBoundaryDrafts(manager *icodingagent.Session, drafts []extension.Sessi
 				firstKept = *draft.FirstKeptEntryID
 			}
 			tokensBefore := compaction.EstimateProjectedContextTokens(manager.BuildSessionProjection(), manager.GetContextBranch()).Tokens
-			id, err = manager.AppendCompactionWithSections(draft.Summary, firstKept, tokensBefore, draft.Details, true, draft.Usage, head, tools)
+			id, err = manager.AppendCompactionWithSections(icodingagent.CompactionEntry{Summary: draft.Summary, FirstKeptEntryID: firstKept, TokensBefore: tokensBefore, Details: draft.Details, Usage: draft.Usage, UsageNull: draft.UsageNull, UsageRaw: draft.UsageRaw, FromHook: true}, head, tools)
 		default:
 			return nil, fmt.Errorf("unsupported session boundary draft type %q", draft.Type)
 		}
@@ -296,7 +324,7 @@ func applyBoundaryDrafts(manager *icodingagent.Session, drafts []extension.Sessi
 
 // recordedBoundaryContext is projectBoundaryContext for a boundary dispatch: it records the preview and the inputs of its projected part in the dispatch's wire cache, so subprocess handlers share one encoding while those inputs stay the same. While they stay the same and no handler that reads Go values has held the latest preview, the next preview reuses its projected part instead of projecting the session again: a projection of the same session state is equal to it.
 func (s *Session) recordedBoundaryContext(wire *boundarywire.Cache, drafts []extension.SessionBoundaryDraft, boundary string) (extension.BoundaryContextPreview, error) {
-	inner := s.inner
+	inner := s.inner.Load()
 	revision := inner.Revision()
 	key := boundarywire.Key{Session: inner, Revision: revision}
 	if len(drafts) == 0 {
@@ -313,7 +341,7 @@ func (s *Session) recordedBoundaryContext(wire *boundarywire.Cache, drafts []ext
 	if err != nil {
 		return preview, err
 	}
-	cacheable := len(drafts) == 0 && inner == s.inner && revision == inner.Revision()
+	cacheable := len(drafts) == 0 && inner == s.inner.Load() && revision == inner.Revision()
 	wire.Built(preview, key, cacheable, sources)
 	if shared {
 		wire.Shared()

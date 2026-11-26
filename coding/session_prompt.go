@@ -215,6 +215,10 @@ func (s *Session) preparePromptInvocation(ctx context.Context, text string, opti
 	if s.isManualCompacting() {
 		return nil, errPromptDuringCompaction
 	}
+	// Reserve the context through the async input hooks and auth checks so tree navigation cannot start meanwhile (#9154). The run
+	// is marked active before this returns, so there is no gap.
+	s.runState.promptPreflight.Add(1)
+	defer s.runState.promptPreflight.Add(-1)
 	source := options.Source
 	if source == "" {
 		source = extension.InputSourceUser
@@ -248,14 +252,14 @@ func (s *Session) preparePromptInvocation(ctx context.Context, text string, opti
 	return s.prepareContentRun(ctx, BuildUserContent(text, images), options.Members, func() { notify(DispositionStarted) })
 }
 
-// ValidatePromptModelAuth rejects a new prompt before compaction and before_agent_start when no model is selected or its provider has no usable auth, as agent-session.ts:1673-1691 does: the published availability snapshot first, then a live auth check. Interactive mode runs the same check before it starts a turn.
+// ValidatePromptModelAuth rejects a new prompt before compaction and before_agent_start when no model is selected or its provider has no usable auth, as agent-session.ts:2242-2259 does: the published availability snapshot first, then a live auth check. The rule names no provider: one without configured auth is refused whatever it is called (`No API key found for <provider>.`, auth-guidance.ts:22-25). Print, RPC and interactive mode all run this check before they start a turn.
 func (s *Session) ValidatePromptModelAuth(ctx context.Context) error {
 	model := s.Model()
 	if model == nil {
 		return errors.New(icodingagent.FormatNoModelSelectedMessage())
 	}
 	provider := providerID(model)
-	if (s.services.Registry().GetProvider(provider) != nil || modelRuntimeRequiresAuth(provider)) && !s.modelRuntime.HasConfiguredAuth(provider) {
+	if !s.modelRuntime.HasConfiguredAuth(provider) {
 		check, err := s.modelRuntime.CheckAuth(ctx, provider)
 		if err != nil {
 			return err
@@ -311,34 +315,38 @@ func (s *Session) SendExtensionUserMessageStaged(content any, options *extension
 		}
 	}
 	ctx := s.backgroundContext()
-	if s.deferSettledAction(func() { s.reportRuntimeError("send_user_message", s.Prompt(ctx, text, &opts)) }) {
+	var after func(report func())
+	if options != nil {
+		after = options.AfterRun
+	}
+	if s.deferSettledAction(func() { s.reportRuntimeErrorAfter(after, "send_user_message", s.Prompt(ctx, text, &opts)) }) {
 		return nil
 	}
 	if stage == nil {
-		return s.startExtensionUserMessage(ctx, text, opts, func(start func()) { start() })
+		return s.startExtensionUserMessage(ctx, text, opts, after, func(start func()) { start() })
 	}
 	stage.Prepare(ctx, func(ctx context.Context) {
-		s.reportRuntimeError("send_user_message", s.startExtensionUserMessage(ctx, text, opts, stage.Start))
+		s.reportRuntimeErrorAfter(after, "send_user_message", s.startExtensionUserMessage(ctx, text, opts, after, stage.Start))
 	})
 	return nil
 }
 
-// startExtensionUserMessage prepares the extension's prompt and passes schedule the step that starts its run.
-func (s *Session) startExtensionUserMessage(ctx context.Context, text string, opts PromptOptions, schedule func(start func())) error {
+// startExtensionUserMessage prepares the extension's prompt and passes schedule the step that starts its run. A failure is reported through after (SendUserMessageOptions.AfterRun).
+func (s *Session) startExtensionUserMessage(ctx context.Context, text string, opts PromptOptions, after func(report func()), schedule func(start func())) error {
 	s.runState.userRunsPending.Add(1)
 	var pendingOnce sync.Once
 	endPending := func() { pendingOnce.Do(func() { s.runState.userRunsPending.Add(-1) }) }
 	run, err := s.preparePromptInvocation(ctx, text, opts)
 	if err != nil || run == nil {
 		endPending()
-		s.reportRuntimeError("send_user_message", err)
+		s.reportRuntimeErrorAfter(after, "send_user_message", err)
 		return nil
 	}
 	started := make(chan struct{})
 	if err := s.startExtensionTask(func() {
 		<-started
 		_, err := run.Run()
-		s.reportRuntimeError("send_user_message", ignoreCancellation(err))
+		s.reportRuntimeErrorAfter(after, "send_user_message", ignoreCancellation(err))
 	}); err != nil {
 		endPending()
 		_, _ = run.Run()

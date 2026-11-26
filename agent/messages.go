@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
 // ConvertToLLM converts AgentMessages to the wire format expected by the AI provider (convertToLlm, messages.ts:148).
@@ -85,7 +86,7 @@ func customMessageContent(content any) (ai.UserContentBlocks, bool) {
 	case []ai.UserContentBlock:
 		return ai.UserContentBlocks(content), true
 	}
-	raw, err := json.Marshal(map[string]any{"role": RoleUser, "content": content})
+	raw, err := jsstring.MarshalKeepingSurrogates(map[string]any{"role": RoleUser, "content": content})
 	if err != nil {
 		return nil, false
 	}
@@ -145,6 +146,7 @@ func (m *AssistantMessage) Observe() *AssistantMessage {
 	out.Deferred = owned.Deferred
 	out.EndTurn = owned.EndTurn
 	out.DurationMs = owned.DurationMs
+	out.FailureResponse = owned.FailureResponse
 	if m.Usage != nil {
 		out.Usage = &owned.Usage
 	}
@@ -217,7 +219,7 @@ func (m *AssistantMessage) LLMMessage() ai.AssistantMessage {
 		ResponseID: m.ResponseID, ProviderThinkingLevel: m.ProviderThinkingLevel, ThinkingLevel: m.ThinkingLevel,
 		Diagnostics: m.Diagnostics,
 		Usage:       usage, StopReason: m.StopReason, Deferred: m.Deferred,
-		ErrorMessage: m.ErrorMessage, ErrorBeforeTimestamp: m.ErrorBeforeTimestamp, RawStopReason: m.RawStopReason,
+		ErrorMessage: m.ErrorMessage, ErrorBeforeTimestamp: m.ErrorBeforeTimestamp, FailureResponse: m.FailureResponse, RawStopReason: m.RawStopReason,
 		EndTurn: m.EndTurn, Timestamp: m.Timestamp, DurationMs: m.DurationMs,
 	}
 }

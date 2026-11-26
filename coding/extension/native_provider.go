@@ -28,13 +28,18 @@ type NativeProvider struct {
 	GetModels func(context.Context) ([]*ai.Model, error)
 	// GetAllModels lists the models of every type and FilterAllModels filters them by credential; nil when the provider object has no such member.
 	// upstream: pi-ai Provider.getAllModels, Provider.filterAllModels
-	GetAllModels             func(context.Context) ([]ai.AnyModel, error)
-	FilterAllModels          func(context.Context, []ai.AnyModel, *ai.Credential) ([]ai.AnyModel, error)
-	FilterModels             func(context.Context, []*ai.Model, *ai.Credential) ([]*ai.Model, error)
-	ResolveAuth              func(context.Context, *ai.Credential, ai.AuthResolutionOverrides) (*ai.AuthResult, *ai.Credential, error)
+	GetAllModels    func(context.Context) ([]ai.AnyModel, error)
+	FilterAllModels func(context.Context, []ai.AnyModel, *ai.Credential) ([]ai.AnyModel, error)
+	FilterModels    func(context.Context, []*ai.Model, *ai.Credential) ([]*ai.Model, error)
+	// ResolveAuth is Pi's resolveProviderAuth for this provider over the registry's credential store (auth/resolve.ts:46-117): a runtime key first, then the stored credential; only an expiring OAuth credential's refresh goes through the store's modify, and the provider's resolvers and toAuth run outside it.
+	// upstream: packages/ai/src/auth/resolve.ts:resolveProviderAuth
+	ResolveAuth              func(context.Context, ai.CredentialStore, ai.AuthResolutionOverrides) (*ai.AuthResult, error)
 	ResolveRefreshCredential func(context.Context, *ai.Credential) (*ai.Credential, *ai.Credential, error)
 	RefreshModels            func(ai.RefreshModelsContext) error
-	Stream                   func(context.Context, *ai.Model, ai.TranscriptContext, ai.StreamOptions) (*ai.AssistantMessageEventStream, error)
+	// RefreshModelsAuth is Pi's Provider.refreshModelsAuth: what the network phase of RefreshModels needs; empty is the default, "credential".
+	// upstream: packages/ai/src/models.ts:Provider.refreshModelsAuth
+	RefreshModelsAuth ai.RefreshModelsAuthMode
+	Stream            func(context.Context, *ai.Model, ai.TranscriptContext, ai.StreamOptions) (*ai.AssistantMessageEventStream, error)
 	// StreamSimple is the provider's simple stream method; a provider with only Stream serves simple requests through it.
 	// upstream: pi-ai Provider.streamSimple
 	StreamSimple func(context.Context, *ai.Model, ai.TranscriptContext, ai.StreamOptions) (*ai.AssistantMessageEventStream, error)
@@ -81,6 +86,7 @@ func NativeProviderOf(provider *ai.ModelsProvider) *NativeProvider {
 		}
 	}
 	carrier.RefreshModels = provider.RefreshModels
+	carrier.RefreshModelsAuth = provider.RefreshModelsAuth
 	carrier.Stream = provider.Stream
 	carrier.StreamSimple = provider.StreamSimple
 	carrier.FetchDeferred = provider.FetchDeferred
@@ -96,7 +102,7 @@ func NativeProviderOf(provider *ai.ModelsProvider) *NativeProvider {
 // upstream: packages/coding-agent/src/core/model-runtime.ts registerNativeProvider(provider: Provider)
 func (p *NativeProvider) ProviderObject() *ai.ModelsProvider {
 	object := &ai.ModelsProvider{
-		ID: p.ID, Name: p.Name, BaseURL: p.BaseURL, Headers: p.Headers, Auth: p.Auth, RefreshModels: p.RefreshModels,
+		ID: p.ID, Name: p.Name, BaseURL: p.BaseURL, Headers: p.Headers, Auth: p.Auth, RefreshModels: p.RefreshModels, RefreshModelsAuth: p.RefreshModelsAuth,
 		Stream: p.Stream, StreamSimple: p.StreamSimple, FetchDeferred: p.FetchDeferred, CancelDeferred: p.CancelDeferred,
 		GenerateImages: p.GenerateImages, Classify: p.Classify,
 	}

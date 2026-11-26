@@ -251,11 +251,11 @@ func summaryAuthShapes() []summaryAuthShape {
 				writeAgentFile(t, agentDir, "models.json", fmt.Sprintf(`{"providers":{"anthropic":{"baseUrl":%q}}}`, w.server.URL))
 				writeAgentFile(t, agentDir, "auth.json", fmt.Sprintf(`{"anthropic":{"type":"oauth","access":%q,"refresh":"plain-refresh","expires":%d}}`, token, expires.UnixMilli()-5*60*1000))
 				return func(services *AgentSessionServices) *ai.Model {
-					candidates := services.ModelRuntime().GetModels("anthropic")
-					if len(candidates) == 0 {
+					catalog := services.ModelRuntime().GetModels("anthropic")
+					if len(catalog) == 0 {
 						t.Fatal("catalog has no anthropic model")
 					}
-					model, err := BuildModel("anthropic/"+candidates[0].ID, services)
+					model, err := BuildModel("anthropic/"+catalog[0].ID, services)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -403,7 +403,7 @@ func summaryOperations() []summaryOperation {
 		}},
 		{"branch-summary", func(t *testing.T, session *Session) error {
 			var target string
-			for _, entry := range session.inner.GetEntries() {
+			for _, entry := range session.inner.Load().GetEntries() {
 				if entry.Base().Type == "message" {
 					target = entry.Base().ID
 					break

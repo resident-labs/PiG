@@ -38,6 +38,7 @@ PARENT is the request that owns the call. Signals HOST-CALL-ERROR when the host 
           (setf (gethash id (extension-pending ext)) slot))
         (let ((call (obj "method" method "args" args)))
           (when (plusp (length request-id)) (setf (gethash "parent_request_id" call) request-id))
+          (when (and parent (request-command parent)) (setf (gethash "command_context" call) t))
           (when timer (setf (gethash "timer" call) t))
           (setf frame (obj "type" "call" "id" id "call" call))))
       (handler-case (send-frame-locked conn frame)
@@ -60,8 +61,11 @@ PARENT is the request that owns the call. Signals HOST-CALL-ERROR when the host 
            (error 'host-call-error :message "extension shut down during host call"))
           ((and (hash-table-p result) (hash-table-p (jget result "error")))
            (let ((err (jget result "error")))
-             (error 'host-call-error :message (frame-error-message err)
-                                     :code (let ((code (jget err "code"))) (and (stringp code) code)))))
+             (if (hash-table-p (jget err "shellExit"))
+                 (error 'shell-timeout-error :message (frame-error-message err) :shell-exit (jget err "shellExit")
+                                             :code (let ((code (jget err "code"))) (and (stringp code) code)))
+                 (error 'host-call-error :message (frame-error-message err)
+                                         :code (let ((code (jget err "code"))) (and (stringp code) code))))))
           (t (let ((value (and (hash-table-p result) (jget result "result"))))
                (if (eq value :null) nil value))))))
 
@@ -72,7 +76,9 @@ PARENT is the request that owns the call. Signals HOST-CALL-ERROR when the host 
 
 (defun deliver-call-result (ext env)
   (let ((slot (sb-thread:with-mutex ((extension-state-lock ext))
-                (let ((slot (gethash (jget env "id" "") (extension-pending ext))))
+                (let* ((id (jget env "id" "")) (slot (gethash id (extension-pending ext))))
+                  ;; An answered call is no longer the request's: a cancel that arrives before the waiting thread wakes must not cancel it (Python drops the parent on delivery).
+                  (when slot (remhash id (extension-pending ext)))
                   slot))))
     ;; Pi resumes the handlers whose dialogs were answered in the order the answers arrived: this reader reads them in that order
     (when slot
@@ -94,8 +100,8 @@ PARENT is the request that owns the call. Signals HOST-CALL-ERROR when the host 
         (when reason (setf (gethash "reason" payload) reason))
         (send-frame-locked conn (obj "type" "request_state" "request_state" payload))))))
 
-(defun respond (ext request-id result error-message)
-  "Answer request REQUEST-ID: a result, or an error message."
+(defun respond (ext request-id result error-message &optional shell-exit)
+  "Answer request REQUEST-ID: a result, or an error message (with SHELL-EXIT, the wire object of Pi's shellExit, for a local shell command's timeout)."
   (let ((conn (extension-conn ext)))
     (sb-thread:with-mutex ((conn-write-lock conn))
       (sb-thread:with-mutex ((extension-state-lock ext))
@@ -111,9 +117,17 @@ PARENT is the request that owns the call. Signals HOST-CALL-ERROR when the host 
       (send-frame-locked conn (obj "type" "request_state" "request_state" (obj "request_id" request-id "state" "completed")))
       (send-frame-locked conn (obj "type" "response" "id" request-id
                                    "response" (obj "result" result
-                                                   "error" (if error-message (obj "message" error-message) nil)))))))
+                                                   "error" (if error-message
+                                                               (let ((error-object (obj "message" error-message)))
+                                                                 (when shell-exit (setf (gethash "shellExit" error-object) shell-exit))
+                                                                 error-object)
+                                                               nil)))))))
 
 ;;; ---------------------------------------------------------------- the context
+
+;;; The context has no function that continues a turn or appends a compaction at a turn's end: a turn_end or agent_before_settle handler does both with its
+;;; result, "entries" (custom, custom_message, context_edit and compaction drafts) and "continue" (one more provider request, no new user message). See "Own
+;;; compaction and continue after an overflow" in the extensions guide.
 
 (defstruct (ctx (:constructor %make-ctx (extension request tool-call-id request-id tool-context-p tool-args tool-index)))
   extension
@@ -144,6 +158,13 @@ PARENT is the request that owns the call. Signals HOST-CALL-ERROR when the host 
     (let ((message (sb-thread:with-mutex ((extension-state-lock (ctx-extension ctx)))
                      (extension-stale-message (ctx-extension ctx)))))
       (when message (error "~A" message)))))
+
+(defun assert-call-active (ctx)
+  "Signal the Host's stale message as the HOST-CALL-ERROR a host call signals, for the calls that would send a frame the host never answers: a context kept past its Session reaches no UI."
+  (unless (ctx-replacement ctx)
+    (let ((message (sb-thread:with-mutex ((extension-state-lock (ctx-extension ctx)))
+                     (extension-stale-message (ctx-extension ctx)))))
+      (when message (error 'host-call-error :message message)))))
 
 (defparameter *dialog-methods* '("ui.select" "ui.confirm" "ui.input" "ui.editor" "ui.custom"))
 (defparameter *rpc-synchronous-ui-effects*
@@ -227,7 +248,8 @@ PARENT is the request that owns the call. Signals HOST-CALL-ERROR when the host 
   (and (ctx-request ctx) (request-reason (ctx-request ctx))))
 
 (defun ctx-on-update (ctx partial)
-  "Stream a partial result of the running tool; PARTIAL is a string or a tool-result hash-table."
+  "Stream a partial result of the running tool; PARTIAL is a string or a tool-result hash-table. Signals the stale message after the session was replaced or reloaded."
+  (assert-call-active ctx)
   (unless (and (ctx-tool-call-id ctx) (plusp (length (ctx-request-id ctx))))
     (error "ctx-on-update is only available while a tool runs"))
   (notify-host (ctx-extension ctx) "tool_update"
@@ -301,7 +323,7 @@ MAX-BUFFER caps the bytes of stdout and stderr together (default 256 MiB, capped
 result reports TRUNCATED and KILLED with a nonzero code; a character the cap cuts is dropped whole. It must be an integer from 0 to the runtime string limit: the
 host fails the call for a fraction, a negative value or one above the limit, and a NaN or infinity signals a host-call-error here, as it cannot cross the wire.
 SIGNAL, an abort-signal, ends the command when it is set (SIGTERM to the command alone, SIGKILL five seconds later if it has not exited): the call returns the output
-so far, killed, code 0. It replaces the cancellation of the calling request."
+so far, killed, code 143 (128 + SIGTERM). It replaces the cancellation of the calling request."
   (let ((call-args (obj "command" command "args" (coerce args 'simple-vector)))
         (options (obj)))
     (when timeout (setf (gethash "timeout" options) timeout))
@@ -395,17 +417,32 @@ function of the call's input (a hash-table) returning \"all\" or the words that 
     (unless (hash-table-p result)
       (error 'host-call-error :message "host reply to getSystemPromptOptions is not an object" :code "invalid_reply"))
     result))
-(defun ctx-get-model-info (ctx)
-  (let ((result (call-result ctx "getModelInfo")))
-    (and (hash-table-p result) (let ((id (jget result "id"))) (and (stringp id) (plusp (length id)))) result)))
+(defun model-info-result (result)
+  (and (hash-table-p result) (let ((id (jget result "id"))) (and (stringp id) (plusp (length id)))) result))
+(defun host-model-info (ctx) (model-info-result (call-result ctx "getModelInfo")))
 (defun ctx-get-model-auth (ctx provider-id model-id)
   (call-result ctx "getModelAuth" (obj "provider" provider-id "modelId" model-id)))
 (defun ctx-get-scoped-models (ctx) (or (call-result ctx "getScopedModels" (obj)) (vector)))
 (defun ctx-set-model (ctx model)
-  "(values success error-message) for the model named MODEL."
-  (success-and-error ctx "setModel" (obj "model" model)))
+  "Pi's pi.setModel(model): make MODEL, a Pi model object, the Session's model; (values switched error-message).
+SWITCHED is NIL, and nothing changes, when the model's provider has no configured auth. The Session uses the object as given, with the
+members the caller left on it (its context window, limits, base URL, compat): a model taken from the model registry and edited, or one
+built by hand for a provider the host knows. The model_select handlers have run when it returns.
+A provider/id string stands for the registry's model of that name. An id no catalog lists names no model: the error is
+\"Model not found: provider/id\", as for Pi's RPC set_model, and nothing is set; a name with no slash is an openai model. The string form asks the host for the model object and then sets it, two calls:
+the object the first call returned is the one set, whatever the registry became in between, and an error of the first call is returned
+without setting."
+  (if (stringp model)
+      (let* ((resolved (or (call-result ctx "resolveModel" (obj "spec" model)) (obj)))
+             (e (jget resolved "error")))
+        (if (and (stringp e) (plusp (length e)))
+            (values nil e)
+            (success-and-error ctx "setModel" (obj "model" (jget resolved "model")))))
+      (success-and-error ctx "setModel" (obj "model" model))))
 (defun ctx-set-thinking-level (ctx level) (ctx-call-host ctx "setThinkingLevel" (obj "level" level)) nil)
-(defun ctx-set-label (ctx entry-id label) (ctx-call-host ctx "setLabel" (obj "entryId" entry-id "label" label)) nil)
+(defun ctx-set-label (ctx entry-id &optional label)
+  "LABEL NIL (or no LABEL) leaves the entry without a label member, as Pi's setLabel(entryId) does; :NULL writes it as null, as setLabel(entryId, null) does; a string is written as given. All but a string that is not empty clear the label."
+  (ctx-call-host ctx "setLabel" (if (null label) (obj "entryId" entry-id) (obj "entryId" entry-id "label" label))) nil)
 (defun ctx-wait-for-idle (ctx) (ctx-call-host ctx "waitForIdle") nil)
 (defun ctx-yield (ctx)
   "Stand for Pi's first `await`: end the host's busy hold for this request (host call \"yield\")."
@@ -416,7 +453,7 @@ function of the call's input (a hash-table) returning \"all\" or the words that 
   (sleep seconds)
   nil)
 (defun ctx-project-trusted-p (ctx) (eq (reply-field ctx "isProjectTrusted" "trusted") t))
-(defun ctx-get-session-id (ctx) (reply-field ctx "getSessionID" "sessionId"))
+(defun host-session-id (ctx) (reply-field ctx "getSessionID" "sessionId"))
 (defun ctx-get-leaf-id (ctx) (optional-string-field ctx "getLeafID" "leafId"))
 (defun ctx-get-all-themes (ctx) (reply-field ctx "ui.getAllThemes" "themes"))
 (defun ctx-get-theme (ctx name)
@@ -438,19 +475,25 @@ function of the call's input (a hash-table) returning \"all\" or the words that 
     (ctx-call-host ctx "sendMessage" (obj "message" message "options" options))
     nil))
 
-(defun ctx-send-user-message (ctx content &key (deliver-as "followUp"))
-  (ctx-call-host ctx "sendUserMessage" (obj "content" content "options" (obj "deliverAs" deliver-as)))
+(defun ctx-send-user-message (ctx content &key deliver-as expand-prompt-templates)
+  "DELIVER-AS is \"steer\" or \"followUp\"; NIL sends no deliverAs, as pi.sendUserMessage(content) does: an idle agent runs CONTENT at once and a streaming agent refuses it with Pi's error (\"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.\", an extension error event send_user_message; the call itself returns), so pass :DELIVER-AS \"followUp\" to queue it behind a run. EXPAND-PROMPT-TEMPLATES (types.ts:1792): true dispatches an extension command and expands a skill command or prompt template in CONTENT as typed input would; :false is false; NIL is Pi's default, false."
+  (let ((options (obj)))
+    (when deliver-as (setf (gethash "deliverAs" options) deliver-as))
+    (when expand-prompt-templates
+      (setf (gethash "expandPromptTemplates" options) (if (eq expand-prompt-templates :false) :false t)))
+    (ctx-call-host ctx "sendUserMessage" (obj "content" content "options" options)))
   nil)
 
 (defun ctx-append-entry (ctx custom-type data)
-  (ctx-call-host ctx "appendEntry" (obj "customType" custom-type "data" data)) nil)
+  "DATA NIL leaves the entry without a data member, as Pi's appendEntry(customType) does; :NULL writes the member as null, as appendEntry(customType, null) does."
+  (ctx-call-host ctx "appendEntry" (if (null data) (obj "customType" custom-type) (obj "customType" custom-type "data" data))) nil)
 
 (defun ctx-set-session-name (ctx name)
   (ctx-call-host ctx "setSessionName" (obj "name" name)) nil)
 
 ;;; session manager reads --------------------------------------------------------
 
-(defstruct (session-manager (:constructor make-session-manager (ctx))) ctx)
+(defstruct (session-manager (:constructor make-session-manager (ctx))) ctx (replicated t))
 
 (defun ctx-session-manager (ctx) (make-session-manager ctx))
 
@@ -459,9 +502,6 @@ function of the call's input (a hash-table) returning \"all\" or the words that 
 
 (defun session-get-cwd (m) (session-read m "getCwd"))
 (defun session-get-session-dir (m) (session-read m "getSessionDir"))
-(defun session-get-session-id (m) (session-read m "getSessionId"))
-(defun session-get-session-file (m) (session-read m "getSessionFile"))
-(defun session-get-session-name (m) (session-read m "getSessionName"))
 (defun session-get-leaf-id (m) (session-read m "getLeafId"))
 (defun session-get-header (m) (session-read m "getHeader"))
 (defun session-get-leaf-entry (m) (session-read m "getLeafEntry"))
@@ -632,7 +672,7 @@ function of the call's input (a hash-table) returning \"all\" or the words that 
   "Call HANDLER, with the new terminal width, after each resize. Rows sent with the footer or header carry the width they were
 laid out for, so after a resize they stay hidden until the extension sends rows for the new width: this is that trigger.
 Handlers run one at a time, in the order the widths arrived, on a worker thread (never the thread that reads the host); a handler
-that signals is reported on stderr and does not stop the others. Returns the unsubscribe function."
+that signals is reported in the extension's log and does not stop the others. Returns the unsubscribe function."
   (let* ((ext (ctx-extension ctx))
          (id (sb-thread:with-mutex ((extension-state-lock ext))
                (let ((id (incf (extension-width-subscriber-id ext))))
@@ -652,7 +692,7 @@ that signals is reported on stderr and does not stop the others. Returns the uns
                  (pop (extension-width-jobs ext)))))
       (dolist (handler (cdr job))
         (handler-case (funcall handler (car job))
-          (error (e) (format *error-output* "~A: width change handler failed: ~A~%" (extension-name ext) e)))))))
+          (error (e) (diagnose "~A: width change handler failed: ~A~%" (extension-name ext) e)))))))
 
 (defun dispatch-width-change (ext width)
   "Queue WIDTH for the handlers subscribed now."

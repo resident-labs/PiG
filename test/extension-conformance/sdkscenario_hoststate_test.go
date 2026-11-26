@@ -3,6 +3,7 @@ package extensionconformance
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"maps"
 	"os"
 	"path/filepath"
@@ -108,8 +109,12 @@ func (r *scenarioRig) installHostState() {
 	})
 	b.SetHostAction("abort", func() { r.calls.add("abort") })
 	// ctx.reload() reloads the host as the command-context action of a mode does (agent-session.ts reload).
-	b.SetHostAction("reload", func(ctx context.Context) error {
-		_, err := r.host.Reload(ctx)
+	b.SetHostAction("reload", func(context.Context) error {
+		if r.reloadRejection != "" {
+			return errors.New(r.reloadRejection)
+		}
+		// The host binds the extensions a reload loads to the context it received, which must outlive the command that asked for the reload.
+		_, err := r.host.Reload(r.t.Context())
 		applyQueuedRegistrations(r.host)
 		return err
 	})

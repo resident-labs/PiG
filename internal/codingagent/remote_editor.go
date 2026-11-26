@@ -51,13 +51,16 @@ func (m *InteractiveMode) setRemoteEditor(editor extension.RemoteEditor) {
 	if m.editor == nil {
 		return
 	}
-	text := m.editor.Text()
+	text := m.editor.GetExpandedText()
 	if m.remoteEditor != nil {
 		m.remoteEditor.finishAllInput()
 	}
 	if editor == nil {
 		m.remoteEditor = nil
 		m.editor.SetRemote(nil)
+		// Pi's setCustomEditorComponent(undefined) puts the expanded draft into the default editor (defaultEditor.setText(currentText)); a replacement's
+		// collapsed marker means nothing to the default editor, which holds none of its content.
+		m.editor.SetText(text)
 		if len(m.autocompleteFactories) == 0 {
 			m.editor.SetAutocompleteChanged(nil)
 			m.autocompleteProvider = nil
@@ -65,7 +68,7 @@ func (m *InteractiveMode) setRemoteEditor(editor extension.RemoteEditor) {
 	} else {
 		h := &remoteEditor{m: m, editor: editor}
 		m.remoteEditor = h
-		m.editor.SetAutocompleteChanged(func(base tui.AutocompleteProvider) { m.rebuildAutocompleteWrappers(base, nil) })
+		m.editor.SetAutocompleteChanged(m.autocompleteChangedCallback())
 		if delegated, ok := editor.(extension.DelegatedRemoteEditor); ok && delegated.Delegated() {
 			m.editor.SetDelegatedRemote(h)
 		} else {
@@ -77,8 +80,28 @@ func (m *InteractiveMode) setRemoteEditor(editor extension.RemoteEditor) {
 	if editor != nil {
 		editor.Configure(m.remoteEditorConfig())
 		editor.SetText(text)
+		m.handPendingAutocompleteToRemoteEditor()
 	}
 	m.requestRender()
+}
+
+// handPendingAutocompleteToRemoteEditor is the provider hand-over of Pi's setCustomEditorComponent (`newEditor.setAutocompleteProvider(this.autocompleteProvider)`,
+// interactive-mode.ts:3015-3017) for an editor whose process was told there was no provider yet (ui.autocomplete.current answered {}) and which this install
+// finds a provider for: the provider was built after the process asked and before the change callback this install sets, so nothing else reaches it. An
+// editor that was handed the provider when it was built, and one installed before any provider exists (the setup that follows syncs it), get no call here:
+// Pi calls the setter once per install. It goes through the bridge call a rebuild uses, off the owner loop, and a refusal comes back as that call's
+// [extension.EditorSyncError].
+func (m *InteractiveMode) handPendingAutocompleteToRemoteEditor() {
+	provider := m.currentAutocompleteProvider()
+	bridge, ok := m.opts.SubprocessUIBridge.(interface {
+		SyncPendingAutocomplete(context.Context, *extension.AutocompleteProvider) error
+	})
+	if provider == nil || !ok {
+		return
+	}
+	m.startAutocompleteWork(func(context.Context) (func(), error) { return nil, nil }, nil, func(ctx context.Context) error {
+		return bridge.SyncPendingAutocomplete(ctx, provider)
+	})
 }
 
 // placeActiveStatusIndicator puts the active status in the editor's border or the status container, whichever the installed editor opted into.
@@ -400,7 +423,7 @@ func (h *remoteEditor) EditorShortcut(data string) {
 // session_shutdown after stopping it) it writes straight to the terminal.
 func (h *remoteEditor) TerminalWrite(data string) {
 	if !h.m.remoteEditorEvents.post(h.m, func() { h.m.writeTerminal(data) }) {
-		tui.WriteToTerminal(os.Stdout, data)
+		h.m.writeDirectOutsideStop(data)
 	}
 }
 
@@ -422,14 +445,20 @@ func (h *remoteEditor) EditorClosed() {
 // writeTerminal writes raw output to the terminal between frames.
 func (m *InteractiveMode) writeTerminal(data string) {
 	if m.tuiStopped.Load() {
-		tui.WriteToTerminal(os.Stdout, data)
+		m.writeDirectOutsideStop(data)
 		return
 	}
 	if writer, ok := m.tuiInst.(interface{ WriteRaw(string) }); ok {
 		writer.WriteRaw(data)
 		return
 	}
-	tui.WriteToTerminal(os.Stdout, data)
+	m.writeDirectOutsideStop(data)
+}
+
+// writeDirectOutsideStop writes data straight to the process's terminal, where no renderer takes part: after the TUI stopped, or for a renderer that cannot write raw
+// output. The goroutine that calls it may be one that the exit's stop does not wait for, so the terminal's stop transaction orders the write (writeOutsideStop).
+func (m *InteractiveMode) writeDirectOutsideStop(data string) {
+	m.writeOutsideStop(func() { tui.WriteToTerminal(os.Stdout, data) })
 }
 
 // runOnMainOK runs fn on the owner loop and reports whether the loop took it.

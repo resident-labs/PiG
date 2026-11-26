@@ -4,7 +4,6 @@ package coding
 
 import (
 	"context"
-	"encoding/json"
 	"reflect"
 	"slices"
 	"sync"
@@ -63,6 +62,10 @@ func cacheWarmingStreamFn(session func() *Session) agent.StreamFn {
 			options, err = s.buildRequestOptions(model, options)
 			if err != nil {
 				return nil, err
+			}
+			// pig additive (D654): a request keeps the status, headers and stream state of its failure only when a retry decider is installed.
+			if icodingagent.DefaultRetryDecider() != nil {
+				ctx = ai.WithFailureResponse(ctx)
 			}
 			// A standalone summary can use this stream but must not replace the live conversation's prefix.
 			if ctx.Value(standaloneSummaryKey{}) == nil {
@@ -189,7 +192,8 @@ func (s *Session) startCacheWarming(model *ai.Model, transcript ai.TranscriptCon
 		return
 	}
 	request := icodingagent.CacheWarmRequest{Model: model, Context: transcript, Options: options}
-	warmer.Start(request, s.cacheContextIsCurrent(model))
+	// The copy of the messages that cacheContextIsCurrent takes is made only for a request the warmer keeps.
+	warmer.StartCapturing(request, func() func() bool { return s.cacheContextIsCurrent(model) })
 }
 
 // cacheContextIsCurrent keeps warming while the current transcript still
@@ -233,7 +237,8 @@ func (s *Session) decideCacheWarming(ctx context.Context, event icodingagent.Cac
 // wait on channel capacity: the goroutine keeps trying to deliver the event
 // until either it succeeds or the event executor ends.
 func (s *Session) emitEntryAppended(ctx context.Context, entry icodingagent.UsageEntry) {
-	raw, err := json.Marshal(entry)
+	// The entry as the session line wrote it (JSON.stringify: a lone surrogate an escape, `<`, `>` and `&` literal); json.Marshal would re-encode those bytes with HTML escapes.
+	raw, err := entry.MarshalJSON()
 	if err != nil || ctx.Err() != nil {
 		return
 	}
@@ -264,6 +269,7 @@ func (s *Session) CacheWarmingStatus() *icodingagent.CacheWarmingStatus {
 // reconciles active warming. Mirrors upstream AgentSession.setCacheWarmingMode.
 func (s *Session) SetCacheWarmingMode(mode icodingagent.CacheWarmingMode) error {
 	if err := s.SettingsManager().SetCacheWarmingMode(mode); err != nil {
+		// pig divergence (D633): a failed save of the mode is returned and the warmer is not told; Pi's setCacheWarmingMode (agent-session.ts:1520-1523) cannot fail and always tells it.
 		return err
 	}
 	if warmer := s.cacheWarmerHooks(); warmer != nil {

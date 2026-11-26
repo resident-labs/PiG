@@ -2,7 +2,7 @@
 
 This page takes you from nothing installed to one finished task. It has four steps: install, choose a model, run a walkthrough and leave. Each step shows what PiG prints.
 
-PiG's first start asks three short questions (theme, header picture and usage data). It does not help you pick a model or run a first task. This page is the guide for those steps. It covers the same ground as Pi 1.5.0's quickstart ([Pi's quickstart](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/quickstart.md)), with PiG's commands and folders.
+PiG's first start asks three short questions (theme, header picture and usage data). It does not help you pick a model or run a first task. This page is the guide for those steps. It covers the same ground as Pi 1.6.0's quickstart ([Pi's quickstart](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/quickstart.md)), with PiG's commands and folders.
 
 ## 1. Install
 
@@ -21,7 +21,7 @@ npm install -g @pi-in-go/pig
 The first command downloads the newest published release, checks its SHA-256 checksum, and puts the `pig` program in the folder `~/.local/bin`. `~` is your home folder. It ends with a line such as:
 
 ```text
-pig-install: Installed 0.5.0+1.2.0 to /home/you/.local/bin/pig
+pig-install: Installed pig 0.5.0 to /home/you/.local/bin/pig
 ```
 
 Your terminal finds a program only when its folder is on your `PATH`. `PATH` is the list of folders the terminal searches for commands. When `~/.local/bin` is not on your `PATH`, the installer prints one more line that tells you what to run, for example:
@@ -35,14 +35,20 @@ Run the `export` command it shows. That command lasts until you close the termin
 Check that the command works:
 
 ```bash
-pig --version
+pig version
 ```
 
-PiG prints its version and the Pi version it follows. The text on your computer shows a different number when your release differs:
+PiG prints its own release and the Pi release it follows. The text on your computer shows different numbers when your release differs:
 
 ```text
-0.5.0+1.2.0
+pig: 0.5.0
+upstream pi: 1.2.0
+go: go1.27.2
+platform: linux/amd64
+build: dev
 ```
+
+`pig --version` prints only the Pi release, `1.2.0` here, exactly as `pi --version` does.
 
 The [Quickstart](/docs/latest/quickstart) lists the other install routes. [Install troubleshooting](/docs/latest/install-troubleshooting#pig-command-not-found) helps when the terminal answers `pig: command not found`.
 
@@ -93,7 +99,7 @@ The first time, PiG shows a setup screen with three questions. Press `Enter` to 
 
 1. **Pick a theme.** `System` uses your terminal's colours.
 2. **Pick a sprite.** The picture of a pig at the top of the screen. It changes nothing else. Change it later with `/sprite`.
-3. **Opt-in to anonymous usage data sharing?** Use `↓` to move to `Don't share` if you do not want to send usage data, then press `Enter`. To change it later, set `"enableAnalytics"` to `true` or `false` in `~/.pig/agent/settings.json`. The screen's text also mentions a privacy command. Neither Pi 1.5.0 nor PiG has one. PiG shows Pi's text with only the program name changed (Pi `first-time-setup.ts:77`).
+3. **Opt-in to anonymous usage data sharing?** Use `↓` to move to `Don't share` if you do not want to send usage data, then press `Enter`. To change it later, set `"enableAnalytics"` to `true` or `false` in `~/.pig/agent/settings.json`. The screen's text also mentions a privacy command. Neither Pi 1.6.0 nor PiG has one. PiG shows Pi's text with only the program name changed (Pi `first-time-setup.ts:77`).
 
 PiG saves your answers in `~/.pig/agent/settings.json` and does not ask again. Pi shows this screen only for its own release with `PI_EXPERIMENTAL=1` set. PiG shows it on the first interactive start (divergence D88, `coding/cli/extensions.go:93-95`). PiG skips the screen when the `PIG_CODING_AGENT_DIR` environment variable is set, and when it runs a single prompt with `-p`.
 
@@ -118,7 +124,7 @@ Type `/login` and press `Enter`:
 ```
 
 - **Sign in with an account** is for a subscription you already pay for, such as ChatGPT or GitHub Copilot. PiG then takes you through that provider's own sign-in.
-- **Sign in with an API key** is for a key from a provider's website. PiG lists the providers. Type part of the provider's name to shorten the list, then press `Enter`. PiG asks for the key and masks what you type: dots, a character count and the last four characters (PiG's `maskSecretInput` setting, divergence D80; Pi 1.5.0 shows the key as typed). It stores the key in `~/.pig/agent/auth.json`, readable by your user only ([Providers](/docs/latest/providers#authentication)).
+- **Sign in with an API key** is for a key from a provider's website. PiG lists the providers. Type part of the provider's name to shorten the list, then press `Enter`. PiG asks for the key and masks what you type: dots, a character count and the last four characters (PiG's `maskSecretInput` setting, divergence D80; Pi 1.6.0 shows the key as typed). It stores the key in `~/.pig/agent/auth.json`, readable by your user only ([Providers](/docs/latest/providers#authentication)).
 
 PiG does not test the key when you save it. It confirms the save and picks a model for you, for example:
 
@@ -205,10 +211,11 @@ The longer walkthroughs start from [Applied use cases](/docs/latest/applied-use-
 Press `Ctrl+D` on an empty editor. PiG prints how to return to the conversation:
 
 ```text
-To resume this session: pig --session 01a12bb7-80df-773c-8928-031c941bb0df
+To resume this session:
+pig --session 01a12bb7-80df-773c-8928-031c941bb0df
 ```
 
-(`internal/codingagent/interactive.go:1420`; Pi prints the same line at `interactive-mode.ts:4338`.)
+(`internal/codingagent/interactive.go` `InteractiveMode.printResumeHint`; Pi prints the same two lines in `interactive-mode.ts` `InteractiveMode.shutdown`.)
 
 Run `pig --continue` in the same folder to resume the most recent conversation. `pig --resume` lists the saved ones. See [Sessions](/docs/latest/sessions).
 

@@ -4,7 +4,7 @@ Operating rules for AI agents maintaining `pig`, the Go port of upstream `pi`. T
 
 ## Mission
 
-`pig` must match upstream `pi` observable behavior unless `docs/parity/DIVERGENCES.md` records a numbered, scrutinized exception. Treat the port as a compiler from upstream TypeScript behavior to Go behavior: `docs/parity/PORT_MAP.md` defines the file map, parity scenarios define behavior, `test/parity/coverage.md` reports proof, and gates keep the claims honest.
+`pig` must match upstream `pi` observable behavior unless `docs/parity/DIVERGENCES.md` records a numbered, scrutinized exception. Treat the port as a compiler from upstream TypeScript behavior to Go behavior: `docs/parity/PORT_MAP.md` defines the file map, parity scenarios define behavior, `test/parity/generated/coverage.md` reports proof, and gates keep the claims honest.
 
 Source of truth:
 - `.upstream/current/` is the upstream mirror.
@@ -18,8 +18,8 @@ Source of truth:
   are Foundation gates. PORT_MAP remains the file navigation roll-up until
   Foundation I finishes generating its statuses from these ledgers.
 - `test/parity/upstream-sync/v<version>.toml` accounts for every changed tracked source file in a version leap.
-- `test/parity/async-contracts.toml` accounts for Promise/async semantics across the complete pinned upstream source tree.
-- `test/parity/coverage.md` and the generated block below report verification.
+- `test/parity/ledgers/async-contracts.toml` accounts for Promise/async semantics across the complete pinned upstream source tree.
+- `test/parity/generated/coverage.md` and the generated block below report verification.
 - `docs/parity/DIVERGENCES.md` records intentional differences.
 
 No prose status claim overrides those files.
@@ -50,6 +50,8 @@ A Piglet cannot supply the parser, resolver, verifier, SDK bridge, isolation bou
 Additive records use `docs/additive-features.md`. Observable Stock PiG differences use `docs/parity/DIVERGENCES.md`. Place one short typed source marker at each production decision point. Tests do not satisfy the source-marker requirement.
 
 Change the version only with `make set-version VERSION=x.y.z`.
+
+PiG does not run on iPhone or iPad. iOS does not let a terminal app run a downloaded binary. On those devices, `install.sh` and the npm launcher tell the user to run PiG on a computer and connect with ssh. Do not add an iOS build target without a new owner decision.
 
 ## Pig-owned format and update policy
 
@@ -173,6 +175,8 @@ byte-faithful behavior before and after.
 
 Port Pi's design, not one case's output. Use Pi's shared data (model catalog, `defaultModelPerProvider`, auth metadata) and one shared function where Pi has one. Never hard-code a provider or model in shared code; cite the Pi line when Pi itself special-cases one. Test shared paths with several provider shapes, never only Copilot or `test-faux`, and fix a special case's siblings together.
 
+Do not trust a tool only because a binary with its name is on `PATH`. On Debian, `/usr/bin/fd` can be FDclone, a file manager that takes the terminal. Before PiG uses a system `fd` or `rg`, it confirms the identity from the `--version` output, and it runs the check and the search without a controlling terminal. When you add a new external tool, apply the same rule: check its identity, detach it from the terminal, and fall back to the managed download.
+
 ## TypeScript async/Promise parity
 
 Treat every upstream `async`, `Promise`, `.then`, `Promise.all`, `Promise.race`, and intentionally unawaited call as control-flow behavior, not syntax to erase. Before porting it, record whether the caller waits, what ordering is guaranteed, how cancellation and errors propagate, whether work is concurrent, and which executor/event loop owns callbacks. Then preserve that contract in Go:
@@ -273,28 +277,28 @@ make async-contracts` or `make verify` from `docs/parity/PORT_MAP.md` and `test/
   port. Everything else is invariant rule, not progress narrative.
 -->
 
-**Porting:** 910 / 929 intended-portable entries ✅ (98.0%); **Verification:** 837 behavioral (92.0%), 73 untested.
-Raw PORT_MAP rows: 1032. Breakdown: 103 n/a (designed out) · 19 🟡 partial. See docs/parity/DIVERGENCES.md for the documented exceptions.
+**Porting:** 1046 / 1049 intended-portable entries ✅ (99.7%); **Verification:** 828 behavioral (79.2%), 218 untested.
+Raw PORT_MAP rows: 1166. Breakdown: 117 n/a (designed out) · 3 🟡 partial. See docs/parity/DIVERGENCES.md for the documented exceptions.
 
 | package | src files | n/a | intended | ✅ | 🟡 | ⬜ | ported | behavioral |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | `agent` | 6 | 1 | 5 | 5 | 0 | 0 | 100.0% | 100.0% |
-| `ai` | 265 | 22 | 243 | 243 | 0 | 0 | 100.0% | 98.8% |
-| `chord` | 247 | 28 | 219 | 213 | 6 | 0 | 97.3% | 86.9% |
+| `ai` | 272 | 24 | 248 | 248 | 0 | 0 | 100.0% | 97.2% |
+| `chord` | 346 | 40 | 306 | 306 | 0 | 0 | 100.0% | 56.2% |
 | `codemode` | 17 | 4 | 13 | 13 | 0 | 0 | 100.0% | 100.0% |
-| `coding-agent` | 256 | 27 | 229 | 228 | 1 | 0 | 99.6% | 99.6% |
-| `durable` | 97 | 10 | 87 | 76 | 11 | 0 | 87.4% | 98.7% |
-| `env` | 23 | 3 | 20 | 19 | 1 | 0 | 95.0% | 100.0% |
+| `coding-agent` | 266 | 27 | 239 | 238 | 1 | 0 | 99.6% | 95.4% |
+| `durable` | 103 | 10 | 93 | 93 | 0 | 0 | 100.0% | 83.9% |
+| `env` | 25 | 3 | 22 | 20 | 2 | 0 | 90.9% | 95.0% |
 | `evals` | 6 | 0 | 6 | 6 | 0 | 0 | 100.0% | 100.0% |
-| `mcp` | 18 | 3 | 15 | 15 | 0 | 0 | 100.0% | 100.0% |
+| `mcp` | 28 | 3 | 25 | 25 | 0 | 0 | 100.0% | 60.0% |
 | `schema` | 43 | 3 | 40 | 40 | 0 | 0 | 100.0% | 0.0% |
 | `telemetry` | 8 | 1 | 7 | 7 | 0 | 0 | 100.0% | 100.0% |
 | `tui` | 46 | 1 | 45 | 45 | 0 | 0 | 100.0% | 100.0% |
 
-- **Four core packages (agent, ai, coding-agent, tui):** 521 / 522 intended-portable files ✅ (99.8%) from 573 rows; 517 behavioral (99.2%), 0 weak-only, 4 untested.
-- **Shipped surface (agent, ai, codemode, coding-agent, mcp, schema, telemetry, tui; coding-agent without ):** 596 / 597 intended-portable files ✅ (99.8%) from 659 rows; 552 behavioral (92.6%), 0 weak-only, 44 untested.
-- **Whole monorepo (12 packages):** 910 / 929 intended-portable files ✅ (98.0%) from 1032 rows; 837 behavioral (92.0%), 0 weak-only, 73 untested.
-- **Interface closure:** 14466 of 14469 semantic interface IDs closed (395 designed-out, 3 pending, 14071 ported). A file-level ✅ does not close an interface ID.
+- **Four core packages (agent, ai, coding-agent, tui):** 536 / 537 intended-portable files ✅ (99.8%) from 590 rows; 518 behavioral (96.6%), 0 weak-only, 18 untested.
+- **Shipped surface (agent, ai, codemode, coding-agent, mcp, schema, telemetry, tui; coding-agent without ):** 621 / 622 intended-portable files ✅ (99.8%) from 686 rows; 553 behavioral (89.0%), 0 weak-only, 68 untested.
+- **Whole monorepo (12 packages):** 1046 / 1049 intended-portable files ✅ (99.7%) from 1166 rows; 828 behavioral (79.2%), 0 weak-only, 218 untested.
+- **Interface closure:** 15360 of 15360 semantic interface IDs closed (582 designed-out, 14778 ported). A file-level ✅ does not close an interface ID.
 
 Behavioral evidence includes paired scenarios and reviewed mutation-proven unit tests; the family table below counts paired scenarios only.
 Weak scenarios not counted as behavioral verification: 4 boot-only, 4 registration-only, 1 smoke-only.
@@ -303,35 +307,35 @@ Weak scenarios not counted as behavioral verification: 4 boot-only, 4 registrati
 |---|---:|---:|---:|---:|---:|---:|---|
 | `_top` | 1 | 1 | 0 | 0 | 0 | 1 | not run |
 | `ai-sdk` | 3 | 3 | 0 | 0 | 0 | 90 | not run |
-| `autocomplete` | 14 | 14 | 0 | 0 | 0 | 5 | not run |
+| `autocomplete` | 20 | 20 | 0 | 0 | 0 | 5 | not run |
 | `cli-utils` | 38 | 38 | 0 | 0 | 0 | 17 | not run |
 | `clipboard-images` | 7 | 7 | 0 | 0 | 2 | 11 | not run |
-| `compaction` | 15 | 15 | 0 | 0 | 0 | 10 | not run |
+| `compaction` | 21 | 21 | 0 | 0 | 0 | 11 | not run |
 | `export-html` | 7 | 7 | 0 | 0 | 0 | 2 | not run |
 | `extension-host` | 1 | 1 | 0 | 0 | 0 | 2 | not run |
-| `extensions-runtime` | 143 | 142 | 0 | 1 | 0 | 63 | not run |
+| `extensions-runtime` | 191 | 190 | 0 | 1 | 0 | 71 | not run |
 | `footer` | 12 | 12 | 0 | 0 | 0 | 9 | not run |
-| `fullscreen` | 14 | 14 | 0 | 0 | 0 | 11 | not run |
-| `interactive-rendering` | 73 | 72 | 1 | 0 | 0 | 37 | not run |
-| `json` | 14 | 14 | 0 | 0 | 0 | 10 | not run |
-| `model-resolver-selector` | 28 | 28 | 0 | 0 | 0 | 16 | not run |
+| `fullscreen` | 20 | 20 | 0 | 0 | 0 | 13 | not run |
+| `interactive-rendering` | 94 | 93 | 1 | 0 | 0 | 42 | not run |
+| `json` | 19 | 19 | 0 | 0 | 0 | 12 | not run |
+| `model-resolver-selector` | 30 | 30 | 0 | 0 | 0 | 16 | not run |
 | `model-runtime-store-catalog` | 26 | 26 | 0 | 0 | 0 | 24 | not run |
-| `oauth` | 32 | 32 | 0 | 0 | 0 | 19 | not run |
-| `print` | 13 | 13 | 0 | 0 | 0 | 9 | not run |
-| `project-trust` | 26 | 26 | 0 | 0 | 0 | 19 | not run |
-| `providers-faux-streaming` | 66 | 65 | 0 | 1 | 0 | 49 | not run |
-| `providers-registry` | 9 | 6 | 0 | 3 | 0 | 27 | not run |
-| `rpc` | 93 | 93 | 0 | 0 | 0 | 32 | not run |
-| `selectors` | 14 | 14 | 0 | 0 | 1 | 15 | not run |
-| `session` | 43 | 43 | 0 | 0 | 0 | 19 | not run |
-| `settings` | 16 | 16 | 0 | 0 | 0 | 21 | not run |
-| `slash-commands` | 29 | 28 | 1 | 0 | 0 | 21 | not run |
-| `startup` | 19 | 18 | 1 | 0 | 0 | 10 | not run |
-| `tools` | 32 | 32 | 0 | 0 | 0 | 35 | not run |
-| `tree` | 9 | 8 | 1 | 0 | 0 | 9 | not run |
-| `tui-components` | 39 | 39 | 0 | 0 | 0 | 36 | not run |
+| `oauth` | 37 | 37 | 0 | 0 | 0 | 19 | not run |
+| `print` | 14 | 14 | 0 | 0 | 0 | 10 | not run |
+| `project-trust` | 27 | 27 | 0 | 0 | 0 | 19 | not run |
+| `providers-faux-streaming` | 72 | 71 | 0 | 1 | 0 | 49 | not run |
+| `providers-registry` | 17 | 14 | 0 | 3 | 0 | 28 | not run |
+| `rpc` | 106 | 106 | 0 | 0 | 0 | 33 | not run |
+| `selectors` | 18 | 18 | 0 | 0 | 1 | 15 | not run |
+| `session` | 58 | 58 | 0 | 0 | 0 | 21 | not run |
+| `settings` | 17 | 17 | 0 | 0 | 0 | 21 | not run |
+| `slash-commands` | 39 | 38 | 1 | 0 | 0 | 24 | not run |
+| `startup` | 39 | 38 | 1 | 0 | 0 | 17 | not run |
+| `tools` | 41 | 41 | 0 | 0 | 0 | 42 | not run |
+| `tree` | 16 | 15 | 1 | 0 | 0 | 11 | not run |
+| `tui-components` | 40 | 40 | 0 | 0 | 0 | 36 | not run |
 
-Full per-file detail: `test/parity/coverage.md`.
+Full per-file detail: `test/parity/generated/coverage.md`.
 
 <!-- END COVERAGE -->
 
@@ -357,6 +361,8 @@ Apply these rules to new work. Do not delete or weaken accepted tests to conform
 ## Upstream test parity
 
 A production file is `ported` only when every upstream test file covering it is ported with the same inputs and expected results, or designed out with a numbered, reviewed reason. Record test locations and current upstream hashes in `test/parity/interfaces/test-mapping-v<version>.json`. A `partial` disposition enumerates the missing cases; file-name similarity, existing code, and a passing smoke test do not close them. Port the covering upstream tests in the same change whenever you port or change a production file. Preserve ordering, cancellation, errors, retained state, and caller effects, not only happy-path output.
+
+If an upstream case does not apply as written, test what it protects in PiG's own way: through the vendored Pi TypeScript, a PiG analogue, or a PiG example. Design it out only when that is impossible or worthless, and say why.
 
 No release may treat a pending or partial upstream test tagged `hot-path` as closed. `make ci-contracts` enforces the reviewed path tags in `test/parity/interfaces/test-porting-policy-v<version>.json` and rejects a decrease in the total ported-file count against the committed baseline. The owner-approved 0.3.x exception records explicit `deferred-0.3.x` rows without changing their partial/pending mappings, hot-path tags, assertions or baseline; [the release-policy procedure](test/parity/README.md#approved-03x-test-porting-gaps) defines the required approval, missing-case reference and follow-up. All unlisted pending/partial hot paths remain release blockers. Keep tag review and the ported baseline current in the same change; never remove a hot-path tag or lower the baseline to pass the gate. A credential or toolchain requirement is not a scope exclusion. Dispatch test-file ownership through `docs/parity/pending-tests-batches.md`; coordinate production files and shared evidence separately.
 
@@ -486,7 +492,12 @@ A divergence is allowed only when it is user-visible or interop-relevant and can
 - `SCRUTINIZED:approved`;
 - remove-when condition;
 - `// pig divergence (D<N>): ...` at each call site;
-- parity coverage or an explicit parity allowance.
+- parity coverage or an explicit parity allowance;
+- for a divergence that a test-mapping entry names, the labeled paragraphs `Protects:`, `PiG-shaped test considered:` and `Why not:`.
+
+The `SCRUTINIZED:approved` line of a record binds its normative text with `text-sha256:<hash>` and `make divergence-quality` fails when the text changes without a new approval line: only the owner runs `make divergence-approve ID=D<N>`, and an agent or a lane that changes a record's normative text (or adds a record) lists it in `automation/ci/divergence-reapproval-pending.txt` as `D<N> <class> <reason>` and says so in its pull request (details in `docs/parity/divergences/head.md`).
+
+The `SCRUTINIZED:approved` line of a record binds its normative text with `text-sha256:<hash>` and `make divergence-quality` fails when the text changes without a new approval line: only the owner runs `make divergence-approve ID=D<N>`, and an agent or a lane that changes a record's normative text (or adds a record) lists it in `automation/ci/divergence-reapproval-pending.txt` as `D<N> <class> <reason>` and says so in its pull request (details in `docs/parity/divergences/head.md`).
 
 Each record is one file, `docs/parity/divergences/D<N>.md`: an active record is a `## D<N> <title>` section, a retired record is one `- D<N>: ...` line. Edit that file only. `make divergences` generates `docs/parity/DIVERGENCES.md` from the files, and a lane does not commit the generated ledger; the merger regenerates it (`TestDivergenceLedgerEqualsItsRecordFiles` fails when they differ).
 
@@ -515,6 +526,14 @@ Set up the toolchain at the pinned versions:
 Reproduce a Windows CI job locally before you change code. Run the same command the job runs (see the `windows` job in `.github/workflows/ci.yml`). Use `go test -v` and a `-timeout` below the job limit, so a stall prints a stack.
 
 Set `PIG_HOME` and `PIG_CODING_AGENT_DIR` to a directory with a space in its path, as CI does. Many Windows bugs are path bugs: separators, drive letters, 8.3 short names, and `D:\work\project` against `/work/project`. Compare with what Pi does on Windows before you change a path rule.
+
+A test must pass on Linux, macOS and Windows unless it states why the platform cannot run it. The macOS and Windows CI shards run only on a dispatched run, so a branch can be green on Linux and still have platform failures. Before you report a lane as ready, ask the coordinator for a dispatched run when the lane touches files, paths, locks, sockets, processes or signals.
+
+Look for these faults:
+- A Windows path written into generated JavaScript or JSON without encoding. `D:\` in a template literal is an invalid escape. Encode the path with `json.Marshal` or `JSON.stringify`, or use `filepath.ToSlash`.
+- File and directory removal. macOS and Windows can report `ENOTEMPTY`, `EPERM` or a pending delete where Linux succeeds. Compare with what Pi does on that platform before you change a retry or an error.
+- AF_UNIX sockets on Windows. They exist as files with different ownership checks.
+- Temporary files that a test leaves behind. `assert-clean-tmp` fails the shard.
 
 Work on a branch named `team/<name>/<topic>`. Push it to the staging remote, not to the public repository. The integrator stacks verified branches into the release branch. Each commit follows Commit hygiene below: `git commit --signoff -S`.
 
@@ -563,9 +582,10 @@ Code and interface style:
 Go style:
 - Build, CI, release-candidate, security-analysis, and documented setup commands use the Go version in `.go-version`, the single source. Do not write the version number in this file.
 - `.go-version` is the one Go pin. Workflows, scripts, images, the devcontainer, and the `toolchain` lines of `go.mod` and `go.work` name that release and no other. A script reads `.go-version` instead of repeating the number. Moving the pin changes `.go-version` and its recorded copies in one change; `make compliance` and `TestGoVersionPolicy` fail on any other release. Dated measurement records keep the release they ran on.
-- Maintained modules declare Go 1.26 or 1.26.0 as their language floor unless a concrete language requirement is approved. Do not raise a `go` directive merely to match the build toolchain.
-- Use language features available at the module floor. Prefer applicable modern standard-library APIs such as `slices.Sort`, `slices.SortFunc`, `cmp.Compare`, `maps.Copy`, `slices.Sorted(maps.Keys(m))`, `strings.Cut`, `CutPrefix`, `SplitSeq`, `for i := range n`, `wg.Go`, `min`, and `max`.
-- `go fix -diff ./...` should be empty.
+- The root module declares Go 1.27.0 as its language floor: the JSON code uses `encoding/json/v2` and `encoding/json/jsontext`, which only a 1.27 module may import (the `stdversion` vet check in `go test` rejects them in a 1.26 module). A module that requires the root module (the Porter extension, the extension conformance fixtures) declares 1.27.0 too, because the go command rejects a lower line than a dependency declares. Every other maintained module (`extensions/sdk`, `piglets/standard`, `piglets/aot`, `examples`, other test and fixture modules) declares Go 1.26 or 1.26.0 and must not import them; the SDK keeps its own JSON copy (`extensions/sdk/json`). Do not raise a `go` directive merely to match the build toolchain, and do not raise any module past its floor without a concrete language requirement the owner approved.
+- JSON that follows `JSON.parse` or `JSON.stringify` takes its `encoding/json/v2` options from `internal/jsonopts` (`Parse`, `Stringify`), joined with the site's own options; a site never changes them for everyone.
+- Use language features available at the module floor. Prefer applicable modern standard-library APIs such as `slices.Sort`, `cmp.Compare`, `maps.Copy`, `slices.Sorted(maps.Keys(m))`, `strings.Cut`, `CutPrefix`, `SplitSeq`, `for i := range n`, `wg.Go`, `min`, and `max`. For a sort with a comparison function, `slices.SortFunc` and `slices.SortStableFunc` compile one more copy of the sort (6 to 27 KB) for each element shape. In code that `cmd/pig` links, call `sortx.Func` and `sortx.Stable` from `internal/sortx` instead: they sort up to 12 (`Func`) or 20 (`Stable`) elements as `slices` does, and a longer slice takes 13 to 68% more CPU. Keep `slices.SortFunc` and `slices.SortStableFunc` where n can be large on a timed path (a keystroke, a frame, a listing, a request body) or the element shape is already linked (strings, pointers, ints), and give the reason in the `sort-instance` entry of `automation/ci/perflint/baseline.toml`: `make perf-lint` fails on a new use without one.
+- `go fix -diff ./...` should be empty in the root module and in every maintained nested Go module (`make go-fix-clean` runs it in each).
 - When observable behavior changes, update the doc comment in the same commit.
 
 Lint commands when touching lint/config/code:
@@ -579,9 +599,19 @@ make lint
 
 Use `make lint-changed` in the development loop. It runs every configured linter over whole changed Go files in changed packages relative to the merge base with `main`. Use `make lint` for the full-repository gate. `make check` always runs the full-repository gate.
 
+## Binary size and dependencies
+
+Binary size is a product property. The release binary has a size ceiling for each target in `automation/perf/ratchet.toml`, and `TestReleaseBinarySizeGate` enforces it. Do not raise a ceiling. When a change makes the binary bigger than its ceiling, find the cause and remove it. After a change makes the binary smaller, lower the ceiling to the new size in the same commit.
+
+Most growth comes from a package that becomes live, not from the code you wrote. The Go linker removes code that nothing calls. When a change starts to call a package that was already in the dependency graph, the whole package and its own dependencies come into the binary. In 0.7.1, one call from the TypeBox check path made a vendored JSON Schema validator live, and that validator pulled in `golang.org/x/text/message`. The binary grew by 766 KB.
+
+Before you add an import to code that `cmd/pig` reaches, find out what it costs. Build `cmd/pig` for the release target before and after the change, and compare the per-package symbol sizes with `go run ./automation/ci/sizereport` (`-out` saves a report, `-base` shows the packages that grew, `-why <package>` prints the chain of references that keeps a package in the binary). If a package is large, use a smaller mechanism, use a package that is already live, or move the work out of the main binary. `TestReleaseBinaryLinksOnlyAllowedPackages` reads `automation/perf/linked-packages.toml` and fails with the name of any heavyweight package that `cmd/pig` links and the list does not name, and of any package on its forbid table. A new entry in the allow list for a third-party package needs the owner's approval; a package under `third_party/` counts as third-party. A package of PiG itself needs no approval, but it joins the list only in the commit that makes it that large, and that commit message gives the size report. A package that leaves the binary leaves the list in the same commit.
+
+Do not keep two implementations of one concept in the binary: one width table per module, one schema checker. The `extensions/sdk` copy of the width table is the exception, because the SDK is a separately published module. The binary has two YAML parsers, and each has one job. `internal/yaml12` reads front matter, because it must read it as Pi's `yaml` package does. `go.yaml.in/yaml/v3` reads Piglet manifests and Compose files and writes the baked Piglet bytes, which are digested and signed. Do not replace one with the other. Do not add a third. Tools that only developers or piglet builds need, such as the Go type checker, do not go into the `pig` binary.
+
 ## Commands
 
-Run `make generate` after changing exported Go API, CLI flags, settings, parity scenarios, or docs mirrors. Commit the result. Never hand-edit generated files; regenerate.
+Run `make generate` after changing exported Go API, CLI flags, settings, parity scenarios, or docs mirrors. Commit the result. Never hand-edit generated files; regenerate. `make generate` also vendors the Pi runtime of the Node extension host from the installed oracle (`make vendor-pi-dist`, then `make node-runtime`), so it needs the pinned Pi (`make parity-deps`): `make vendor-pi-dist-drift` and `make node-runtime-drift` fail when either is stale. The observation oracles (`automation/gen/regenerate-observation-oracles.sh`) are recordings under a pinned Node, not derivations: `make generate` does not re-record them, and their timestamps are not drift.
 
 Primary gates:
 ```bash
@@ -648,7 +678,7 @@ artifacts, and published evidence.
 
 ## Commit hygiene
 
-User-facing changes go in `changelog.d/<lane>-<sha>.md`, one fragment per commit range, as `### Added`, `### Changed`, `### Fixed` (and `Upgrading`, `Deprecated`, `Removed`, `Security`, `Known issues`) sections of bullets in `CHANGELOG.md`'s style. `<sha>` is a commit of the range reachable from `HEAD`; a rebase, squash or amend replaces SHAs, so rename the fragment after the commit that replaced it. Every `### Fixed` bullet ends with `<!-- fix: <sha> -->` naming the commit (or commits, comma-separated) that fixes it, also reachable from `HEAD` (or named by a `Fix-Commit: <full sha>` trailer of a squash commit `HEAD` reaches, see `.github/CONTRIBUTING.md`): the bug ledger reads `### Fixed`, and a bullet without a marker has its commits guessed from history, which once credited the 0.5.0 squash and its ~11,000 tests to five bullets. `### Upgrading` is what a user of the previous release must change; the fold appends it to the release's "Upgrading from" section. Do not edit `CHANGELOG.md`. `make changelog-check` validates the names, sections, markers and reachability against the full history of `HEAD` (a shallow clone fails) and `make changelog-unreleased` prints the assembly; fragments whose commits a squash replaced before these rules are listed in `automation/ci/changelogfrag/legacy.txt`, are exempt from the name and marker rules, and the list only shrinks. The integrator runs `make changelog-fold VERSION=x.y.z` to append the fragments to that release in `CHANGELOG.md` and delete them; it runs again at release for fragments written since. `make bug-ledger` refuses to attribute the tests of a commit that touches more than 500 files (a squash or merge) and names the entry; name the real fix commit in its marker.
+User-facing changes go in `changelog.d/<lane>-<sha>.md`, one fragment per commit range, as `### Added`, `### Changed`, `### Fixed` (and `Upgrading`, `Deprecated`, `Removed`, `Security`, `Known issues`) sections of bullets in `CHANGELOG.md`'s style. `<sha>` is a commit of the range reachable from `HEAD`; a rebase, squash or amend replaces SHAs, so rename the fragment after the commit that replaced it. Every `### Fixed` bullet ends with `<!-- fix: <sha> -->` naming the commit (or commits, comma-separated) that fixes it, also reachable from `HEAD` (or named by a `Fix-Commit: <full sha>` trailer of a squash commit `HEAD` reaches, see `.github/CONTRIBUTING.md`): the bug ledger reads `### Fixed`, and a bullet without a marker has its commits guessed from history, which once credited the 0.5.0 squash and its ~11,000 tests to five bullets. A bullet states the cause and the regression tests of its fix after the fix marker, as `<!-- cause: <why the bug happened> -->` and `<!-- tests: <test>[, <test>...] -->` (or the fix commit does, with a `Root-Cause:` trailer and `Regression-Test:` trailers); otherwise the ledger reads the cause from the prose of the commit message, never from a paragraph that reports how the fix was checked (`Tests:`, `Ran:`, `Evidence:`, `Verified on ...`), and lists only the tests the fix commit adds or edits. `make bug-ledger-check` fails for a fix whose newest commit has an author instant at or after 2026-11-14T05:00:00Z (UTC; the instant is compared, not the author's calendar date, so the author's time zone does not matter; the time printed in the message is the commit's own instant in UTC) with no derivable cause, for an entry whose impact class its text no longer reads as, and for an entry that names a commit `HEAD` does not reach while its marker names the commit that replaced it (`.github/CONTRIBUTING.md`). `### Upgrading` is what a user of the previous release must change; the fold appends it to the release's "Upgrading from" section. Do not edit `CHANGELOG.md`. `make changelog-check` validates the names, sections, markers and reachability against the full history of `HEAD` (a shallow clone fails) and `make changelog-unreleased` prints the assembly; fragments whose commits a squash replaced before these rules are listed in `automation/ci/changelogfrag/legacy.txt`, are exempt from the name and marker rules, and the list only shrinks. The integrator runs `make changelog-fold VERSION=x.y.z` to append the fragments to that release in `CHANGELOG.md` and delete them; it runs again at release for fragments written since. The fold moves fragments only and stops, changing nothing, while `## [Unreleased]` in `CHANGELOG.md` still holds an entry: run `make set-version VERSION=x.y.z SET_VERSION_ARGS=--move-unreleased` first (`docs/project/RELEASING.md`). It does not fold into `Unreleased`, whose fragments `make changelog-unreleased` assembles. `make bug-ledger` refuses to attribute the tests of a commit that touches more than 500 files (a squash or merge) and names the entry; name the real fix commit in its marker.
 
 Every commit requires both a DCO `Signed-off-by` line and a signature GitHub marks **Verified**. Use `git commit --signoff -S`. Sign-off is not a cryptographic signature. See `.github/CONTRIBUTING.md` for SSH signing setup and unsigned-commit repair. If signing is unavailable, a maintainer lands the change in a maintainer-signed commit with a `Co-authored-by:` trailer.
 

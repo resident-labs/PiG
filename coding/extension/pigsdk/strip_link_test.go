@@ -47,15 +47,20 @@ func TestStripExtensionSDKRustAndPythonBuildOmitsSDKPackages(t *testing.T) {
 
 // D92: the Go SDK package stays linked (fused extensions are built on it), so
 // a pig_strip_extension_sdk_go build proves its omission by symbol: pigsdk,
-// the only production package that reads the embedded sdk.Source, no longer
-// references it, and the linker drops the unreferenced embed. The stock
-// package references it.
+// the only production package that reads the embedded Go SDK sources
+// (internal/gosdkbundle.Source), no longer references it, and the linker drops
+// the unreferenced embed. The stock package references it. No build of pigsdk
+// references the nested module's own bundle (extensions/sdk.Source): the root
+// module may not read anything of that module that its published version lacks,
+// and the module's gzip copies would add to the binary what the root's frame
+// replaces.
 func TestStripExtensionSDKGoBuildOmitsSDKSource(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds the pigsdk package in -short mode")
 	}
-	const symbol = pigModule + "/extensions/sdk.Source"
-	references := func(tags string) bool {
+	const symbol = pigModule + "/internal/gosdkbundle.Source"
+	const nested = pigModule + "/extensions/sdk.Source"
+	references := func(symbol, tags string) bool {
 		archive := filepath.Join(t.TempDir(), "pigsdk.a")
 		args := []string{"build", "-o", archive}
 		if tags != "" {
@@ -72,11 +77,16 @@ func TestStripExtensionSDKGoBuildOmitsSDKSource(t *testing.T) {
 			return strings.HasSuffix(strings.TrimSpace(line), " "+symbol)
 		})
 	}
-	if !references("") {
+	if !references(symbol, "") {
 		t.Errorf("the stock pigsdk package does not reference %s", symbol)
 	}
-	if references("pig_strip_extension_sdk_go") {
+	if references(symbol, "pig_strip_extension_sdk_go") {
 		t.Errorf("a pig_strip_extension_sdk_go build of pigsdk references %s", symbol)
+	}
+	for _, tags := range []string{"", "pig_strip_extension_sdk_go"} {
+		if references(nested, tags) {
+			t.Errorf("pigsdk (tags %q) references %s", tags, nested)
+		}
 	}
 }
 
@@ -114,5 +124,36 @@ func TestTypeEngineIsLinkedOnlyWhileAnSDKIsEmbedded(t *testing.T) {
 	}
 	if slices.Contains(deps(pigModule+"/coding/extension/host/subprocess", ""), engine) {
 		t.Errorf("the extension host links the type engine without pigsdk")
+	}
+}
+
+// D92: with features: extension-sdk-go stripped, the typed upgrade analysis (coding/cli/extension_upgrade_analyze.go: the go command build of the analysis driver, its run, and the rewrite build check) is not linked into the binary: coding/cli of a pig_strip_extension_sdk_go build holds none of its symbols, and the stock build holds them.
+func TestStripExtensionSDKGoBuildOmitsTheUpgradeAnalysis(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the cli package in -short mode")
+	}
+	symbols := func(tags string) string {
+		archive := filepath.Join(t.TempDir(), "cli.a")
+		args := []string{"build", "-o", archive}
+		if tags != "" {
+			args = append(args, "-tags", tags)
+		}
+		if out, err := exec.Command("go", append(args, pigModule+"/coding/cli")...).CombinedOutput(); err != nil {
+			t.Fatalf("go %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+		out, err := exec.Command("go", "tool", "nm", archive).Output()
+		if err != nil {
+			t.Fatalf("go tool nm: %v", err)
+		}
+		return string(out)
+	}
+	stock, stripped := symbols(""), symbols("pig_strip_extension_sdk_go")
+	for _, symbol := range []string{"cli.runAnalysisDriver", "cli.classifyRewriteBuild", "extensionUpgrader).withGoCompile"} {
+		if !strings.Contains(stock, symbol) {
+			t.Errorf("the stock coding/cli does not hold %s", symbol)
+		}
+		if strings.Contains(stripped, symbol) {
+			t.Errorf("a pig_strip_extension_sdk_go build of coding/cli holds %s", symbol)
+		}
 	}
 }

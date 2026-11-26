@@ -109,7 +109,7 @@ func TestCompactLiveDropsTheOldestMessagesOnOverflow(t *testing.T) {
 	if _, err := CompactLive(t.Context(), livePrep(), request, "", nil, ai.RetryCallbacks{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(sizes) != 3 || !(sizes[0] > sizes[1] && sizes[1] > sizes[2]) {
+	if len(sizes) != 3 || sizes[0] <= sizes[1] || sizes[1] <= sizes[2] {
 		t.Fatalf("request sizes = %v, want three shrinking requests", sizes)
 	}
 	for _, first := range firsts {
@@ -154,5 +154,17 @@ func TestCompactLiveNudgesOnceAfterAToolCall(t *testing.T) {
 	_, err := CompactLive(t.Context(), livePrep(), request, "", nil, ai.RetryCallbacks{})
 	if err == nil || calls != 2 {
 		t.Fatalf("calls = %d, err = %v; want two calls and an error", calls, err)
+	}
+}
+
+// Dyna's no-prefix path uses the single serialized request, even when upstream D167 would chunk it.
+func TestCompactStandaloneKeepsTheProviderOverflow(t *testing.T) {
+	model := &ai.Model{Capabilities: ai.ModelCapabilities{ContextWindow: 6000}}
+	prep := livePrep()
+	prep.MessagesToSummarize = overWindowMessages(60, 1000)
+	completer := &overWindowCompleter{limitTokens: 6000}
+	_, err := CompactStandalone(t.Context(), prep, model, "key", nil, "", "", CompleterStreamFn(completer), nil, nil, ai.RetryCallbacks{}, "")
+	if err == nil || !strings.Contains(err.Error(), "prompt is too long") || len(completer.requests) != 1 {
+		t.Fatalf("summarization used %d requests and returned %v; want one refused request", len(completer.requests), err)
 	}
 }

@@ -20,9 +20,11 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/data"
 	"github.com/MichaelKinsy/PiG/chord/next/host"
 	"github.com/MichaelKinsy/PiG/chord/next/registries"
+	chordtelemetry "github.com/MichaelKinsy/PiG/chord/next/telemetry"
+	pitelemetry "github.com/MichaelKinsy/PiG/telemetry"
 )
 
-// Ports packages/chord/src/next-node/http/http.ts. The HTTP component (slice 10 §2; decisions "The HTTP core is a fetch
+// Ports packages/chord/src/node/http/http.ts. The HTTP component (slice 10 §2; decisions "The HTTP core is a fetch
 // handler", "The HTTP server is a native object", "The HTTP component's security baseline", "Settings are arguments,
 // extensions are registries"): `CreateHttp` takes the app's settings (where to listen, the links endpoint, the close bound)
 // and builds one Web-standard handler, `Fetch`, from the registries its facet serves (`Http`, `Authenticators`), an upgrade
@@ -43,7 +45,10 @@ type HttpOptions struct {
 	Links *LinksOptions
 	// CloseTimeout is how long `Close` waits for running requests and closing sockets: 30 s by default (0).
 	CloseTimeout time.Duration
-	OnError      func(HttpError)
+	// Telemetry is the telemetry adapter (the host's): each routed request is a `chord.http` root span, its scope's ctx under
+	// it; a W3C `traceparent` is extracted only from a request a contributed relay verified. None: the no-op one.
+	Telemetry pitelemetry.TelemetryContext
+	OnError   func(HttpError)
 }
 
 // LinksOptions is the links endpoint's path and what it gives each socket (`maxPayload` 1 MiB by default).
@@ -53,6 +58,12 @@ type LinksOptions struct {
 	Options LinkOptions
 	// OptionsFunc is per request and principal; an error is reported `hook_failed` and refuses the upgrade (403).
 	OptionsFunc func(request HttpRequest, principal data.Principal) (LinkOptions, error)
+	// Opened runs once a link is accepted (`links.opened`), with the request, the principal it acts as and closeLink, which
+	// terminates that link at once (an app closing the links of a credential it revoked: no close handshake, the peer sees 1006;
+	// any goroutine may call it, later calls and calls after the link is gone do nothing); the function it returns runs when the
+	// socket closes, once, also when the hook ended the link before it returned. An error is reported `hook_failed` and the link
+	// stays.
+	Opened func(request HttpRequest, principal data.Principal, closeLink func()) (closed func(), err error)
 }
 
 // HttpErrorKind tells what an HttpError reports.
@@ -73,6 +84,7 @@ const (
 	HookAuthenticate HookName = "authenticate"
 	HookRelay        HookName = "relay"
 	HookLinksOptions HookName = "links.options"
+	HookLinksOpened  HookName = "links.opened"
 )
 
 // HttpError is what the component reports: route_failed (Pattern, Plugin), wrap_failed (Name, Plugin), socket_failed
@@ -123,6 +135,12 @@ func (s *registrySet) authenticatorsNow() []AuthenticatorEntry {
 	s.authenticators.Batch().Section(func() { authenticators = s.authenticators.Value().([]AuthenticatorEntry) })
 	return authenticators
 }
+
+// ErrRequestFinished is the cause the component ends a request's context with once the request is over (its consumer finished and its
+// scope ended). Pi's request `AbortController` is aborted by a disconnect or by `close` only and is never aborted for a finished
+// request: work an authenticator or a handler left running on the context (a sign-in's `lastUsed` write) goes on after the
+// request, so it stays on when the cause is this one.
+var ErrRequestFinished = errors.New("http: the request finished")
 
 // running is a request or an upgrade from its arrival to its end: what `close` waits for, then seals.
 type running struct {
@@ -181,6 +199,8 @@ type HttpComponent struct {
 	options HttpOptions
 	onError func(HttpError)
 	ctx     context.Context
+	// spanHost is the `chord.host` of its `chord.http` spans: its host's.
+	spanHost string
 	// base is the component's context without its cancellation: each request's scope adds its own signal.
 	base     context.Context
 	defaults *DefaultHeaders
@@ -215,6 +235,7 @@ func newComponent(h host.Host, options HttpOptions, ctx context.Context, after a
 		listening: &listeningPromise{done: make(chan struct{})},
 	}
 	c.upgrades.after = after
+	c.spanHost = chordtelemetry.HostAttribute(h.Address())
 	//portlint:allow ctxmapping the component's own `#closing` AbortController, aborted by close
 	c.closing, c.closingCancel = context.WithCancel(context.Background())
 	listen := options.Listen
@@ -263,8 +284,7 @@ func newComponent(h host.Host, options HttpOptions, ctx context.Context, after a
 func (c *HttpComponent) Facet() host.Facet { return c.facet }
 
 // Fetch answers a request (an app's own server mounts it); connection is what the server knows of the socket: without
-// LocalAddress and LocalPort no request is local. Requests before the publication wait for it (503 past the host's
-// `readyTimeout`).
+// LocalAddress and LocalPort no request is local. Requests before the publication are answered 503 at once.
 func (c *HttpComponent) Fetch(request *nethttp.Request, connection Connection) *nethttp.Response {
 	served := c.Serve(WebIncoming(request), connection)
 	answer := served.Answer
@@ -325,7 +345,7 @@ func (c *HttpComponent) Close(ctx context.Context) {
 func (c *HttpComponent) isClosing() bool { return c.closing.Err() != nil }
 
 // Serve serves request: its answer, and what its consumer calls once the body is written or abandoned. It never fails:
-// whatever fails answers (503 before the publication or while closing, 403, 404, 500 reported).
+// whatever fails answers (503 before the host's `Load` or while closing, 403, 404, 500 reported).
 func (c *HttpComponent) Serve(request Incoming, connection Connection) Served {
 	//portlint:allow ctxbackground an AbortController: the request's own root, ended by its client or by close
 	controller, cancel := context.WithCancelCause(context.Background())
@@ -357,7 +377,7 @@ func (c *HttpComponent) Serve(request Incoming, connection Connection) Served {
 		c.mu.Lock()
 		delete(c.running, current)
 		c.mu.Unlock()
-		cancel(errors.New("http: the request finished"))
+		cancel(ErrRequestFinished)
 	}()
 	return Served{Answer: answer, Finished: finish}
 }
@@ -410,7 +430,7 @@ func (c *HttpComponent) serveSteps(request Incoming, connection Connection, cont
 	}
 	admitted := admission.(*Admitted)
 	// A fresh script nonce per response (decision "A CSP nonce per response").
-	webRequest := newWebRequest(request, admitted, c.nonces.Next())
+	webRequest := newWebRequest(request, admitted, c.nonces.Next(), connection.RemoteAddress)
 	match, status := router.Route(request.Method(), webRequest.Path())
 	if status != Found {
 		code := 404
@@ -433,9 +453,17 @@ func (c *HttpComponent) serveSteps(request Incoming, connection Connection, cont
 			return served{answer: c.refusal(503, admitted, router, head)}
 		}
 	}
+	// Deny by default (decision "The app kit, point 3"): no plugin code runs for nobody unless the route is public.
+	if principal == nil && !match.Public {
+		return served{answer: c.refusal(401, admitted, router, head)}
+	}
 	answered := make(chan Answer, 1)
 	scope := make(chan struct{})
+	span := c.span(request, match, admitted)
 	rootCtx := chordctx.WithAbortSignal(c.base, controller)
+	if span != nil {
+		rootCtx = chordctx.WithTelemetry(rootCtx, span.Span())
+	}
 	go func() {
 		defer close(scope)
 		_, err := c.host.Root(func(ctx host.Ctx) (any, error) {
@@ -457,7 +485,59 @@ func (c *HttpComponent) serveSteps(request Incoming, connection Connection, cont
 			}
 		}
 	}()
-	return served{answer: <-answered, scope: scope}
+	answer := <-answered
+	if span != nil {
+		span.Span().SetAttributes(pitelemetry.SpanAttributes{pitelemetry.Attr("status", answer.Status)})
+		if answer.Status >= 500 {
+			chordtelemetry.SpanFailed(span.Span(), "http_failed", fmt.Sprintf("status %d", answer.Status))
+		}
+		//portlint:allow golifetime ends with the request's scope, which `close` seals
+		go func() {
+			<-scope
+			span.End()
+		}()
+	}
+	return served{answer: answer, scope: scope}
+}
+
+// span is a routed request's `chord.http` span (its method and route pattern; its path never: it may carry ids or secrets): a
+// root of the adapter, or the child of a W3C `traceparent` (and its `tracestate`) of a request a contributed relay verified,
+// never a browser's; none without an adapter that records.
+func (c *HttpComponent) span(request Incoming, match *RouteMatch, admitted *Admitted) *chordtelemetry.OpenSpan {
+	adapter := c.options.Telemetry
+	if adapter == nil || chordtelemetry.Untraced(adapter) {
+		return nil
+	}
+	attributes := pitelemetry.SpanAttributes{pitelemetry.Attr("chord.host", c.spanHost), pitelemetry.Attr("method", request.Method()), pitelemetry.Attr("route", match.Pattern)}
+	traceparent := ""
+	if admitted.Provenance.Kind == ProvenanceRelayed {
+		traceparent = traceHeader(request, "traceparent", 256)
+	}
+	if traceparent == "" {
+		return chordtelemetry.NewOpenSpan(adapter, "chord.http", attributes)
+	}
+	carrier := pitelemetry.TelemetryCarrier{"traceparent": traceparent}
+	if tracestate := traceHeader(request, "tracestate", 512); tracestate != "" {
+		carrier["tracestate"] = tracestate
+	}
+	return chordtelemetry.NewOpenSpan(chordtelemetry.ParentOf(carrier, adapter), "chord.http", attributes)
+}
+
+// traceHeader is a W3C trace header of request, when present, within its bound (in UTF-16 units, as `length`) and printable
+// ASCII (as a link's carrier); otherwise none ("": ignored). The longest taken from a relayed request: `traceparent` is 55
+// characters, `tracestate` at most 512; the relay forwards what the browser sent unless it strips them, so they are bounded
+// (review L2).
+func traceHeader(request Incoming, name string, bound int) string {
+	value, ok := request.Header(name)
+	if !ok || len(value) > bound {
+		return ""
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < 0x20 || value[i] > 0x7e {
+			return ""
+		}
+	}
+	return value
 }
 
 // run runs the wraps and the route in the request's scope ctx, and makes its answer (a failure: a reported 500).
@@ -526,7 +606,7 @@ func (c *HttpComponent) hookFailed(hook HookName, plugin string, err error) {
 	c.onError(HttpError{Kind: ErrHookFailed, Hook: hook, Plugin: plugin, Error: err})
 }
 
-// registriesNow is the registries: resolved once, waiting for the publication; a failed try is tried again later.
+// registriesNow is the registries: resolved once, after the host's `Load` (`not_ready` before it); a failed try is tried again later.
 func (c *HttpComponent) registriesNow() (*registrySet, error) {
 	c.mu.Lock()
 	if c.registries != nil {
@@ -632,7 +712,7 @@ func (c *HttpComponent) upgradeSteps(w nethttp.ResponseWriter, r *nethttp.Reques
 	}
 	request, refusal := nodeIncomingOf(r)
 	if refusal != nil {
-		refuse(w, refusal.Status)
+		refuse(w, int(refusal.Status))
 		return
 	}
 	registrySet, err := c.registriesNow()
@@ -659,14 +739,10 @@ func (c *HttpComponent) upgradeSteps(w nethttp.ResponseWriter, r *nethttp.Reques
 		refuse(w, 403)
 		return
 	}
-	webRequest := newWebRequest(request, admitted, c.nonces.Next())
+	webRequest := newWebRequest(request, admitted, c.nonces.Next(), connectionOf(r).RemoteAddress)
 	principal := c.principal(registrySet.authenticatorsNow(), webRequest, signal)
 	if c.isClosing() || signal.Err() != nil {
 		refuse(w, 503)
-		return
-	}
-	if principal == nil {
-		refuse(w, 403)
 		return
 	}
 	// The deliveries before the router check: a change delivered after it that misses the connection is seen once it is kept.
@@ -674,12 +750,17 @@ func (c *HttpComponent) upgradeSteps(w nethttp.ResponseWriter, r *nethttp.Reques
 	defer c.upgrades.settled(seen)
 	// The router now: a host, a relay or a socket removed while authenticating refuses the upgrade.
 	router := registrySet.routerNow()
-	if (admitted.Allowed != "" && !router.Hosts.Has(admitted.Allowed)) || (admitted.Relay != nil && !containsRelay(router.Relays, admitted.Relay)) {
+	if (admitted.Allowed != "" && !slices.Contains(router.Hosts, admitted.Allowed)) || (admitted.Relay != nil && !containsRelay(router.Relays, admitted.Relay)) {
 		refuse(w, 403)
 		return
 	}
 	admission2 := UpgradeAdmission{Allowed: admitted.Allowed, Relay: admitted.Relay, Principal: principal}
 	if links := c.options.Links; links != nil && webRequest.Path() == links.Path {
+		// The links endpoint always needs a principal: a link acts as one.
+		if principal == nil {
+			refuse(w, 401)
+			return
+		}
 		options := links.Options
 		if links.OptionsFunc != nil {
 			var err error
@@ -695,7 +776,18 @@ func (c *HttpComponent) upgradeSteps(w nethttp.ResponseWriter, r *nethttp.Reques
 			return
 		}
 		defer c.upgrades.release()
-		c.upgrades.Link(w, r, admission2, options, c.host, c.ctx, router)
+		opened := func(closeLink func()) func() {
+			if links.Opened == nil {
+				return nil
+			}
+			closed, err := tryOpened(links.Opened, webRequest, principal, closeLink)
+			if err != nil {
+				c.hookFailed(HookLinksOpened, "", err)
+				return nil
+			}
+			return closed
+		}
+		c.upgrades.Link(w, r, admission2, options, c.host, c.ctx, router, opened)
 		return
 	}
 	match, status := router.Socket(webRequest.Path())
@@ -705,6 +797,10 @@ func (c *HttpComponent) upgradeSteps(w nethttp.ResponseWriter, r *nethttp.Reques
 		return
 	case NoMatch:
 		refuse(w, 404)
+		return
+	}
+	if principal == nil && !match.Public {
+		refuse(w, 401)
 		return
 	}
 	webRequest.params = match.Params
@@ -878,4 +974,10 @@ func panicError(recovered any) error {
 		return err
 	}
 	return fmt.Errorf("%v", recovered)
+}
+
+// tryOpened is the `links.opened` hook as a call that cannot panic: a panic is its error (a thrown error of Pi's).
+func tryOpened(hook func(HttpRequest, data.Principal, func()) (func(), error), request HttpRequest, principal data.Principal, closeLink func()) (closed func(), err error) {
+	defer recoverAs(&err)
+	return hook(request, principal, closeLink)
 }

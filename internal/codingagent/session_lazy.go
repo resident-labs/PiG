@@ -10,6 +10,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
@@ -34,7 +35,7 @@ func (s *Session) locateLocked(slot *entrySlot, off int64, line []byte) {
 // locateHashedLocked is locateLocked of a line of size bytes whose recordHash is hash.
 func (s *Session) locateHashedLocked(slot *entrySlot, off int64, size int, hash uint64) {
 	cold := s.coldLocked(slot)
-	cold.off, cold.size, cold.hash, cold.block = off, int32(size), uint32(hash), 0
+	cold.off, cold.size, cold.hash = off, int32(size), uint32(hash)
 }
 
 // errRecordChanged is the reason a read gives for a record whose bytes are not the indexed ones.
@@ -189,12 +190,18 @@ func (s *Session) noteTimestampLocked(i int, timestamp string) {
 func (s *Session) lazyAtLocked(i int) bool {
 	slot := &s.slots[i]
 	cold := s.coldPart(slot)
-	return slot.typ() == typeMessage && slot.entry == nil && (cold.block != 0 || cold.off >= 0 && s.backing != "")
+	return slot.typ() == typeMessage && s.resident.get(i) == nil && (cold.blockOf() != 0 || cold.off >= 0 && s.backing != "")
 }
 
 // entryHandlesLocked returns the entries of the given slots for a whole-history read: a resident entry as it is, a message that is not
 // resident as a LazyEntry, and any other entry read from its record. The caller holds s.mu.
 func (s *Session) entryHandlesLocked(indexes []int32) []SessionEntry {
+	return s.entryHandlesStaleLocked(indexes, nil)
+}
+
+// entryHandlesStaleLocked is entryHandlesLocked that reports, as readSlotsStaleLocked does, an entry read from its record that the record no
+// longer holds.
+func (s *Session) entryHandlesStaleLocked(indexes []int32, stale *atomic.Int64) []SessionEntry {
 	out := make([]SessionEntry, len(indexes))
 	s.handleMu.Lock()
 	if grow := len(s.slots) - len(s.handles); grow > 0 {
@@ -203,10 +210,10 @@ func (s *Session) entryHandlesLocked(indexes []int32) []SessionEntry {
 	var missing []int
 	var need []int32
 	for k, i := range indexes {
-		slot := &s.slots[i]
+		resident := s.resident.get(int(i))
 		switch {
-		case slot.entry != nil:
-			out[k] = slot.entry
+		case resident != nil:
+			out[k] = resident
 		case s.lazyAtLocked(int(i)):
 			handle := &s.handles[i]
 			if !handle.Indexed() {
@@ -219,31 +226,37 @@ func (s *Session) entryHandlesLocked(indexes []int32) []SessionEntry {
 	}
 	s.handleMu.Unlock()
 	if len(need) > 0 {
-		for j, entry := range s.readSlotsLocked(need) {
+		for j, entry := range s.readSlotsStaleLocked(need, stale) {
 			out[missing[j]] = entry
 		}
 	}
 	return out
 }
 
+// timestampLocked is the timestamp of the entry of slot i as its record carries it. The caller holds s.mu.
+func (s *Session) timestampLocked(i int) string {
+	if timestamp, odd := s.oddTimestamps[i]; odd {
+		return timestamp
+	}
+	timestamp, _ := dateISOString(s.slots[i].ts)
+	return timestamp
+}
+
 // newHandleLocked is the LazyEntry of slot i, which lazyAtLocked accepts. The caller holds s.mu.
 func (s *Session) newHandleLocked(i int) sessionentry.LazyEntry {
 	slot := &s.slots[i]
-	timestamp, odd := s.oddTimestamps[i]
-	if !odd {
-		timestamp, _ = dateISOString(slot.ts)
-	}
+	timestamp := s.timestampLocked(i)
 	cold := s.coldPart(slot)
 	at := sessionentry.RecordAt{Off: cold.off, Size: cold.size, Hash: uint64(cold.hash)}
-	if cold.block != 0 {
+	if blockNo := cold.blockOf(); blockNo != 0 {
 		at.Off = cold.blockAt()
-		return sessionentry.NewLazyEntry(slot.id, s.parentPtrLocked(i), timestamp, s.blockList[cold.block-1], at)
+		return sessionentry.NewLazyEntry(s.idOf(slot), s.parentPtrLocked(i), timestamp, s.blockList[blockNo-1], at)
 	}
 	if s.records == nil || s.records.path != s.backing || s.records.snapshot != s.snapshot {
 		// A handle keeps the source it was made with; a new backing file gets a new source.
 		s.records = &fileRecords{path: s.backing, snapshot: s.snapshot}
 	}
-	return sessionentry.NewLazyEntry(slot.id, s.parentPtrLocked(i), timestamp, s.records, at)
+	return sessionentry.NewLazyEntry(s.idOf(slot), s.parentPtrLocked(i), timestamp, s.records, at)
 }
 
 // mustMessage is sessionentry.AsMessage for code that has no error to return. No LazyEntry reaches it: lazy entries leave the Session only
@@ -305,7 +318,7 @@ func (r HandleReads) GetTree() []*SessionTreeNode { return r.treeHandles() }
 
 // GetEntry is Session.GetEntry with a lazy message entry.
 func (r HandleReads) GetEntry(id string) (SessionEntry, bool) {
-	return r.Session.GetEntryHandle(id)
+	return r.GetEntryHandle(id)
 }
 
 // GetEntryHandle reads entry metadata without decoding message payloads. Callers that inspect payloads must use the error-returning sessionentry read funnel.

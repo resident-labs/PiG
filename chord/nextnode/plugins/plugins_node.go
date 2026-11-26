@@ -43,7 +43,7 @@ var nodeFiles embed.FS
 // minimumNode is the first Node that strips TypeScript types by default: Pi's `packages/chord` `engines.node`.
 const minimumNode = "v22.19.0"
 
-// defaultReadyTimeout is how long Load waits for the process to start and connect (chord/host's loader waits as long).
+// defaultReadyTimeout is how long Load waits for the process to start and connect (Pi's loader waits as long).
 // SocketOwnerEnv names the environment variable that tells a process who started it, for the directories its NodeHosts make:
 // the process that starts a worker sets it to a NewSocketOwner and removes what the worker left (RemoveSocketDirsOf); the worker
 // takes it out of its environment at start (AdoptSocketOwner).
@@ -164,6 +164,8 @@ type NodeHostError struct {
 // chain goes on through the causes' own; a cause that is no Error is an error of its string). Chord is set when it is a
 // ChordError (`aborted` after a reload's commit carries `details.committed`). Unwrap gives both, so errors.As finds a
 // *data.ChordError anywhere in the chain.
+//
+// Ports packages/chord/src/node/plugins/stack.ts: Stack is the mapped stack the verbatim stack.ts produces in the Node subprocess.
 type NodeError struct {
 	Name    string
 	Message string
@@ -239,6 +241,35 @@ func (exit *NodeExit) Unwrap() []error {
 // completeMarker is the file extractNode writes last into a tree: its content is the hash the tree's directory is named for.
 const completeMarker = ".complete"
 
+// nodeTreeHash is the content hash that names an extracted tree: the manifest (which carries the hash of every file of the copy of
+// Pi) and every file of the runtime's own beside it (host.mjs, proxy.mjs, bridge.mjs, ...), by name. Two builds whose runtimes differ
+// in any of these files extract to different directories, so builds that share a cache directory (test runs of different trees on one
+// machine) never repair one another's tree in place while a process of the other build reads it.
+func nodeTreeHash(fsys fs.FS) (string, error) {
+	manifest, err := fs.ReadFile(fsys, "node/manifest.json")
+	if err != nil {
+		return "", err
+	}
+	entries, err := fs.ReadDir(fsys, "node")
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.New()
+	sum.Write(manifest)
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Name() == "manifest.json" {
+			continue
+		}
+		content, err := fs.ReadFile(fsys, "node/"+entry.Name())
+		if err != nil {
+			return "", err
+		}
+		sum.Write(fmt.Appendf(nil, "\x00%s\x00%d\x00", entry.Name(), len(content)))
+		sum.Write(content)
+	}
+	return hex.EncodeToString(sum.Sum(nil)), nil
+}
+
 // extractNode extracts the embedded tree under cacheDir (once per content hash) and returns its directory. A new tree is
 // extracted aside and renamed into place, so a process that lost the race finds the winner's. A directory is trusted when
 // its marker (written last) names this content and each of its files has the embedded size; one that is not (a cache that
@@ -251,18 +282,11 @@ func extractNode(cacheDir string) (string, error) {
 		}
 		cacheDir = filepath.Join(base, "pig")
 	}
-	manifest, err := nodeFiles.ReadFile("node/manifest.json")
+	hash, err := nodeTreeHash(nodeFiles)
 	if err != nil {
 		return "", err
 	}
-	driver, err := nodeFiles.ReadFile("node/host.mjs")
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.New()
-	sum.Write(manifest)
-	sum.Write(driver)
-	hash := hex.EncodeToString(sum.Sum(nil))
+	//portlint:allow utf16units hash is a hex digest, ASCII only, so its byte offsets are its UTF-16 code-unit offsets
 	dir := filepath.Join(cacheDir, "chord-plugins-node-"+hash[:16])
 	if nodeTreeComplete(dir, hash) {
 		return dir, nil
@@ -572,6 +596,8 @@ type NodeHost struct {
 	cb nodeCallbacks
 	// bridge is what the app holds of the plugins' host through the reference RPC (plugins_node_reference.go).
 	bridge nodeBridge
+	// events is the sender of the events that cross between the Go hosts and the process's host (plugins_node_events.go).
+	events eventOutbox
 }
 
 // Exited is closed when the process ended.
@@ -667,6 +693,7 @@ func startNode(options NodeOptions, ctx context.Context) (*NodeHost, error) {
 
 	life, endLife := context.WithCancel(context.WithoutCancel(ctx))
 	h := &NodeHost{options: options, life: life, endLife: endLife, started: make(chan struct{}), reaped: make(chan struct{}), exited: make(chan struct{}), closeBegun: make(chan struct{}), closeTimeout: defaultCloseTimeout, startAfter: afterTimer, pending: map[int]*nodeCall{}}
+	h.events.control = h.controlEvents
 	output := options.OnOutput
 	if output == nil {
 		output = func(stream NodeStream, chunk []byte) {
@@ -688,6 +715,9 @@ func startNode(options NodeOptions, ctx context.Context) (*NodeHost, error) {
 	h.cmd.Stdout = forwardWriter(func(chunk []byte) { output(NodeStdout, chunk) })
 	h.stderr.forward = func(chunk []byte) { output(NodeStderr, chunk) }
 	h.cmd.Stderr = &h.stderr
+	// Pi's server awaits the child's exit (workers.ts `child.process.exited`), not the end of its output: a process the plugins
+	// started that inherited the output pipes must not hold the exit of this one, which Wait would wait for until it ended.
+	h.cmd.WaitDelay = h.stopGrace()
 	if err := h.cmd.Start(); err != nil {
 		return nil, fmt.Errorf("starting node: %w", err)
 	}
@@ -761,9 +791,13 @@ func (h *NodeHost) startFailure(what string) error {
 
 // wait is the goroutine that waits for the process: it records how it ended, closes Exited and fails every pending
 // request. The channel is read to its end first (the process closed it when it ended; bounded by the stop grace), so a `fatal`
-// the process sent before it exited is in the NodeExit.
+// the process sent before it exited is in the NodeExit; then the sender of the bridge's events is ended and joined.
 func (h *NodeHost) wait() {
 	err := h.cmd.Wait()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// The process exited with code 0; what it started held its output pipes past the stop grace (WaitDelay).
+		err = nil
+	}
 	close(h.reaped)
 	if port := h.port.Load(); port != nil {
 		timer := time.NewTimer(h.stopGrace())
@@ -773,6 +807,8 @@ func (h *NodeHost) wait() {
 		}
 		timer.Stop()
 	}
+	// The sender of the bridge's events is joined before Exited closes: the process is gone, so a write under way returns.
+	h.events.stop()
 	h.mu.Lock()
 	if !h.closing || err != nil {
 		code, signal := processExit(h.cmd.ProcessState, h.killed.Load())
@@ -812,10 +848,13 @@ func (h *NodeHost) channelEnded() {
 	select {
 	case <-h.exited:
 	case <-timer.C:
+		// The reason is recorded only if the kill took effect, under the lock wait takes to build the exit: a process that exited
+		// by itself after the grace began (Exited waits for what holds its pipes) was not killed, whatever the timer says.
 		h.mu.Lock()
-		h.killReason = fmt.Sprintf("its link closed and it did not exit within %s", wait)
+		if h.kill() {
+			h.killReason = fmt.Sprintf("its link closed and it did not exit within %s", wait)
+		}
 		h.mu.Unlock()
-		h.kill()
 	}
 }
 
@@ -827,10 +866,13 @@ func (h *NodeHost) stopGrace() time.Duration {
 	return defaultStopGrace
 }
 
-func (h *NodeHost) kill() {
+// kill kills the process and reports whether it took effect: a process that was waited for already is not killed.
+func (h *NodeHost) kill() bool {
 	if h.cmd.Process != nil && h.cmd.Process.Kill() == nil {
 		h.killed.Store(true)
+		return true
 	}
+	return false
 }
 
 // stop kills the process and waits until it ended (a process that was killed ends at once; the stop grace bounds the wait for what

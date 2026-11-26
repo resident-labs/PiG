@@ -2,17 +2,22 @@ package subprocess
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
 
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/coding/uiview"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
 	"github.com/MichaelKinsy/PiG/internal/orderedjson"
+	"github.com/MichaelKinsy/PiG/internal/sessionentry"
 )
 
-// pig additive (D19): autocomplete callback handles stay on their owner connection. ui.addAutocompleteProvider names a factoryId; autocomplete.sync wraps it around current or invokes apply/trigger, while autocomplete.suggest awaits getSuggestions. Captured references use ui.autocomplete.invoke and one-way release notifications. Columns are UTF-16. Parent cancellation owns handler calls; queryId also cancels editor-owned calls without a parent.
+// pig additive (D19): autocomplete callback handles stay on their owner connection. ui.addAutocompleteProvider names a factoryId; autocomplete.sync wraps it around current, invokes apply/trigger, or tells an installed editor's runtime that the host rebuilt the provider chain (operation "changed", current the new descriptor, answered with no result; Pi's setupAutocompleteProvider calls setAutocompleteProvider on the installed editor after every rebuild), while autocomplete.suggest awaits getSuggestions. Captured references use ui.autocomplete.invoke and one-way release notifications. Columns are UTF-16. Parent cancellation owns handler calls; queryId also cancels editor-owned calls without a parent.
 type autocompleteDescriptor struct {
 	ID                string   `json:"id"`
 	LocalID           string   `json:"localId,omitempty"`
@@ -85,6 +90,15 @@ type Envelope struct {
 	// barrier, when set, is a host-side marker, not a frame: the dispatcher closes it when it reaches it, so everything the read loop read before the marker is dispatched.
 	barrier *dispatchMark
 
+	// pooled is the reusable frame the read loop built this envelope in (response_frame.go); releaseResponse returns it.
+	pooled *responseFrame
+
+	// held, when set, marks a frame the read loop did not act on because a report_error notification it read earlier is not applied yet: the loop that reads Incoming acts on it after the report (Conn.applyHeld).
+	held bool
+
+	// ackCounted records that readLoop counted this MsgCall frame in its request's ackHold before sealing.
+	ackCounted bool
+
 	// Common fields
 	ID string `json:"id,omitempty"` // Correlation ID for request/response pairs
 
@@ -142,6 +156,8 @@ type RegisterPayload struct {
 	// MarkdownTransformer reports that the extension registered a Markdown
 	// transformer. The host runs it with RequestMarkdownTransform.
 	MarkdownTransformer bool `json:"markdown_transformer,omitempty"`
+	// MarkdownMessageTypes are the surfaces the transformer runs on. Absent selects the default types; an empty list runs it nowhere.
+	MarkdownMessageTypes *[]string `json:"markdown_message_types,omitempty"`
 	// OwnsThinkingRuns reports that the extension owns the thinking runs of assistant messages (pi.ownThinkingRuns), as of the register frame. Later changes arrive as CallOwnThinkingRuns.
 	// pig additive (D214)
 	OwnsThinkingRuns bool `json:"owns_thinking_runs,omitempty"`
@@ -282,6 +298,8 @@ type ProviderDecl struct {
 	// ImageAPIs and ClassifierAPIs name the APIs whose implementations (ProviderConfig images and classifiers) run in the extension.
 	ImageAPIs      []string `json:"image_apis,omitempty"`
 	ClassifierAPIs []string `json:"classifier_apis,omitempty"`
+	// RefreshModels says the config's refreshModels callback runs in the extension (types.ts:1930); the host then runs it with provider_operation kind "refreshModels".
+	RefreshModels bool `json:"refresh_models,omitempty"`
 }
 
 // NativeProviderDeclaration describes callback ownership, never executable code. Key identifies the owner's callback object; Handle identifies its host-owned reference lifetime. Methods lists the callable public members. Provider calls carry caller callbacks as request-scoped handles, and stream creation is acknowledged before ordered events.
@@ -296,6 +314,8 @@ type NativeProviderDeclaration struct {
 	BaseURL *string                         `json:"baseUrl,omitempty"`
 	Models  []extension.ProviderModelConfig `json:"models"`
 	OAuth   *ProviderOAuthConfig            `json:"oauth,omitempty"`
+	// RefreshModelsAuth is the Provider object's refreshModelsAuth (ai/src/models.ts:204): "credential" (the default when absent) or "configured". Pi types the member and never validates it, so the host carries it unchanged and anything but "configured" refreshes with the credential.
+	RefreshModelsAuth ai.RefreshModelsAuthMode `json:"refreshModelsAuth,omitempty"`
 }
 
 type ProviderObjectAuthDeclaration struct {
@@ -366,13 +386,17 @@ type ModelStreamCallback struct {
 // ProviderOAuthConfig is the "oauth" sub-object inside a ProviderDecl.Config. It
 // carries declarative fields and capability flags only, never functions.
 type ProviderOAuthConfig struct {
-	Name               string `json:"name"`
-	IsSubscription     bool   `json:"isSubscription,omitempty"`
-	HasLogin           bool   `json:"has_login"`
-	HasRefresh         bool   `json:"has_refresh"`
-	HasGetAPIKey       bool   `json:"has_get_api_key"`
-	HasModifyModels    bool   `json:"has_modify_models,omitempty"`
-	HasCredentialStore bool   `json:"has_credential_store,omitempty"`
+	Name           string `json:"name"`
+	IsSubscription bool   `json:"isSubscription,omitempty"`
+	// UsesCallbackServer is Pi's deprecated flag, kept for source compatibility: canonical auth flows ignore it (types.ts:2026), so the host
+	// carries the value in the registered config and never runs a callback server for it.
+	UsesCallbackServer bool `json:"usesCallbackServer,omitempty"`
+	HasLogin           bool `json:"has_login"`
+	HasRefresh         bool `json:"has_refresh"`
+	HasGetAPIKey       bool `json:"has_get_api_key"`
+	// HasModifyModels says the extension implements oauth.modifyModels; the host then runs it with MethodOAuthModifyModels.
+	HasModifyModels    bool `json:"has_modify_models,omitempty"`
+	HasCredentialStore bool `json:"has_credential_store,omitempty"`
 }
 
 // OAuth bridge request methods (host→ext), carried in RequestPayload.Method.
@@ -380,6 +404,7 @@ const (
 	MethodOAuthLogin             = "oauth_login"              // Args: none.                Result: OAuthCredentialsWire.
 	MethodOAuthRefresh           = "oauth_refresh"            // Args: OAuthCredentialsWire. Result: OAuthCredentialsWire.
 	MethodOAuthGetAPIKey         = "oauth_get_api_key"        // Args: OAuthCredentialsWire. Result: OAuthAPIKeyResult.
+	MethodOAuthModifyModels      = "oauth_modify_models"      // Args: OAuthModifyModelsArgs. Result: OAuthModifyModelsResult.
 	MethodOAuthCredentialStatus  = "oauth_credential_status"  // Args: none.                Result: OAuthCredentialStatusResult.
 	MethodOAuthStoreCredentials  = "oauth_store_credentials"  // Args: OAuthCredentialsWire. Result: OAuthStoreResult.
 	MethodOAuthDeleteCredentials = "oauth_delete_credentials" // Args: none.                Result: OAuthDeleteResult.
@@ -441,6 +466,18 @@ type OAuthAPIKeyResult struct {
 	APIKey string `json:"apiKey"`
 }
 
+// OAuthModifyModelsArgs is the argument of MethodOAuthModifyModels: Pi's modifyModels(models, credentials) inputs. Models are the chat models' model objects and
+// Credentials the stored OAuth credential (the token object with its "type":"oauth" discriminator, as refreshToken and getApiKey receive it).
+type OAuthModifyModelsArgs struct {
+	Models      json.RawMessage `json:"models"`
+	Credentials json.RawMessage `json:"credentials"`
+}
+
+// OAuthModifyModelsResult is the reply to MethodOAuthModifyModels: the model objects modifyModels returned.
+type OAuthModifyModelsResult struct {
+	Models []json.RawMessage `json:"models"`
+}
+
 // OAuthInputResult is the reply to a value-returning login callback. Cancel is
 // true when the user dismissed the prompt.
 type OAuthInputResult struct {
@@ -479,6 +516,8 @@ type EntryRendererDecl struct {
 
 // ReadyPayload is sent after successful registration. The session name and the active model travel in State (State.Session.SessionName, State.Model), the one snapshot every state_update repeats.
 type ReadyPayload struct {
+	// Group names the Host whose Session this member serves, unique in the process; a runtime scopes its per-process bookkeeping by it. Absent for a Host that shares no cells. pig additive (D232).
+	Group  string            `json:"group,omitempty"`
 	Cwd    string            `json:"cwd"`              // Working directory
 	Mode   string            `json:"mode,omitempty"`   // Run mode: tui|rpc|json|print (ctx.mode)
 	Width  int               `json:"width"`            // Terminal width
@@ -492,24 +531,25 @@ type ReadyPayload struct {
 
 // StatePayload is the host's view of state visible to extensions through
 // the upstream-faithful synchronous getters (pi.getThinkingLevel(),
-// ctx.isIdle(), ctx.getContextUsage(), etc.). The tool registry is not state:
+// ctx.isIdle(), etc.). The context usage is not state: Pi computes it live from the branch, so ctx.getContextUsage() is a host call. The tool registry is not state:
 // pi.getAllTools() and pi.getActiveTools() are host calls, so a registration
 // costs the SDK nothing in the size of the registry. It is
 // sent with [ReadyPayload] at startup and re-sent via "state_update"
 // notifies whenever the host knows it has changed.
+// Order: the ready payload is a connection's first state. The Host writes no state_update to a connection before its ready (Conn.withholdState), and pushes a change the ready's snapshot missed right after it. An SDK that reads a state_update before the ready applies it before the ready's snapshot and goes on loading.
 // State fields carry explicit empty/null values so a snapshot clears prior values; session log pages remain incremental. A state_update omits commands and systemPromptOptions while the recipient already holds them byte for byte; the ready state always carries them.
 type StatePayload struct {
 	// Commands is the wire form of the slash-command catalog ([]CommandInfo),
 	// pre-encoded so the host can omit it from a state_update whose recipient already holds it.
-	Commands            json.RawMessage            `json:"commands,omitempty"`
-	ThinkingLevel       string                     `json:"thinkingLevel"`
-	Model               any                        `json:"model"`
+	Commands      json.RawMessage `json:"commands,omitempty"`
+	ThinkingLevel string          `json:"thinkingLevel"`
+	// Model is the active model object, null for a bound Session with no model. It is omitted while the host has no model source bound, so a replica keeps the value unknown and asks the host.
+	Model               any                        `json:"model,omitempty"`
 	ScopedModels        []scopedModelSnapshot      `json:"scopedModels"`
 	Session             *SessionStatePayload       `json:"session,omitempty"`
 	IsIdle              bool                       `json:"isIdle"`
 	ProjectTrusted      bool                       `json:"projectTrusted"`
 	HasPendingMessages  bool                       `json:"hasPendingMessages"`
-	ContextUsage        *extensionContextUsageDTO  `json:"contextUsage"`
 	SystemPrompt        string                     `json:"systemPrompt"`
 	SystemPromptOptions json.RawMessage            `json:"systemPromptOptions,omitempty"`
 	Flags               map[string]json.RawMessage `json:"flags"`
@@ -543,6 +583,9 @@ type StatePayload struct {
 	// The Node runtime installs it as pi-tui's keybindings manager, the one
 	// Pi hands editor and custom-component factories and sets globally.
 	Keybindings any `json:"keybindings,omitempty"`
+	// UIAbilities (D614) is what the attached client draws; absent when none is attached, so an extension cannot mount.
+	// Every state is a full snapshot, so an absent value clears it.
+	UIAbilities *uiview.ClientAbilities `json:"uiAbilities,omitempty"`
 }
 
 // TerminalCapabilitiesPayload mirrors pi-tui's TerminalCapabilities.
@@ -584,20 +627,13 @@ type SessionStatePayload struct {
 	EntriesAppended  []json.RawMessage `json:"entriesAppended,omitempty"`
 	EntryCount       int               `json:"entryCount"`
 	EntriesRemaining bool              `json:"entriesRemaining,omitempty"`
+	// MessageEntries names, for the entries message_end persisted since the last push, the sequence the message_end request carried for each (RequestPayload.MessageSeqs). A Node runtime that kept the object a handler held for that sequence gives the entry that object, as Pi's entry holds the event's own message. They ride on every push, whether or not the runtime has the log: a runtime that reads the session file later binds the entries it finds there by id.
+	MessageEntries []sessionentry.MessageSeq `json:"messageEntries,omitempty"` //portlint:allow emptydrop a PiG-only frame field; absent means no entry was persisted since the last push
 	// Info carries the session manager facts the log does not hold: the
 	// header, cwd, session directory, and whether the session persists
 	// (upstream getHeader, getCwd, getSessionDir, isPersisted,
 	// usesDefaultSessionDir).
 	Info json.RawMessage `json:"info,omitempty"`
-}
-
-// extensionContextUsageDTO mirrors extension.ContextUsage on the wire. We
-// duplicate it here to avoid importing the public extension package from
-// the protocol layer.
-type extensionContextUsageDTO struct {
-	Tokens        *int     `json:"tokens"`
-	ContextWindow int      `json:"contextWindow"`
-	Percent       *float64 `json:"percent"`
 }
 
 // ── Request (host→ext) ───────────────────────────────────────────────────────
@@ -616,8 +652,12 @@ type RequestPayload struct {
 	ChildSession string `json:"child_session,omitempty"`
 	// ToolCallIndex, on tool_call, is the call's position among the tool calls of the assistant message that issued it (its batch). Absent for a call no assistant message issued (a nested executeTool call).
 	ToolCallIndex *int `json:"tool_call_index,omitempty"`
+	// MessageSeqs, on message_start, message_end, turn_end and agent_end, numbers the messages the event carries, in the order the event holds them (message_start and message_end have one, turn_end has its message and then its tool results, agent_end its messages): the sequence the session gave each, 0 for a message Pi shares no object for. The same message has the same number in every event and in SessionStatePayload.MessageEntries, so a Node runtime hands each handler the one object Pi's handlers share (agent-session.ts appendMessage stores the message object message_end carried).
+	MessageSeqs []uint64 `json:"message_seqs,omitempty"` //portlint:allow emptydrop a PiG-only frame field; absent means no message of the event is shared
 	// SignalTimeoutMS, on oauth_refresh, tells a runtime whose refresh callback receives an AbortSignal that the signal is AbortSignal.timeout(SignalTimeoutMS) alone: the caller's cancellation never reaches it, as in Pi's refreshStoredOAuthCredential (auth/resolve.ts). Absent, the signal follows the request's cancellation.
 	SignalTimeoutMS *float64 `json:"signal_timeout_ms,omitempty"`
+	// SignalAborted, on a session_before_compact or session_before_tree event, reports that the event's AbortSignal had already aborted when the host dispatched the handler: Pi's runner awaits every handler of those events with event.signal aborted (runner.ts emit), so a handler dispatched after the abort starts with event.signal.aborted true. When the signal ends while the handler runs, the host sends a signal-only cancel (CancelPayload.SignalOnly) and keeps waiting for the reply, as Pi keeps the handler's result. On tool_call it reports that the call's context had ended when the call reached the host (a direct call of the tool, or an abort that lands after the agent's gate): Pi runs tool.execute with an aborted signal, so the tool starts with signal.aborted true and its host calls run; the signal-only cancel follows the request, and D111's grace period runs from the abort.
+	SignalAborted bool `json:"signal_aborted,omitempty"`
 	// OwnSignal, on tool_call, reports a nested call that runs with the signal its caller passed in options.signal: the tool's signal parameter is that signal, not the run's.
 	OwnSignal bool `json:"own_signal,omitempty"`
 	// ExecuteID, with OwnSignal, names the executeTool call of the same connection that made this nested call, so its runtime can hand the tool the very signal object its caller passed.
@@ -659,9 +699,18 @@ type WithSessionArgs struct {
 // NotifyInvalidate (host→ext) carries the stale message after the host invalidated the extension's Session. A runtime that answers pi or ctx members locally throws InvalidateArgs.Message from them afterwards, as Pi's runner.invalidate makes them throw (runner.ts:679-690).
 const NotifyInvalidate = "invalidate"
 
-// InvalidateArgs is the NotifyInvalidate argument.
+// InvalidateArgs is the NotifyInvalidate argument. Ack, when it is not zero, asks a Node runtime to answer with NotifyInvalidateAck once it has applied the invalidation; it numbers such frames of one connection.
 type InvalidateArgs struct {
 	Message string `json:"message"`
+	Ack     uint64 `json:"ack,omitempty"`
+}
+
+// NotifyInvalidateAck (Node runtime→host) says the runtime applied the NotifyInvalidate frame whose Ack is Seq: the members of a captured pi or ctx that it answers locally throw the stale message from here on, and every call it made before is on the wire ahead of the ack. Pi's runner.invalidate() is synchronous, so the old ctx is stale before reload() goes on to load the settings and the extensions (agent-session.ts:3825-3826); a reload waits for this ack at the same point (Host.supersedeGenerations). The args are InvalidateAckArgs.
+const NotifyInvalidateAck = "invalidate_ack"
+
+// InvalidateAckArgs carries NotifyInvalidateAck.
+type InvalidateAckArgs struct {
+	Seq uint64 `json:"seq"`
 }
 
 // NotifyReloadStarted (host→ext) tells a running generation that Host.Reload has begun, before the host writes the replacement generations' admissions to the process's control channel. In print and JSON mode a Node runtime that answered a prompt's last call or session_shutdown waits in place for the host's next step (Pi's print mode continues without an event-loop turn); this notification is that step for a reload, so the runtime returns to its event loop, which reads the admissions. It carries no arguments and changes no state. The host sends it only to a Node runtime: the Go, Rust and Python SDKs have no such wait.
@@ -733,8 +782,10 @@ type BeforeAgentStartResponsePayload struct {
 
 // ToolCallResponsePayload is the result of a tool_call handler. Input is the event's input when the handler left it different from the one it received; an omitted Input means the handler made no edit. Result is the handler's ordinary block result. Any other member is an error: a reply in another shape would otherwise decode as no result and lose a block.
 type ToolCallResponsePayload struct {
-	Input  json.RawMessage `json:"_pigToolCallInput"`
-	Result json.RawMessage `json:"_pigToolCallResult"`
+	Input json.RawMessage `json:"_pigToolCallInput"`
+	// EventInput is event.input when the handler assigned a new object to it instead of editing the one it received; the next handlers receive it and the tool does not.
+	EventInput json.RawMessage `json:"_pigToolCallEventInput"`
+	Result     json.RawMessage `json:"_pigToolCallResult"`
 }
 
 func (p *ToolCallResponsePayload) UnmarshalJSON(data []byte) error {
@@ -746,6 +797,72 @@ func (p *ToolCallResponsePayload) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*p = ToolCallResponsePayload(decoded)
+	return nil
+}
+
+// EventResponsePayload is the result of an extension's message_start, message_end, turn_end or agent_end handler, from every SDK (turn_end's reply carries it beside its boundary members). Edits are the messages of the event the handler left different from the ones it received (an in-place edit, which Pi's later handlers, the saved entry and the next provider request all hold), each at its position in the event's list of messages; an omitted Edits means the handler made no edit. Result is the handler's ordinary result. Any other member is an error.
+type EventResponsePayload struct {
+	Edits  []EventEdit     `json:"_pigEventEdits"`
+	Result json.RawMessage `json:"_pigEventResult"`
+}
+
+func (p *EventResponsePayload) UnmarshalJSON(data []byte) error {
+	type eventResponsePayload EventResponsePayload
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var decoded eventResponsePayload
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	*p = EventResponsePayload(decoded)
+	return nil
+}
+
+// EventEdit is one message of an event as a handler left it: At is its position in the messages the event holds (message_start and message_end: 0; turn_end: 0 for the assistant message, then the tool results; agent_end: the index in messages) and Message the message. It has no decoder of its own: the reply's strict decode reaches its members, and applyEventEdits refuses an entry that names no position or no message object.
+//
+// The second form names a member of the event itself: {"member":"note","value":<json>} assigns it and {"member":"note","deleted":true} removes it (a top-level member of message_start, message_update, turn_start, agent_start or agent_end that a handler added, reassigned or deleted; see [extension.EventMember]). An entry is of one form: an entry with At or Message and Member, Value or Deleted is refused.
+type EventEdit struct {
+	At      *int            `json:"at"`
+	Message json.RawMessage `json:"message"`
+	Member  string          `json:"member"`
+	Value   json.RawMessage `json:"value"`
+	Deleted bool            `json:"deleted"`
+}
+
+// isMemberEntry tells whether the entry is of the second form (it names a member, or carries a member's value or deletion).
+func (e EventEdit) isMemberEntry() bool { return e.Member != "" || len(e.Value) > 0 || e.Deleted }
+
+// memberEvent tells whether a handler's edit of a top-level member of the event is carried: the events a Pi handler shares one object across handlers for (runner.ts emit) whose own members are not messages the entry holds.
+func memberEvent(event string) bool {
+	switch event {
+	case "message_start", "message_update", "turn_start", "agent_start", "agent_end":
+		return true
+	}
+	return false
+}
+
+// ToolResultResponsePayload is the result of an extension's tool_result handler, from every SDK. Edits names the members of the event the handler left different from the ones it received and, of those, the ones it edited in the object it received (see [extension.ToolResultEdits]); an omitted Edits means the handler made no edit. Result is the handler's ordinary result. Any other member is an error.
+type ToolResultResponsePayload struct {
+	Edits  *ToolResultEditsPayload `json:"_pigToolResultEdits"`
+	Result json.RawMessage         `json:"_pigToolResultResult"`
+}
+
+// ToolResultEditsPayload is the members a tool_result handler changed, as ToolResultEventResult holds them (Members), and which of them are edits to the object the handler received (Shared).
+type ToolResultEditsPayload struct {
+	Members extension.ToolResultEventResult `json:"members"`
+	Changed []string                        `json:"changed"`
+	Shared  []string                        `json:"shared"`
+}
+
+func (p *ToolResultResponsePayload) UnmarshalJSON(data []byte) error {
+	type toolResultResponsePayload ToolResultResponsePayload
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var decoded toolResultResponsePayload
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	*p = ToolResultResponsePayload(decoded)
 	return nil
 }
 
@@ -766,11 +883,38 @@ type ErrorInfo struct {
 	// one (a JavaScript `err.stack`). Hosts report it as upstream reports
 	// `ExtensionError.stack`.
 	Stack string `json:"stack,omitempty"`
+	// ShellExit is set on the error of a local shell command (Pi's createLocalBashOperations().exec) that timed out after its shell had already exited, so the
+	// tool was only still waiting for background processes that held the output pipes (Pi's ShellTimeoutError.shellExit). The host sets it on the error reply of
+	// builtinTool.localExec, and an SDK sets it on the error response of user_bash_exec when the error its exec raised is the one its local operations returned,
+	// unchanged. Message is then "timeout:<seconds>". It is omitted otherwise.
+	ShellExit *ShellExitInfo `json:"shellExit,omitempty"`
+	// closedByHost is set only on the answer a Conn makes up for a request still pending when the host closed the connection (Close, Retire): the extension did not give it, so it is no failure of the handler. It is neither sent nor read on the wire, and a copy of the value outside this process loses it, which is right: only the host's callers classify it (managedExt.answerError).
+	closedByHost bool
+}
+
+// ShellExitInfo is Pi's `shellExit`: the shell's own exit code and the seconds it ran, rounded to a tenth as Pi rounds them (Math.round(ms / 100) / 10).
+type ShellExitInfo struct {
+	ExitCode     int     `json:"exitCode"`
+	AfterSeconds float64 `json:"afterSeconds"`
+}
+
+// errorInfoOf is the wire error of err: its message, and the shell's exit when err is the local shell backend's timeout after the shell had exited.
+func errorInfoOf(err error) *ErrorInfo {
+	info := &ErrorInfo{Message: err.Error()}
+	var timeout *tools.ShellTimeoutError
+	if errors.As(err, &timeout) && timeout.ShellExit != nil {
+		info.ShellExit = &ShellExitInfo{ExitCode: timeout.ShellExit.ExitCode, AfterSeconds: timeout.ShellExit.AfterSeconds}
+	}
+	return info
 }
 
 func (e *ErrorInfo) ToError() error {
 	if e == nil {
 		return nil
+	}
+	if timeout, ok := strings.CutPrefix(e.Message, "timeout:"); ok && e.Code == "" && e.ShellExit != nil {
+		// Pi's bash tool tells the error of its local backend by class, and the error an extension's exec rethrows unchanged is that error.
+		return &tools.ShellTimeoutError{Timeout: timeout, ShellExit: &tools.ShellExit{ExitCode: e.ShellExit.ExitCode, AfterSeconds: e.ShellExit.AfterSeconds}}
 	}
 	message := e.Message
 	if e.Code != "" {
@@ -791,7 +935,7 @@ func (e *remoteError) ErrorStack() string { return e.stack }
 
 // ── Notify (bidirectional) ───────────────────────────────────────────────────
 
-// NotifyPayload carries a fire-and-forget notification. The host-only runtime_input_end notification, sent only to a Node runtime, removes stdin as a Node keepalive and releases each command's suspension: a command's request_state suspended is sent only after it, as a re-evaluation of the command's closed window (a command that started or finished a host call since its window closed gets a fresh window). After it, a Node process reports when its event loop drained, without arguments, on each connection it hosts, and the host applies runtime_drained and runtime_quit_yield to the process after every connection it holds for that process reported or closed. runtime_drained reports a still-pending quit handler whose event loop drained: Pi's exit when its loop empties, which takes the host's loop-drain checkpoint. runtime_commands_drained reports, from a process with no pending quit handler, that its event loop drained with an unanswered command it had not reported: the process cannot answer the commands whose started request_state precedes the report on each connection, and the host does not end. A command read after a report is reported again if the loop drains with it unanswered. runtime_quit_yield reports a post-disposal boundary that suspended beyond its immediately fulfilled continuations: Pi's exit at the stdout flush, which applies the flush checkpoint. Command suspension travels as request_state, after runtime_input_end. None completes an extension request.
+// NotifyPayload carries a fire-and-forget notification. The host-only runtime_input_end notification, sent only to a Node runtime, removes stdin as a Node keepalive and releases each command's suspension: a command's request_state suspended is sent only after it, as a re-evaluation of the command's closed window (a command that started or finished a host call since its window closed gets a fresh window). After it, a Node process reports when its event loop drained, without arguments, on each connection it hosts, and the host applies runtime_drained and runtime_quit_yield to the process after every connection it holds for that process reported or closed. runtime_drained reports a still-pending quit handler whose event loop drained: Pi's exit when its loop empties, which takes the host's loop-drain checkpoint. runtime_commands_drained reports, from a process with no pending quit handler, that its event loop drained with an unanswered command it had not reported: the process cannot answer the commands whose started request_state precedes the report on each connection, and the host does not end. A command read after a report is reported again if the loop drains with it unanswered. runtime_quit_yield reports a post-disposal boundary that suspended beyond its immediately fulfilled continuations: Pi's exit at the stdout flush, which applies the flush checkpoint. Command suspension travels as request_state, after runtime_input_end. None completes an extension request. runtime_commands_drained is also the report of a Node process that has nothing unanswered: after runtime_input_end, and never before it, every Node process reports each time its event loop drained, whatever it has left unanswered, so that the host can tell a process that holds a timer, a socket or a child process from one that holds nothing (Pi's one event loop holds them for every extension; Host.evaluateLoopDrain). The report carries no arguments; a request the host sent that crossed it is not covered by it, and the process reports again after it ran.
 type NotifyPayload struct {
 	Method string          `json:"method"` // e.g. "width_change", "widget_invalidate"
 	Args   json.RawMessage `json:"args,omitempty"`
@@ -846,16 +990,62 @@ type ToolUpdatePayload struct {
 // result is empty. A runtime with an event loop needs no such call: it reports its first microtask checkpoint (NotifyHandlerYielded).
 const CallYield = "yield"
 
-// NotifyHandlerYielded (ext→host) tells the host that the code that sent a triggering message, a handler or a timer's or an I/O callback, awaited or
-// returned control to the runtime's event loop. The send carried the token in its yield_token argument. A runtime with an event
-// loop sends it from the first microtask checkpoint after the send, because the host cannot see an await, and only after the host answered the send;
-// the host then answers isIdle from the Session again (sync_run_hold.go). A thread-based SDK does not send it: its handler yields in a call whose
+// NotifyHandlerYielded (ext→host) tells the host that the code that sent a message, a handler or a timer's or an I/O callback, awaited or
+// returned control to the runtime's event loop. The send carried the token in its yield_token argument: a triggering sendMessage, and a sendUserMessage that names no delivery. A runtime with an event
+// loop sends it from the first microtask checkpoint after the send, because the host cannot see an await. For a sendMessage it comes only after the host answered the send, and
+// the host then answers isIdle from the Session again (sync_run_hold.go); a sendUserMessage is not awaited, so the host first applies the calls queued before the report. The host makes the held
+// failure report of the sends of that token at the report (sync_run_report.go). A thread-based SDK does not send it: its handler yields in a call whose
 // upstream API returns a Promise, or when it returns.
 const NotifyHandlerYielded = "handler_yielded"
 
 // HandlerYieldedPayload is the NotifyHandlerYielded argument.
 type HandlerYieldedPayload struct {
 	Token string `json:"token"`
+}
+
+// NotifyReportError (ext→host) is Pi's `runtime.reportError` (types.ts ExtensionRuntimeState.reportError, Pi 18e99051be24): an error the extension raised where no
+// host request is waiting to carry it, reported as one of that extension's errors like the error of a pi.on handler. The extension path comes from the
+// connection and the host fills in the rest of the ExtensionError. The notification is fire-and-forget (like NotifyEventsQuiesce).
+//
+// Order (pig additive; Pi's reportError is synchronous): Pi reports a handler's error inside the handler and answers the request whose handler it was after
+// the handler returned, so an error reaches the runner's error listeners before that request's response does (loader.ts:537-549, runner.ts:749-753,
+// agent-session.ts:2172-2178), and a rejection after an await before the emitter's later microtasks (event-bus.ts:15-27). The host's loop applies a
+// notification off the read loop, which routes a response straight to its waiter and counts a quiesce (NotifyEventsQuiesce, the realm's microtask
+// checkpoint that releases the emitter) itself, so either could overtake the report written before it on the same socket. The read loop therefore
+// counts the reports it has passed to the host's loop and the loop has not applied (reportOrder), and queues behind them the response of a request that
+// was in flight when it read the report and the quiesce of an emission that existed then; the host's loop acts on them once it applied the report. This
+// is host-internal state of the read loop (Envelope.held, the report's emission mark): nothing of it is on the wire. A request the host sent after the
+// report was read, and the quiesce of an emission created after it, are never queued behind it: the error listener the report is applied to may call the
+// extension or emit and wait for the answer, which would wait for the listener. A queued frame is acted on when its report was applied; when the
+// connection ends (the emission forgets the connection, hostEventBus.closed, so the emitter's settle goes on); when the process is restarted (the old
+// connection ends, and the new one has an order of its own); and when the run is cancelled (the emitter's events.settle call returns its context's error).
+// The order is kept per connection; the report of a listener that runs inside another extension's emit travels on the connection of that emit's extension
+// (ReportErrorPayload.Extension).
+//
+// The rule for an error is one: an error of a host-initiated call travels in that call's response, and one raised with no request to answer is reported
+// with this notification. Every handler of the Go, Python, Rust and Lisp SDKs runs inside the host's events.dispatch request, so its failure is that
+// request's error response (ResponsePayload.Error with Message and Stack) and no SDK of them sends this notification. Node's pi.events handler can run with no
+// request to answer: the single Node realm keeps Pi's in-heap emitter and the host never dispatches to it, and a handler's rejection after its await comes
+// after the dispatch response was written; the Node runtime sends this notification for those. The host drops it as it drops a failed dispatch response:
+// when no runner reports yet, when the runner is stale, and for a generation a reload replaced.
+const NotifyReportError = "report_error"
+
+// ReportErrorPayload is the NotifyReportError argument: ExtensionError.event, ExtensionError.error and ExtensionError.stack (omitted when the runtime has none).
+type ReportErrorPayload struct {
+	Event string `json:"event"`
+	Error string `json:"error"`
+	Stack string `json:"stack,omitempty"`
+	// Extension names the extension whose listener failed when the report travels on the connection of another extension of the same shared Node realm.
+	// The in-heap pi.events bus of a shared realm runs a listener inside the emit of the extension that emitted, and Pi reports its error before that emit
+	// returns, so the report must precede the emitter's response, which only the emitter's own connection orders. Empty means the connection's own extension.
+	// This is not multi-registration or cross-extension targeting: every extension of a cell keeps its own connection and registers, serves its tools,
+	// events and requests only on it, and no request is addressed to another extension. Only this error report of a listener that ran inside another
+	// extension's emit names its owner, and only the Node runtime sends it: the Go, Python, Rust and Lisp SDKs send no report_error at all (their
+	// handlers run inside the host's events.dispatch request and fail it). The host takes the name for that extension's error only when the extension is
+	// of the connection's own process; any other name (an extension the host does not know, or one that runs in another process) is ignored, the report is
+	// applied as the connection's own extension's in its place in the order, and the refused name is reported first as an error of the connection's
+	// extension through the runner's error listeners (a notification has no reply to carry a refusal). A report without a name is the connection's own, as before.
+	Extension string `json:"extension,omitempty"`
 }
 
 // Focused custom UI uses three current-wire message classes. Input is an
@@ -882,6 +1072,11 @@ const (
 	// another custom component, dialog or overlay opened over it, or the one over it closed. The extension sets the component's
 	// focused flag and the handle's isFocused as Pi's TUI.setFocus does, and renders again.
 	NotifyUICustomFocus = "ui.custom.focus"
+	// NotifyUICustomInvalidate (host→ext) tells a mounted ui.custom component that the host's TUI was invalidated, as Pi's
+	// TUI.invalidate calls invalidate() on every mounted root and every overlay's component (tui.ts:951-954) after a theme change, a
+	// cell-size report or a change of image support. The extension calls the component's invalidate and renders it again. A
+	// theme_change with the active palette precedes it on the connection when the palette changed. Nobody waits for it.
+	NotifyUICustomInvalidate = "ui.custom.invalidate"
 	// CallUICustomShowOverlay, CallUICustomHideOverlay and CallUICustomSetFocus (ext→host, synchronous) are Pi's TUI.showOverlay,
 	// hideOverlay and setFocus (tui.ts:598-842) on the tui a ui.custom factory receives. showOverlay mounts a raw overlay for a
 	// component of the extension under its own key, with no ui.custom call behind it: its frames, input, focus and controls use
@@ -890,11 +1085,13 @@ const (
 	CallUICustomHideOverlay = "ui.custom.hideOverlay"
 	CallUICustomSetFocus    = "ui.custom.setFocus"
 	// CallTuiAlt (ext→host) drives a TuiAltScreen the extension constructed (pi-tui's alternate-screen host) and RequestTuiAltCallback
-	// (host→ext request) asks the extension for what it owns: its Terminal, its components and its listeners. A tui.alt call the extension makes while
-	// it serves a callback names that request as its parent (CallPayload.ParentRequestID): when the host's frame goroutine sent the callback (a
-	// component's render, an overlay's visible callback, a style callback, a terminal write, an invalidate or focus it triggered), that goroutine runs
-	// the call at once, while it holds the frame lock, as Pi's render calls the screen. From such a callback the calls render, renderNow, start, stop,
-	// copyActiveSelectionToClipboard, queryTerminalColors and input fail (D208).
+	// (host→ext request) asks the extension for what it owns: its Terminal, its components and its listeners. The host sends the callbacks of one screen from
+	// one goroutine, the screen's owner, one at a time and each answered before the next, as Pi's one event loop runs a screen's frames, input and mouse events:
+	// a component's render and its handleInput never run together. A tui.alt call the extension makes while it serves a callback names that request as its
+	// parent (CallPayload.ParentRequestID): the owner waits for the callback and runs the call at once, as Pi's callbacks call the screen on its one thread;
+	// any other call runs on the owner after the task it is in. When the callback is one of a frame's (a component's render, an overlay's visible callback, a
+	// style callback, a terminal write, an invalidate or focus it triggered) the owner holds the frame lock, and from such a callback the calls render,
+	// renderNow, start, stop, copyActiveSelectionToClipboard, queryTerminalColors and input fail (D208).
 	CallTuiAlt            = "tui.alt"
 	RequestTuiAltCallback = "tui.alt.cb"
 )
@@ -955,6 +1152,14 @@ type RemoteOverlayMousePayload struct {
 	Event extension.RemoteMouseEvent `json:"event"`
 }
 
+// RemoteOverlayInvalidatePayload is a NotifyUICustomInvalidate argument.
+type RemoteOverlayInvalidatePayload struct {
+	Key string `json:"key"`
+	// Count is how many times the TUI was invalidated since the last notify for this component, at least 1: the extension calls
+	// the component's invalidate that many times and renders once. A burst the connection has no room for is one frame.
+	Count int `json:"count"`
+}
+
 // RemoteOverlayFocusPayload is a NotifyUICustomFocus argument.
 type RemoteOverlayFocusPayload struct {
 	Key     string `json:"key"`
@@ -993,6 +1198,23 @@ const (
 	// NotifyUIViewEvicted (host→ext) reports image refs whose bytes the
 	// host dropped; the next frame that references one sends its data again.
 	NotifyUIViewEvicted = "ui.view.evicted"
+)
+
+// pig additive (D614): plugin UI mounts over D107 views. An extension mounts a view in a client slot and the host sends
+// back the user's intents. The records are in coding/uiview; the wire has no version field.
+const (
+	CallUIViewMount  = "ui.view.mount"
+	CallUIViewUpdate = "ui.view.update"
+	CallUIViewHide   = "ui.view.hide"
+	CallUIViewShow   = "ui.view.show"
+	CallUIViewFinish = "ui.view.finish"
+	CallUIViewRemove = "ui.view.remove"
+	CallUIViewState  = "ui.view.state"
+	// CallUIViewDiagnostics returns the notices of a mount: what the host rejected or ended and what a client could not draw.
+	CallUIViewDiagnostics = "ui.view.diagnostics"
+	// RequestUIViewIntent (host→ext) raises one intent of a mount and expects {outcome: done|refused|failed, answer?, error?}.
+	// A cancellable intent that times out or is cancelled by its caller is cancelled through the request's ordinary cancel frame.
+	RequestUIViewIntent = "ui.view.intent"
 )
 
 // View node kinds. Each mirrors the upstream pi-tui (or coding-agent
@@ -1173,6 +1395,8 @@ type ViewNode struct {
 
 	// ViewWidgetFields are the fields of the widget kinds (view_widget_wire.go).
 	ViewWidgetFields
+	// ViewGridFields are the fields of a grid (view_grid_wire.go).
+	ViewGridFields
 }
 
 // viewNodeWire is a ViewNode with its "message" as raw JSON: a loader's
@@ -1192,6 +1416,12 @@ func (n *ViewNode) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*n = ViewNode(wire.viewNodeFields)
+	if n.Kind == ViewKindGrid {
+		// pig additive (D614): a grid is read strictly, in the node, its cells and its chips.
+		if err := decodeGridNode(data); err != nil {
+			return err
+		}
+	}
 	if len(wire.Message) == 0 || string(wire.Message) == "null" {
 		return nil
 	}
@@ -1389,6 +1619,8 @@ type CallPayload struct {
 	Tick bool `json:"tick,omitempty"`
 	// OriginToolCallID, with Tick, is the tool call whose handler queued the callback that made the call (a Node runtime knows it from the request the callback was queued in). The host runs the call after that call's tool_execution_end, whether the call reaches the host before or after the event: the runtime is another process, so the time between its answer and the callback's call decides nothing about Pi's order. Empty when no tool call queued the callback.
 	OriginToolCallID string `json:"origin_tool_call_id,omitempty"`
+	// CommandContext marks a call made through a command context: the context of a command handler or of a withSession callback, the only contexts Pi gives newSession, fork, navigateTree, switchSession and reload (runner.ts createCommandContext). The SDK sets it from the kind of the context the call is made through, so a context kept past its request keeps its kind; the host refuses those five calls without it (commandOnlyCall).
+	CommandContext bool `json:"command_context,omitempty"`
 }
 
 // ── CallResult (host→ext) ────────────────────────────────────────────────────
@@ -1419,6 +1651,8 @@ type WidgetPushPayload struct {
 type CancelPayload struct {
 	RequestID string `json:"request_id,omitempty"`
 	Reason    string `json:"reason,omitempty"`
+	// SignalOnly reports that only the request's AbortSignal ended (session_before_compact, session_before_tree: Pi's abortCompaction aborts the AbortController, agent-session.ts:2867; tool_call: Pi's run abort aborts the signal executePreparedToolCall hands tool.execute, agent-loop.ts:817-853) and the request goes on: the runtime aborts the signal its handler holds and cancels no host call, as Pi's in-process calls never fail with the abort. The host keeps answering the handler's calls, before and after, and waits for its reply. An ordinary cancel, without it, ends the request and its host calls; a tool_call whose grace period ended is ended by one.
+	SignalOnly bool `json:"signal_only,omitempty"`
 }
 
 // ShutdownPayload signals the extension to exit gracefully.
@@ -1549,6 +1783,56 @@ type RenderResult struct {
 	// View is the rendered component's structure (D107); with Lines absent
 	// the host renders it at the requested width.
 	View json.RawMessage `json:"view,omitempty"`
+	// Mouse is set by an extension whose component lives in its process (Node) and takes the mouse; the host then hands it the clicks inside the
+	// component (a kit view needs no flag: its mouse regions are in the view).
+	Mouse bool `json:"mouse,omitempty"`
+	// Regions are the rectangles, local to the component's first cell, in which the MouseRegions of a Node component's tree answer a click, as Pi's
+	// hit test finds them; the host hit-tests them itself and leaves a click outside them to text selection. Absent for a component without a
+	// MouseRegion, and for one that handles the mouse itself (Mouse).
+	Regions []RenderMouseRegion `json:"regions,omitempty"` //portlint:allow emptydrop a frame between the host and the Node runtime, not Pi output; an empty list and an absent one both mean no MouseRegion
+}
+
+// RenderMouseRegion is one rectangle of RenderResult.Regions.
+type RenderMouseRegion struct {
+	X      int `json:"x"`
+	Y      int `json:"y"`
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
+
+// RenderComponentPayload is the argument of RequestRenderMessage and RequestRenderEntry: the message (PayloadKey "message") or entry ("entry") and
+// the options and width to draw it at.
+//
+// Key names the transcript component the renderer draws for (RenderIdentity); it is the same on every request for one message or entry and is
+// empty for a renderer call that is not for a displayed one. Pi hands a renderer the same message object on every rebuild, so an extension keeps
+// per-message state in a WeakMap; the extension keeps it under Key (the Go, Rust, Python and Lisp SDKs as a state bag of the renderer's options, Node as
+// the message object itself) until NotifyRenderRelease names Key.
+//
+// Rerender runs the renderer, as Pi does when it builds the component: the first request, a new expansion or padding, an invalidation. Without it
+// the extension draws the component its last run returned at Width (a Node extension; a resize, or the events below), as Pi draws the same component
+// every frame. An extension that keeps no component runs the renderer either way.
+//
+// Events are the mouse events the view took since the last request: kit "mouse" view events of the mouse regions of the view (Node names the
+// region, with coordinates local to it), or, for a Node component, the click inside it (local to the component). The extension applies them in order
+// before it draws.
+type RenderComponentPayload struct {
+	Key      string             `json:"key,omitempty"`
+	Rerender bool               `json:"rerender,omitempty"`
+	Events   []ViewEventPayload `json:"events,omitempty"` //portlint:allow emptydrop a frame between the host and the Node runtime, not Pi output; an empty list and an absent one both mean no events
+	Options  json.RawMessage    `json:"options"`
+	Width    int                `json:"width"`
+	// Message or Entry is the custom message or session entry, as upstream's renderer receives it.
+	Message json.RawMessage `json:"message,omitempty"`
+	Entry   json.RawMessage `json:"entry,omitempty"`
+}
+
+// NotifyRenderRelease (host→ext) reports that a message or entry the extension rendered is no longer shown, so it drops the state it kept under the
+// key. Args is a RenderReleasePayload.
+const NotifyRenderRelease = "render_release"
+
+// RenderReleasePayload names one released message or entry.
+type RenderReleasePayload struct {
+	Key string `json:"key"`
 }
 
 // RequestRenderTool (host→ext) runs a tool's renderCall or renderResult for

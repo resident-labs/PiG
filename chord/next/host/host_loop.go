@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MichaelKinsy/PiG/chord/internal/parking"
 	"github.com/MichaelKinsy/PiG/internal/goroutineid"
 )
 
@@ -42,6 +43,17 @@ type Loop struct {
 	scheduled bool
 
 	tasks sync.WaitGroup
+	// hops counts what the join waits for (host_loop_seam.go): the joined hops in flight and the tasks (awaitTask) that run,
+	// not the ones parked on a wait the loop does not run. quiet is closed when it falls to zero. inflight are the tasks that
+	// have not ended and parked those of them that wait, by the wait. All guarded by mu.
+	hops     int
+	quiet    chan struct{}
+	inflight map[*parking.Task]struct{}
+	parked   map[*parking.Parked]struct{}
+	// stall is how long a join waits for a running task before it reports it; zero: joinStall (host_loop_seam.go).
+	stall time.Duration
+	// pacing is the bookkeeping of the paced ending tasks, guarded by mu (host_loop_seam.go).
+	pacing pacer
 
 	// idle are the coroutines of finished handlers; pending the handlers that parked or returned in the running section,
 	// whose rest runs when it ends (host_loop_lend.go). idle is guarded by mu, pending by the section.
@@ -56,6 +68,9 @@ var _ eventLoop = (*Loop)(nil)
 
 // onLoop reports whether the caller is running a section of the loop.
 func (l *Loop) onLoop() bool { return l.owner.Load() == goroutineid.Current() }
+
+// InSection reports whether the caller is running a section of the loop: what a component's batch gives UseSection.
+func (l *Loop) InSection() bool { return l.onLoop() }
 
 // Run runs work as one synchronous section: inline when the caller is already on the loop (nested synchronous calls
 // nest, as in Pi), otherwise once the loop is free. The microtasks queued meanwhile run before an outermost Run returns.
@@ -94,7 +109,7 @@ func (l *Loop) Queue(job func()) {
 	}
 	l.mu.Unlock()
 	if start {
-		l.Go(func() { l.Run(func() {}) })
+		l.joined(func() { l.Run(func() {}) })
 	}
 }
 

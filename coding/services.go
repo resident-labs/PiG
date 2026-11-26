@@ -124,7 +124,8 @@ type CreateAgentSessionServicesOptions struct {
 	ModelRuntime *ModelRuntime
 
 	// ModelRuntimeSignal bounds the model catalog restore and the first availability refresh of the runtime the Services
-	// create; nil never cancels. Upstream CreateAgentSessionServicesOptions.modelRuntimeSignal (an AbortSignal).
+	// create; nil never cancels. It bounds neither the resource reload nor the refresh that follows it. Upstream
+	// CreateAgentSessionServicesOptions.modelRuntimeSignal (an AbortSignal).
 	ModelRuntimeSignal context.Context
 
 	// ExtensionFlagValues are the CLI values for extension flags in command-line order (a JavaScript Map keeps insertion order,
@@ -179,6 +180,9 @@ func CreateAgentSessionServices(opts CreateAgentSessionServicesOptions) (*AgentS
 	if signal == nil {
 		signal = context.Background()
 	}
+	// agent-session-services.ts:140-146 passes modelRuntimeSignal to ModelRuntime.create alone: the resource reload (:154) and the refresh after the
+	// extension registrations (:194) take no signal.
+	afterCreate := context.WithoutCancel(signal)
 
 	projectTrusted := true
 	if opts.ProjectTrusted != nil {
@@ -221,7 +225,7 @@ func CreateAgentSessionServices(opts CreateAgentSessionServicesOptions) (*AgentS
 	services.extensionFlagValues = opts.ExtensionFlagValues
 	if opts.ResourceLoader != nil {
 		services.resourceLoader, services.sharedLoader = opts.ResourceLoader, true
-		services.applyLoadedExtensions(signal)
+		services.applyLoadedExtensions(afterCreate)
 		return services, nil
 	}
 	if opts.ResourceLoaderOptions != nil || opts.ResourceLoaderReloadOptions != nil {
@@ -235,11 +239,11 @@ func CreateAgentSessionServices(opts CreateAgentSessionServicesOptions) (*AgentS
 		if opts.ResourceLoaderReloadOptions != nil {
 			reload = *opts.ResourceLoaderReloadOptions
 		}
-		if err := services.resourceLoader.ReloadWith(signal, reload); err != nil {
+		if err := services.resourceLoader.ReloadWith(afterCreate, reload); err != nil {
 			services.Close()
 			return nil, fmt.Errorf("coding.CreateAgentSessionServices: reload resources: %w", err)
 		}
-		services.applyLoadedExtensions(signal)
+		services.applyLoadedExtensions(afterCreate)
 	}
 	return services, nil
 }
@@ -369,6 +373,7 @@ func NewModelRuntime(services *AgentSessionServices) (*ModelRuntime, error) {
 	runtime := &ModelRuntime{services: services, modelNetworkEnabled: icodingagent.ModelNetworkEnabled()}
 	runtime.prepare = runtime.prepareRequest
 	services.Registry().SetAPIStream(runtime.builtinStream)
+	services.Registry().SetAPISimpleStream(runtime.builtinStreamSimple)
 	runtime.availability = modelAvailability{
 		providerSeq:     make(map[string]uint64),
 		listCredentials: services.Registry().ListCredentials,
@@ -383,6 +388,15 @@ func (runtime *ModelRuntime) Close() {
 	if runtime != nil {
 		runtime.services.Close()
 	}
+}
+
+// SettleCredentialWrites waits until the credential modifications already in progress finish, such as an OAuth refresh a background catalog refresh started, so a process that exits next does not lose the rotated token. It fails only with ctx's cancellation cause.
+// upstream: packages/coding-agent/src/core/model-runtime.ts:settleCredentialWrites (b2cb62923)
+func (runtime *ModelRuntime) SettleCredentialWrites(ctx context.Context) error {
+	if runtime == nil {
+		return nil
+	}
+	return runtime.services.Registry().SettleCredentialWrites(ctx)
 }
 
 // startBackground schedules maintenance under the same owner used by availability siblings.
@@ -406,7 +420,7 @@ func (runtime *ModelRuntime) GetModels(providerID ...string) []*ai.Model {
 	return slices.DeleteFunc(models, func(model *ai.Model) bool { return model.ProviderMeta.ProviderID != providerID[0] })
 }
 
-// runtimeModels lists GetModels() as resolver models without building a plain bundled catalog's models: such a model's BuildNativeModel
+// runtimeModels lists GetModels() as resolver models without building a plain bundled catalog's models: such a model's BuildSource
 // builds the bound model GetModels lists.
 func (runtime *ModelRuntime) runtimeModels() []icodingagent.RuntimeModel {
 	if runtime == nil || runtime.services == nil {
@@ -414,7 +428,13 @@ func (runtime *ModelRuntime) runtimeModels() []icodingagent.RuntimeModel {
 	}
 	sources := runtime.services.Registry().GetAllModelDataSources()
 	models := make([]icodingagent.RuntimeModel, 0, len(sources))
-	for _, source := range sources {
+	// The entry is read when the model is built, so a routing variant (D199) is derived only for a model that is kept. One function builds
+	// every listed model: a model's own state is its source, which points into sources.
+	build := func(source *icodingagent.ModelDataSource) *ai.Model {
+		return runtime.bindCatalogModel(source.Entry().ToModel())
+	}
+	for i := range sources {
+		source := &sources[i]
 		generated := source.Generated
 		if generated == nil {
 			models = append(models, runtimeModelOf(runtime.bindCatalogModel(source.Model)))
@@ -422,12 +442,13 @@ func (runtime *ModelRuntime) runtimeModels() []icodingagent.RuntimeModel {
 		}
 		// A catalog entry's model reasons when the entry does (ToCapabilities reports a MaxThinking only for a reasoning entry).
 		models = append(models, icodingagent.RuntimeModel{
-			Provider:         generated.Provider,
-			ID:               generated.ID,
-			Name:             generated.DisplayName,
-			Reasoning:        generated.Reasoning,
-			Headers:          ai.ProviderHeadersFromStrings(generated.Headers),
-			BuildNativeModel: func() *ai.Model { return runtime.bindCatalogModel(generated.ToModel()) },
+			Provider:    generated.Provider,
+			ID:          source.ID(),
+			Name:        source.Name(),
+			Reasoning:   generated.Reasoning,
+			Headers:     ai.ProviderHeadersFromStrings(generated.Headers),
+			Source:      source,
+			BuildSource: build,
 		})
 	}
 	return overlayVirtualModels(&runtime.virtuals, models, func(model icodingagent.RuntimeModel) (string, string) { return model.Provider, model.ID }, runtimeModelOf)
@@ -468,7 +489,7 @@ func (runtime *ModelRuntime) SetChangeListener(listener func()) func() {
 // Stream returns immediately. Context normalization happens before asynchronous setup. Setup failures are errors; provider cancellation is aborted, and an established stream owns its terminal event.
 func (runtime *ModelRuntime) Stream(ctx context.Context, model *ai.Model, request ai.Context, options ai.StreamOptions) *ai.AssistantMessageEventStream {
 	if err := assertChat(model); err != nil {
-		return runtime.failedStream(model, err)
+		return runtime.failedStream(ctx, model, err)
 	}
 	if model != nil && registryOwnsModelBackend(model.Provider) && runtime.services.Registry().GetProvider(model.ProviderMeta.ProviderID) != nil {
 		return runtime.services.Registry().NativeModels().Stream(ctx, model, request, options)
@@ -492,7 +513,7 @@ func (runtime *ModelRuntime) StreamSimple(ctx context.Context, model *ai.Model, 
 		selected = options[0]
 	}
 	if err := assertChat(model); err != nil {
-		return runtime.failedStream(model, err)
+		return runtime.failedStream(ctx, model, err)
 	}
 	if IsVirtualModel(model) {
 		return runtime.streamVirtual(ctx, model, request, selected)
@@ -520,24 +541,16 @@ func (runtime *ModelRuntime) start(ctx context.Context, model *ai.Model, transcr
 	}
 	preparedModel, provider, preparedOptions, err := runtime.prepare(ctx, model, options)
 	if err != nil {
-		failureCtx := ctx
-		if !extension.ModelStreamRequestFromContext(ctx).API {
-			failureCtx = context.WithoutCancel(ctx)
-		}
-		runtime.fail(failureCtx, outer, model, err)
+		// lazy.ts:83 (Pi f3a64af07, #8635): a setup that rejected while the request signal is aborted ends as "aborted", with the rejection's message.
+		runtime.fail(ctx, outer, model, err)
 		return
 	}
-	apiRequest := extension.ModelStreamRequestFromContext(ctx).API
-	if apiRequest {
+	if extension.ModelStreamRequestFromContext(ctx).API {
 		defer func() { _ = provider.Close() }()
 	}
 	if ctx.Err() != nil && runtime.knowsProvider(preparedModel, provider) {
-		// Pi races auth resolution with the request signal (resolve.ts raceWithAbortSignal) inside lazyStream's setup, so a request cancelled before its provider starts is a setup rejection: reason "error" with the signal's reason, as prepare failures are reported above.
-		failureCtx := ctx
-		if !apiRequest {
-			failureCtx = context.WithoutCancel(ctx)
-		}
-		runtime.fail(failureCtx, outer, preparedModel, ai.AbortReason(ctx))
+		// Pi races auth resolution with the request signal (resolve.ts raceWithAbortSignal) inside lazyStream's setup, so a request cancelled before its provider starts is a setup rejection with the signal's reason; lazy.ts:83 reports it as "aborted" (Pi f3a64af07).
+		runtime.fail(ctx, outer, preparedModel, ai.AbortReason(ctx))
 		return
 	}
 	leaf := provider
@@ -548,14 +561,8 @@ func (runtime *ModelRuntime) start(ctx context.Context, model *ai.Model, transcr
 	_, registeredCallback := leaf.(*registeredStreamProvider)
 	if native, ok := leaf.(*nativeModelProvider); ok {
 		native.simple = simple
-	} else if simple && registryBuilt && !registeredCallback && preparedModel.ProviderMeta.API != ai.APIPiMessages {
-		// Every API module's streamSimple but pi-messages.ts (:432-444) builds its options with buildBaseOptions; pi-messages sends the caller's.
-		ai.ApplyOmittedReasoning(preparedModel, &preparedOptions)
-		maxTokens := preparedOptions.MaxTokens
-		if maxTokens == 0 {
-			maxTokens = preparedModel.Capabilities.MaxOutputTokens
-		}
-		preparedOptions.MaxTokens = ai.ClampMaxTokensToContext(preparedModel, transcript, maxTokens)
+	} else if simple && registryBuilt && !registeredCallback {
+		preparedOptions = prepareSimpleStreamOptions(preparedModel, transcript, preparedOptions)
 	}
 	if registryBuilt {
 		if !registeredCallback {
@@ -606,7 +613,7 @@ func (runtime *ModelRuntime) prepareRequest(ctx context.Context, model *ai.Model
 		providerID = model.Provider.ID()
 	}
 	if providerID == "" || model.Provider == nil {
-		return nil, nil, ai.StreamOptions{}, fmt.Errorf("unknown provider: %s", providerID)
+		return nil, nil, ai.StreamOptions{}, fmt.Errorf("Unknown provider: %s", providerID)
 	}
 
 	if native := runtime.services.Registry().NativeProvider(providerID); native != nil && registryOwnsModelBackend(model.Provider) {
@@ -643,18 +650,21 @@ func (runtime *ModelRuntime) prepareRequest(ctx context.Context, model *ai.Model
 			overrides.APIKey = &options.APIKey
 		}
 		registry := runtime.services.Registry()
-		if refreshed := runtime.GetModel(providerID, model.ID); refreshed != nil {
-			requestModel = refreshed
+		// A model object an extension set is sent as it is: Pi's request uses the model it is given (model-runtime.ts:667-689 prepareRequest), and the Session replaces the object when the registry's model changes (refreshCurrentModelFromRegistry). A model the host built from a name takes the registry's current model of that name.
+		object := runtime.modelObjectOrigin(model) != nil
+		listed := runtime.GetModel(providerID, model.ID)
+		if listed != nil && !object {
+			requestModel = listed
 		}
 		auth, err := registry.ResolveRegistryModelAuth(ctx, requestModel, overrides)
 		if err != nil {
 			return nil, nil, ai.StreamOptions{}, err
 		}
 		if auth == nil {
-			if options.APIKey == "" && modelRuntimeRequiresAuth(providerID) && registry.GetProvider(providerID) == nil && !registry.ModelRegistry.HasConfiguredAuth(providerID) {
+			if options.APIKey == "" && registry.GetProvider(providerID) == nil && !registry.ModelRegistry.HasConfiguredAuth(providerID) {
 				return nil, nil, ai.StreamOptions{}, &modelRuntimeAuthMissingError{provider: providerID}
 			}
-			resolved, err := buildModel(providerID+"/"+model.ID, runtime.services, options.APIKey)
+			resolved, err := buildUnauthenticatedRequestModel(model, listed, object, runtime.services, options.APIKey)
 			if err != nil {
 				return nil, nil, ai.StreamOptions{}, err
 			}
@@ -713,7 +723,7 @@ func (runtime *ModelRuntime) prepareRequest(ctx context.Context, model *ai.Model
 type modelRuntimeAuthMissingError struct{ provider string }
 
 func (e *modelRuntimeAuthMissingError) Error() string {
-	return "provider is not configured: " + e.provider
+	return "Provider is not configured: " + e.provider
 }
 
 func mergeRuntimeHeaders(base map[string]string, override ai.ProviderHeaders) ai.ProviderHeaders {
@@ -733,16 +743,6 @@ func mergeRuntimeHeaders(base map[string]string, override ai.ProviderHeaders) ai
 		merged[name] = value
 	}
 	return merged
-}
-
-// modelRuntimeRequiresAuth reports whether a provider without a registered auth contract needs configured auth. Amazon Bedrock needs it: its upstream auth (amazon-bedrock.ts bedrockAuth.resolve) requires a stored key or an AWS env signal.
-func modelRuntimeRequiresAuth(providerID string) bool {
-	switch providerID {
-	case "ollama":
-		return false
-	default:
-		return true
-	}
 }
 
 func (runtime *ModelRuntime) fail(ctx context.Context, stream *ai.AssistantMessageEventStream, model *ai.Model, err error) {
@@ -769,6 +769,12 @@ func (runtime *ModelRuntime) fail(ctx context.Context, stream *ai.AssistantMessa
 	_ = stream.Push(ai.ErrorEvent{Reason: reason, Error: message})
 }
 
+// testFauxModelID is the one model the harness provider lists (test/parity/testdata/test-faux-provider.ts:706).
+const testFauxModelID = "faux-1"
+
+// IsTestFauxModel reports whether id is a model the harness test-faux provider lists.
+func IsTestFauxModel(id string) bool { return id == testFauxModelID }
+
 // registerHarnessTestFaux registers the provider Pi's parity harness registers from an extension (test/parity/testdata/test-faux-provider.ts): one provider
 // with a configured key, so it is an available provider of the model snapshot as there, and every consumer of that snapshot (the footer's provider count,
 // the selectors, the model lists) sees what Pi's sees. The faux stream itself is built in (buildProviderForEntry).
@@ -778,8 +784,8 @@ func registerHarnessTestFaux(reg *icodingagent.ModelRegistry) error {
 		APIKey:  "unused",
 		API:     "test-faux",
 		Models: []extension.ProviderModelConfig{{
-			ID: "faux-1", Name: "Test Faux", API: "test-faux", Provider: "test-faux", BaseURL: "http://localhost:0",
-			Input: []string{"text", "image"}, ContextWindow: ai.TestFauxContextWindow, MaxTokens: ai.TestFauxMaxTokens,
+			ID: testFauxModelID, Name: "Test Faux", API: "test-faux", Provider: "test-faux", BaseURL: "http://localhost:0",
+			Input: ai.TestFauxInput(), ContextWindow: ai.TestFauxContextWindow, MaxTokens: ai.TestFauxMaxTokens,
 		}},
 	})
 }

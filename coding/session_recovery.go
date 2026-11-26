@@ -59,7 +59,7 @@ func (s *Session) refreshReplacementContext() {
 
 func (s *Session) refreshProjectedContext(preserveInstructionBaseline bool) {
 	// The agent's transcript shares the messages of the kept projection, as the requests do: the history is held once, not once for the agent and once for the projection.
-	projection := s.inner.BuildSessionProjectionView()
+	projection := s.inner.Load().BuildSessionProjectionView()
 	ids := make(map[any]string, len(projection.Messages))
 	for _, entry := range projection.Entries {
 		for _, message := range entry.Messages {
@@ -108,9 +108,10 @@ func (s *Session) findPersistedMessageEntryID(message agent.AgentMessage) (strin
 	if found {
 		return id, true
 	}
+	in := s.inner.Load()
 	if message.ToolResult != nil {
 		// The newest projected entries are the turn's own: the kept projection extends by each append, so the lookup reads them without projecting the history, and a match ends the walk.
-		projection := s.inner.BuildSessionProjectionView()
+		projection := in.BuildSessionProjectionView()
 		for _, entry := range slices.Backward(projection.Entries) {
 			for _, projected := range entry.Messages {
 				if projected.ToolResult != nil && projected.ToolResult.ToolCallID == message.ToolResult.ToolCallID {
@@ -126,7 +127,7 @@ func (s *Session) findPersistedMessageEntryID(message agent.AgentMessage) (strin
 	if messageIndex < 0 {
 		return "", false
 	}
-	projection := s.inner.BuildSessionProjectionView()
+	projection := in.BuildSessionProjectionView()
 	// Restoring a transcript without a system entry prepends the current
 	// baseline. It has no persisted entry and shifts projected positions.
 	messages := s.agent.Messages()
@@ -216,15 +217,16 @@ func (s *Session) omitRecoveryAttempt(message *agent.AssistantMessage) error {
 		}
 		targetIDs[i] = id
 	}
+	in := s.inner.Load()
 	for _, targetID := range targetIDs {
 		if targetID == "" {
 			continue
 		}
-		editID, err := s.inner.AppendContextEdit(targetID, nil)
+		editID, err := in.AppendContextEdit(targetID, nil)
 		if err != nil {
 			return err
 		}
-		if entry, ok := s.inner.GetEntry(editID); ok {
+		if entry, ok := in.GetEntry(editID); ok {
 			s.emitOrderedEvent(agent.EntryAppendedEvent{Entry: entry.Raw()})
 		}
 	}
@@ -279,7 +281,7 @@ func (s *Session) handlePostAgentRun(ctx context.Context) (bool, error) {
 	if message == nil {
 		return s.agent.HasQueuedMessages(), nil
 	}
-	if icodingagent.IsRetryableError(message, s.contextWindowFor(message)) {
+	if s.isRetryableSessionError(message) {
 		retrying, err := s.prepareRetry(ctx, message)
 		if err != nil {
 			return false, err
@@ -329,7 +331,21 @@ func (s *Session) prepareRetry(ctx context.Context, message *agent.AssistantMess
 			s.retryAttempt.Add(-1)
 			return nil, nil
 		}
-		delayMs := ai.RetryDelayMs(ai.RetryPolicy{BaseDelayMs: cfg.BaseDelayMs, MaxAgentDelayMs: &cfg.MaxAgentDelayMs}, attempt)
+		var delayMs int
+		// pig additive (D654): an installed decider chooses the delay in place of the exponential schedule (agent-session.ts:3951).
+		if decider := icodingagent.DefaultRetryDecider(); decider != nil {
+			decision, ok := s.takePendingRetryDecision(message)
+			if !ok {
+				decision = decider(attempt, cfg.MaxRetries, message.LLMMessage())
+			}
+			if !decision.Retry {
+				s.retryAttempt.Add(-1)
+				return nil, nil
+			}
+			delayMs = decision.DelayMs
+		} else {
+			delayMs = ai.RetryDelayMs(ai.RetryPolicy{BaseDelayMs: cfg.BaseDelayMs, MaxAgentDelayMs: &cfg.MaxAgentDelayMs}, attempt)
+		}
 		errorMessage := message.ErrorMessage
 		if errorMessage == "" {
 			errorMessage = "Unknown error"
@@ -362,6 +378,24 @@ func (s *Session) prepareRetry(ctx context.Context, message *agent.AssistantMess
 	retry, err := wait.await()
 	s.mu.Lock()
 	return retry, err
+}
+
+func (s *Session) isRetryableSessionError(message *agent.AssistantMessage) bool {
+	if icodingagent.DefaultRetryDecider() != nil {
+		return message != nil && message.StopReason == ai.StopReasonError && !icodingagent.IsContextOverflow(message, s.contextWindowFor(message))
+	}
+	return icodingagent.IsRetryableError(message, s.contextWindowFor(message))
+}
+
+func (s *Session) takePendingRetryDecision(message *agent.AssistantMessage) (ai.RetryDecision, bool) {
+	s.retryMu.Lock()
+	defer s.retryMu.Unlock()
+	msg, decision := s.retryPendingMsg, s.retryPendingDecision
+	s.retryPendingMsg, s.retryPendingDecision = nil, nil
+	if msg == message && decision != nil {
+		return *decision, true
+	}
+	return ai.RetryDecision{}, false
 }
 
 // finishCancelledRetry ends an in-progress retry sequence after an abort.
@@ -437,7 +471,7 @@ func (s *Session) contextWindow() int {
 }
 
 func (s *Session) currentBranch() []icodingagent.SessionEntry {
-	return s.inner.GetContextBranch()
+	return s.inner.Load().GetContextBranch()
 }
 
 // compactionSettings returns the compaction settings for the current model,

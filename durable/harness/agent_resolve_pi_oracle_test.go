@@ -9,14 +9,12 @@ import (
 	"errors"
 	"math/rand"
 	"os/exec"
-	"path/filepath"
 	"reflect"
 	"strconv"
 	"testing"
 
-	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/durable"
-	"github.com/MichaelKinsy/PiG/internal/testenv"
+	"github.com/MichaelKinsy/PiG/internal/pioracle"
 )
 
 type agentWrapSpec struct {
@@ -136,9 +134,8 @@ func TestResolveAgentMatchesPi(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root := testenv.ModuleRoot(t)
-	cmd := exec.CommandContext(t.Context(), "node", "--disable-warning=ExperimentalWarning", "testdata/agent_oracle.mjs", filepath.Join(root, ".upstream", "current", "packages"))
-	cmd.Env = append(cmd.Environ(), "PI_INTEROP_DIR="+filepath.Join(root, "durable", "interop")+"/")
+	cmd := exec.CommandContext(t.Context(), "node", "--disable-warning=ExperimentalWarning", "testdata/agent_oracle.mjs", pioracle.Packages(t))
+	cmd.Env = append(cmd.Environ(), "PI_INTEROP_DIR="+pioracle.Project(t))
 	cmd.Stdin = bytes.NewReader(payload)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -168,7 +165,7 @@ func TestResolveAgentMatchesPi(t *testing.T) {
 		for e, source := range spec.Extensions {
 			extension := &durable.Extension{Name: source.Name}
 			for _, tool := range source.Tools {
-				extension.Tools = append(extension.Tools, &durable.ToolRegistration{ToolSchema: ai.ToolSchema{Name: tool["name"], Description: tool["description"]}})
+				extension.Tools = append(extension.Tools, &durable.ToolRegistration{Name: tool["name"], Description: tool["description"]})
 			}
 			for _, section := range source.Sections {
 				key := section["key"]

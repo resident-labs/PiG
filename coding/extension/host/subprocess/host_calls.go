@@ -45,9 +45,9 @@ func startsAsync(method string) bool {
 		// The public call remains synchronous in its SDK. A reverse factory/provider callback can reenter the host, so release its call lane at callback initiation.
 		return true
 	case "ui.select", "ui.confirm", "ui.input", "ui.editor", CallUICustom,
-		"setModel", "registerProvider", "exec", CallLoadingExec, "complete", "modelStream", CallProviderObject, "getModelAuth", "getProviderAuth", "getAvailableOfType", "classify", "generateImages", "refreshModelRegistry", "compact",
+		CallSetModel, CallResolveModel, "registerProvider", "exec", CallLoadingExec, "complete", "modelStream", CallProviderObject, "getModelAuth", "getProviderAuth", "getAvailableOfType", "classify", "generateImages", "refreshModelRegistry", "compact",
 		"waitForIdle", "newSession", "fork", "navigateTree", "switchSession", "reload", CallExecuteTool, CallBuiltinToolExecute, CallBuiltinToolLocalExec, CallSessionGraphAsync,
-		CallChildSessionCreate, CallChildSessionPrompt, CallChildSessionQueue, CallChildSessionAbort, CallChildSessionBindExtensions, CallChildSessionEmit,
+		CallChildSessionCreate, CallChildSessionPrompt, CallChildSessionQueue, CallChildSessionAbort, CallChildSessionBindExtensions, CallChildSessionEmit, CallChildSessionOpAsync,
 		CallOAuthOnPrompt, CallOAuthOnSelect, CallOAuthOnManualCodeInput:
 		return true
 	default:
@@ -186,28 +186,26 @@ func (l *callLanes) barrierMark() func() {
 	return reached.Wait
 }
 
-// queueCall orders one extension→host call. A Promise-shaped call runs on its
-// own goroutine, and the lane advances once the call has applied its
-// synchronous part (it marks initiation) or has finished, whichever is first.
-// The UI bridge marks initiation; a bare call handler has no initiation point,
-// so its call finishes before the lane advances.
-func (h *Host) queueCall(me *managedExt, conn *Conn, lanes *callLanes, callID string, call *CallPayload) {
-	h.queueCallDone(me, conn, lanes, callID, call, nil)
-}
-
-// queueCallDone is queueCall that calls done, when it is not nil, once the call ran or started: its effect is written. The request that made the call learns
-// that it applied (ackHold). A call that can wait for the session or the user (startsAsync) does not hold the acknowledgment of the handler awaiting it: the
-// handler is suspended on it, which is what the acknowledgment reports.
-func (h *Host) queueCallDone(me *managedExt, conn *Conn, lanes *callLanes, callID string, call *CallPayload, done func()) {
+// queueCallDone orders one extension→host call and calls done, when it is not nil, once the call ran or started: its effect is written. A Promise-shaped call
+// runs on its own goroutine, and the lane advances once the call has applied its synchronous part (it marks initiation) or has finished, whichever is first;
+// a bare call handler has no initiation point, so its call finishes before the lane advances. The request that made the call learns that it applied (ackHold)
+// when ackCounted is true (readLoop counted the frame before sealing). A call that can wait for the session or the user (startsAsync) does not hold the
+// acknowledgment of the handler awaiting it: the handler is suspended on it, which is what the acknowledgment reports. A call whose upstream API returns nothing
+// (holdsForLoopTurn) is one the handler does not wait for: it holds the acknowledgment until the handler's synchronous part is over (ackHold.applied).
+func (h *Host) queueCallDone(me *managedExt, conn *Conn, lanes *callLanes, callID string, call *CallPayload, ackCounted bool, done func()) {
 	if startsAsync(call.Method) {
-		conn.hostCallApplied(call.ParentRequestID)
+		if ackCounted {
+			conn.hostCallApplied(call.ParentRequestID, false)
+		}
 	} else {
 		applied := done
 		done = func() {
 			if applied != nil {
 				applied()
 			}
-			conn.hostCallApplied(call.ParentRequestID)
+			if ackCounted {
+				conn.hostCallApplied(call.ParentRequestID, holdsForLoopTurn(call.Method))
+			}
 		}
 	}
 	if done == nil {
@@ -363,23 +361,37 @@ func (h *Host) runCall(me *managedExt, conn *Conn, callID string, call *CallPayl
 		}
 		h.xref.unhold(conn, callID)
 	}
-	if callCtx.Err() != nil {
+	// A nested tool call made after its request's signal aborted (a tool_call's abort cancels no call but the nested tool calls) runs with that aborted signal, as Pi's nested call does with the outer tool's: its extension is not told to cancel it, so a dropped call would never be answered.
+	if callCtx.Err() != nil && !conn.parentAbortedOnly(call.ParentRequestID) {
 		refuseReferences()
 		return
 	}
-	// A reload invalidates the replaced runner, so its captured pi and ctx throw Pi's stale message (runner.ts:721-734, agent-session.ts:3580). The generation still runs while its command returns from `await ctx.reload()` (retireGeneration), so answer each call with that error: a dropped call would block the command, and the stop that waits for it, forever.
-	if me.replaced.Load() {
+	// A reload invalidates the runner of the generations it replaces before the extensions load again, so their captured pi and ctx throw Pi's stale message from then on (agent-session.ts:3825-3826 oldRunner.invalidate(), runner.ts:729-741). A generation runs on past that point: every handler that was in flight goes on until the commit, and its command until it returns from `await ctx.reload()` (retireGeneration). So each call it makes from that point (Host.supersedes) is answered with that error: a dropped call would block the handler that waits for it, and the stop that waits for that handler, forever. A call that was running at that point keeps its result: Pi checks staleness where a member is used, not where a pending promise settles.
+	if me.replaced.Load() || h.supersedes(me) {
+		// The runtime releases its bus listeners when the invalidate notification arrives, and Pi's unsubscribe never throws (releasesBusListeners): a refusal would end the process with the handlers the generation still runs.
+		if !releasesBusListeners(call.Method) {
+			refuseReferences()
+			if callID != "" {
+				_ = conn.Send(&Envelope{Type: MsgCallResult, ID: callID, CallResult: &CallResultPayload{Error: &ErrorInfo{Message: (&inproc.StaleError{}).Error()}}})
+			}
+			return
+		}
+	} else if !h.acceptsNodeGeneration(me) {
 		refuseReferences()
+		return
+	}
+	// A command-only session action through a context that is not a command context (an event, a tool, a shortcut: Pi's createContext() object lacks the member) is refused before it can replace the session under the emit that made it. The kind is the SDK's, sent with the call from the context the call is made through, not the live request's: a context kept past its request is the same context. A call without the mark is not from a command context.
+	if commandOnlyCall(call.Method) && !call.CommandContext {
+		refuseReferences()
+		if mark != nil {
+			mark()
+		}
 		if callID != "" {
-			_ = conn.Send(&Envelope{Type: MsgCallResult, ID: callID, CallResult: &CallResultPayload{Error: &ErrorInfo{Message: (&inproc.StaleError{}).Error()}}})
+			_ = conn.Send(&Envelope{Type: MsgCallResult, ID: callID, CallResult: &CallResultPayload{Error: commandOnlyCallError(call.Method)}})
 		}
 		return
 	}
-	if !h.acceptsNodeGeneration(me) {
-		refuseReferences()
-		return
-	}
-	// Pi's loop stays alive for a call that starts I/O, a child process or a session change, and does not for a dialog that stdin can no longer answer. The count runs from the call's frame, and the drain notification that follows it waits for the call's lane (queueCall), so the drain sees it.
+	// Pi's loop stays alive for a call that starts I/O, a child process or a session change, and does not for a dialog that stdin can no longer answer. The count runs from the call's frame, and the drain notification that follows it waits for the call's lane (queueCallDone), so the drain sees it.
 	if takesInteractiveFocus(call.Method) {
 		defer conn.countHostCall(call.ParentRequestID, true)()
 	} else if startsAsync(call.Method) {
@@ -392,7 +404,13 @@ func (h *Host) runCall(me *managedExt, conn *Conn, callID string, call *CallPayl
 	if mark != nil {
 		callCtx = extension.WithCallInitiation(callCtx, mark)
 	}
-	if message := h.staleMessage.Load(); message != nil {
+	// The handler of such a call leaves work for the settlement of the handler that awaits it (extension.AfterCallerSettles); the answer hands it on.
+	var afterCaller []func()
+	if settlesCaller(call.Method) {
+		callCtx = extension.WithCallerSettlement(callCtx, func(fn func()) { afterCaller = append(afterCaller, fn) })
+	}
+	// pig additive (D232): refusing a runtime's bus release (releasesBusListeners) would end a process other Hosts share.
+	if message := h.staleMessage.Load(); message != nil && (h.cells == nil || !releasesBusListeners(call.Method)) {
 		if callID != "" {
 			_ = conn.Send(&Envelope{Type: MsgCallResult, ID: callID, CallResult: &CallResultPayload{Error: &ErrorInfo{Message: *message}}})
 		}
@@ -484,7 +502,7 @@ func (h *Host) runCall(me *managedExt, conn *Conn, callID string, call *CallPayl
 	case call.Method == CallHighlightCode:
 		result, err = h.handleHighlightCode(call)
 	case call.Method == CallTypeEngine:
-		result, err = h.handleTypeEngine(call)
+		result, err = h.handleTypeEngine(conn, call)
 	case call.Method == CallLoadTheme:
 		result, err = h.handleLoadTheme(call)
 	case call.Method == CallFileMutationEnter:
@@ -560,7 +578,17 @@ func (h *Host) runCall(me *managedExt, conn *Conn, callID string, call *CallPayl
 		dialogSlot.Run(func() { h.replyToCall(me, conn, callID, call, callCtx, result, err) })
 		return
 	}
+	// The work is registered before the answer is written, so the caller's first report after it is not missed.
+	afterCaller = conn.afterCallerSettles(call.ParentRequestID, afterCaller)
 	h.replyToCall(me, conn, callID, call, callCtx, result, err)
+	for _, fn := range afterCaller {
+		fn()
+	}
+}
+
+// settlesCaller reports whether the handler of method leaves work for the settlement of the code that awaits it. Pi's reload is one chain of awaits that ends in the continuation of the command that awaited it (agent-session.ts:3815-3861, rpc-mode.ts:345-347), and RPC mode reads no input inside that chain.
+func settlesCaller(method string) bool {
+	return method == "reload"
 }
 
 // publishesStateBeforeResult reports whether the host sends the caller its state before the result of method. Pi's Session writes are
@@ -569,7 +597,7 @@ func (h *Host) runCall(me *managedExt, conn *Conn, callID string, call *CallPayl
 // focus exposes its state the same way. The Go SDK's statePublishingCalls lists the Session writes (extensions/sdk/context.go).
 func publishesStateBeforeResult(method string) bool {
 	switch method {
-	case "setModel", "appendEntry", "setLabel", "setSessionName", "sendMessage":
+	case CallSetModel, "appendEntry", "setLabel", "setSessionName", "sendMessage", "registerProvider", "unregisterProvider", CallRegisterVirtualModel, CallUnregisterVirtualModel, "refreshModelRegistry":
 		return true
 	}
 	return takesInteractiveFocus(method)
@@ -581,6 +609,9 @@ func (h *Host) replyToCall(me *managedExt, conn *Conn, callID string, call *Call
 		// Pi's model changes and dialogs expose current state before their Promise settles, including cancellation and dialog errors returned in the payload.
 		// upstream: agent-session.ts:3406-3411 (appendEntry): the entry is in the session log when appendEntry returns, so the caller's subscribed session mirror receives it before the call result.
 		err = h.pushStateTo(callCtx, me, conn)
+	} else if me != nil && h.behindHostState(me) {
+		// A host-side change this extension has not been pushed yet (hostStateChanged only queues the push), or one in flight: a reply must not carry newer host state than the replica it precedes, or a reader that learned a change from a call reads an older replica afterwards. A watchSessionLog call holds the cursor lock from its read of the log to here, so its flush runs under it: the log it returns is never newer than the state that names its Session.
+		_ = h.pushState(callCtx, me, conn, call.Method == "watchSessionLog")
 	}
 	if call.Method == "abort" && err == nil {
 		// upstream: agent.ts:340-342 aborts the active run's controller before abort() returns, so a handler that holds ctx.signal sees it aborted once its abort call returns. The run's cancellation also starts the watcher that forwards the abort (runSignals.frame), and that frame can reach the connection after this reply; the frame sent here precedes it on the connection's one ordered stream, and the watcher's frame then finds the state sent.
@@ -593,7 +624,7 @@ func (h *Host) replyToCall(me *managedExt, conn *Conn, callID string, call *Call
 		_ = conn.Send(&Envelope{
 			Type:       MsgCallResult,
 			ID:         callID,
-			CallResult: &CallResultPayload{Error: &ErrorInfo{Message: err.Error()}},
+			CallResult: &CallResultPayload{Error: errorInfoOf(err)},
 		})
 		return
 	}

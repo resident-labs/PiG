@@ -11,6 +11,7 @@
 // exception or rejection; the process exits with code 1, after the exception was printed on stderr as Node prints it).
 // The notifications of bridge.mjs (`unwatch`, `release`) have no answer either; its events are `frame`, `watchEnd` and `state`, and it serves the
 // requests that hold a local type of the plugins for the Go side (`get`, `value`, `watch`, `call`) and contracts as data (`describe`).
+// The events of the two hosts cross as `event` and `ack` messages, in both directions, none answered (events.mjs).
 // The calls to the Go side are `{ event: "call", call, name, args }` (answered by the request `{ op: "answer", id: call, ok,
 // result | error }`) and `{ event: "cancel", call }` (callbacks.mjs), and the telemetry the host reports is
 // `{ event: "telemetry", op, ... }` (telemetry.mjs). The host's synchronous callbacks (`principalKey`, `revokedBy`) use a second
@@ -21,15 +22,17 @@
 // attaches to its host with a route of the host's kind or `accept`): the control request `attach`, which has no answer. A
 // link silent for the heartbeat (30 s) is closed by this host, and the process exits with it; the heartbeat starts with the
 // link, so a host nothing attaches has none.
-import { EventEmitter } from "node:events";
+import { createReadStream, createWriteStream } from "node:fs";
 import { enableCompileCache, flushCompileCache } from "node:module";
 import { connect } from "node:net";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import "./resolve.mjs";
 import * as callbacks from "./callbacks.mjs";
 import { importGoPackage } from "./gopackage.mjs";
 import { openHostStore } from "./store.mjs";
 import { createTelemetry } from "./telemetry.mjs";
+import { FramedPort } from "./port.mjs";
 import { inspect } from "node:util";
 
 // V8's code cache for the modules below (Pi's vendored closure, type-stripped on import), kept in the extracted tree: a
@@ -42,85 +45,19 @@ enableCompileCache(fileURLToPath(new URL("./v8/", import.meta.url)));
 
 const tree = new URL("./pi/chord/src/", import.meta.url);
 const pi = (path) => import(new URL(path, tree).href);
-const [chordNext, { ipcLink }, { createPluginRuntime }, { mapStack }, { BACKGROUND_CONTEXT, withAbortSignal, withTelemetry }, { nodeCompression }, { canonicalJson }] =
+const [chordNext, { ipcLink }, { createPluginRuntime, PluginError }, { mapStack }, { BACKGROUND_CONTEXT, withAbortSignal, withTelemetry }, { nodeCompression }, { canonicalJson }] =
 	await Promise.all([
-		pi("next/index.ts"),
-		pi("next/link/index.ts"),
-		pi("next-node/plugins/runtime.ts"),
-		pi("next-node/plugins/stack.ts"),
+		pi("index.ts"),
+		pi("link/index.ts"),
+		pi("node/plugins/runtime.ts"),
+		pi("node/plugins/stack.ts"),
 		pi("context/index.ts"),
-		pi("next-node/compression.ts"),
-		pi("next/data/internal.ts"),
+		pi("node/compression.ts"),
+		pi("data/internal.ts"),
 	]);
-const { createHost, isChordError } = chordNext;
-
-const KIND_LINK = 0;
-const KIND_CONTROL = 1;
-
-/** A framed socket as the IPC channel `ipcLink` takes: Uint8Array messages are the link's, anything else the app's. */
-class FramedPort extends EventEmitter {
-	#socket;
-	#buffer = Buffer.alloc(0);
-	/** The frames whose write has not completed, and whether `disconnect` waits for them to end the socket. */
-	#writing = 0;
-	#ending = false;
-	connected = true;
-
-	constructor(socket) {
-		super();
-		this.#socket = socket;
-		socket.on("data", (chunk) => this.#read(chunk));
-		const ended = () => {
-			if (!this.connected) return;
-			this.connected = false;
-			this.emit("disconnect");
-		};
-		socket.on("close", ended);
-		socket.on("error", ended);
-	}
-
-	#read(chunk) {
-		this.#buffer = this.#buffer.length === 0 ? chunk : Buffer.concat([this.#buffer, chunk]);
-		for (;;) {
-			if (this.#buffer.length < 4) return;
-			const length = this.#buffer.readUInt32BE(0);
-			if (this.#buffer.length < 4 + length) return;
-			const kind = this.#buffer[4];
-			const payload = this.#buffer.subarray(5, 4 + length);
-			this.#buffer = this.#buffer.subarray(4 + length);
-			if (kind === KIND_LINK) this.emit("message", new Uint8Array(payload));
-			else if (kind === KIND_CONTROL) this.emit("message", JSON.parse(payload.toString("utf8")));
-		}
-	}
-
-	#write(kind, payload, callback) {
-		const header = Buffer.allocUnsafe(5);
-		header.writeUInt32BE(1 + payload.length, 0);
-		header[4] = kind;
-		this.#socket.write(header);
-		this.#writing++;
-		return this.#socket.write(payload, (error) => {
-			this.#writing--;
-			if (this.#ending && this.#writing === 0) this.#socket.end();
-			callback(error ?? null);
-		});
-	}
-
-	send(message, callback) {
-		return this.#write(KIND_LINK, message, callback);
-	}
-
-	control(message, callback = () => {}) {
-		return this.#write(KIND_CONTROL, Buffer.from(JSON.stringify(message)), callback);
-	}
-
-	/** Ends the writing side once every frame written is out: an `end()` while a write is in flight loses it (Windows). */
-	disconnect() {
-		this.connected = false;
-		this.#ending = true;
-		if (this.#writing === 0) this.#socket.end();
-	}
-}
+const { createHost, decodeJsonl, encodeJsonl, isChordError } = chordNext;
+// host.ts's `Destination` (resolve.mjs): already loaded by the import of the host above.
+const { setParentServes, forgetParentServes } = await import("./destination.mjs");
 
 /**
  * An error as it crosses to the Go side: its message, its stack mapped through the plugin scripts' source maps, and its
@@ -198,17 +135,19 @@ process.on("uncaughtException", (error) => {
 
 async function load(request, context) {
 	if (hosted !== undefined) throw new Error("load: this process loaded its host already");
-	const modules = { "@earendil-works/chord/next": chordNext };
+	const modules = { "@earendil-works/chord": chordNext };
 	for (const [specifier, file] of Object.entries(request.modules)) modules[specifier] = await import(pathToFileURL(file).href);
 	for (const pkg of request.goPackages) modules[pkg.specifier] = await importGoPackage(pkg);
-	// principalKey and revokedBy are synchronous in the host: they call the Go side on a connection of their own.
+	// principalKey, revokedBy and parentServes are synchronous in the host: they call the Go side on a connection of their own.
 	if (request.syncToken !== undefined) await callbacks.startSync(process.argv[2], request.syncToken);
+	// The remote types the Go host serves go over the link to it (destination.mjs).
+	setParentServes(request.parentServes === true ? (name) => callbacks.callSync("parentServes", name) : undefined);
 	const telemetry = request.telemetry === undefined ? undefined : createTelemetry({ emit: (event) => port.control({ event: "telemetry", ...event }), ...request.telemetry });
 	// The proxies of the Go host's own facets import it (bridge.mjs).
 	modules[GO_PACKAGE] = bridge.hostPackage;
 	const core = [];
-	for (const { name, module } of request.core) {
-		core.push({ name, facet: (await import(pathToFileURL(module).href)).default });
+	for (const { name, module, export: exported } of request.core) {
+		core.push({ name, facet: module !== undefined ? (await import(pathToFileURL(module).href)).default : chordNext[exported]() });
 	}
 	const store = request.store === undefined ? undefined : await openHostStore(request.store.path, context);
 	const host = createHost({
@@ -218,18 +157,29 @@ async function load(request, context) {
 		...(request.heartbeat === undefined ? {} : { heartbeat: request.heartbeat }),
 		...(request.closeTimeout === undefined ? {} : { closeTimeout: request.closeTimeout }),
 		...(request.readyTimeout === undefined ? {} : { readyTimeout: request.readyTimeout }),
+		...(request.reloadDrainTimeout === undefined ? {} : { reloadDrainTimeout: request.reloadDrainTimeout }),
+		...(request.eventWindow === undefined ? {} : { eventWindow: request.eventWindow }),
 		...(request.compression === true ? { compression: nodeCompression } : {}),
 		...(telemetry === undefined ? {} : { telemetry }),
 		...(request.principalKey === true
 			? { principalKey: callbacks.memoizedByPrincipal((principal) => canonicalJson(principal, BACKGROUND_CONTEXT), (principal) => callbacks.callSync("principalKey", principal)) }
 			: {}),
+		...(request.principalAttributes === true ? { principalAttributes: (principal) => callbacks.callSync("principalAttributes", principal) } : {}),
 		...(request.revokedBy === true ? { revokedBy: (principal) => callbacks.callSync("revokedBy", principal) } : {}),
 		onError: (error) => port.control({ event: "error", error: hostError(error) }),
 	});
 	const runtime = createPluginRuntime();
+	// The names the runtime offered the host (`TestPlugin` tells a plugin that failed before the host, in its build or
+	// evaluation, from one whose setup failed in it: a plugin that never reached the host was not offered).
+	const offered = [];
+	const hostLoad = host.load.bind(host);
+	host.load = (facets, loadContext) => {
+		offered.push(...facets.map(({ name }) => name));
+		return hostLoad(facets, loadContext);
+	};
 	// What the host's work runs under: the app's telemetry parent, when it gave an adapter.
 	const base = telemetry === undefined ? BACKGROUND_CONTEXT : withTelemetry(telemetry, BACKGROUND_CONTEXT);
-	hosted = { host, runtime, store, peer: request.peer, base };
+	hosted = { host, runtime, store, peer: request.peer, base, core, scripts: request.scripts, offered };
 	// The host's keep-alive counts, for the app that supervises it (NodeOptions.OnActivity): now, and at each change.
 	port.control({ event: "activity", counts: host.activity.value });
 	void host.activity.watch(BACKGROUND_CONTEXT).then((watch) =>
@@ -238,8 +188,16 @@ async function load(request, context) {
 		}),
 	);
 	const traced = telemetry === undefined ? context : withTelemetry(telemetry, context);
-	const report = await runtime.load(host, { kind: request.kind, core, scripts: request.scripts, modules }, traced);
-	return { failed: report.failed.map(({ plugin, error }) => ({ plugin, error: wireError(error) })) };
+	const wireFailures = (failures) => failures.map(({ plugin, error }) => ({ plugin, error: wireError(error) }));
+	try {
+		const report = await runtime.load(host, { kind: request.kind, core, scripts: request.scripts, modules }, traced);
+		return { failed: wireFailures(report.failed) };
+	} catch (error) {
+		// A required root's plugins failed once the host's load settled (runtime.ts's PluginError): the host stays
+		// loaded, and the Go side raises the error with these (`required` is never empty then).
+		if (!(error instanceof PluginError)) throw error;
+		return { failed: wireFailures(error.failed), required: wireFailures(error.required) };
+	}
 }
 
 /**
@@ -258,6 +216,8 @@ function hostError(error) {
 
 async function reload(request, context) {
 	if (hosted === undefined) throw new Error("reload: no host is loaded");
+	hosted.scripts = request.scripts;
+	forgetParentServes();
 	const report = await hosted.runtime.reload(hosted.host, request.scripts, context);
 	return {
 		plugins: report.plugins,
@@ -267,7 +227,7 @@ async function reload(request, context) {
 }
 
 /**
- * As a worker connects to its parent (next-node/workers/main.ts): the Go side uses the other end of the link, as the server
+ * As a worker connects to its parent (node/workers/main.ts): the Go side uses the other end of the link, as the server
  * of a worker does, and `peer` is who the Go side is, as this host stamps it. Once; the host's heartbeat starts with the link.
  */
 function attach() {
@@ -283,10 +243,40 @@ async function revoke(request, context) {
 	return {};
 }
 
+/**
+ * The host data operations of this process's host (Pi's `host.exportHostData`, `importHostData` and `deleteHostData`, which
+ * `app.ts` calls on its one host), over JSONL files at paths the Go side names: the archive is `encodeJsonl` of the export and
+ * `decodeJsonl` of the import, as `app.ts` pipes them. The Go side's store is another file (D462): this process's host holds the
+ * plugins' documents and rows.
+ */
+const hostDataOperations = {
+	exportHostData: async (request, context) => {
+		if (hosted === undefined) throw new Error("exportHostData: no host is loaded");
+		const parts = encodeJsonl(hosted.host.exportHostData(request.address, context));
+		await pipeline(parts, createWriteStream(request.path, { mode: 0o600 }));
+		return {};
+	},
+	importHostData: async (request, context) => {
+		if (hosted === undefined) throw new Error("importHostData: no host is loaded");
+		const parts = decodeJsonl(createReadStream(request.path));
+		await hosted.host.importHostData(parts, context, {
+			address: request.address,
+			...(request.existing === undefined ? {} : { existing: request.existing }),
+		});
+		return {};
+	},
+	deleteHostData: async (request, context) => {
+		if (hosted === undefined) throw new Error("deleteHostData: no host is loaded");
+		await hosted.host.deleteHostData(request.address, context);
+		return {};
+	},
+};
+
 // The reference RPC and contracts as data (bridge.mjs, contracts.mjs): the control requests of `NodeHost.Get` and the Go host's `Bridged` facets.
 const { createBridge, GO_PACKAGE } = await import("./bridge.mjs");
 const bridge = createBridge({ port, wireError, host: () => hosted?.host });
-const operations = { load, reload, revoke, ...bridge.operations };
+const { testOperations } = await import("./testing.mjs");
+const operations = { load, reload, revoke, ...hostDataOperations, ...bridge.operations, ...testOperations({ hosted: () => hosted, chord: chordNext }) };
 
 port.on("message", (message) => {
 	if (message instanceof Uint8Array) return;

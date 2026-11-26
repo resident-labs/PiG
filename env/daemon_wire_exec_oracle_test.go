@@ -185,7 +185,16 @@ func TestDaemonExecMatchesPisDaemon(t *testing.T) {
 				environment := daemonEnvironment(base, tmp, extra...)
 				d := startWireDaemon(t, binary, root, environment)
 				frames := d.call(withRoot(test.request, root).(daemon.Object), nil)
-				outputs[index] = renderExec(frames, root, !test.window, []wireNormalizer{spillName, {regexp.MustCompile(regexp.QuoteMeta(tmp)), "{TMP}"}, {regexp.MustCompile(regexp.QuoteMeta(base)), "{BASE}"}})
+				realTmp, _ := filepath.EvalSymlinks(tmp)
+				realBase, _ := filepath.EvalSymlinks(base)
+				norms := []wireNormalizer{spillName, {regexp.MustCompile(regexp.QuoteMeta(tmp)), "{TMP}"}, {regexp.MustCompile(regexp.QuoteMeta(base)), "{BASE}"}}
+				if realTmp != "" && realTmp != tmp {
+					norms = append(norms, wireNormalizer{regexp.MustCompile(regexp.QuoteMeta(realTmp)), "{TMP}"})
+				}
+				if realBase != "" && realBase != base {
+					norms = append(norms, wireNormalizer{regexp.MustCompile(regexp.QuoteMeta(realBase)), "{BASE}"})
+				}
+				outputs[index] = renderExec(frames, root, !test.window, norms)
 			}
 			compareWire(t, test.name, outputs[0], outputs[1])
 		})
@@ -243,6 +252,11 @@ func TestDaemonCancelRightBehindItsRequestMatchesPisDaemon(t *testing.T) {
 // TestDaemonHelloMatchesPisDaemon compares the hello reply under each environment that changes it.
 func TestDaemonHelloMatchesPisDaemon(t *testing.T) {
 	version := wireNormalizer{regexp.MustCompile(`"version":"[^"]*"`), `"version":"V"`}
+	normalizers := []wireNormalizer{version}
+	if _, err := os.Stat(pinnedDaemonSource(t, "process.rs")); err != nil {
+		// A pin before Pi 9c9ce8547 does not list the `process` feature PiG's daemon does.
+		normalizers = append(normalizers, wireNormalizer{regexp.MustCompile(`,"process"\]`), `]`})
+	}
 	for _, test := range []struct {
 		name string
 		env  []string
@@ -270,7 +284,11 @@ func TestDaemonHelloMatchesPisDaemon(t *testing.T) {
 					environment = append(environment, strings.ReplaceAll(entry, "{TMP}", tmp))
 				}
 				d := startWireDaemon(t, binary, root, environment)
-				text := render(d.call(object("op", "hello"), nil), root, []wireNormalizer{version, {regexp.MustCompile(regexp.QuoteMeta(base)), "{BASE}"}})
+				helloNorms := []wireNormalizer{{regexp.MustCompile(regexp.QuoteMeta(base)), "{BASE}"}}
+				if realBase, err := filepath.EvalSymlinks(base); err == nil && realBase != base {
+					helloNorms = append(helloNorms, wireNormalizer{regexp.MustCompile(regexp.QuoteMeta(realBase)), "{BASE}"})
+				}
+				text := render(d.call(object("op", "hello"), nil), root, append(helloNorms, normalizers...))
 				outputs[index] = d.sync + text
 			}
 			compareWire(t, test.name, outputs[0], outputs[1])

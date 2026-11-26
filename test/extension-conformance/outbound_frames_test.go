@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,10 +20,23 @@ import (
 
 // frameCheck holds the frames a Host wrote that are not json.Marshal of their own envelope.
 type frameCheck struct {
-	mu       sync.Mutex
-	frames   int
-	events   map[string]int
-	failures []string
+	mu     sync.Mutex
+	frames int
+	events map[string]int
+	// deltas and deepDeltas count the event requests that carry the operations of an event stream (no payload of their own), and those whose operations nest past
+	// serde_json's 128 levels, by event.
+	deltas     map[string]int
+	deepDeltas map[string]int
+	// signalCancels counts the signal-only cancel frames (CancelPayload.SignalOnly) the host wrote.
+	signalCancels int
+	// abortedToolCalls counts the tool_call requests the host wrote with signal_aborted set.
+	abortedToolCalls int
+	// toolCalls counts the tool_call requests the host wrote.
+	toolCalls int
+	failures  []string
+	// keep names the events whose request frames are kept as written, by extension: kept[extName+"\x00"+event].
+	keep map[string]bool
+	kept map[string][][]byte
 }
 
 // checkOutboundFrames fails t when a frame the host writes to an extension, in any load mode, is not the bytes json.Marshal writes for the envelope it carries: every member in the encoder's order, every raw member compact and escaped as the encoder escapes it (<, >, &, U+2028, U+2029). Each realization of an extension then receives the bytes it received before the host shared or spliced encodings.
@@ -53,15 +67,61 @@ func (c *frameCheck) observe(extName string, frame []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.frames++
+	if env.Type == subprocess.MsgCancel && env.Cancel != nil && env.Cancel.SignalOnly {
+		c.signalCancels++
+	}
+	if env.Request != nil && env.Request.Method == subprocess.MethodToolCall {
+		c.toolCalls++
+		if env.Request.SignalAborted {
+			c.abortedToolCalls++
+		}
+	}
 	if env.Request != nil && env.Request.Method == "event" {
 		if c.events == nil {
 			c.events = map[string]int{}
 		}
 		c.events[env.Request.Event]++
+		if c.keep[env.Request.Event] {
+			if c.kept == nil {
+				c.kept = map[string][][]byte{}
+			}
+			key := extName + "\x00" + env.Request.Event
+			c.kept[key] = append(c.kept[key], bytes.Clone(frame))
+		}
+		if stream := env.Request.Stream; stream != nil && len(stream.Ops) > 0 && len(env.Request.Args) == 0 {
+			if c.deltas == nil {
+				c.deltas, c.deepDeltas = map[string]int{}, map[string]int{}
+			}
+			c.deltas[env.Request.Event]++
+			if bytes.Contains(stream.Ops, bytes.Repeat([]byte("["), 150)) || bytes.Contains(stream.Ops, bytes.Repeat([]byte(`{"a":`), 150)) {
+				c.deepDeltas[env.Request.Event]++
+			}
+		}
 	}
 	if failure != "" && len(c.failures) < 5 {
 		c.failures = append(c.failures, failure)
 	}
+}
+
+// signalCancelFrames returns how many signal-only cancel frames the host wrote, counted by the write loop before it writes each, so a frame the loop writes after the count follows that cancel on the wire.
+func (c *frameCheck) signalCancelFrames() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.signalCancels
+}
+
+// toolCallRequests returns how many tool_call requests the host wrote: a nested tool call is a request of its own.
+func (c *frameCheck) toolCallRequests() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.toolCalls
+}
+
+// abortedToolCallRequests returns how many tool_call requests the host wrote with signal_aborted set: calls whose context had ended when they reached the host (D111).
+func (c *frameCheck) abortedToolCallRequests() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.abortedToolCalls
 }
 
 // eventFrames returns how many event requests of each kind the host wrote.
@@ -69,6 +129,35 @@ func (c *frameCheck) eventFrames() map[string]int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return maps.Clone(c.events)
+}
+
+// deepDeltaFrames returns how many delta frames of each event the host wrote whose operations nest past serde_json's 128 levels.
+func (c *frameCheck) deepDeltaFrames() map[string]int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return maps.Clone(c.deepDeltas)
+}
+
+// keepEventFrames keeps, from now on, every request frame of the event the host writes, for keptEventFrames.
+func (c *frameCheck) keepEventFrames(event string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.keep == nil {
+		c.keep = map[string]bool{}
+	}
+	c.keep[event] = true
+	for key := range c.kept {
+		if strings.HasSuffix(key, "\x00"+event) {
+			delete(c.kept, key)
+		}
+	}
+}
+
+// keptEventFrames returns the request frames of the event the host wrote to the extension since keepEventFrames, in the order written.
+func (c *frameCheck) keptEventFrames(extName, event string) [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.kept[extName+"\x00"+event])
 }
 
 func clip(b []byte) string {
@@ -127,7 +216,7 @@ func TestOutboundFramesAreTheEncodersBytes(t *testing.T) {
 				t.Fatal(err)
 			}
 			raw := slices.Clone(wireInput)
-			call := extension.CustomToolCallEvent{ToolCallEventBase: extension.ToolCallEventBase{Type: "tool_call", ToolCallID: "corpus-call", WireInput: &raw}, ToolName: "corpus_tool", Input: input}
+			call := extension.CustomToolCallEvent{Type: "tool_call", ToolCallID: "corpus-call", WireInput: &raw, ToolName: "corpus_tool", Input: input}
 			if _, err := h.runner.EmitToolCall(ctx, call); err != nil {
 				t.Fatalf("emit tool_call: %v", err)
 			}

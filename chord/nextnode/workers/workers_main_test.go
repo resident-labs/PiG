@@ -15,10 +15,11 @@ import (
 	chordctx "github.com/MichaelKinsy/PiG/chord/context"
 	"github.com/MichaelKinsy/PiG/chord/next/host"
 	"github.com/MichaelKinsy/PiG/chord/nextnode/plugins"
+	"github.com/MichaelKinsy/PiG/chord/nextnode/plugins/model"
 )
 
-// pi: packages/chord/src/next-node/workers/main.ts
-// Ports packages/chord/test/next-node/workers/main.test.ts: the worker's side: the start message, the lock, `started` on
+// pi: packages/chord/src/node/workers/main.ts
+// Ports packages/chord/test/node/workers/main.test.ts: the worker's side: the start message, the lock, `started` on
 // `connect`, `ready`; shutdown during startup, the parent's disconnect and SIGTERM each run the closers and exit; `fatal`
 // redacted.
 
@@ -132,7 +133,9 @@ func TestTheWorkersSideSendsStartedWhenTheAppConnectsThenReadyWithItsLoadReportA
 	if !ready.Idle || ready.Report == nil || len(ready.Report.Plugins.Added) != 0 || len(ready.Report.Failed) != 0 {
 		t.Fatalf("ready = %+v report=%+v, want idle with no plugin added and none failed", ready, ready.Report)
 	}
-	worker.child.Kill()
+	// Shut down, not killed: a SIGKILL would leave its lock's socket file on macOS and the BSDs.
+	worker.child.Send(ToWorker{Kind: ToWorkerShutdown})
+	<-worker.child.Exited()
 }
 
 func TestTheWorkersSideShutsDownDuringItsStartupAbortsItRunsTheClosersRegisteredSoFarInReverseOrderExits0(t *testing.T) {
@@ -156,7 +159,7 @@ func TestTheWorkersSideShutsDownDuringItsStartupAbortsItRunsTheClosersRegistered
 
 // A shutdown that finds a reload in flight in the NodeHost, whose event loop is blocked and answers nothing, closes the worker's
 // link to the server before the NodeHost ends and fails the reload (Pi's `#shutdown` runs the closers in reverse order, and the
-// host closer, registered last, closes the link: packages/chord/src/next-node/workers/main.ts, ipc.ts's close frame precedes the
+// host closer, registered last, closes the link: packages/chord/src/node/workers/main.ts, ipc.ts's close frame precedes the
 // `reloaded` reply). The NodeHost's close runs after the app's closers, those it registered before and after the load, so the
 // server reads the reload's failure after its link closed, where it settles the reload from `ended`
 // (TestTheRolloutStepListsAWorkerStoppedCleanlyDuringItAsStoppedAndOneThatCrashedWithItsError). The NodeHost stays blocked until
@@ -247,5 +250,40 @@ func TestTheWorkersIdleStateReadsTheNodeHostsActivityThroughItsReports(t *testin
 	w.mu.Unlock()
 	if idle {
 		t.Fatalf("idle with a reference held (the last report: %+v)", w.activity)
+	}
+}
+
+// A worker whose plugins are not shipped through WorkerPlugins.Load (an app with compiled-in plugins) applies a server's
+// reload through WorkerMainOptions.Reload: it answers `reloaded` with the hook's report, set after set.
+func TestTheWorkersSideAppliesAReloadThroughTheReloadHookWhenNoPluginRuntimeWasLoaded(t *testing.T) {
+	log := filepath.Join(t.TempDir(), "log")
+	worker := started(t, workerBehaviour{Log: log, GoReload: true})
+	until(t, func() bool { return worker.has(FromWorkerReady) })
+	script := func(digest string) plugins.PluginScript {
+		return plugins.PluginScript{Plugin: model.Plugin{Name: "@test/a"}, Built: model.BuiltFacet{Kind: model.BuiltFacetScript, Digest: digest}}
+	}
+	for _, digest := range []string{"d1", "d2"} {
+		worker.child.Send(ToWorker{Kind: ToWorkerReload, Scripts: []plugins.PluginScript{script(digest)}})
+	}
+	until(t, func() bool {
+		count := 0
+		for _, kind := range worker.controlKinds() {
+			if kind == FromWorkerReloaded {
+				count++
+			}
+		}
+		return count == 2
+	})
+	for _, message := range worker.messages() {
+		if message.Kind == FromWorkerReloaded && (message.Report == nil || !reflect.DeepEqual(message.Report.Plugins.Changed, []string{"@test/a"})) {
+			t.Fatalf("reloaded = %+v, want the hook's report", message)
+		}
+	}
+	text, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(text) != "reload @test/a@d1\nreload @test/a@d2\n" {
+		t.Fatalf("the hook saw %q", text)
 	}
 }

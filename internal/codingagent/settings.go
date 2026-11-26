@@ -22,6 +22,7 @@ import (
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/internal/allocsize"
+	"github.com/MichaelKinsy/PiG/internal/atomicfile"
 	"github.com/MichaelKinsy/PiG/internal/changeobservers"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
 	"github.com/MichaelKinsy/PiG/internal/configroot"
@@ -304,6 +305,10 @@ type terminalSettingsWire struct {
 	ImageWidthCells      *int  `json:"imageWidthCells,omitempty"`
 	ClearOnShrink        *bool `json:"clearOnShrink,omitempty"`
 	ShowTerminalProgress *bool `json:"showTerminalProgress,omitempty"`
+	// ScreenWriter is PiG's own key; see Settings.TerminalScreenWriter.
+	ScreenWriter string `json:"screenWriter,omitempty"`
+	// FramePacing is PiG's own key; see Settings.TerminalFramePacing.
+	FramePacing string `json:"framePacing,omitempty"`
 	// Hyperlinks, Images, and TrueColor keep the authored JSON value; see
 	// Settings.GetTerminalCapabilityOverrides.
 	Hyperlinks json.RawMessage `json:"hyperlinks,omitempty"`
@@ -419,8 +424,8 @@ type CacheWarmingMode string
 // CacheWarmingModes lists the modes in Pi's order (CACHE_WARMING_MODES).
 var CacheWarmingModes = []CacheWarmingMode{"off", "streaming", "idle"}
 
-// defaultCacheWarmingMode is Pi's default: warm only while the agent runs.
-const defaultCacheWarmingMode CacheWarmingMode = "streaming"
+// defaultCacheWarmingMode is Pi's default (settings-defaults.ts cacheWarming): warm during runs and, for up to 30 minutes, between them.
+const defaultCacheWarmingMode CacheWarmingMode = "idle"
 
 func parseHTTPIdleTimeoutMs(value any) (int, bool) {
 	switch v := value.(type) {
@@ -741,6 +746,14 @@ type Settings struct {
 	// Default: false.
 	ShowTerminalProgress *bool `json:"showTerminalProgress,omitempty"`
 
+	// TerminalScreenWriter is terminal.screenWriter, what a fullscreen terminal is sent: "writer" for only what changes its screen, "pi" for Pi's bytes; see GetTerminalScreenWriter. PIG_TUI_SCREEN_WRITER overrides it. It is read once, when interactive mode starts. Global setting only.
+	// pig divergence (D624): Pi has no such key; it writes every row a frame holds.
+	TerminalScreenWriter string `json:"screenWriter,omitempty"`
+
+	// TerminalFramePacing is terminal.framePacing, how soon a streaming reply's next frame may begin in fullscreen mode: "pi" for Pi's 16 ms, the default, "adaptive" for the last frame's cost times four between 10 and 16 ms; see GetTerminalFramePacing. PIG_FRAME_PACING overrides it. It is read once, when interactive mode starts. Global setting only.
+	// pig additive (D625): Pi has no such key; its frame interval is one constant, which is what the key unset selects.
+	TerminalFramePacing string `json:"framePacing,omitempty"`
+
 	// terminalHyperlinks, terminalImages, and terminalTrueColor hold the
 	// authored terminal.hyperlinks, terminal.images, and terminal.trueColor
 	// JSON values. Upstream types them boolean | "auto",
@@ -1057,6 +1070,8 @@ func cloneSettings(s Settings) Settings {
 		AutocompleteMaxVisible:         cloneIntPtr(s.AutocompleteMaxVisible),
 		ClearOnShrink:                  cloneBoolPtr(s.ClearOnShrink),
 		ShowTerminalProgress:           cloneBoolPtr(s.ShowTerminalProgress),
+		TerminalScreenWriter:           s.TerminalScreenWriter,
+		TerminalFramePacing:            s.TerminalFramePacing,
 		terminalHyperlinks:             slices.Clone(s.terminalHyperlinks),
 		terminalImages:                 slices.Clone(s.terminalImages),
 		terminalTrueColor:              slices.Clone(s.terminalTrueColor),
@@ -1160,12 +1175,14 @@ func (s Settings) MarshalJSON() ([]byte, error) {
 		}
 	}
 	if s.ShowImages != nil || s.ImageWidthCells > 0 || s.imageWidthCellsSet || s.ClearOnShrink != nil || s.ShowTerminalProgress != nil ||
-		s.terminalHyperlinks != nil || s.terminalImages != nil || s.terminalTrueColor != nil {
+		s.TerminalScreenWriter != "" || s.TerminalFramePacing != "" || s.terminalHyperlinks != nil || s.terminalImages != nil || s.terminalTrueColor != nil {
 		w.Terminal = &terminalSettingsWire{
 			ShowImages:           s.ShowImages,
 			ImageWidthCells:      imageWidthCellsWire(s),
 			ClearOnShrink:        s.ClearOnShrink,
 			ShowTerminalProgress: s.ShowTerminalProgress,
+			ScreenWriter:         s.TerminalScreenWriter,
+			FramePacing:          s.TerminalFramePacing,
 			Hyperlinks:           s.terminalHyperlinks,
 			Images:               s.terminalImages,
 			TrueColor:            s.terminalTrueColor,
@@ -1327,6 +1344,8 @@ func (s *Settings) UnmarshalJSON(data []byte) error {
 		}
 		s.ClearOnShrink = w.Terminal.ClearOnShrink
 		s.ShowTerminalProgress = w.Terminal.ShowTerminalProgress
+		s.TerminalScreenWriter = w.Terminal.ScreenWriter
+		s.TerminalFramePacing = w.Terminal.FramePacing
 		s.terminalHyperlinks = w.Terminal.Hyperlinks
 		s.terminalImages = w.Terminal.Images
 		s.terminalTrueColor = w.Terminal.TrueColor
@@ -1674,6 +1693,55 @@ func decodeSettingJSON(raw json.RawMessage) any {
 	return value
 }
 
+// The values of terminal.screenWriter.
+const (
+	TerminalScreenWriterWriter = "writer"
+	TerminalScreenWriterPi     = "pi"
+)
+
+// TerminalScreenWriterDefault is what terminal.screenWriter means when the key is unset or holds neither value: the one place
+// that says what a fullscreen terminal is sent when nobody chose (D624). Nothing else in the tree names the default. The screen
+// writer is opt-in in 0.8.0: the default is Pi's bytes until the writer is shown on the owner's terminals.
+const TerminalScreenWriterDefault = TerminalScreenWriterPi
+
+// GetTerminalScreenWriter returns the terminal.screenWriter setting, TerminalScreenWriterWriter or TerminalScreenWriterPi. The key unset, and any other value, is TerminalScreenWriterDefault.
+// pig divergence (D624): see Settings.TerminalScreenWriter.
+func (s Settings) GetTerminalScreenWriter() string {
+	return terminalScreenWriterOr(s.TerminalScreenWriter, TerminalScreenWriterDefault)
+}
+
+// terminalScreenWriterOr is value when it is one of the two values of terminal.screenWriter, byDefault otherwise.
+func terminalScreenWriterOr(value, byDefault string) string {
+	if value == TerminalScreenWriterWriter || value == TerminalScreenWriterPi {
+		return value
+	}
+	return byDefault
+}
+
+// The values of terminal.framePacing.
+const (
+	TerminalFramePacingAdaptive = "adaptive"
+	TerminalFramePacingPi       = "pi"
+)
+
+// terminalFramePacingDefault is the frame pacing of a run that selects none: the terminal.framePacing key unset or holding any other value, and PIG_FRAME_PACING naming no policy. It is Pi's interval: the adaptive policy's median and 95th percentile gap between visible changes are shorter, but it uses 4 to 7 % more CPU time, most of it for the frames it draws more, and its 99th percentile while a 200 KB file is written is half a millisecond over Pi's (D625). This constant is the only place the default is decided.
+// pig additive (D625): the adaptive policy is opt-in.
+const terminalFramePacingDefault = TerminalFramePacingPi
+
+// terminalFramePacingOr returns value when it names a frame pacing, else byDefault.
+func terminalFramePacingOr(value, byDefault string) string {
+	if value == TerminalFramePacingAdaptive || value == TerminalFramePacingPi {
+		return value
+	}
+	return byDefault
+}
+
+// GetTerminalFramePacing returns the terminal.framePacing setting, TerminalFramePacingAdaptive or TerminalFramePacingPi. The key unset, and any other value, is the default, terminalFramePacingDefault.
+// pig additive (D625): see Settings.TerminalFramePacing.
+func (s Settings) GetTerminalFramePacing() string {
+	return terminalFramePacingOr(s.TerminalFramePacing, terminalFramePacingDefault)
+}
+
 // GetShowTerminalProgress returns whether OSC 9;4 terminal progress indicators are enabled.
 func (s Settings) GetShowTerminalProgress() bool {
 	if s.ShowTerminalProgress == nil {
@@ -1722,7 +1790,11 @@ type SettingsManager struct {
 	globalLoadErr  error
 	projectLoadErr error
 	errors         []SettingsError
-	memory         *memorySettingsStorage
+	// writer performs the persisted writes of file and extension storage in the order the setters queued them (settings-manager.ts writeQueue).
+	writer settingsWriter
+	// unsavedGlobal and unsavedProject are the changes of a scope that no write has saved yet: Pi's modifiedFields and modifiedProjectFields, which a write clears only when it succeeds (settings-manager.ts:578-584). nil when there is none.
+	unsavedGlobal, unsavedProject *unsavedSettings
+	memory                        *memorySettingsStorage
 	// storage is the extension-owned backend of SettingsManager.fromStorage; nil for file and memory storage.
 	storage SettingsStorage
 	// generation counts the changes of merged (setMergedLocked); extensionEncoding is the extension encoding of one generation.
@@ -1919,11 +1991,13 @@ func (sm *SettingsManager) CWD() string {
 	return sm.cwd
 }
 
-// Load reloads the backing settings layers and discards transient overrides. Previously recorded errors remain until DrainErrors.
+// Load reloads the backing settings layers and discards transient overrides, after the writes queued before the call (settings-manager.ts reload awaits writeQueue). Previously recorded errors remain until DrainErrors.
 func (sm *SettingsManager) Load() {
+	sm.writer.wait()
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	// upstream: packages/coding-agent/src/core/settings-manager.ts:reload
+	sm.unsavedGlobal, sm.unsavedProject = nil, nil
 	if sm.memory != nil {
 		sm.global = cloneSettings(sm.memory.global)
 		sm.globalObject = cloneSettingsObject(sm.memory.globalObject)
@@ -2046,6 +2120,7 @@ func (sm *SettingsManager) SetProjectTrusted(trusted bool) {
 		return
 	}
 	sm.projectTrusted = trusted
+	sm.unsavedProject = nil
 	sm.project = Settings{}
 	sm.projectObject = orderedjson.New()
 	sm.projectLoadErr = nil
@@ -2080,9 +2155,86 @@ func ThemeOverride(theme string) Settings {
 	return Settings{Theme: theme, themeEmpty: theme == ""}
 }
 
-// Flush waits for queued writes. pig writes settings synchronously, so this is a no-op.
-// Mirrors upstream SettingsManager.flush() API for parity.
-func (sm *SettingsManager) Flush() error { return nil }
+// Flush waits for the writes queued before the call (settings-manager.ts flush). A setter returns after its own write, so Flush waits only for the write of a setter that another goroutine is still in. A write that fails is recorded for DrainErrors, so Flush itself does not fail.
+func (sm *SettingsManager) Flush() error {
+	sm.writer.wait()
+	return nil
+}
+
+// unsavedSettings is the change of a settings scope that no write has saved yet.
+type unsavedSettings struct {
+	// before is the scope as it was before its oldest unsaved setter.
+	before Settings
+	// marked lists the top-level keys the unsaved setters before the latest one changed, in the order they first changed them: Pi's modifiedFields is a Set, which a write walks in insertion order (settings-manager.ts:278, :609).
+	marked []string
+	// latestBefore and latestOrder are the scope before the latest unsaved setter and the order that setter passed. Its keys are worked out only when a later setter carries it, which happens only after a write failed.
+	latestBefore Settings
+	latestOrder  []string
+	// replace is what the unsaved setters passed as replace.
+	replace []string
+}
+
+// settingsChange is what one write persists: the change of its scope from before to the setter's result, with the order and replace of saveScope.
+type settingsChange struct {
+	before         Settings
+	order, replace []string
+}
+
+// carryUnsaved returns the change the write of a setter persists and the scope's unsaved change after that setter. The setter changed the scope from before to after and passed order and replace. With an unsaved change the write starts from the scope before the oldest unsaved setter, so it also saves what an earlier, failed write of the scope did not, as Pi's does with the fields still marked modified, and it adds new keys to the file in the order the setters changed them. The caller holds sm.mu for writing.
+func carryUnsaved(unsaved *unsavedSettings, before, after Settings, order, replace []string) (settingsChange, *unsavedSettings) {
+	if unsaved == nil {
+		return settingsChange{before: before, order: order, replace: replace}, &unsavedSettings{before: before, latestBefore: before, latestOrder: order, replace: replace}
+	}
+	marked := appendMissing(unsaved.marked, setterKeys(unsaved.latestOrder, unsaved.latestBefore, before))
+	change := settingsChange{before: unsaved.before, order: appendMissing(marked, setterKeys(order, before, after)), replace: slices.Concat(unsaved.replace, replace)}
+	return change, &unsavedSettings{before: unsaved.before, marked: marked, latestBefore: before, latestOrder: order, replace: change.replace}
+}
+
+// setterKeys lists the top-level keys a setter changed, in the order it changed them: the order it passed, or the keys that differ between before and after, sorted as a write applies them.
+func setterKeys(order []string, before, after Settings) []string {
+	if order != nil {
+		return order
+	}
+	beforeMap, err := settingsJSONMap(before)
+	if err != nil {
+		return nil
+	}
+	afterMap, err := settingsJSONMap(after)
+	if err != nil {
+		return nil
+	}
+	var keys []string
+	for key, value := range afterMap {
+		if old, ok := beforeMap[key]; !ok || !bytes.Equal(old, value) {
+			keys = append(keys, key)
+		}
+	}
+	for key := range beforeMap {
+		if _, ok := afterMap[key]; !ok {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// appendMissing returns keys followed by the entries of more that keys does not hold, in a new slice.
+func appendMissing(keys, more []string) []string {
+	out := slices.Clone(keys)
+	for _, key := range more {
+		if !slices.Contains(out, key) {
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
+// writeFailed records the failure of a queued write for DrainErrors (settings-manager.ts recordError); path is the file the write targeted.
+func (sm *SettingsManager) writeFailed(scope, path string, err error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.errors = append(sm.errors, SettingsError{Scope: scope, Path: sm.errorPath(path), Error: err})
+}
 
 // GetCompactionSettings resolves ordinary settings and rejects invalid authored token values. The optional model selects the compaction.modelOverrides entry for its provider and ID, as upstream getCompactionSettings(model?: Pick<Model, "provider" | "id">).
 func (sm *SettingsManager) GetCompactionSettings(model ...*ai.Model) (CompactionConfig, error) {
@@ -2194,7 +2346,7 @@ func (sm *SettingsManager) SetDefaultProjectTrust(trust DefaultProjectTrust) err
 	return sm.UpdateGlobal(func(s *Settings) { s.DefaultProjectTrust = string(trust) })
 }
 
-// GetCacheWarmingMode returns the global cache-warming mode, or "streaming"
+// GetCacheWarmingMode returns the global cache-warming mode, or "idle"
 // when it is unset or invalid. Project settings are ignored because each
 // refresh costs money. Mirrors upstream getCacheWarmingMode.
 func (sm *SettingsManager) GetCacheWarmingMode() CacheWarmingMode {
@@ -2487,15 +2639,77 @@ type ProviderRetryConfig struct {
 	MaxRetryDelayMs int
 }
 
+// builtinRetryConfig is upstream's retry default: 3 retries (settings-manager.ts:21), 2000 ms base (:22), 60000 ms cap.
+var builtinRetryConfig = RetryConfig{Enabled: true, MaxRetries: 3, BaseDelayMs: 2000, MaxAgentDelayMs: 60000}
+
+var defaultRetryConfig atomic.Pointer[RetryConfig]
+
+// SetDefaultRetryConfig replaces the retry defaults GetRetrySettings starts from; a settings.json `retry` member still overrides each
+// field. A fused Piglet member sets it through its CLI hook (clihook.Result.Retry), before the Session starts.
+func SetDefaultRetryConfig(config RetryConfig) { defaultRetryConfig.Store(&config) }
+
+// DefaultRetryConfig is the retry configuration a Session uses when no settings file names one.
+func DefaultRetryConfig() RetryConfig {
+	if config := defaultRetryConfig.Load(); config != nil {
+		return *config
+	}
+	return builtinRetryConfig
+}
+
+var (
+	defaultRetryDecider       atomic.Pointer[ai.RetryDecider]
+	defaultRetrySilent        atomic.Bool
+	defaultHTTPIdleMsOverride atomic.Pointer[int]
+)
+
+// SetDefaultRetryDecider installs the retry classifier and delay hook a fused Piglet member supplies through
+// clihook.Result.Retry. Nil restores PiG's built-in classifier and exponential schedule.
+// pig additive (D654): inert unless a fused member installs a decider.
+func SetDefaultRetryDecider(decider ai.RetryDecider, silent bool) {
+	if decider == nil {
+		defaultRetryDecider.Store(nil)
+	} else {
+		defaultRetryDecider.Store(&decider)
+	}
+	defaultRetrySilent.Store(silent)
+}
+
+// DefaultRetryDecider returns the installed retry decider, or nil when PiG's built-in retry rules apply.
+func DefaultRetryDecider() ai.RetryDecider {
+	if p := defaultRetryDecider.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// DefaultRetrySilent reports whether PiG's built-in interactive retry status indicator and final "Retry failed after ..."
+// error line are suppressed because the piglet renders its own.
+func DefaultRetrySilent() bool { return defaultRetrySilent.Load() }
+
+// SetDefaultHTTPIdleTimeoutMs replaces the default HTTP idle timeout GetHttpIdleTimeoutMs uses when settings.json names
+// none; nil restores PiG's built-in 300000 ms default.
+func SetDefaultHTTPIdleTimeoutMs(timeoutMs *int) {
+	if timeoutMs == nil {
+		defaultHTTPIdleMsOverride.Store(nil)
+		return
+	}
+	v := *timeoutMs
+	defaultHTTPIdleMsOverride.Store(&v)
+}
+
+// DefaultHTTPIdleTimeoutMs is the HTTP idle timeout a Session uses when no settings file names one.
+func DefaultHTTPIdleTimeoutMs() int {
+	if p := defaultHTTPIdleMsOverride.Load(); p != nil {
+		return *p
+	}
+	return defaultHTTPIdleTimeoutMs
+}
+
 // GetRetrySettings returns retry settings with defaults applied.
 // Mirrors upstream SettingsManager.getRetrySettings (settings-manager.ts:683-690).
 func (sm *SettingsManager) GetRetrySettings() RetryConfig {
-	result := RetryConfig{
-		Enabled:         true,
-		MaxRetries:      3,     // upstream default: 3 (settings-manager.ts:21)
-		BaseDelayMs:     2000,  // upstream default: 2000ms (settings-manager.ts:22)
-		MaxAgentDelayMs: 60000, // upstream default cap for exponential retry backoff
-	}
+	// pig additive (D653): a fused member's clihook Retry replaces the built-in defaults; with none set this is upstream's 3 / 2000 / 60000.
+	result := DefaultRetryConfig()
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	s := &sm.merged
@@ -2595,7 +2809,7 @@ func (s *Settings) httpIdleTimeoutMs() (int, error) {
 		return 0, fmt.Errorf("Invalid httpIdleTimeoutMs setting: %v", s.httpIdleTimeoutInvalid)
 	}
 	if s.HTTPIdleTimeoutMs == nil {
-		return defaultHTTPIdleTimeoutMs, nil
+		return DefaultHTTPIdleTimeoutMs(), nil
 	}
 	timeoutMs, ok := parseHTTPIdleTimeoutMs(*s.HTTPIdleTimeoutMs)
 	if !ok {
@@ -2756,17 +2970,31 @@ func (sm *SettingsManager) GetEnableInstallTelemetry() bool {
 }
 
 // IsInstallTelemetryEnabled reports whether install/attribution telemetry is
-// enabled, honoring the PI_TELEMETRY env override first and otherwise the
+// enabled, honoring the PIG_TELEMETRY / PI_TELEMETRY env override first and otherwise the
 // enableInstallTelemetry setting (default true). Mirrors upstream
 // isInstallTelemetryEnabled (telemetry.ts:8): when PI_TELEMETRY is set its
 // truthiness wins; otherwise the setting decides. Gates provider attribution
 // headers (provider-attribution.ts) in addition to package-install telemetry.
 // pig divergence (D26): gates the OpenRouter/NVIDIA/Cloudflare attribution headers in coding/model.go.
 func (sm *SettingsManager) IsInstallTelemetryEnabled() bool {
-	if env, ok := os.LookupEnv("PI_TELEMETRY"); ok {
-		return isTruthyTelemetryEnvFlag(env)
+	if value, ok := InstallTelemetryEnvOverride(); ok {
+		return isTruthyTelemetryEnvFlag(value)
 	}
 	return sm.GetEnableInstallTelemetry()
+}
+
+// InstallTelemetryEnvOverride is the one place that resolves the telemetry environment override: PIG_TELEMETRY, PiG's name, when it is
+// set, otherwise Pi's PI_TELEMETRY. ok is false when neither is set and the enableInstallTelemetry setting decides. The value is returned
+// as written; both names share one grammar (Pi's isTruthyEnvFlag). The reader of the setting and `pig`'s export to the Node extension
+// runtime both call it.
+// pig divergence (D2): PIG_TELEMETRY wins over PI_TELEMETRY when both are set (owner decision 2026-11-17).
+func InstallTelemetryEnvOverride() (value string, ok bool) {
+	//perf:ok one environment lookup per provider request or start-up; read on each call as Pi's default parameter reads process.env.PI_TELEMETRY (telemetry.ts:8, called from sdk.ts:352 per request), so a changed variable applies at once; a cached value would not
+	if value, ok = os.LookupEnv("PIG_TELEMETRY"); ok {
+		return value, true
+	}
+	//perf:ok the same per-call read (telemetry.ts:8), reached only when PIG_TELEMETRY is unset
+	return os.LookupEnv("PI_TELEMETRY")
 }
 
 // isTruthyTelemetryEnvFlag mirrors upstream isTruthyEnvFlag (telemetry.ts:3):
@@ -3210,6 +3438,18 @@ func (sm *SettingsManager) GetExtensionsTypescriptRuntime() string {
 	return ""
 }
 
+// GetTerminalScreenWriter returns the global terminal.screenWriter setting, normalized as Settings.GetTerminalScreenWriter does. A project file cannot set it.
+// pig divergence (D624): see Settings.TerminalScreenWriter.
+func (sm *SettingsManager) GetTerminalScreenWriter() string {
+	return sm.GetGlobalSettings().GetTerminalScreenWriter()
+}
+
+// GetTerminalFramePacing returns the global terminal.framePacing setting, normalized as Settings.GetTerminalFramePacing does. A project file cannot set it.
+// pig additive (D625): see Settings.TerminalFramePacing.
+func (sm *SettingsManager) GetTerminalFramePacing() string {
+	return sm.GetGlobalSettings().GetTerminalFramePacing()
+}
+
 // GetExtensionsAutoUpgrade reports whether the global settings turn on the automatic Go extension upgrade. It is off unless set, and a project file cannot turn it on.
 // pig additive (D109): see Settings.ExtensionsAutoUpgrade.
 func (sm *SettingsManager) GetExtensionsAutoUpgrade() bool {
@@ -3270,7 +3510,7 @@ func (sm *SettingsManager) GlobalPath() string {
 	return filepath.Join(sm.agentDir, "settings.json")
 }
 
-// UpdateGlobal applies fn and refreshes the merged view, then saves to the selected backing storage. Like Pi's setters (settings-manager.ts:668-682), the change stays in effect in memory when the global file had parse errors, which skips the save, or when the save fails.
+// UpdateGlobal applies fn and refreshes the merged view, then saves to the selected backing storage. Like Pi's setters (settings-manager.ts save), the change is in effect in memory at once and its write goes through the manager's write queue, which has performed it when UpdateGlobal returns (settingsWriter). A write that fails is recorded for DrainErrors, as Pi's is, and the change stays in effect in memory; UpdateGlobal also returns the failure, which Pi's setter cannot, or the skipped save of a global file that had parse errors.
 func (sm *SettingsManager) UpdateGlobal(fn func(*Settings)) error {
 	return sm.updateGlobalOrdered(nil, fn)
 }
@@ -3284,6 +3524,16 @@ func (sm *SettingsManager) updateGlobalOrdered(order []string, fn func(*Settings
 // updateGlobalReplacing is updateGlobalOrdered for a setter that assigns whole top-level objects: the keys in replace are written as the setter left
 // them, dropping members the file holds that PiG does not model (setWarnings assigns `{ ...warnings }`), where other setters patch their nested objects.
 func (sm *SettingsManager) updateGlobalReplacing(order, replace []string, fn func(*Settings)) error {
+	write, err := sm.changeGlobal(order, replace, fn)
+	if err != nil {
+		return err
+	}
+	// pig divergence (D633): the setter returns the failure of its write, which Pi's cannot throw; both record it for the settings diagnostics.
+	return sm.writer.settle(write)
+}
+
+// changeGlobal applies fn to the global layer and queues the write of the change, which the caller settles after the lock is released.
+func (sm *SettingsManager) changeGlobal(order, replace []string, fn func(*Settings)) (*settingsWrite, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	before := cloneSettings(sm.global)
@@ -3293,25 +3543,45 @@ func (sm *SettingsManager) updateGlobalReplacing(order, replace []string, fn fun
 	if sm.memory != nil {
 		sm.memory.global = cloneSettings(sm.global)
 		sm.memory.globalObject = sm.globalObject.Clone()
-		return nil
+		return nil, nil
 	}
 	if sm.globalLoadErr != nil {
-		return fmt.Errorf("global settings file has parse errors: %w", sm.globalLoadErr)
+		return nil, fmt.Errorf("global settings file has parse errors: %w", sm.globalLoadErr)
 	}
 	path := filepath.Join(sm.agentDir, "settings.json")
-	if err := sm.saveScope("global", path, before, sm.global, order, replace); err != nil {
-		sm.errors = append(sm.errors, SettingsError{Scope: "global", Path: sm.errorPath(path), Error: err})
-		return err
-	}
-	return nil
+	after := cloneSettings(sm.global)
+	var change settingsChange
+	change, sm.unsavedGlobal = carryUnsaved(sm.unsavedGlobal, before, after, order, replace)
+	return sm.writer.enqueue(func() error {
+		if err := sm.saveScope("global", path, change.before, after, change.order, change.replace); err != nil {
+			return err
+		}
+		sm.mu.Lock()
+		sm.unsavedGlobal = nil
+		sm.mu.Unlock()
+		return nil
+	}, func(err error) { sm.writeFailed("global", path, err) }), nil
 }
 
-// UpdateProject applies fn to trusted project settings and refreshes the merged view, then saves to the selected storage. Like Pi's saveProjectSettings (settings-manager.ts:684-698), an untrusted project refuses the change, and otherwise the change stays in effect in memory when the project file had parse errors, which skips the save, or when the save fails.
+// errProjectUntrustedWrite is the error of Pi's assertProjectTrustedForWrite (settings-manager.ts:555-559).
+var errProjectUntrustedWrite = errors.New("Project is not trusted; refusing to write project settings")
+
+// UpdateProject applies fn to trusted project settings and refreshes the merged view, then saves to the selected storage. Like Pi's saveProjectSettings (settings-manager.ts), an untrusted project refuses the change, and otherwise the change is in effect in memory at once and its write goes through the manager's write queue, which has performed it when UpdateProject returns (settingsWriter) and which checks the trust again when it performs it. A write that fails is recorded for DrainErrors, as Pi's is, and the change stays in effect in memory; UpdateProject also returns the failure, which Pi's setter cannot, or the refusal, or the skipped save of a project file that had parse errors.
 func (sm *SettingsManager) UpdateProject(fn func(*Settings)) error {
+	write, err := sm.changeProject(fn)
+	if err != nil {
+		return err
+	}
+	// pig divergence (D633): the setter returns the failure of its write, which Pi's cannot throw; both record it for the settings diagnostics.
+	return sm.writer.settle(write)
+}
+
+// changeProject is changeGlobal for the project layer.
+func (sm *SettingsManager) changeProject(fn func(*Settings)) (*settingsWrite, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	if !sm.projectTrusted {
-		return errors.New("Project is not trusted; refusing to write project settings")
+		return nil, errProjectUntrustedWrite
 	}
 	before := cloneSettings(sm.project)
 	fn(&sm.project)
@@ -3320,17 +3590,28 @@ func (sm *SettingsManager) UpdateProject(fn func(*Settings)) error {
 	if sm.memory != nil {
 		sm.memory.project = cloneSettings(sm.project)
 		sm.memory.projectObject = sm.projectObject.Clone()
-		return nil
+		return nil, nil
 	}
 	if sm.projectLoadErr != nil {
-		return fmt.Errorf("project settings file has parse errors: %w", sm.projectLoadErr)
+		return nil, fmt.Errorf("project settings file has parse errors: %w", sm.projectLoadErr)
 	}
 	path := filepath.Join(ProjectConfigDir(sm.cwd), "settings.json")
-	if err := sm.saveScope("project", path, before, sm.project, nil, nil); err != nil {
-		sm.errors = append(sm.errors, SettingsError{Scope: "project", Path: sm.errorPath(path), Error: err})
-		return err
-	}
-	return nil
+	after := cloneSettings(sm.project)
+	var change settingsChange
+	change, sm.unsavedProject = carryUnsaved(sm.unsavedProject, before, after, nil, nil)
+	return sm.writer.enqueue(func() error {
+		// The trust is checked again when the write is performed (settings-manager.ts:579-581): a project that lost it since the setter is not written.
+		if !sm.IsProjectTrusted() {
+			return errProjectUntrustedWrite
+		}
+		if err := sm.saveScope("project", path, change.before, after, change.order, change.replace); err != nil {
+			return err
+		}
+		sm.mu.Lock()
+		sm.unsavedProject = nil
+		sm.mu.Unlock()
+		return nil
+	}, func(err error) { sm.writeFailed("project", path, err) }), nil
 }
 
 // SetPackages persists the global package source list, including an explicitly empty array.
@@ -3382,12 +3663,10 @@ func (sm *SettingsManager) SetProjectThemePaths(paths []string) error {
 // GlobalSettingsPath returns the global settings file path, or empty for memory storage.
 func (sm *SettingsManager) GlobalSettingsPath() string { return sm.GlobalPath() }
 
-// loadSettingsFile reads a settings file as Pi's tryLoadFromStorage does, returning the settings and the object Pi holds for them (settingsFileObject).
+// loadSettingsFile reads a settings file as Pi's tryLoadFromStorage does, returning the settings and the object Pi holds for them (settingsFileObject). FileSettingsStorage.withLock tests existsSync(path) (settings-manager.ts:231), which is false for every stat error: a file that cannot be reached because a parent is a regular file or cannot be searched is no settings file, not a load error.
 func loadSettingsFile(path string) (result Settings, object *orderedjson.Object, err error) {
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+	if !pathExists(path) {
 		return Settings{}, orderedjson.New(), nil
-	} else if err != nil {
-		return Settings{}, orderedjson.New(), err
 	}
 	release, err := acquireSyncLockWithRetry(path)
 	if err != nil {
@@ -3532,8 +3811,9 @@ func saveSettingsPatchReplacing(path string, before, after Settings, order, repl
 	if err != nil {
 		return err
 	}
+	// pig divergence (D651): replaced through a private temporary file and a rename, in place where that is refused; Pi writes the file in place.
 	// upstream: coding-agent/src/core/settings-manager.ts:245 writeFileSync(path, next, "utf-8"): no mode, so a new file is 0666 with the umask taken out.
-	if err := os.WriteFile(path, encoded, 0o666); err != nil {
+	if err := atomicfile.WriteFile(path, encoded, 0o666); err != nil {
 		return nodeerrno.FromPathError(err)
 	}
 	return nil
@@ -3832,6 +4112,7 @@ func deepMergeJSONObjects(base, override json.RawMessage) json.RawMessage {
 // either true or false.
 func mergeSettings(global, project Settings) Settings {
 	m := cloneSettings(global)
+	// pig divergence (D645): the unknown keys of the project file are merged as own entries, so a settings key `__proto__` is one more unknown key and nothing under it is a setting; Pi's `result[key] = ...` on a plain object sets the merged object's prototype with it and reads its members as settings.
 	m.extra = mergeSettingsExtra(m.extra, project.extra)
 	if project.DefaultProvider != "" || project.emptyStrings.defaultProvider {
 		m.DefaultProvider, m.emptyStrings.defaultProvider = project.DefaultProvider, project.emptyStrings.defaultProvider

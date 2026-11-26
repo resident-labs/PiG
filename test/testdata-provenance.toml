@@ -60,6 +60,11 @@ owner = "pi"
 generator = "codemode/testdata/upstream-oracle.mjs"
 
 [[golden]]
+paths = ["coding/testdata/overflow-owner-pi.jsonl"]
+owner = "pi"
+generator = "test/parity/testdata/session-overflow-owner-pi.mjs"
+
+[[golden]]
 paths = ["mcp/testdata/upstream-golden.json"]
 owner = "pi"
 generator = "mcp/testdata/upstream-oracle.mjs"
@@ -75,9 +80,14 @@ owner = "pi"
 generator = "test/parity/testdata/mermaid-transform-pi.mjs"
 
 [[golden]]
-paths = ["internal/codingagent/testdata/pi104-render-probe/builtin-renderers.golden.json"]
+paths = ["internal/codingagent/testdata/mermaid-transform-themed-golden.jsonl"]
 owner = "pi"
-generator = "internal/codingagent/testdata/pi104-render-probe/regen.sh"
+generator = "test/parity/testdata/mermaid-transform-pi.mjs"
+
+[[golden]]
+paths = ["internal/codingagent/testdata/pi-render-probe/builtin-renderers.golden.json"]
+owner = "pi"
+generator = "internal/codingagent/testdata/pi-render-probe/regen.sh"
 
 [[golden]]
 paths = ["internal/latex/testdata/golden.jsonl"]
@@ -90,12 +100,12 @@ owner = "pi"
 generator = "test/parity/testdata/mermaid-labels-pi.mjs"
 
 [[golden]]
-paths = ["internal/mermaid/testdata/parse-golden.jsonl"]
+paths = ["internal/mermaid/testdata/parse-golden.jsonl.gz"]
 owner = "pi"
 generator = "test/parity/testdata/mermaid-parse-pi.mjs"
 
 [[golden]]
-paths = ["internal/mermaid/testdata/render-golden.jsonl"]
+paths = ["internal/mermaid/testdata/render-golden.jsonl.gz"]
 owner = "pi"
 generator = "test/parity/testdata/mermaid-pi.mjs"
 
@@ -142,8 +152,27 @@ paths = ["durable/core/probe/testdata/*.events", "durable/core/contracttest/bind
 [[input]]
 paths = ["coding/cli/testdata/session-replaced-2860.lisp"]
 
+# model-after-new.lisp is the Lisp SDK realization of model-after-new.mjs (an extension provider fixture program, not expected output); same reason.
 [[input]]
-paths = ["coding/cli/testdata/*/go.mod", "coding/cli/testdata/*/LICENSE", "coding/cli/testdata/*/Cargo.toml", "coding/cli/testdata/*/Cargo.lock"]
+paths = ["coding/cli/testdata/model-after-new.lisp"]
+
+[[golden]]
+paths = ["internal/yaml12/testdata/v3diff/differences.txt"]
+owner = "pig"
+invariant = "TestParseMatchesTheLibrary"
+why = "The file lists where go.yaml.in/yaml/v3, which PiG links for Piglets and Compose files, reads a document differently from internal/yaml12, which is held to the yaml library Pi uses by TestParseMatchesTheLibrary. Pi has no second parser, so the list is PiG's own: it records the exact documents whose meaning moves if one parser replaces the other."
+
+# The yaml12 differential test reads piglet-corpus.json as its input documents (the Piglet test YAML it harvested); it rewrites only differences.txt. go.mod is the data-only marker that keeps testdata out of the root module zip.
+[[input]]
+paths = ["internal/yaml12/testdata/v3diff/piglet-corpus.json", "internal/yaml12/testdata/go.mod"]
+
+[[input]]
+paths = ["coding/cli/testdata/go.mod", "coding/cli/testdata/*/go.mod", "coding/cli/testdata/*/LICENSE", "coding/cli/testdata/*/Cargo.toml", "coding/cli/testdata/*/Cargo.lock"]
+
+# rpc-settle-wait.lisp is the Lisp SDK realization of the settle-wait fixture program that rpc-settle-wait.py and the -go and -rs directories
+# realize: a test program, not expected output.
+[[input]]
+paths = ["coding/cli/testdata/rpc-settle-wait.lisp"]
 
 [[golden]]
 paths = ["coding/cli/testdata/d82-w7/rpc-usage-pi.json", "coding/cli/testdata/d82-w7/rpc-usage-extension-pi.json"]
@@ -225,3 +254,19 @@ generator = "schema/testdata/gen-coerce-golden.mjs"
 paths = ["tui/testdata/utf8-decoder-oracle.json"]
 owner = "pi"
 generator = "tui/testdata/utf8-decoder-oracle.mjs"
+
+# go.mod is the data-only marker that keeps the transcripts out of the root module zip.
+[[input]]
+paths = ["internal/viewcarrier/testdata/go.mod"]
+
+[[golden]]
+paths = ["internal/viewcarrier/testdata/transcripts/*.txt"]
+owner = "pig"
+invariant = "TestCarrierMessagesAreTheGoAPI"
+why = "Pi has no plugin UI carrier, so the nine messages of the view carrier (D614) are PiG's own wire format. The invariant test asserts as values that every message carries the Go API's records and codes; the transcripts add the exact member order and bytes a client or a relay on another protocol builds against, which TestCarrierTranscripts pins."
+
+[[golden]]
+paths = ["coding/testdata/tool_schema_request_bodies.golden.json"]
+owner = "pig"
+invariant = "TestRequestBodiesAreUnchangedByHoldingToolSchemasOnce"
+why = "The original digests from commit 9cd955810e pin the requests tool schema sharing did not change. The Dyna fork pins its P16 live-compaction requests in place of Pi's standalone summaries; The Responses fixtures emit a text-item event for that summary, and subsequent requests replay its text. The SSE fixture does not attempt Codex WebSocket upgrades, which have no request body. Other request digests remain the original pre-refactor bytes. Provider conformance tests hold the wire against Pi."

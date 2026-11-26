@@ -127,7 +127,7 @@ func TestABoundaryCompactionHeadDeclaresTheExecutableTools(t *testing.T) {
 			ToolsAdded []struct{ Name string } `json:"toolsAdded"`
 		} `json:"systemMessage"`
 	}
-	entries := h.session.inner.GetEntries()
+	entries := h.session.inner.Load().GetEntries()
 	last := entries[len(entries)-1]
 	if last.Base().Type != "compaction" {
 		t.Fatalf("last entry %s", last.Base().Type)

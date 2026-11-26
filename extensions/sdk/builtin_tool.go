@@ -27,8 +27,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -56,11 +58,14 @@ type ModelImageResizeOptions struct {
 }
 
 // ReadOperations is Pi's ReadOperations: pluggable file reading, for example over SSH. ReadFile and Access are required; DetectImageMimeType is optional,
-// and without it every file is read as text. An empty MIME type is Pi's null or undefined: not an image.
+// and without it every file is read as text. An empty MIME type is Pi's null or undefined: not an image. CreateReadStream is Pi's createReadStream and is
+// optional: when set, the read tool reads a text file through the stream and keeps only the lines it shows in memory, where ReadFile loads the whole file. The
+// host closes the stream when the read ends or is aborted; it reads the stream in chunks of at most 64 KB.
 type ReadOperations struct {
 	ReadFile            func(absolutePath string) ([]byte, error)
 	Access              func(absolutePath string) error
 	DetectImageMimeType func(absolutePath string) (string, error)
+	CreateReadStream    func(absolutePath string) (io.ReadCloser, error)
 }
 
 // ReadToolOptions is Pi's ReadToolOptions.
@@ -97,11 +102,13 @@ type EditToolOptions struct {
 	Operations *EditOperations
 }
 
-// GrepOperations is Pi's GrepOperations. IsDirectory is required and fails when the path does not exist; ReadFile is optional and, without it, matched files
-// are streamed from the local file system.
+// GrepOperations is Pi's GrepOperations: IsDirectory is required and fails when the path does not exist.
 type GrepOperations struct {
 	IsDirectory func(absolutePath string) (bool, error)
-	ReadFile    func(absolutePath string) (string, error)
+	// ReadFile is Pi's optional readFile.
+	//
+	// Deprecated: Ignored. Grep takes its context lines from ripgrep, so the host never calls it and it is not sent to the host. Wrap the tool's Execute to search a remote system.
+	ReadFile func(absolutePath string) (string, error)
 }
 
 // GrepToolOptions is Pi's GrepToolOptions.
@@ -199,6 +206,8 @@ type ToolsOptions struct {
 // builtinCallbacks are the functions of one call's options, which stay in this process. The host calls them with requestBuiltinToolCallback under the handle the
 // call carries.
 type builtinCallbacks struct {
+	// streams are the read streams the host has open, by the id createReadStream returned.
+	streams   *readStreams
 	read      *ReadOperations
 	write     *WriteOperations
 	edit      *EditOperations
@@ -259,6 +268,10 @@ func readSpec(cwd string, options *ReadToolOptions) (builtinSpec, error) {
 		if ops.DetectImageMimeType != nil {
 			spec.options.Operations = append(spec.options.Operations, "detectImageMimeType")
 		}
+		if ops.CreateReadStream != nil {
+			spec.options.Operations = append(spec.options.Operations, "createReadStream")
+			spec.callbacks.streams = &readStreams{}
+		}
 		spec.callbacks.read = ops
 	}
 	return spec, nil
@@ -298,9 +311,6 @@ func grepSpec(cwd string, options *GrepToolOptions) (builtinSpec, error) {
 			return spec, err
 		}
 		spec.setOperations("isDirectory")
-		if ops.ReadFile != nil {
-			spec.options.Operations = append(spec.options.Operations, "readFile")
-		}
 		spec.callbacks.grep = ops
 	}
 	return spec, nil
@@ -854,9 +864,30 @@ func (c *builtinCallbacks) call(member string, raw json.RawMessage) (any, error)
 		case c.edit != nil:
 			data, err := c.edit.ReadFile(path.Path)
 			return base64.StdEncoding.EncodeToString(data), err
-		case c.grep != nil && c.grep.ReadFile != nil:
-			return c.grep.ReadFile(path.Path)
 		}
+	case "operations.createReadStream":
+		if err := decode(&path); err != nil {
+			return nil, err
+		}
+		if c.read != nil && c.read.CreateReadStream != nil {
+			stream, err := c.read.CreateReadStream(path.Path)
+			if err != nil {
+				return nil, err
+			}
+			return c.streams.add(stream), nil
+		}
+	case "operations.readStream":
+		var stream streamArg
+		if err := decode(&stream); err != nil {
+			return nil, err
+		}
+		return c.streams.next(stream.Stream)
+	case "operations.closeStream":
+		var stream streamArg
+		if err := decode(&stream); err != nil {
+			return nil, err
+		}
+		return nil, c.streams.close(stream.Stream)
 	case "operations.access":
 		if err := decode(&path); err != nil {
 			return nil, err
@@ -1000,6 +1031,22 @@ type localExecCall struct {
 	Aborted   bool               `json:"aborted,omitempty"`
 }
 
+// shellTimeoutError is the error of the local operations' exec for a command that timed out after its shell had exited (Pi's ShellTimeoutError with a
+// shellExit, which Pi does not export). The bash tool the host runs matches it by type, as Pi's matches the class, so only this error, returned from an
+// exec unchanged, keeps the shell's exit: an error wrapped around it, or built with its message, is the plain `timeout:<seconds>`.
+type shellTimeoutError struct {
+	message      string
+	exitCode     int
+	afterSeconds float64
+}
+
+func (e *shellTimeoutError) Error() string { return e.message }
+
+// ShellExitReport is read by the host of a fused extension, which cannot name this type.
+func (e *shellTimeoutError) ShellExitReport() (exitCode int, afterSeconds float64, ok bool) {
+	return e.exitCode, e.afterSeconds, true
+}
+
 // localExecReply is Pi's `{ exitCode }`, the reply of builtinTool.localExec.
 type localExecReply struct {
 	ExitCode *int `json:"exitCode"`
@@ -1051,6 +1098,13 @@ func localShellExec(shell, shellPath, command, cwd string, o BashExecOptions) (B
 			return BashExecResult{}, failed
 		}
 		if execErr != nil {
+			if reporter, ok := execErr.(interface {
+				ShellExitReport() (exitCode int, afterSeconds float64, ok bool)
+			}); ok && strings.HasPrefix(execErr.Error(), "timeout:") {
+				if exitCode, afterSeconds, exited := reporter.ShellExitReport(); exited {
+					return BashExecResult{}, &shellTimeoutError{message: execErr.Error(), exitCode: exitCode, afterSeconds: afterSeconds}
+				}
+			}
 			return BashExecResult{}, execErr
 		}
 		var reply localExecReply
@@ -1106,6 +1160,9 @@ func localShellExec(shell, shellPath, command, cwd string, o BashExecOptions) (B
 		return BashExecResult{}, failed
 	}
 	if err := callResultError(result, callErr); err != nil {
+		if result != nil && result.Error != nil && result.Error.ShellExit != nil {
+			return BashExecResult{}, &shellTimeoutError{message: err.Error(), exitCode: result.Error.ShellExit.ExitCode, afterSeconds: result.Error.ShellExit.AfterSeconds}
+		}
 		return BashExecResult{}, err
 	}
 	if result == nil {

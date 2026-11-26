@@ -4,6 +4,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -51,6 +52,48 @@ func TestLintRules(t *testing.T) {
 			wantRules: nil,
 		},
 		{
+			name:   "provider fixture model options pass with a fixture",
+			source: "# Upstream evidence (pi v0.69.0)\nsome toml",
+			sc: scenario{
+				Name:                    "fixture-options",
+				Driver:                  "interactive-tmux",
+				ProviderFixture:         "anthropic-messages",
+				ProviderFixtureBasePath: "/api.anthropic.com",
+				ProviderFixtureCompat:   map[string]any{"supportsStrictTools": true},
+				Covers:                  []string{"packages/tui/src/autocomplete.ts"},
+				Tags:                    []string{"fast", "hermetic"},
+				Assert:                  assertBlock{OutputEqual: true},
+			},
+			wantRules: nil,
+		},
+		{
+			name:   "provider fixture model options without a fixture fail",
+			source: "# Upstream evidence (pi v0.69.0)\nsome toml",
+			sc: scenario{
+				Name:                  "fixture-options-alone",
+				Driver:                "interactive-tmux",
+				ProviderFixtureCompat: map[string]any{"supportsStrictMode": true},
+				Covers:                []string{"packages/tui/src/autocomplete.ts"},
+				Tags:                  []string{"fast", "hermetic"},
+				Assert:                assertBlock{OutputEqual: true},
+			},
+			wantRules: []string{"provider-fixture-option"},
+		},
+		{
+			name:   "a provider fixture base path without a leading slash fails",
+			source: "# Upstream evidence (pi v0.69.0)\nsome toml",
+			sc: scenario{
+				Name:                    "fixture-base-path",
+				Driver:                  "interactive-tmux",
+				OpenAIFixture:           true,
+				ProviderFixtureBasePath: "api.anthropic.com/",
+				Covers:                  []string{"packages/tui/src/autocomplete.ts"},
+				Tags:                    []string{"fast", "hermetic"},
+				Assert:                  assertBlock{OutputEqual: true},
+			},
+			wantRules: []string{"provider-fixture-base-path"},
+		},
+		{
 			name:   "unknown provider fixture API fails",
 			source: "# Upstream evidence (pi v0.69.0)\nsome toml",
 			sc: scenario{
@@ -87,6 +130,18 @@ func TestLintRules(t *testing.T) {
 				Tags:   []string{"fast", "hermetic"},
 			},
 			wantRules: []string{"no-equality-comparator"},
+		},
+		{
+			name:   "a transcript sequence window is an equality comparator",
+			source: "# Upstream evidence (pi v0.69.0)\nsome toml",
+			sc: scenario{
+				Name:   "window-test",
+				Driver: "interactive-tmux",
+				Covers: []string{"packages/tui/src/autocomplete.ts"},
+				Tags:   []string{"fast", "hermetic"},
+				Assert: assertBlock{TranscriptSequencesEqual: []sequenceWindowBlock{{From: "\x1b[?2031l"}}},
+			},
+			wantRules: nil,
 		},
 		{
 			name:   "boot-only description exempts equality rule",
@@ -467,6 +522,90 @@ func TestLintRules(t *testing.T) {
 			},
 			wantRules: []string{"unknown-divergence"},
 		},
+		{
+			name:   "pig-only record under JSON equality passes",
+			source: "# Upstream evidence (pi v0.69.0)\n# D1 makes pig emit one extra record.\n",
+			sc: scenario{
+				Name:   "pig-only-ok",
+				Driver: "rpc-mode",
+				Covers: []string{"packages/tui/src/autocomplete.ts"},
+				Tags:   []string{"fast", "hermetic"},
+				Assert: assertBlock{JSONOutputEqual: true, JSONPigOnlyRecords: []jsonPigOnlyRecordRule{{Divergence: "D1", Record: `{"type":"x"}`, Count: 1, BeforeType: "y", Reason: "r"}}},
+			},
+			wantRules: nil,
+		},
+		{
+			name:   "pig-only record without JSON equality fails",
+			source: "# Upstream evidence (pi v0.69.0)\n# D1 makes pig emit one extra record.\n",
+			sc: scenario{
+				Name:   "pig-only-text",
+				Driver: "rpc-mode",
+				Covers: []string{"packages/tui/src/autocomplete.ts"},
+				Tags:   []string{"fast", "hermetic"},
+				Assert: assertBlock{ExitCode: new(int), JSONPigOnlyRecords: []jsonPigOnlyRecordRule{{Divergence: "D1", Record: `{"type":"x"}`, Count: 1, BeforeType: "y", Reason: "r"}}},
+			},
+			wantRules: []string{"json-pig-only-without-json"},
+		},
+		{
+			name:   "pig-only record without a reason fails",
+			source: "# Upstream evidence (pi v0.69.0)\n# D1 makes pig emit one extra record.\n",
+			sc: scenario{
+				Name:   "pig-only-bare",
+				Driver: "rpc-mode",
+				Covers: []string{"packages/tui/src/autocomplete.ts"},
+				Tags:   []string{"fast", "hermetic"},
+				Assert: assertBlock{JSONOutputEqual: true, JSONPigOnlyRecords: []jsonPigOnlyRecordRule{{Divergence: "D1", Record: `{"type":"x"}`, Count: 1, BeforeType: "y"}}},
+			},
+			wantRules: []string{"json-pig-only-incomplete"},
+		},
+		{
+			name:   "pig-only record without a position fails",
+			source: "# Upstream evidence (pi v0.69.0)\n# D1 makes pig emit one extra record.\n",
+			sc: scenario{
+				Name:   "pig-only-unpinned",
+				Driver: "rpc-mode",
+				Covers: []string{"packages/tui/src/autocomplete.ts"},
+				Tags:   []string{"fast", "hermetic"},
+				Assert: assertBlock{JSONOutputEqual: true, JSONPigOnlyRecords: []jsonPigOnlyRecordRule{{Divergence: "D1", Record: `{"type":"x"}`, Count: 1, Reason: "r"}}},
+			},
+			wantRules: []string{"json-pig-only-incomplete"},
+		},
+		{
+			name:   "ordered JSON equality alone passes and takes pig-only records",
+			source: "# Upstream evidence (pi v0.69.0)\n# D1 makes pig emit one extra record.\n",
+			sc: scenario{
+				Name:   "ordered-ok",
+				Driver: "rpc-mode",
+				Covers: []string{"packages/tui/src/autocomplete.ts"},
+				Tags:   []string{"fast", "hermetic"},
+				Assert: assertBlock{JSONOutputOrderedEqual: true, JSONPigOnlyRecords: []jsonPigOnlyRecordRule{{Divergence: "D1", Record: `{"type":"x"}`, Count: 1, BeforeType: "y", Reason: "r"}}},
+			},
+			wantRules: nil,
+		},
+		{
+			name:   "ordered and plain JSON equality together fail",
+			source: "# Upstream evidence (pi v0.69.0)\n",
+			sc: scenario{
+				Name:   "ordered-and-equal",
+				Driver: "rpc-mode",
+				Covers: []string{"packages/tui/src/autocomplete.ts"},
+				Tags:   []string{"fast", "hermetic"},
+				Assert: assertBlock{JSONOutputEqual: true, JSONOutputOrderedEqual: true},
+			},
+			wantRules: []string{"json-ordered-and-equal"},
+		},
+		{
+			name:   "ordered JSON equality with text normalization fails",
+			source: "# Upstream evidence (pi v0.69.0)\n",
+			sc: scenario{
+				Name:   "ordered-normalized",
+				Driver: "rpc-mode",
+				Covers: []string{"packages/tui/src/autocomplete.ts"},
+				Tags:   []string{"fast", "hermetic"},
+				Assert: assertBlock{JSONOutputOrderedEqual: true, OutputNormalizedEqual: true},
+			},
+			wantRules: []string{"json-text-normalization"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -779,5 +918,59 @@ both_contain = ["Anthropic (Claude Pro/Max)", "OpenAI (ChatGPT Plus/Pro)", "GitH
 	got := lintOAuthProviderCoverage(missingDir)
 	if len(got) != 3 {
 		t.Fatalf("lintOAuthProviderCoverage missing set got %d violations, want 3: %+v", len(got), got)
+	}
+}
+
+// TestLintTranscriptSequences exercises rule 17: a transcript_sequences_equal window names a stream range, and each floating sequence is one sequence kind
+// that Pi was recorded writing at two or more places, cited under a '# floating-evidence:' comment.
+func TestLintTranscriptSequences(t *testing.T) {
+	keys := floatingSequenceBlock{Sequence: "\x1b[>4;2m", Reason: "answers a query", EvidenceRuns: 20, EvidencePositions: []int{35, 204}}
+	title := floatingSequenceBlock{OSC: func() *int { n := 0; return &n }(), Reason: "follows the keys", EvidenceRuns: 20, EvidencePositions: []int{36, 205}}
+	with := func(mutate func(*floatingSequenceBlock)) floatingSequenceBlock {
+		f := keys
+		mutate(&f)
+		return f
+	}
+	const evidence = "# floating-evidence: 20 Pi runs recorded 2026-11-16, positions 35 and 204\n"
+	for name, tc := range map[string]struct {
+		driver string
+		source string
+		window sequenceWindowBlock
+		want   []string
+	}{
+		"a recorded startup window":     {"interactive-tmux", evidence, sequenceWindowBlock{Window: "startup", Floating: []floatingSequenceBlock{keys, title}}, nil},
+		"markers instead of a name":     {"interactive-tmux", evidence, sequenceWindowBlock{From: "\x1b[?1049l"}, nil},
+		"a driver without a transcript": {"cli-mode", "", sequenceWindowBlock{Window: "startup"}, []string{"transcript-sequences-driver"}},
+		"an unknown window":             {"interactive-tmux", "", sequenceWindowBlock{Window: "exit"}, []string{"transcript-sequences-window"}},
+		"the whole stream":              {"interactive-tmux", "", sequenceWindowBlock{}, []string{"transcript-sequences-window"}},
+		"a name and markers":            {"interactive-tmux", "", sequenceWindowBlock{Window: "startup", Until: "x"}, []string{"transcript-sequences-window"}},
+		"no evidence comment":           {"interactive-tmux", "", sequenceWindowBlock{Window: "startup", Floating: []floatingSequenceBlock{keys}}, []string{"floating-evidence-missing"}},
+		"a CSI prefix":                  {"interactive-tmux", evidence, sequenceWindowBlock{Window: "startup", Floating: []floatingSequenceBlock{with(func(f *floatingSequenceBlock) { f.Sequence = "\x1b[" })}}, []string{"transcript-sequences-floating"}},
+		"two sequences":                 {"interactive-tmux", evidence, sequenceWindowBlock{Window: "startup", Floating: []floatingSequenceBlock{with(func(f *floatingSequenceBlock) { f.Sequence = "\x1b[>4;2m\x1b[?u" })}}, []string{"transcript-sequences-floating"}},
+		"an unfinished OSC":             {"interactive-tmux", evidence, sequenceWindowBlock{Window: "startup", Floating: []floatingSequenceBlock{with(func(f *floatingSequenceBlock) { f.Sequence = "\x1b]0;title" })}}, []string{"transcript-sequences-floating"}},
+		"sequence and osc":              {"interactive-tmux", evidence, sequenceWindowBlock{Window: "startup", Floating: []floatingSequenceBlock{with(func(f *floatingSequenceBlock) { f.OSC = title.OSC })}}, []string{"transcript-sequences-floating"}},
+		"no reason":                     {"interactive-tmux", evidence, sequenceWindowBlock{Window: "startup", Floating: []floatingSequenceBlock{with(func(f *floatingSequenceBlock) { f.Reason = "" })}}, []string{"transcript-sequences-floating"}},
+		"write kinds":                   {"interactive-tmux", "", sequenceWindowBlock{From: "\x1b[?2004h", WriteKinds: true}, nil},
+		"write kinds, erasures only":    {"interactive-tmux", "", sequenceWindowBlock{From: "\x1b[?2004h", WriteKinds: true, ErasuresOnly: true}, []string{"transcript-sequences-write-kinds"}},
+		"runs collapse without kinds":   {"interactive-tmux", "# frame-count-evidence: x\n", sequenceWindowBlock{From: "\x1b[?2004h", CollapseFrameRuns: true}, []string{"transcript-sequences-write-kinds"}},
+		"runs collapse, no evidence":    {"interactive-tmux", "", sequenceWindowBlock{From: "\x1b[?2004h", WriteKinds: true, CollapseFrameRuns: true}, []string{"frame-count-evidence-missing"}},
+		"runs collapse with evidence":   {"interactive-tmux", "# frame-count-evidence: 2 Pi runs, 2 and 3 frames\n", sequenceWindowBlock{From: "\x1b[?2004h", WriteKinds: true, CollapseFrameRuns: true}, nil},
+		"one recorded position":         {"interactive-tmux", evidence, sequenceWindowBlock{Window: "startup", Floating: []floatingSequenceBlock{with(func(f *floatingSequenceBlock) { f.EvidencePositions = []int{35, 35} })}}, []string{"transcript-sequences-floating"}},
+		"one recorded run":              {"interactive-tmux", evidence, sequenceWindowBlock{Window: "startup", Floating: []floatingSequenceBlock{with(func(f *floatingSequenceBlock) { f.EvidenceRuns = 1 })}}, []string{"transcript-sequences-floating"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sc := &scenario{Name: "sequences", Driver: tc.driver, Assert: assertBlock{TranscriptSequencesEqual: []sequenceWindowBlock{tc.window}}}
+			var got []string
+			for _, v := range lintTranscriptSequences("s.toml", tc.source, sc) {
+				got = append(got, v.Rule)
+			}
+			if len(tc.want) == 0 && len(got) > 0 || len(tc.want) > 0 && !slices.Contains(got, tc.want[0]) {
+				t.Fatalf("rules = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	var noWindow scenario
+	if got := lintTranscriptSequences("s.toml", "", &noWindow); len(got) != 0 {
+		t.Fatalf("a scenario without a window: %v", got)
 	}
 }

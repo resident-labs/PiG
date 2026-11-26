@@ -101,7 +101,7 @@ func loadExtensionPathsIn(ctx context.Context, paths []string, cwd string, runti
 	// A headless bridge: the loaded extensions' contexts read the Session state a Session binds to it (agent-session.ts _bindExtensionCore), and with no UI bound hasUI is false.
 	bridge := subprocess.NewUIBridge(func() {})
 	// The load-time pi-ai calls a module makes run through the global API providers until a Session binds its own model surface, as they do on a host with no bridge.
-	icodingagent.WireEarlyModelStream(bridge, "")
+	icodingagent.WireEarlyModelStream(bridge)
 	host.SetUIBridge(bridge)
 	result.bridge = bridge
 	host.SetMode(string(extension.ModePrint))
@@ -121,8 +121,23 @@ func loadExtensionPathsIn(ctx context.Context, paths []string, cwd string, runti
 	return result
 }
 
+// fusedMemberConfig is the host configuration of a `builtin:<name>` path that names a member fused into this Piglet Binary, and false for any other
+// path. Pi's `-e builtin:<name>` names a built-in extension (resource-loader.ts:722-727); a Piglet Binary's fused members are the Binary's built-ins.
+// Stock PiG fuses none, so it is always false there.
+func fusedMemberConfig(path string) (subprocess.ExtConfig, bool) {
+	name, ok := strings.CutPrefix(path, icodingagent.BuiltinPathPrefix)
+	if !ok || name == "" {
+		return subprocess.ExtConfig{}, false
+	}
+	config := subprocess.ExtConfig{Name: name, Enabled: true, Path: path}
+	return config, subprocess.RunsFused(config)
+}
+
 // extensionPathConfigs is the host configuration of one discovered path.
 func extensionPathConfigs(path string) []subprocess.ExtConfig {
+	if config, ok := fusedMemberConfig(path); ok {
+		return []subprocess.ExtConfig{config}
+	}
 	config, _, err := subprocess.ResolveExtConfigWithResolver(path, "", packagemanager.ConfiguredExtensionResolver(nil))
 	if err == nil {
 		return []subprocess.ExtConfig{config}

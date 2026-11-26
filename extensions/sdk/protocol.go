@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -69,6 +70,8 @@ type registerMsg struct {
 	// MarkdownTransformer reports a registered Markdown transformer; the host
 	// runs it with markdown_transform requests.
 	MarkdownTransformer bool `json:"markdown_transformer,omitempty"`
+	// MarkdownMessageTypes are the surfaces the transformer runs on, always listed when one is registered (an empty list runs it nowhere).
+	MarkdownMessageTypes *[]string `json:"markdown_message_types,omitempty"`
 	// OwnsThinkingRuns reports that the extension owns the thinking runs of assistant messages (PiG-only).
 	// pig additive (D214)
 	OwnsThinkingRuns bool `json:"owns_thinking_runs,omitempty"`
@@ -169,6 +172,8 @@ type providerDef struct {
 	// ImageAPIs and ClassifierAPIs name the APIs whose implementations (ProviderConfig images and classifiers) run in the extension.
 	ImageAPIs      []string `json:"image_apis,omitempty"`
 	ClassifierAPIs []string `json:"classifier_apis,omitempty"`
+	// RefreshModels says the config's refreshModels callback runs in the extension (types.ts:1930).
+	RefreshModels bool `json:"refresh_models,omitempty"`
 }
 
 type rendererDef struct {
@@ -199,10 +204,15 @@ type requestMsg struct {
 	ChildSession string `json:"child_session,omitempty"`
 	// ToolCallIndex, on tool_call, is the call's position in its assistant message's batch (Context.ToolCallIndex).
 	ToolCallIndex *int `json:"tool_call_index,omitempty"`
+	// SignalAborted, on session_before_compact, session_before_tree and tool_call, reports that the request's AbortSignal had already aborted when the host dispatched the handler: the request's signal starts aborted, so Context.Done is closed in the handler's first line (its host calls run), as event.signal.aborted is true in Pi, and as the signal a tool receives is when Pi's tool.execute is called with an aborted signal.
+	SignalAborted bool `json:"signal_aborted,omitempty"`
 
 	// streamData and streamErr are the payload a stream request produced, or why it could not be produced (applyEventStream).
 	streamData map[string]any
 	streamErr  error
+	// keyOrder is the member order of the objects of the payload an event handler was given, recorded when it was decoded (Context.ObjectKeys), until the reply.
+	keyOrder *json.ObjectOrder
+	keyMu    sync.Mutex
 }
 
 type responseMsg struct {
@@ -219,6 +229,8 @@ type callMsg struct {
 	Method          string          `json:"method"`
 	Args            json.RawMessage `json:"args,omitempty"`
 	ParentRequestID string          `json:"parent_request_id,omitempty"`
+	// CommandContext marks a call made through a command context (a command handler's or a withSession callback's), kept with the context after its request ended: Pi gives newSession, fork, navigateTree, switchSession and reload to no other context, and the host refuses them without it.
+	CommandContext bool `json:"command_context,omitempty"`
 	// Timer marks a call made through a request's context after the request's handler returned: deferred work, which Pi runs from a timer, an immediate or a later continuation, once the loop turns (D189).
 	Timer bool `json:"timer,omitempty"`
 }
@@ -254,6 +266,8 @@ func (m widgetPushMsg) MarshalJSON() ([]byte, error) {
 type cancelMsg struct {
 	RequestID string `json:"request_id,omitempty"`
 	Reason    string `json:"reason,omitempty"`
+	// SignalOnly reports that only the request's AbortSignal ended (session_before_compact, session_before_tree) and the request goes on: the signal its handler holds (Context.Done, Err) aborts and no host call is cancelled, as Pi's in-process calls never fail with the abort.
+	SignalOnly bool `json:"signal_only,omitempty"`
 }
 
 type pingMsg struct {
@@ -275,6 +289,13 @@ type shutdownMsg struct {
 type errorInfo struct {
 	Code    string `json:"code,omitempty"`
 	Message string `json:"message"`
+	// ShellExit is Pi's ShellTimeoutError.shellExit: on the error of a local shell command that timed out after its shell had exited.
+	ShellExit *shellExitInfo `json:"shellExit,omitempty"`
+}
+
+type shellExitInfo struct {
+	ExitCode     int     `json:"exitCode"`
+	AfterSeconds float64 `json:"afterSeconds"`
 }
 
 // conn manages the socket connection with read/write goroutines and
@@ -293,6 +314,8 @@ type conn struct {
 	pending        map[string]chan *callResultMsg
 	pendingParents map[string]string
 	requestParents map[string]*requestParent
+	// unarmed holds the requests the read loop queued for the main loop and the main loop has not armed yet, with the cancel frames the read loop read for each (queuedCancel).
+	unarmed map[string]queuedCancel
 	// pendingSlots maps a dialog call to the response slot of the tool handler that waits for it. The read loop settles the slot when it reads the answer.
 	pendingSlots map[string]*settleSlot
 
@@ -356,6 +379,7 @@ func (c *conn) readLoop() {
 		clear(c.pending)
 		clear(c.pendingParents)
 		clear(c.requestParents)
+		clear(c.unarmed)
 		c.pendingMu.Unlock()
 		close(c.done)
 	}()
@@ -373,9 +397,27 @@ func (c *conn) readLoop() {
 			return
 		}
 		var env envelope
-		if err := json.Unmarshal(data, &env); err != nil {
-			// The Node, Python and Rust SDKs end the connection on a frame they cannot decode, as the host does; skipping it would leave the host waiting for the answer to a request it carried.
-			return
+		if err := json.UnmarshalFrame(data, &env); err != nil {
+			// pig divergence (D268): Pi fails a call at a V8-stack-dependent depth (about 4400 levels); the SDK reads every frame the host can send (json.UnmarshalFrame).
+			// A frame nested past what the reader takes is not a reason to end the connection (the host sends none: its own marshal refuses a value past 10000 levels): the
+			// request it carries is answered with Pi's RangeError, a host call's result is that error, and a notification is dropped with a diagnostic. Any other frame the
+			// SDK cannot decode ends the connection, as the host does; skipping it would leave the host waiting for the answer to a request it carried.
+			if !strings.Contains(err.Error(), "exceeded max depth") {
+				return
+			}
+			kind, id := frameHead(data)
+			switch {
+			case kind == msgRequest && id != "":
+				if c.respond(id, nil, errTooDeep) != nil {
+					return
+				}
+				continue
+			case kind == msgCallResult && id != "":
+				env = envelope{Type: msgCallResult, ID: id, CallResult: &callResultMsg{Error: &errorInfo{Message: errTooDeep.Error()}}}
+			default:
+				diagnosticf("pig-sdk: dropped a frame nested deeper than the reader takes\n")
+				continue
+			}
 		}
 		if args != nil {
 			if env.Request == nil {
@@ -410,11 +452,125 @@ func (c *conn) readLoop() {
 			}
 			continue
 		}
+		if env.Type == msgCancel {
+			id := env.ID
+			if id == "" && env.Cancel != nil {
+				id = env.Cancel.RequestID
+			}
+			signalOnly := env.Cancel != nil && env.Cancel.SignalOnly
+			var cause error
+			if env.Cancel != nil && env.Cancel.Reason != "" {
+				cause = cancelReason(env.Cancel.Reason)
+			}
+			if c.routeCancel(id, signalOnly, cause) {
+				continue
+			}
+		}
 		// Everything else goes to the main loop.
 		if env.Type == msgNotify {
 			c.notifications.Add(1)
 		}
+		if env.Type == msgRequest {
+			c.queueRequest(env.ID)
+		}
 		c.incoming <- env
+	}
+}
+
+// errTooDeep is V8's RangeError, which Pi's JavaScript parser and stringify throw for a value nested past the stack: a request nested past the reader's bound fails with it.
+var errTooDeep = errors.New("Maximum call stack size exceeded")
+
+// frameHead is the "type" and "id" strings of the top-level object of frame, read without decoding the members that nest: brackets are counted, strings read whole. A
+// frame the reader refused for its depth is answered from them.
+func frameHead(frame []byte) (kind, id string) {
+	i, n := 0, len(frame)
+	skip := func() {
+		for i < n && (frame[i] == ' ' || frame[i] == '\t' || frame[i] == '\r' || frame[i] == '\n') {
+			i++
+		}
+	}
+	// str reads the string at frame[i] (a quote) and leaves i after it.
+	str := func() (string, bool) {
+		start := i
+		i++
+		for i < n && frame[i] != '"' {
+			if frame[i] == '\\' {
+				i++
+			}
+			i++
+		}
+		if i >= n {
+			return "", false
+		}
+		i++
+		var text string
+		if json.Unmarshal(frame[start:i], &text) != nil {
+			return "", false
+		}
+		return text, true
+	}
+	skip()
+	if i >= n || frame[i] != '{' {
+		return "", ""
+	}
+	i++
+	for {
+		skip()
+		if i >= n || frame[i] != '"' {
+			return kind, id
+		}
+		key, ok := str()
+		if !ok {
+			return kind, id
+		}
+		skip()
+		if i >= n || frame[i] != ':' {
+			return kind, id
+		}
+		i++
+		skip()
+		if i < n && frame[i] == '"' {
+			value, ok := str()
+			if !ok {
+				return kind, id
+			}
+			switch key {
+			case "type":
+				kind = value
+			case "id":
+				id = value
+			}
+		} else {
+			depth := 0
+		scan:
+			for i < n {
+				switch frame[i] {
+				case '"':
+					if _, ok := str(); !ok {
+						return kind, id
+					}
+					continue
+				case '{', '[':
+					depth++
+				case '}', ']':
+					if depth == 0 {
+						break scan
+					}
+					depth--
+				case ',':
+					if depth == 0 {
+						break scan
+					}
+				}
+				i++
+			}
+		}
+		skip()
+		if i < n && frame[i] == ',' {
+			i++
+			continue
+		}
+		return kind, id
 	}
 }
 
@@ -546,6 +702,7 @@ func (c *conn) beginCall(parentRequestID string, parent *requestParent, method s
 	default:
 	}
 	timer := false
+	commandContext := false
 	if parent != nil {
 		parentRequestID, err = c.parentIDLocked(parent)
 		if err != nil {
@@ -557,6 +714,7 @@ func (c *conn) beginCall(parentRequestID string, parent *requestParent, method s
 			callCtx = parent.runtime
 			timer = true
 		}
+		commandContext = parent.command
 	}
 	c.pending[id] = ch
 	c.pendingParents[id] = parentRequestID
@@ -568,7 +726,7 @@ func (c *conn) beginCall(parentRequestID string, parent *requestParent, method s
 	if err := c.sendLocked(envelope{
 		Type: msgCall,
 		ID:   id,
-		Call: &callMsg{Method: method, Args: argsJSON, ParentRequestID: parentRequestID, Timer: timer},
+		Call: &callMsg{Method: method, Args: argsJSON, ParentRequestID: parentRequestID, CommandContext: commandContext, Timer: timer},
 	}); err != nil {
 		c.pendingMu.Lock()
 		delete(c.pending, id)
@@ -697,15 +855,31 @@ func (c *conn) respond(id string, result any, respErr error) error {
 	return c.writeFrameLocked(response)
 }
 
+// orderedReply is a result whose objects the host sent, written with the member order it sent them in (json.ObjectOrder).
+type orderedReply struct {
+	value any
+	order json.KeyOrder
+}
+
 // encodeResponse is the response frame of a request. A result that cannot be encoded, or that cannot be framed (past MaxFrameSize), is answered with that
 // failure, as the Node and Python SDKs answer it, rather than leaving the host waiting for a response until the call is aborted.
 func encodeResponse(id string, result any, respErr error) ([]byte, error) {
 	resp := &responseMsg{}
 	if respErr != nil {
 		resp.Error = &errorInfo{Message: respErr.Error()}
+		// Pi's bash tool tells the error of the local backend by class, so only that error, rethrown unchanged, keeps the shell's exit.
+		if timeout, ok := errors.AsType[*shellTimeoutError](respErr); ok {
+			resp.Error.ShellExit = &shellExitInfo{ExitCode: timeout.exitCode, AfterSeconds: timeout.afterSeconds}
+		}
 	}
 	if result != nil {
-		data, err := json.MarshalJS(result)
+		var data []byte
+		var err error
+		if reply, ok := result.(orderedReply); ok {
+			data, err = json.MarshalJSOrdered(reply.value, reply.order)
+		} else {
+			data, err = json.MarshalJS(result)
+		}
 		if err != nil {
 			resp.Error = &errorInfo{Message: err.Error()}
 		} else {

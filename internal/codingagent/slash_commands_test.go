@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -369,7 +370,7 @@ func TestBuiltinSlashCommands_MatchesRegistry(t *testing.T) {
 	if len(got) == 0 {
 		t.Fatal("BuiltinSlashCommands returned empty")
 	}
-	want := defaultBuiltins()
+	want := slices.DeleteFunc(defaultBuiltins(), func(command BuiltinSlashCommand) bool { return strippedFeatureCommand(command.Name) })
 	if len(got) != len(want) {
 		t.Fatalf("BuiltinSlashCommands len=%d, defaultBuiltins len=%d", len(got), len(want))
 	}
@@ -575,8 +576,8 @@ func TestSessionHandlerMessageCounting(t *testing.T) {
 			Message agent.AgentMessage `json:"message"`
 		}
 		e := wireEntry{
-			SessionEntryBase: SessionEntryBase{Type: "message", ID: "x"},
-			Message:          message,
+			Type: "message", ID: "x",
+			Message: message,
 		}
 		raw, err := json.Marshal(e)
 		if err != nil {
@@ -648,7 +649,7 @@ func TestSessionHandlerUsesAllEntryUsage(t *testing.T) {
 	sess := NewSession("stats-session", "/tmp")
 	appendMessage := func(id string, message agent.AgentMessage) {
 		t.Helper()
-		entry := MessageEntry{SessionEntryBase: SessionEntryBase{Type: "message", ID: id, ParentID: sess.GetLeafID(), Timestamp: "2025-01-01T00:00:00Z"}, Message: message}
+		entry := MessageEntry{Type: "message", ID: id, ParentID: sess.GetLeafID(), Timestamp: "2025-01-01T00:00:00Z", Message: message}
 		if err := sess.AppendEntry(entry); err != nil {
 			t.Fatal(err)
 		}
@@ -695,7 +696,7 @@ func TestSessionHandlerRepeatedCallAllocationsDoNotScaleWithEntries(t *testing.T
 		t.Helper()
 		sess := NewSession("stats-session", "/tmp")
 		for i := range entries {
-			entry := MessageEntry{SessionEntryBase: SessionEntryBase{Type: "message", ID: fmt.Sprintf("u%d", i), Timestamp: "2025-01-01T00:00:00Z"}, Message: agent.AgentMessage{User: &agent.UserMessage{Role: "user", Content: ai.UserContentBlocks{ai.TextContent{Text: strings.Repeat("x", 1024)}}}}}
+			entry := MessageEntry{Type: "message", ID: fmt.Sprintf("u%d", i), Timestamp: "2025-01-01T00:00:00Z", Message: agent.AgentMessage{User: &agent.UserMessage{Role: "user", Content: ai.UserContentBlocks{ai.TextContent{Text: strings.Repeat("x", 1024)}}}}}
 			if err := sess.AppendEntry(entry); err != nil {
 				t.Fatal(err)
 			}
@@ -754,6 +755,7 @@ func TestBuiltinSlashCommandsFollowUpstreamOrder(t *testing.T) {
 		"copy", "name", "session", "changelog", "hotkeys", "fork", "clone", "trust", "login", "logout",
 		"new", "compact", "resume", "reload", "quit",
 	}
+	want = slices.DeleteFunc(want, strippedFeatureCommand) // a build that strips the changelog has no /changelog
 	var got []string
 	for _, cmd := range BuiltinSlashCommands() {
 		if cmd.Hidden || strings.HasPrefix(cmd.Name, "probe-") {
@@ -763,5 +765,36 @@ func TestBuiltinSlashCommandsFollowUpstreamOrder(t *testing.T) {
 	}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("builtin order = %v, want %v", got, want)
+	}
+}
+
+// Pi interactive-mode.ts:3331-3463 matches a built-in only by the exact text "/name" (or "/name " plus arguments for a command that takes
+// them); nothing else is a command, so "/neww" is not "/new" and "/logi" is not "/login". Row 106: the text then goes to the prompt path,
+// where a model-less session answers with the login guidance. Measured on the pin in tmux, print and RPC (test/parity/scenarios/slash-commands 29, 30).
+func TestSlashDispatchIsExactNameMatch(t *testing.T) {
+	r := NewSlashRegistry()
+	for _, line := range []string{"/neww", "/ne", "/new w", "/new-", "/newer", "/logi", "/loginx"} {
+		sc, out, cleared, quit := newTestSlashContext()
+		err := r.Dispatch(sc, line, nil)
+		if !errors.Is(err, ErrUnknownSlashCommand) {
+			t.Errorf("Dispatch(%q) = %v, want ErrUnknownSlashCommand", line, err)
+		}
+		if out.Len() != 0 || *cleared || *quit {
+			t.Errorf("Dispatch(%q) ran a command: output %q", line, out.String())
+		}
+	}
+}
+
+// An unknown slash falls through to the prompt path without a transcript error of its own (interactive-mode.ts onSubmit has no unknown-command branch).
+func TestInteractiveUnknownSlashShowsNoErrorOfItsOwn(t *testing.T) {
+	m := resumeThinkingMode(t, false)
+	prepareAssistantEventTest(t, m)
+	m.slashRegistry = NewSlashRegistry()
+	if m.resolvableSlashCommand("/neww") {
+		t.Error("an unknown slash resolves locally; Pi sends it to the prompt path")
+	}
+	m.dispatchSlashContext(m.buildSlashContext(t.Context()), "/neww")
+	if text := stripANSITest(strings.Join(m.chatContainer.Render(120), "\n")); strings.Contains(text, "Error") || strings.Contains(text, "nknown") {
+		t.Errorf("transcript after an unknown slash: %q", text)
 	}
 }

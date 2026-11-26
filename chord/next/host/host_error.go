@@ -8,7 +8,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/state"
 )
 
-// Ports packages/chord/src/next/host/host.ts (Position, HostError, GetOptions): the data types of the host that its helper
+// Ports packages/chord/src/host/host.ts (Position, HostError, GetOptions): the data types of the host that its helper
 // files name. D5b declares them ahead of the host core (DESIGN-go-layout.md section 5); the host port does not redeclare
 // them. Pi's `HostOptions`, `LinkOptions`, `Host` and `createHost` are the host core's.
 
@@ -55,6 +55,14 @@ const (
 	// ErrDeriveFailed: a derive's compute threw (Object, Member when it is an exposed state member, Error), once per
 	// failure episode.
 	ErrDeriveFailed HostErrorKind = "derive_failed"
+	// ErrEventMappingFailed: an event mapping for an older consumer threw (decision "Events: fire-and-forget members"): that
+	// emit is dropped for that version only; once per failure episode, the next mapped emit ends it (Object, Member,
+	// Version, Error).
+	ErrEventMappingFailed HostErrorKind = "event_mapping_failed"
+	// ErrQueryFailed: a live read's run in a commit threw (a row its code cannot read), once per failure episode (a good
+	// run ends it): the query is a failed member until then (Object, Query, Error; `self.query`, and the named queries of
+	// slice 14).
+	ErrQueryFailed HostErrorKind = "query_failed"
 	// ErrRoutineFailed: a routine's call threw, or its source failed for good (Object, Routine, Error).
 	ErrRoutineFailed HostErrorKind = "routine_failed"
 	// ErrJobFailed: a job's `run` threw, not after an abort (Object, Job, ID, Error): its outcome is `failed { threw }`.
@@ -71,23 +79,35 @@ const (
 	// `registry <name>`) and its State ("loading" or "failed"); a diagnostic of a ring across hosts started at the same
 	// moment or a long wait (nothing fails) (Object, WaitingFor, State, Since).
 	ErrParkedLong HostErrorKind = "parked_long"
+	// ErrUnboundLong: a request waited unbound for 5 s after the host's publication (a type or registry not served here, not
+	// at its version, a registry whose first `compose` threw), once: WaitingFor is the type's name or `registry <name>`,
+	// Error why, Since when it started (Date.now() time). It keeps waiting.
+	ErrUnboundLong HostErrorKind = "unbound_long"
+	// ErrTransactionCancelled: the context a document change or transaction was started with ended before it
+	// committed (a root whose fn returned, a caller that cancelled, its object's end), besides the rejection (Object, Error).
+	ErrTransactionCancelled HostErrorKind = "transaction_cancelled"
 )
 
 // HostError is what `onError` gets, by Kind (Pi's tagged union, one struct as registries.RegistryError is). Object is the
 // object's type, with its params key when it has params. Only the fields the Kind lists are set; Batch and Registry are
 // set for their kinds, which Kind then repeats.
 type HostError struct {
-	Kind       HostErrorKind
-	Object     string
-	Failure    data.FailureCause
-	Error      error
-	Native     Position
-	Routine    Position
-	Address    string
-	Member     string
-	Job        string
-	ID         string
-	Restarts   int
+	Kind    HostErrorKind
+	Object  string
+	Failure data.FailureCause
+	Error   error
+	Native  Position
+	Routine Position
+	Address string
+	Member  string
+	// Query is a query_failed's query: the table's name for `self.query`, the named query's label for `self.liveQuery`,
+	// `self.count` and `self.list` (slice 14).
+	Query    string
+	Job      string
+	ID       string
+	Restarts int
+	// Version is an event_mapping_failed's consumer version.
+	Version    int
 	WaitingFor string
 	// State is a parked_long's blocker state: "loading" or "failed".
 	State    string

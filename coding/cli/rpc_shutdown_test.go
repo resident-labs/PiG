@@ -205,32 +205,20 @@ func handledPromptResponse(id string) rpcRecord {
 
 var rpcShutdownStartedNotify = rpcRecord{"type": "extension_ui_request", "method": "notify", "message": "session_shutdown started", "notifyType": "info"}
 
-// Pi 0.87.1 when stdin ends while a tool call is in flight:
+// Pi (pin c23b9ec1, Pi main 7a53c310a #9126) when stdin ends while a tool call is in flight:
 //
-//  1. rpc-mode.ts:804-807 runs shutdown(): 733-737 remove the signal handlers
-//     and unsubscribe the stdout forwarder of Session events, 738 awaits
-//     runtimeHost.dispose().
-//  2. agent-session-runtime.ts:406-413 emits session_shutdown, then calls
-//     AgentSession.dispose (agent-session.ts:1170-1191): agent.abort(),
-//     runner.invalidate() (it guards ctx, not dispatch) and
-//     _disconnectFromAgent(), which unsubscribes _handleAgentEvent. The
-//     aborted run's message, tool and agent_end events therefore reach
-//     neither extensions nor persistence nor stdout.
-//  3. The aborted tool resolves. The Agent's finishTurn hook
-//     (_installAgentBoundaryHooks, agent-session.ts:674-683) is not a
-//     subscription, so agent-loop.ts:285 still dispatches the turn_end
-//     boundary: the tool-call assistant message was persisted before stdin
-//     ended, so turn_end reaches the extension.
-//  4. The tool batch did not terminate, so the loop streams the next
-//     response with the aborted signal and finishes that aborted turn
-//     (agent-loop.ts:244-252). Its message_end never reached the
-//     disconnected _handleAgentEvent, so _dispatchTurnEndBoundary cannot
-//     resolve its entry and emits "turn_end could not resolve the persisted
-//     assistant entry ID" (agent-session.ts:642-650), which rpc-mode.ts:348
-//     writes to stdout as extension_error.
-//  5. The run then settles: _emitAgentSettled (agent-session.ts:870-876)
-//     emits agent_settled through the extension runner; its listeners were
-//     cleared. shutdown() awaits flushRawStdout and exits 0.
+//  1. rpc-mode.ts:826-829 runs shutdown(): 744-751 unsubscribe the stdout
+//     forwarder of Session events and await runtimeHost.dispose().
+//  2. agent-session-runtime.ts:409-417 awaits session.abort() before it emits
+//     session_shutdown. abort() (agent-session.ts:2601-2612) aborts the Agent
+//     and awaits waitForIdle, so the event loop turns while the Session is
+//     still connected: the aborted tool resolves, its tool_execution_end and
+//     result message, the turn_end boundary, the next aborted turn, agent_end
+//     and agent_settled reach the extensions and the session file, and none
+//     reaches stdout, whose forwarder is gone.
+//  3. Only then does dispose() emit session_shutdown (the fixture's handler
+//     notifies first) and dispose the Session. shutdown() flushes stdout and
+//     exits 0.
 var (
 	rpcMidPromptInputEndExtensionEvents = []string{
 		"agent_start", "turn_start",
@@ -238,19 +226,23 @@ var (
 		"message_start", "message_end", // user
 		"message_start", "message_end", // tool-call assistant
 		"tool_execution_start", "tool_running",
-		"session_shutdown", "turn_end", "agent_settled",
+		"tool_execution_end",
+		"message_start", "message_end", // tool result
+		"turn_end",
+		"turn_start",
+		"message_start", "message_end", // aborted assistant
+		"turn_end",
+		"agent_end", "agent_settled",
+		"session_shutdown",
 	}
-	// The fixture's session_shutdown handler notifies first.
-	rpcMidPromptInputEndStdout = []rpcRecord{
-		rpcShutdownStartedNotify,
-		{"type": "extension_error", "extensionPath": "<boundary>", "event": "turn_end", "error": "turn_end could not resolve the persisted assistant entry ID"},
-	}
+	// The fixture's session_shutdown handler notifies; the aborted run's events are not forwarded.
+	rpcMidPromptInputEndStdout = []rpcRecord{rpcShutdownStartedNotify}
 )
 
-// After stdin ends mid-prompt, pig writes only the session_shutdown
-// notification and the turn_end boundary's extension_error to stdout, and
-// delivers session_shutdown, the tool-call turn's turn_end and agent_settled
-// to the extension, in Pi's order.
+// After stdin ends mid-prompt, pig settles the aborted run first, as Pi's
+// dispose() does, and then delivers session_shutdown. Stdout gets only the
+// session_shutdown notification; the extension sees the whole aborted run
+// before session_shutdown.
 func TestRPCInputEndMidPromptDeliversPiShutdownSequence(t *testing.T) {
 	p, report := startRPCShutdownFixture(t)
 	afterEOF, events := endInputMidPrompt(p, report)
@@ -269,6 +261,29 @@ func TestRPCInputEndMidPromptSequenceComparedWithPi(t *testing.T) {
 	afterEOF, events := endInputMidPrompt(p, report)
 	if !reflect.DeepEqual(afterEOF, rpcMidPromptInputEndStdout) || !slices.Equal(events, rpcMidPromptInputEndExtensionEvents) {
 		t.Fatalf("Pi stdout after stdin ended = %v, extension events = %v; want %v, %v", afterEOF, events, rpcMidPromptInputEndStdout, rpcMidPromptInputEndExtensionEvents)
+	}
+}
+
+// Pi 1.5.2, a tool that ignores its abort signal at stdin's end: dispose() awaits
+// session.abort() (agent-session-runtime.ts:415-417), which aborts the Agent and
+// waits for it to be idle (agent-session.ts:2601-2612). The tool settles nothing
+// and holds no handle, so the run never ends, Node's event loop empties, and the
+// process exits 0 right after the abort: no session_shutdown handler runs and
+// nothing reaches stdout. Pig's Node runtime reports that drained loop once the
+// abort has reached the tool, and pig exits 0 the same.
+func TestRPCInputEndWithAbortDeafToolExitsZeroWithoutShutdown(t *testing.T) {
+	inFlight := rpcMidPromptInputEndExtensionEvents[:slices.Index(rpcMidPromptInputEndExtensionEvents, "tool_running")+1]
+	for _, impl := range rpcShutdownImplementations {
+		t.Run(impl.name, func(t *testing.T) {
+			p, report := impl.start(t, "RPC_SHUTDOWN_TOOL_DEAF=1")
+			afterEOF, events := endInputMidPrompt(p, report)
+			if len(afterEOF) != 0 {
+				t.Fatalf("stdout after stdin ended = %v, want nothing: the dispose never returns", afterEOF)
+			}
+			if !slices.Equal(events, inFlight) {
+				t.Fatalf("extension events = %v, want %v: the tool ignores its abort and no session_shutdown runs", events, inFlight)
+			}
+		})
 	}
 }
 
@@ -490,10 +505,12 @@ func TestRPCInputEndLeavesLastLineDialogPending(t *testing.T) {
 	}
 }
 
-// Pi 0.87.1: ctx.shutdown() sets rpc-mode.ts shutdownRequested (346), which
-// the command loop checks after the command (748-749); shutdown() then
-// disposes the runtime and exits 0 although stdin is still open. The
-// The prompt response and shutdown notification follow Pi's Promise continuations in a fixed order.
+// Pi (pin c23b9ec1): ctx.shutdown() sets rpc-mode.ts shutdownRequested, which
+// checkShutdownRequested (763-766) reads only when no command is being
+// handled and the Session is idle: handleInputLine calls it after it wrote
+// the command's response (rpc-mode.ts:809-813). shutdown() then disposes the
+// runtime and exits 0 although stdin is still open, so the prompt response
+// precedes the session_shutdown notification.
 func TestRPCExtensionShutdownRequestExits(t *testing.T) {
 	for _, impl := range rpcShutdownImplementations {
 		t.Run(impl.name, func(t *testing.T) {
@@ -502,12 +519,7 @@ func TestRPCExtensionShutdownRequestExits(t *testing.T) {
 			p.sendJSON(map[string]any{"id": "quit", "type": "prompt", "message": "/quit"})
 			records := drainRPCOutput(p)
 			p.waitForExit("after ctx.shutdown()")
-			response := handledPromptResponse("quit")
-			want := []rpcRecord{rpcShutdownStartedNotify, response}
-			if impl.name == "pig" {
-				// pig divergence (D231): follows Pi main 1708b4788, where the shutdown waits for the command's prompt response.
-				want = []rpcRecord{response, rpcShutdownStartedNotify}
-			}
+			want := []rpcRecord{handledPromptResponse("quit"), rpcShutdownStartedNotify}
 			if !reflect.DeepEqual(records, want) {
 				t.Fatalf("stdout = %v, want the prompt response and the session_shutdown notification", records)
 			}
@@ -540,12 +552,11 @@ func TestRPCInputEndWritesSessionShutdownDialog(t *testing.T) {
 	}
 }
 
-// rpc-mode.ts shutdown() (728-744): the first trigger removes the signal
-// handlers, unsubscribes stdout, disposes, flushes stdout unless the signal is
-// SIGTERM, and exits. After it started, a termination signal takes its
-// default action, and stdin end or a shutdown request re-enters shutdown(),
-// which exits 0 at once; stdin end after the dispose finished does nothing,
-// because detachInput ran (739).
+// rpc-mode.ts shutdown() (728-744): the first trigger unsubscribes stdout,
+// disposes, flushes stdout unless the signal is SIGTERM, and exits. After it
+// started (Pi main ace560c30), a stdin end, a
+// shutdown request or a single signal does nothing and the dispose finishes; a
+// repeated signal exits at once with 128 plus its number.
 func TestRPCShutdownTriggers(t *testing.T) {
 	type harness struct {
 		shutdown *rpcShutdown
@@ -558,12 +569,10 @@ func TestRPCShutdownTriggers(t *testing.T) {
 			close(h.release)
 		}
 		h.shutdown = newRPCShutdown(
-			func() { h.steps <- "remove signal handlers" },
 			func() { h.steps <- "detach" },
 			func() { h.steps <- "dispose"; <-h.release },
 			func() { h.steps <- "flush" },
 			func(code int) { h.steps <- fmt.Sprintf("exit %03d", code) },
-			func(sig os.Signal) { h.steps <- "die " + sig.String() },
 		)
 		return h
 	}
@@ -584,7 +593,7 @@ func TestRPCShutdownTriggers(t *testing.T) {
 		t.Helper()
 		done := make(chan struct{})
 		go func() { trigger(); close(done) }()
-		for _, step := range []string{"remove signal handlers", "detach", "dispose"} {
+		for _, step := range []string{"detach", "dispose"} {
 			if got := <-h.steps; got != step {
 				t.Fatalf("step = %q, want %q", got, step)
 			}
@@ -595,56 +604,68 @@ func TestRPCShutdownTriggers(t *testing.T) {
 	t.Run("stdin end flushes and exits 0", func(t *testing.T) {
 		h := newHarness(false)
 		h.shutdown.inputEnd()
-		expect(t, h, "remove signal handlers", "detach", "dispose", "flush", "exit 000")
+		expect(t, h, "detach", "dispose", "flush", "exit 000")
 	})
 	t.Run("a shutdown request flushes and exits 0", func(t *testing.T) {
 		h := newHarness(false)
 		h.shutdown.requested()
-		expect(t, h, "remove signal handlers", "detach", "dispose", "flush", "exit 000")
+		expect(t, h, "detach", "dispose", "flush", "exit 000")
 	})
 	t.Run("SIGTERM exits 143 without a flush", func(t *testing.T) {
 		h := newHarness(false)
 		h.shutdown.signal(syscall.SIGTERM)
-		expect(t, h, "remove signal handlers", "detach", "dispose", "exit 143")
+		expect(t, h, "detach", "dispose", "exit 143")
 	})
 	t.Run("another signal flushes and exits 128 plus its number", func(t *testing.T) {
 		h := newHarness(false)
 		h.shutdown.signal(syscall.SIGINT)
-		expect(t, h, "remove signal handlers", "detach", "dispose", "flush", "exit 130")
+		expect(t, h, "detach", "dispose", "flush", "exit 130")
 	})
-	t.Run("a signal during a dispose takes its default action", func(t *testing.T) {
+	t.Run("a single signal during a dispose does not interrupt it", func(t *testing.T) {
 		h := newHarness(true)
-		done := disposing(t, h, h.shutdown.inputEnd)
-		h.shutdown.signal(syscall.SIGTERM)
-		expect(t, h, "die "+syscall.SIGTERM.String())
+		done := disposing(t, h, func() { h.shutdown.inputEnd() })
+		if h.shutdown.signal(syscall.SIGTERM) {
+			t.Fatal("the signal started a second shutdown")
+		}
+		expect(t, h)
 		close(h.release)
 		<-done
-		expect(t, h)
+		expect(t, h, "flush", "exit 000")
 	})
-	t.Run("stdin end during a signal dispose exits 0 at once", func(t *testing.T) {
+	t.Run("a repeated signal during a dispose exits at once", func(t *testing.T) {
 		h := newHarness(true)
-		done := disposing(t, h, func() { h.shutdown.signal(syscall.SIGTERM) })
-		h.shutdown.inputEnd()
-		expect(t, h, "exit 000")
-		close(h.release)
-		<-done
-		// The process ended at the first exit; the dispose finishing afterwards does not exit 143.
-		expect(t, h)
-	})
-	t.Run("a shutdown request during a stdin-end dispose exits 0 at once", func(t *testing.T) {
-		h := newHarness(true)
-		done := disposing(t, h, h.shutdown.inputEnd)
-		h.shutdown.requested()
-		expect(t, h, "exit 000")
+		done := disposing(t, h, func() { h.shutdown.inputEnd() })
+		h.shutdown.repeatedSignal(syscall.SIGTERM)
+		expect(t, h, "exit 143")
 		close(h.release)
 		<-done
 		// The process ended at the first exit; the dispose finishing afterwards neither flushes nor exits again.
 		expect(t, h)
 	})
+	t.Run("stdin end during a signal dispose does not interrupt it", func(t *testing.T) {
+		h := newHarness(true)
+		done := disposing(t, h, func() { h.shutdown.signal(syscall.SIGTERM) })
+		if h.shutdown.inputEnd() {
+			t.Fatal("stdin end claimed the process while a signal's shutdown was running")
+		}
+		expect(t, h)
+		close(h.release)
+		<-done
+		expect(t, h, "exit 143")
+	})
+	t.Run("a shutdown request during a stdin-end dispose does nothing", func(t *testing.T) {
+		h := newHarness(true)
+		done := disposing(t, h, func() { h.shutdown.inputEnd() })
+		h.shutdown.requested()
+		expect(t, h)
+		close(h.release)
+		<-done
+		expect(t, h, "flush", "exit 000")
+	})
 	t.Run("stdin end after a finished dispose does nothing", func(t *testing.T) {
 		h := newHarness(false)
 		h.shutdown.signal(syscall.SIGTERM)
-		expect(t, h, "remove signal handlers", "detach", "dispose", "exit 143")
+		expect(t, h, "detach", "dispose", "exit 143")
 		h.shutdown.inputEnd()
 		expect(t, h)
 	})

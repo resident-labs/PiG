@@ -21,6 +21,7 @@ const (
 var fixtureRoot string
 
 func TestMain(m *testing.M) {
+	maybeRunHarnessTestHelper()
 	if fifoPath := os.Getenv(nodePreflightHelperFIFOEnv); fifoPath != "" {
 		fifo, err := os.OpenFile(fifoPath, os.O_WRONLY, 0)
 		if err != nil {
@@ -52,7 +53,7 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
-	testRoot, err := os.MkdirTemp("", "pig-sp-")
+	testRoot, err := testenv.MkdirShortTemp("pig-sp-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "create isolated test home:", err)
 		os.Exit(2)

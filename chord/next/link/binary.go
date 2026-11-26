@@ -9,7 +9,7 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
-// Ports packages/chord/src/next/link/binary.ts. The binary codec (2b): a kind byte (its high bit set when an origin
+// Ports packages/chord/src/link/binary.ts. The binary codec (2b): a kind byte (its high bit set when an origin
 // follows as a varint), then the kind's fields as unsigned varints, length-prefixed UTF-8 strings, raw incarnation (16
 // bytes) and fingerprint (8 bytes), parts as length-prefixed bytes whose prefix also says whether the part is deflated
 // (decoded as views of the message, never parsed or inflated here), and byte segments only beside payloads marked as
@@ -38,12 +38,18 @@ const (
 	kindPing
 	kindPong
 	kindRevoke
+	kindEvent
 	kindCount
 )
 
 const (
 	// originFlag is the kind byte's flag for an origin.
 	originFlag = 0x80
+	// oldFlag is the kind byte's third flag: on a `call`, old work of a reload (`call.old`); on an `ack`, an event ack, its
+	// count following (so a state ack stays one byte); another kind with it is unknown.
+	oldFlag = 0x20
+	// traceFlag is the kind byte's flag for a trace carrier (a hold's or call's): the carrier follows the origin as JSON.
+	traceFlag = 0x40
 	// payloadPresent and payloadSegments are a payload's flags: present, and carrying byte segments.
 	payloadPresent  = 1
 	payloadSegments = 2
@@ -85,11 +91,24 @@ func (binaryCodec) Encode(message Message) (encoded []byte, err error) {
 	defer recoverCodec(&err)
 	writer := newWriter()
 	kind := kindOf(message)
+	if call, ok := message.(*CallMessage); ok && call.Old {
+		kind |= oldFlag
+	}
+	if ack, ok := message.(*AckMessage); ok && ack.Events.Ok {
+		kind |= oldFlag
+	}
+	trace := traceOf(message)
+	if trace != nil {
+		kind |= traceFlag
+	}
 	if origin := OriginOf(message); origin.Ok {
 		writer.byte(kind | originFlag)
 		writer.varint(origin.Value)
 	} else {
 		writer.byte(kind)
+	}
+	if trace != nil {
+		writer.json(carrierValue(trace, traceOrderOf(message)))
 	}
 	encodeFields(message, writer)
 	return writer.finish(), nil
@@ -104,12 +123,32 @@ func (binaryCodec) Decode(bytes []byte) (message Message, err error) {
 	if hasOrigin {
 		origin = reader.varint()
 	}
-	kind := int(first &^ originFlag)
-	if kind >= kindCount {
+	hasOld := first&oldFlag != 0
+	kind := int(first &^ (originFlag | traceFlag | oldFlag))
+	if kind >= kindCount || (hasOld && kind != kindCall && kind != kindAck) {
 		fail("binary: an unknown kind")
 	}
-	message = decodeFields(kind, reader)
+	var trace any
+	hasTrace := first&traceFlag != 0
+	if hasTrace {
+		trace = reader.json()
+	}
+	if kind == kindAck && hasOld {
+		message = &AckMessage{Events: Some(reader.varint())}
+	} else {
+		message = decodeFields(kind, reader)
+	}
 	reader.end()
+	if hasTrace {
+		// The message schema refuses a carrier on a kind without one, or of another shape.
+		carrier, order, ok := carrierOf(trace)
+		if !ok || !setTrace(message, carrier, order) {
+			failWith(errSchema)
+		}
+	}
+	if hasOld && kind == kindCall {
+		message.(*CallMessage).Old = true
+	}
 	// A fresh message; the message schema refuses an origin of 0.
 	if hasOrigin && !setOrigin(message, origin) {
 		fail("binary: an origin on a kind without one")
@@ -155,9 +194,66 @@ func kindOf(message Message) int {
 		return kindPong
 	case *RevokeMessage:
 		return kindRevoke
+	case *EventMessage:
+		return kindEvent
 	}
 	fail("binary: an unknown message type %T", message)
 	return 0
+}
+
+// traceOf is a hold's or call's trace carrier; nil for no carrier and for another kind.
+func traceOf(message Message) map[string]string {
+	switch typed := message.(type) {
+	case *HoldMessage:
+		return typed.Trace
+	case *CallMessage:
+		return typed.Trace
+	}
+	return nil
+}
+
+// traceOrderOf is the key order of a hold's or call's carrier, as it was decoded.
+func traceOrderOf(message Message) []string {
+	switch typed := message.(type) {
+	case *HoldMessage:
+		return typed.TraceOrder
+	case *CallMessage:
+		return typed.TraceOrder
+	}
+	return nil
+}
+
+// setTrace sets a decoded hold's or call's carrier; false for another kind.
+func setTrace(message Message, carrier map[string]string, order []string) bool {
+	switch typed := message.(type) {
+	case *HoldMessage:
+		typed.Trace, typed.TraceOrder = carrier, order
+	case *CallMessage:
+		typed.Trace, typed.TraceOrder = carrier, order
+	default:
+		return false
+	}
+	return true
+}
+
+// carrierOf reads a decoded JSON value as a carrier: an object of strings, and its keys in the order they came. The message
+// schema refuses any other shape.
+func carrierOf(value any) (map[string]string, []string, bool) {
+	object, ok := value.(*delta.JsonObject)
+	if !ok {
+		return nil, nil, false
+	}
+	carrier := make(map[string]string, object.Len())
+	order := make([]string, 0, object.Len())
+	for key, member := range object.All() {
+		text, ok := member.(string)
+		if !ok {
+			return nil, nil, false
+		}
+		carrier[key] = text
+		order = append(order, key)
+	}
+	return carrier, order, true
 }
 
 // setOrigin sets a decoded message's origin in place; false for a kind without one.
@@ -176,6 +272,8 @@ func setOrigin(message Message, origin int) bool {
 	case *BoundMessage:
 		typed.Origin = Some(origin)
 	case *StateMessage:
+		typed.Origin = Some(origin)
+	case *EventMessage:
 		typed.Origin = Some(origin)
 	case *AckMessage:
 		typed.Origin = Some(origin)
@@ -295,7 +393,20 @@ func encodeFields(message Message, writer *writer) {
 		writer.json(typed.Error)
 	case *RevokeMessage:
 		writer.json(typed.Revocation)
-	case *AckMessage, *ClosedMessage, *PingMessage, *PongMessage:
+	case *EventMessage:
+		writer.varint(len(typed.Events))
+		for _, entry := range typed.Events {
+			writer.varint(entry.Hold)
+			writer.varint(entry.Member)
+			writer.varint(entry.At)
+			writer.part(entry.Value)
+		}
+	case *AckMessage:
+		// An event ack's count (the kind byte's flag says it follows); a state ack has no field.
+		if typed.Events.Ok {
+			writer.varint(typed.Events.Value)
+		}
+	case *ClosedMessage, *PingMessage, *PongMessage:
 	}
 }
 
@@ -324,7 +435,16 @@ func decodeFields(kind int, reader *reader) Message {
 	case kindHello:
 		protocol := reader.varint()
 		incarnation := uuid(reader.raw(16))
+		// 0: no window (a window is at least 1).
 		return &HelloMessage{Protocol: protocol, Incarnation: incarnation, Calls: reader.varint()}
+	case kindEvent:
+		count := reader.count()
+		events := make([]WireEvent, count)
+		for index := range events {
+			hold, member, at := reader.varint(), reader.varint(), reader.varint()
+			events[index] = WireEvent{Hold: hold, Member: member, At: at, Value: reader.part()}
+		}
+		return &EventMessage{Events: events}
 	case kindHold:
 		message := &HoldMessage{Hold: reader.varint()}
 		message.Type = reader.string()

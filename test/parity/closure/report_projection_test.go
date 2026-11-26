@@ -109,7 +109,7 @@ func TestRenderCoverageProjectsPortMapClaim(t *testing.T) {
 	hash := HashBytes([]byte("denominator-coverage"))
 	graph, err := Build([]Record{
 		&Snapshot{Kind: KindSnapshot, ID: "snapshot:denominator-coverage", UpstreamCommit: strings.Repeat("a", 40), TargetCommit: strings.Repeat("b", 40), ToolchainHash: hash, EnvironmentHash: hash},
-		&Pin{Kind: KindPin, ID: "pin:denominator-coverage", SnapshotID: "snapshot:denominator-coverage", Repository: "pig", Commit: strings.Repeat("b", 40), Path: "test/parity/coverage.md", SemanticID: "denominator:coverage-row", StartLine: 1, EndLine: 10, QuoteHash: hash},
+		&Pin{Kind: KindPin, ID: "pin:denominator-coverage", SnapshotID: "snapshot:denominator-coverage", Repository: "pig", Commit: strings.Repeat("b", 40), Path: "test/parity/generated/coverage.md", SemanticID: "denominator:coverage-row", StartLine: 1, EndLine: 10, QuoteHash: hash},
 		rowOrderFact(t, "snapshot:denominator-coverage", "pin:denominator-coverage", CoverageDataset, "rows", []string{"packages/example.ts"}),
 		&Fact{Kind: KindFact, ID: "fact:denominator:coverage-row:example", SnapshotID: "snapshot:denominator-coverage", FactType: "denominator:coverage-row", SubjectID: "packages/example.ts", Resolution: "observed", PinIDs: []string{"pin:denominator-coverage"}, Value: json.RawMessage(`{"fields":["` + "`packages/example.ts`" + `","✅","1 (scenario)","1 (scenario)","1 pass"]}`)},
 		&ProvisionalClaim{Kind: KindProvisionalClaim, ID: "provisional:denominator:port-map:example", SnapshotID: "snapshot:denominator-coverage", SubjectID: "packages/example.ts", SourcePinID: "pin:denominator-coverage", Status: "✅"},
@@ -298,7 +298,7 @@ func TestRenderAsyncContractsPreservesRowsAndProjectsState(t *testing.T) {
 	hash := HashBytes([]byte("denominator-async-contract"))
 	graph, err := Build([]Record{
 		&Snapshot{Kind: KindSnapshot, ID: "snapshot:async-contract", UpstreamCommit: strings.Repeat("a", 40), TargetCommit: strings.Repeat("b", 40), ToolchainHash: hash, EnvironmentHash: hash},
-		&Pin{Kind: KindPin, ID: "pin:async-contract", SnapshotID: "snapshot:async-contract", Repository: "pig", Commit: strings.Repeat("b", 40), Path: "test/parity/async-contracts.toml", SemanticID: "denominator:async-contract", StartLine: 1, EndLine: 10, QuoteHash: hash},
+		&Pin{Kind: KindPin, ID: "pin:async-contract", SnapshotID: "snapshot:async-contract", Repository: "pig", Commit: strings.Repeat("b", 40), Path: "test/parity/ledgers/async-contracts.toml", SemanticID: "denominator:async-contract", StartLine: 1, EndLine: 10, QuoteHash: hash},
 		&Fact{Kind: KindFact, ID: "fact:denominator:async-contract:metadata", SnapshotID: "snapshot:async-contract", FactType: "denominator:async-contract", SubjectID: "<metadata>", Resolution: "resolved", PinIDs: []string{"pin:async-contract"}, Value: json.RawMessage(`{"version":"0.84.0"}`)},
 		rowOrderFact(t, "snapshot:async-contract", "pin:async-contract", AsyncContractDataset, "files", []string{"packages/example.ts"}),
 		&Fact{Kind: KindFact, ID: "fact:denominator:async-contract:row", SnapshotID: "snapshot:async-contract", FactType: "denominator:async-contract", SubjectID: "packages/example.ts", Resolution: "observed", PinIDs: []string{"pin:async-contract"}, Value: json.RawMessage(`{"contracts":["awaited"],"disposition":"ported","evidence":["example_test.go"],"path":"packages/example.ts","rationale":"reviewed"}`)},
@@ -651,7 +651,7 @@ func TestStructuredReportsPreserveCurrentAuthorityRows(t *testing.T) {
 		{name: "semantic mapping", dataset: SemanticMappingDataset, path: "test/parity/interfaces/mapping-v" + coding.UpstreamVersion + ".json", sections: []string{"mappings"}},
 		{name: "semantic delta", dataset: SemanticDeltaDataset, path: "test/parity/interfaces/delta-v" + coding.UpstreamReviewedVersion + "-v" + coding.UpstreamVersion + ".json", sections: []string{"changes"}},
 		{name: "input and render mapping", dataset: InputRenderMappingDataset, path: "test/parity/interfaces/behavior-input-mapping-v" + coding.UpstreamVersion + ".json", sections: []string{"mappings", "renderMappings"}},
-		{name: "async", dataset: AsyncContractDataset, path: "test/parity/async-contracts.toml", sections: []string{"files"}, toml: true},
+		{name: "async", dataset: AsyncContractDataset, path: "test/parity/ledgers/async-contracts.toml", sections: []string{"files"}, toml: true},
 		{name: "changed source", dataset: ChangedSourceDataset, path: "test/parity/upstream-sync/v" + coding.UpstreamVersion + ".toml", sections: []string{"files"}, toml: true},
 		{name: "behavior", dataset: BehaviorContractDataset, path: "test/parity/behavior-contracts.toml", sections: []string{"contract"}, toml: true},
 		{name: "format ownership", dataset: FormatOwnershipDataset, path: "test/parity/format-versions.toml", sections: []string{"fields"}, toml: true},
@@ -701,7 +701,7 @@ func TestMarkdownReportsPreserveCurrentAuthorityRows(t *testing.T) {
 		denominatorFields   int
 	}{
 		{name: "port map", dataset: PortMapDataset, path: "docs/parity/PORT_MAP.md", denominatorFields: 3},
-		{name: "coverage", dataset: CoverageDataset, path: "test/parity/coverage.md", denominatorFields: 5},
+		{name: "coverage", dataset: CoverageDataset, path: "test/parity/generated/coverage.md", denominatorFields: 5},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			current, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(test.path)))

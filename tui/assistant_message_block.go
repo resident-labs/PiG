@@ -49,9 +49,14 @@ type AssistantMessageComponent struct {
 	// spacers, thinkingRuns and terminalError are the children updateContent keeps across updates (see updateContent).
 	spacers           []*Spacer
 	thinkingRuns      []thinkingRunRegion
+	hiddenMemo        hiddenThinkingMemo
 	terminalError     []Component
 	terminalErrorLine string
 	terminalErrorPad  int
+	// rowBuf is the array renderBorrowedChild renders into.
+	rowBuf []string
+	// streamMemos is what the block's Markdown segments kept at the frame last drawn, held while the message streams (pinStreamMemos).
+	streamMemos []*markdownMemos
 }
 
 func (b *AssistantMessageComponent) newMarkdown(text string) *Markdown {
@@ -181,10 +186,11 @@ func (b *AssistantMessageComponent) UpdateContent(message AssistantMessage, isSt
 }
 
 // FinishStreaming tells the block that its message is complete: its Markdown drops the memos that only speed up the
-// render of the next streamed delta. The rows are unchanged. A hidden thinking run shows its label, so its Markdown does
+// render of the next streamed delta, and the block lets go of the ones it held for the next frame. The rows are unchanged. A hidden thinking run shows its label, so its Markdown does
 // not render again and drops them now (Markdown.FinishStreaming keeps them for an undrawn text's next render).
 func (b *AssistantMessageComponent) FinishStreaming() {
 	b.finished = true
+	b.streamMemos = nil
 	run := 0
 	for _, segment := range b.segments {
 		segment.md.FinishStreaming()
@@ -234,7 +240,8 @@ func (b *AssistantMessageComponent) appendDelta(thinking bool, delta string) {
 	if len(b.content) == 0 || b.content[len(b.content)-1].Thinking != thinking {
 		b.content = append(b.content, AssistantSegment{Thinking: thinking})
 	}
-	b.content[len(b.content)-1].Text += delta
+	last := &b.content[len(b.content)-1]
+	last.Text = jsstring.Concat(last.Text, delta) // a high half ending one delta and a low half starting the next are one character, as in JavaScript
 	b.SetContent(b.content)
 }
 
@@ -302,6 +309,7 @@ func (b *AssistantMessageComponent) SetContent(content []AssistantSegment) {
 
 // Dispose releases this block's Markdown generations without allowing a late publication.
 func (b *AssistantMessageComponent) Dispose() {
+	b.streamMemos = nil
 	b.md.Dispose()
 	for _, segment := range b.segments {
 		segment.md.Dispose()
@@ -441,8 +449,14 @@ func (b *AssistantMessageComponent) SetTerminalError(stopReason, errorMessage st
 	b.updateContent()
 }
 
+// IsDirty reports the block's own invalidation, which every mutator of the block calls (updateContent ends in Container.Invalidate), and not Container.IsDirty's scan of the
+// content beneath it: a parent container stops asking once it read the block clean (kidInvalidation lists the exact type), so a settled
+// transcript costs no scan per block. TestAParentContainerShowsWhatAnyExportedMutatorChanged holds each mutator to that.
+func (b *AssistantMessageComponent) IsDirty() bool { return b.invalidatable.IsDirty() }
+
 // Invalidate rebuilds the content so theme-baked colors follow the active theme (assistant-message.ts invalidate). It runs on the goroutine that owns the block, as Pi's runs on its event loop; a transform worker marks the block dirty through SetAsyncMarkdownTransforms instead.
 func (b *AssistantMessageComponent) Invalidate() {
+	b.streamMemos = nil
 	b.Container.Invalidate()
 	b.updateContent()
 }
@@ -456,6 +470,45 @@ func (b *AssistantMessageComponent) Render(width int) []string {
 		b.measureOwnedRuns(width)
 	}
 	out := b.renderCopy(width)
+	b.pinStreamMemos()
+	return b.withZones(out)
+}
+
+// renderBorrowedChild is Render into an array the block keeps for its next render: the parent container that borrows it
+// copies the rows before the block renders again, so a streamed message does not allocate its whole row list each frame.
+// Only a container that holds the block as a child calls it, under that container's lock.
+func (b *AssistantMessageComponent) renderBorrowedChild(width int) []string {
+	if width < 1 {
+		width = 1
+	}
+	if b.ownedRuns {
+		b.measureOwnedRuns(width)
+	}
+	b.rowBuf = b.renderInto(width, b.rowBuf)
+	b.pinStreamMemos()
+	return b.withZones(b.rowBuf)
+}
+
+// pinStreamMemos holds what the block's Markdown segments kept at the frame just drawn, in place of what it held for the frame before, until the stream ends (FinishStreaming) or the block is invalidated or disposed. A Markdown lets go of its memos when its render returns, as markdown.ts holds its rendered blocks in a WeakRef, so a collection between two frames makes the next one render every block of the answer again; a message that streams draws again within a frame's time, so its block holds them for that frame. A collection that ends between a segment's render and this call has released that segment's memos, and its next render builds them again, as it does for a Markdown nothing holds.
+// pig additive (D112): the rows are the same with or without the memos; the block holds one frame's memos of its own segments and nothing older.
+func (b *AssistantMessageComponent) pinStreamMemos() {
+	if b.finished {
+		return
+	}
+	held := b.streamMemos[:0]
+	for _, segment := range b.segments {
+		if memos := segment.md.memosRef.Value(); memos != nil {
+			held = append(held, memos)
+		}
+	}
+	if len(held) < len(b.streamMemos) {
+		clear(b.streamMemos[len(held):])
+	}
+	b.streamMemos = held
+}
+
+// withZones adds the OSC 133 zone boundaries to out in place.
+func (b *AssistantMessageComponent) withZones(out []string) []string {
 	if b.hasToolCalls || len(out) == 0 {
 		return out
 	}
@@ -529,6 +582,27 @@ type thinkingRunRegion struct {
 	region     *MouseRegion
 }
 
+// hiddenThinkingMemo is the hidden-thinking text drawn for the inputs beside it: the theme's thinking colour, the label and whether chalk draws
+// modifiers (chalk's color level above zero).
+type hiddenThinkingMemo struct {
+	color, label string
+	plain        bool
+	text         string
+	set          bool
+}
+
+// hiddenThinkingText is the hidden-thinking label in the theme's thinking colour and italic. A click that hides or shows a run changes none of
+// its inputs, so the block keeps the text it built for them instead of building it again.
+func (b *AssistantMessageComponent) hiddenThinkingText() string {
+	color, plain := ActiveTheme().ThinkingText, chalkModifiersOff.Load()
+	memo := &b.hiddenMemo
+	if !memo.set || memo.color != color || memo.label != b.hiddenLabel || memo.plain != plain {
+		*memo = hiddenThinkingMemo{color: color, label: b.hiddenLabel, plain: plain, set: true,
+			text: ChalkItalic(color + b.hiddenLabel + FgClose(color))}
+	}
+	return memo.text
+}
+
 // thinkingRun is the mouse region of thinking run index: its Markdown, or the hidden-thinking label when hidden. A click toggles the
 // run's visibility.
 func (b *AssistantMessageComponent) thinkingRun(index int, md *Markdown, hidden bool) *MouseRegion {
@@ -538,7 +612,7 @@ func (b *AssistantMessageComponent) thinkingRun(index int, md *Markdown, hidden 
 	kept := &b.thinkingRuns[index]
 	hiddenText := ""
 	if hidden {
-		hiddenText = ChalkItalic(ActiveTheme().ThinkingText + b.hiddenLabel + FgClose(ActiveTheme().ThinkingText))
+		hiddenText = b.hiddenThinkingText()
 	} else {
 		md.SetDefaultColor(ActiveTheme().ThinkingText)
 	}

@@ -255,11 +255,11 @@ func TestHelpTextMentionsPiglets(t *testing.T) {
 	}
 }
 
-func TestHelpTextUsesPigSelfUpdateTargets(t *testing.T) {
+// Pi main c23b9ec1 args.ts: the auth line reads "Log in or out, print credentials, or check provider readiness" now that auth login and logout exist.
+func TestHelpTextDescribesAuthLoginLogoutAndStatus(t *testing.T) {
 	help := captureStdout(func() { printHelp(os.Stdout, false) })
-	// Pi 1.1.0 args.ts:293 lists `${APP_NAME} update [source|self|pi]`: the app's own name is the third self target, so pig lists `pig`, never `pi`.
-	if !strings.Contains(help, "pig update [source|self|pig]") || strings.Contains(help, "source|self|pi]") {
-		t.Fatalf("help has stale self-update targets:\n%s", help)
+	if want := "pig auth <command>            Log in or out, print credentials, or check provider readiness"; !strings.Contains(help, want) {
+		t.Fatalf("help lacks the auth line %q:\n%s", want, help)
 	}
 }
 
@@ -267,6 +267,11 @@ func TestHelpTextMentionsProviderEnvVars(t *testing.T) {
 	help := captureStdout(func() { printHelp(os.Stdout, false) })
 	for _, envVar := range []string{
 		"TOGETHER_API_KEY",
+		// Pi 1397070024: a variable per Qwen Token Plan.
+		"QWEN_TOKEN_PLAN_TEAM_API_KEY",
+		"QWEN_TOKEN_PLAN_TEAM_CN_API_KEY",
+		"QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY",
+		"QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY",
 		"XIAOMI_API_KEY",
 		"XIAOMI_TOKEN_PLAN_CN_API_KEY",
 		"XIAOMI_TOKEN_PLAN_AMS_API_KEY",

@@ -17,13 +17,13 @@ The qualified verification toolchain is:
 - Go 1.27.4;
 - macOS 13 or later for native macOS builds;
 - Git;
-- Node.js 24.22.1;
-- npm 12.1.0;
-- Python 3.12;
+- Node.js 24.22.2;
+- npm 12.2.1;
+- Python 3.12, and CPython 3.11 for `make test-sdk-py-311`, which `make check` runs (`PIG_SDK_PY_311` names the interpreter; the default is `python3.11`);
 - Rust and Cargo 1.97.1;
 - tmux 3.7 on Unix.
 
-Use the versions pinned by the repository and CI image metadata.
+Use the versions pinned by the repository and CI image metadata. The root module declares Go 1.27 as its language floor, because it imports `encoding/json/v2`; the extension SDK and the other nested modules keep Go 1.26.
 
 ## Build
 
@@ -34,7 +34,11 @@ go build -o bin/pig ./cmd/pig
 
 Do not use `go install ./cmd/pig` in a development checkout. Keep test and candidate binaries under the repository `bin/` directory or another explicit temporary path.
 
-After editing `coding/extension/host/subprocess/runtime-node/`, run `go generate ./coding/extension/host/subprocess` before a direct `go build`. Commit both `runtime-node.pack` and `runtime_node_digest_generated.go` with the source changes. The archive holds the same runtime files in a few solid zstd blocks (`noderuntimepack`); its generated content digest keys the immutable runtime cache. `make pig`, `make build`, `make install`, and `make parity-bin` regenerate it automatically. `TestNodeRuntimeArchiveMatchesSources` rejects added, removed, or changed source files that are missing from the archive.
+After editing `coding/extension/host/subprocess/runtime-node/`, run `go generate ./coding/extension/host/subprocess` before a direct `go build`. Commit both `runtime-node.pack` and `runtime_node_digest_generated.go` with the source changes. The archive holds the same runtime files in a few solid zstd blocks (`noderuntimepack`); its generated content digest keys the immutable runtime cache. `make pig`, `make build`, `make install`, and `make parity-bin` regenerate it automatically. The blocks are written by the pinned zstd command at its highest level (22), like every other embedded frame (`automation/ci/install-zstd.sh` builds it; `internal/zstdblob`); a block of the archive on disk that already decodes to the same bytes is kept, so those targets need the command only after a runtime source changed. `TestNodeRuntimeArchiveMatchesSources` rejects added, removed, or changed source files that are missing from the archive.
+
+`make generate` vendors Pi's runtime for this host from the installed pinned Pi (`make vendor-pi-dist`, which needs `make parity-deps`) and then packs it (`make node-runtime`). `make vendor-pi-dist-drift` and `make node-runtime-drift` fail when either step is stale, and CI's bookkeeping job runs both. The observation oracles (`automation/gen/regenerate-observation-oracles.sh`) are recordings under a pinned Node, not derivations. `make generate` does not re-record them, and their timestamps are not drift.
+
+`make generate` vendors Pi's runtime for this host from the installed pinned Pi (`make vendor-pi-dist`, which needs `make parity-deps`) and then packs it (`make node-runtime`). `make vendor-pi-dist-drift` and `make node-runtime-drift` fail when either step is stale, and CI's bookkeeping job runs both. The observation oracles (`automation/gen/regenerate-observation-oracles.sh`) are recordings under a pinned Node, not derivations. `make generate` does not re-record them, and their timestamps are not drift.
 
 ## Release version
 
@@ -58,7 +62,18 @@ This target installs the lockfile-pinned Pi comparator. It retrieves the pinned 
 
 ## Model catalog generation
 
-`cmd/gen-models -src <published models.generated.js> -out <file>` translates the pinned published Pi catalog into Go. This is the complete-catalog regeneration path used by `automation/gen/generate-model-catalogs.sh`.
+The model catalog is Pi's: the data Pi's own catalog generator (`packages/ai/catalog/generate.ts`, `generate-models` before `build` in Pi) makes from live models.dev, OpenRouter, Vercel AI Gateway, NVIDIA NIM and Radius responses. It is not the frozen snapshot the published `@earendil-works/pi-ai` 1.5.2 package ships (that snapshot is the day Pi built its release). PiG commits the responses of one live fetch, `automation/gen/catalog-source/responses.tar.gz`, and `meta.json` beside it: the fetch time, every URL with its status and sha256, the sha256 of the archive, and the Pi commit whose generator is run over it (the pin) and the Pi commit of the three provider catalog files (`pi-overlay/`) that Pi main changed after the pin. The catalog now in the tree was fetched at the `fetchedAt` of that file. `make model-catalogs` (part of `make generate`) reads only that recording and is offline: `cmd/gen-models -replay-source` ports Pi's generator over it, the oracle Pi's own generator runs over the same recording (`automation/pin/oracle.py` installs its output into the oracle's `pi-ai` and the bundle `pi` runs), the script requires the two outputs to be identical (every file, every byte), and `cmd/gen-models -src` emits the Go catalogs from the oracle's barrel and shards. The parity scenarios therefore compare PiG with a Pi that holds the same data.
+
+A refresh is a reviewed data change, not a side effect of a build. To refresh near the cut:
+
+1. `make model-catalogs-live` fetches live (the only target that does), replaces the recording, rebuilds the oracle over it and regenerates the Go catalogs (about 2 minutes plus the oracle build).
+2. `make vendor-pi-dist vendor-sdk-ts-pin-declarations generate` regenerates the vendored Node shims (which carry the data), `extensions/sdk-ts/pi-pin.d.ts` and every derived file (about 8 minutes).
+3. Review `git diff --stat` and the model list: models removed, models added, changed limits and prices (the diff of `ai/catalog_records` and `test/parity/interfaces/pig-go.json` is not readable; compare `automation/gen/catalog-source/meta.json` and the data of the oracle with the previous commit's). A removed model that is a default (`defaultModelPerProvider`) or that a test restores from a session must be handled in that test.
+4. Re-run: `go test ./ai/... ./cmd/gen-models ./coding ./coding/extension ./internal/codingagent/...`, the `model-resolver-selector`, `model-runtime-store-catalog` and `providers-registry` parity families, `make test-sdk-ts`, `make model-data-check`, the size rows (`TestReleaseBinarySizeGate`; the data moves the binaries), then the lane precheck. Pinned values in tests come from Pi's own tests at the pinned Pi commit or from the oracle's data, never from the Go output. A refresh needs no test edit: the one differential test (the Go generator equals Pi's generator over the recording) and the tests that read the oracle's data follow the recording, and a test that needs a model of fixed values uses a hand-written `zz-fixture` model.
+
+When the pin moves (`make pin-bump`), the recording must be refreshed too: the oracle refuses a recording whose `piCommit` is not the pin, and the overlay is re-taken from Pi at the new pin (the overlay is empty when the pin's generator already has those files).
+
+`cmd/gen-models -src <models.generated.js> -out <file>` translates a Pi catalog barrel into Go; `automation/gen/generate-model-catalogs.sh` runs it on the oracle's barrel.
 
 The command also exposes the ported models.dev Fireworks and Qwen Token Plan generation stages. Use `--json-only --json-output <directory>` to inspect their JSON catalogs without changing the committed Go catalog. Add `--strict` to reject an Individual model list that loses a required tool-capable model before publishing output. Other upstream network-provider stages and TypeScript publication are not implemented by this mode. Without `--json-only`, this mode writes the selected stages to `-out`; use a separate output file, not the complete committed catalog.
 

@@ -4,53 +4,134 @@ package codingagent
 
 import (
 	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/internal/jsonopts"
 	"github.com/MichaelKinsy/PiG/tui"
 )
 
-// Ports packages/coding-agent/src/modes/interactive/interactive-mode.ts:3985-4025.
-func countDroppedThinkingBlocks(message *agent.AssistantMessage) int {
-	count := 0
-	for _, diagnostic := range message.Diagnostics {
-		if diagnostic.Type != "anthropic_input_transformations" {
+type reasoningDropDiagnostic struct {
+	provider    string
+	droppedType string
+	noun        [2]string
+}
+
+var reasoningDropDiagnostics = map[string]*reasoningDropDiagnostic{
+	"anthropic_input_transformations": {
+		provider:    "Anthropic",
+		droppedType: "thinking_dropped",
+		noun:        [2]string{"thinking block", "thinking blocks"},
+	},
+	"openai_input_transformations": {
+		provider:    "OpenAI",
+		droppedType: "reasoning",
+		noun:        [2]string{"reasoning item", "reasoning items"},
+	},
+}
+
+type droppedReasoningState struct {
+	diagnostic *reasoningDropDiagnostic
+	count      int
+}
+
+// Ports packages/coding-agent/src/modes/interactive/interactive-mode.ts (getDroppedReasoning).
+// Returns the matching diagnostic kind, its dropped count, and the index of the diagnostic in message.Diagnostics
+// without allocating, so the unchanged path stays zero-allocation.
+func countDroppedReasoning(message *agent.AssistantMessage) (droppedReasoningState, int) {
+	if message == nil {
+		return droppedReasoningState{}, -1
+	}
+	for i, diagnostic := range message.Diagnostics {
+		kind := reasoningDropDiagnostics[diagnostic.Type]
+		if kind == nil {
 			continue
 		}
+		count := 0
 		switch transformations := diagnostic.Details["transformations"].(type) {
 		case []any:
 			for _, value := range transformations {
-				if transformation, ok := value.(map[string]any); ok && transformation["type"] == "thinking_dropped" {
+				if transformation, ok := value.(map[string]any); ok && transformation["type"] == kind.droppedType {
 					count++
 				}
 			}
 		case []map[string]any:
 			for _, transformation := range transformations {
-				if transformation["type"] == "thinking_dropped" {
+				if transformation["type"] == kind.droppedType {
 					count++
 				}
 			}
+		default:
+			continue
+		}
+		if count > 0 {
+			return droppedReasoningState{diagnostic: kind, count: count}, i
 		}
 	}
-	return count
+	return droppedReasoningState{}, -1
 }
 
-// maybeShowThinkingDropNotice compares with the preceding displayed response. Session persistence can overtake queued UI events, so the owner loop keeps this scalar and branch rebuilds initialize it in their existing history walk.
+func collectDroppedReasoningReasons(diagnostic ai.AssistantMessageDiagnostic, droppedType string) []string {
+	var seen map[string]struct{}
+	var reasons []string
+	add := func(transformation map[string]any) {
+		if transformation["type"] != droppedType {
+			return
+		}
+		reason, ok := transformation["reason"].(string)
+		if !ok {
+			return
+		}
+		if seen == nil {
+			seen = make(map[string]struct{})
+		}
+		if _, dup := seen[reason]; !dup {
+			seen[reason] = struct{}{}
+			reasons = append(reasons, reason)
+		}
+	}
+	switch transformations := diagnostic.Details["transformations"].(type) {
+	case []any:
+		for _, value := range transformations {
+			if transformation, ok := value.(map[string]any); ok {
+				add(transformation)
+			}
+		}
+	case []map[string]any:
+		for _, transformation := range transformations {
+			add(transformation)
+		}
+	}
+	return reasons
+}
+
+// maybeShowThinkingDropNotice compares with the preceding displayed response. Session persistence can overtake queued UI events, so the owner loop keeps this state and branch rebuilds initialize it in their existing history walk.
 func (m *InteractiveMode) maybeShowThinkingDropNotice(message *agent.AssistantMessage) {
 	if !m.showCacheMissNotices() {
 		return
 	}
-	count := countDroppedThinkingBlocks(message)
-	if count == 0 || count <= m.previousThinkingDroppedCount {
+	dropped, diagIdx := countDroppedReasoning(message)
+	if dropped.count == 0 {
 		return
 	}
-	noun := "thinking blocks"
-	if count == 1 {
-		noun = "thinking block"
+	if m.previousDroppedReasoning.diagnostic == dropped.diagnostic && dropped.count <= m.previousDroppedReasoning.count {
+		return
 	}
-	text := fmt.Sprintf("Anthropic dropped %d %s (details in session)", count, noun)
+	noun := dropped.diagnostic.noun[1]
+	if dropped.count == 1 {
+		noun = dropped.diagnostic.noun[0]
+	}
+	reasons := ""
+	if list := collectDroppedReasoningReasons(message.Diagnostics[diagIdx], dropped.diagnostic.droppedType); len(list) > 0 {
+		reasons = ": " + strings.Join(list, ", ")
+	}
+	text := fmt.Sprintf("%s dropped %d %s%s (details in session)", dropped.diagnostic.provider, dropped.count, noun, reasons)
 	m.chatContainer.Add(tui.NewSpacer(1))
 	m.chatContainer.Add(themedNotice("warning", text, 1))
 }
@@ -67,6 +148,61 @@ func (m *InteractiveMode) finalizeRunningTools() {
 	m.toolMu.Unlock()
 }
 
+// fileCallMembers is the members of a read or write call's arguments the file renderers read (toolBodyRendererForCall).
+type fileCallMembers struct {
+	FilePath fileCallMember `json:"file_path"`
+	Path     fileCallMember `json:"path"`
+	Content  fileCallMember `json:"content"`
+}
+
+// fileCallMember is what the renderers ask of one member: whether it is absent (missing or null), a string, or a value of another
+// type. A value of another type is skipped, not built. A repeated member's last value, null included, is the one kept.
+type fileCallMember struct {
+	kind jsontext.Kind // 0 for a missing member
+	text string        // the value of a string member
+}
+
+func (member *fileCallMember) UnmarshalJSONFrom(decoder *jsontext.Decoder) error {
+	kind := decoder.PeekKind()
+	if kind != '"' {
+		*member = fileCallMember{kind: kind}
+		return decoder.SkipValue()
+	}
+	token, err := decoder.ReadToken()
+	if err != nil {
+		return err
+	}
+	*member = fileCallMember{kind: kind, text: token.String()}
+	return nil
+}
+
+// otherFileCallArgument stands for a member the model sent as a boolean, a number, an array or an object.
+type otherFileCallArgument struct{}
+
+// fileCallArguments reads from a read or write call's arguments the three members the file renderers use and nothing else: a string
+// member as its string, a missing or null one as no member, and one of any other type as otherFileCallArgument. Text that is not one
+// JSON object gives no members. Member names match exactly, as upstream's property reads on event.args do.
+func fileCallArguments(args json.RawMessage) ai.JsonObject {
+	var members fileCallMembers
+	if err := jsonv2.Unmarshal(args, &members, jsonopts.Parse); err != nil {
+		return nil
+	}
+	arguments := make(ai.JsonObject, 3)
+	for _, member := range [...]struct {
+		name  string
+		value *fileCallMember
+	}{{"file_path", &members.FilePath}, {"path", &members.Path}, {"content", &members.Content}} {
+		switch member.value.kind {
+		case 0, 'n':
+		case '"':
+			arguments[member.name] = member.value.text
+		default:
+			arguments[member.name] = otherFileCallArgument{}
+		}
+	}
+	return arguments
+}
+
 // handleAgentEvent handles one event from the agent loop for live rendering.
 // It runs on the main input goroutine (driven by the inputLoop select on
 // m.eventCh), single-threaded with keystroke handling and posted UI tasks, so
@@ -74,9 +210,14 @@ func (m *InteractiveMode) finalizeRunningTools() {
 // JS event loop where agent events and input are dispatched on one thread.
 // Cross-event state (the current assistant block / message / turn index) lives
 // on InteractiveMode fields since the handler is now invoked per event.
-// setTerminalProgress writes the OSC 9;4 terminal progress indicator.
-var setTerminalProgress = tui.SetTerminalProgress
 
+// handleAgentEvent takes one item of the Session's Events on the owner loop.
+//
+// Pi's frame is a timer callback (packages/tui/src/tui.ts:1033-1090 requestRender), so it cannot begin between two events that Pi's loop handles in one task: the events of a response the provider delivered in one run, and the message_end, tool_execution_start, turn_end and agent_end the loop emits behind them without awaiting anything (packages/agent/src/agent-loop.ts:262-263, 296-299, 329). The Session marks the bounds of such a task (eventRegionMarker). The loop takes the frame timer and the events from one select, so between the markers it only collects the events, and applies them all in the iteration that takes the closing marker: a frame that falls due meanwhile draws the state before the task, as Pi's timer does when it fires before the task, and the frame after it draws the whole task.
+//
+// No frame, dialog or input waits for a marker. A producer that waits inside a task delays that task's events only, and a task that closes early is drawn as it was without markers. A task of one message_update, the chunk of a provider that streams, arrives without markers and is applied as it arrives (coding.Session, sessionEventRegions).
+//
+// Applying a task's events at its close, rather than as they arrive with only the frame timer kept out of the task, makes the task one change of the mode's state: every paint sees all of it or none, the paint after a keystroke and the one a dialog asks for by name included, and a task whose end went unreported would hold back its own events, never the screen. What is collected is kept small (collectEvent).
 func (m *InteractiveMode) handleAgentEvent(ev agent.AgentEvent) {
 	if m.tuiTornDown {
 		// Pi's stop() unsubscribes the mode from its Session before it stops the TUI (interactive-mode.ts stop: this.unsubscribe()), so the events of a run that ends under the quit's dispose reach the extensions and the session file but not the mode, and nothing of the run is drawn after the stop. The Session's flush still waits for its acknowledgement.
@@ -85,16 +226,97 @@ func (m *InteractiveMode) handleAgentEvent(ev agent.AgentEvent) {
 		}
 		return
 	}
-	// Each assistant message owns one block updated from authoritative event snapshots.
 	if barrier, ok := ev.(eventBarrier); ok {
+		if marker, ok := ev.(eventRegionMarker); ok {
+			if open, bounds := marker.EventRegion(); bounds {
+				m.setEventRegion(open)
+				return
+			}
+		}
 		// Every earlier event has now been handled on this loop.
+		m.applyEventRegion()
 		barrier.AcknowledgeEvent()
 		return
 	}
+	if m.eventRegionOpen {
+		m.collectEvent(ev)
+		switch ev.(type) {
+		case agent.AgentEndEvent, agent.AgentSettledEvent:
+			// The run is over, so its task is, whatever became of the closing marker.
+			m.setEventRegion(false)
+		}
+		return
+	}
+	m.applyAgentEvent(ev)
+}
+
+// setEventRegion opens a task's region, or closes it and applies the events collected in it.
+func (m *InteractiveMode) setEventRegion(open bool) {
+	m.eventRegionOpen = open
+	if !open {
+		m.applyEventRegion()
+	}
+}
+
+// The values of InteractiveMode.eventRegionUpdate: the part of the message that the message_update collected last reports.
+const (
+	// eventRegionNoUpdate: the event collected last is no message_update, or none is collected.
+	eventRegionNoUpdate = iota
+	// eventRegionMessageUpdate: it reports no tool call.
+	eventRegionMessageUpdate
+	// eventRegionToolCallUpdate plus a content index: it reports the tool call of that block.
+	eventRegionToolCallUpdate
+)
+
+// collectEvent keeps ev for the close of the task that runs.
+//
+// A message_update that follows another of the same part of the message takes its place. Pi applies every message_update of a task before the frame that follows the task, and each is applied from what it carries alone (interactive-mode.ts handleEvent message_update: the message, and for a tool call its block's arguments), so the later of two for one part leaves what both would have left: the message block is set from the later message, and the card of the tool call at one content index is created once and given the later arguments. A response that arrives in one piece is one task of hundreds of updates; held until the close they would be so many messages kept alive for the collector to trace and so many blocks set for one frame. Updates for different tool calls, and the events between them, keep their order.
+func (m *InteractiveMode) collectEvent(ev agent.AgentEvent) {
+	part := eventRegionNoUpdate
+	if update, ok := ev.(agent.MessageUpdateEvent); ok {
+		part = eventRegionMessageUpdate
+		switch event := update.AssistantMessageEvent.(type) {
+		case ai.ToolCallStartEvent:
+			part = toolCallUpdatePart(event.ContentIndex)
+		case ai.ToolCallDeltaEvent:
+			part = toolCallUpdatePart(event.ContentIndex)
+		case ai.ToolCallEndEvent:
+			part = toolCallUpdatePart(event.ContentIndex)
+		}
+		if part != eventRegionNoUpdate && part == m.eventRegionUpdate {
+			m.eventRegion[len(m.eventRegion)-1] = ev
+			return
+		}
+	}
+	m.eventRegionUpdate = part
+	m.eventRegion = append(m.eventRegion, ev)
+}
+
+// toolCallUpdatePart is the eventRegionUpdate value of a message_update that reports the tool call of the block at index. An index that is no block's names no part, so such an update is kept beside its neighbours.
+func toolCallUpdatePart(index int) int {
+	if index < 0 {
+		return eventRegionNoUpdate
+	}
+	return eventRegionToolCallUpdate + index
+}
+
+// applyEventRegion applies the collected events in the order they arrived, in this one iteration of the loop.
+func (m *InteractiveMode) applyEventRegion() {
+	events := m.eventRegion
+	m.eventRegion, m.eventRegionUpdate = m.eventRegion[:0], eventRegionNoUpdate
+	for i, ev := range events {
+		events[i] = nil
+		m.applyAgentEvent(ev)
+	}
+}
+
+// applyAgentEvent updates the mode for one Session event.
+func (m *InteractiveMode) applyAgentEvent(ev agent.AgentEvent) {
+	// Each assistant message owns one block updated from authoritative event snapshots.
 	m.programStatusReporter().HandleEvent(ev)
 	switch e := ev.(type) {
 	case agent.SessionInfoChangedEvent:
-		tui.SetTerminalTitle(tui.BuildTerminalTitle(e.Name, m.opts.CWD))
+		m.setTerminalTitle(tui.BuildTerminalTitle(e.Name, m.opts.CWD))
 		m.statusLine.SetName(e.Name)
 		m.tuiInst.RequestRender()
 
@@ -108,18 +330,20 @@ func (m *InteractiveMode) handleAgentEvent(ev agent.AgentEvent) {
 		clear(m.toolFileCalls)
 		clear(m.pendingArgs)
 		m.toolMu.Unlock()
-		if m.opts.Settings.GetShowTerminalProgress() {
-			setTerminalProgress(true)
-		}
-		// Show the working status in the opted-in editor border.
-		m.startWorkingLoader()
+		// Pi restores the main escape handler here; the terminal progress and the working status start at turn_start.
+		m.retryEscapeHandler = false
 
 	case agent.AgentEndEvent:
 		if m.opts.Settings.GetShowTerminalProgress() {
-			setTerminalProgress(false)
+			m.setTerminalProgress(false)
 		}
-		// Stop working loader. Mirrors upstream streaming_stopped.
-		m.stopWorkingLoader()
+		m.clearStatusIndicator("working")
+		// Pi removes a message still streaming when the run ends (interactive-mode.ts agent_end).
+		if m.evCurrentBlock != nil {
+			m.chatContainer.Remove(m.evCurrentBlock)
+			m.assistantBlocks = slices.DeleteFunc(m.assistantBlocks, func(block *tui.AssistantMessageComponent) bool { return block == m.evCurrentBlock })
+			m.evCurrentBlock = nil
+		}
 		// Finalize any tool still mid-execution when the turn ended (an
 		// aborted run emits no ToolExecutionEnd, so its component would stay
 		// ToolStateRunning and its live "Elapsed X.Xs" footer would keep
@@ -136,7 +360,7 @@ func (m *InteractiveMode) handleAgentEvent(ev agent.AgentEvent) {
 
 	case agent.TurnStartEvent:
 		if m.opts.Settings.GetShowTerminalProgress() {
-			setTerminalProgress(true)
+			m.setTerminalProgress(true)
 		}
 		if m.workingVisible {
 			if m.activeStatusIndicator == nil || m.activeStatusIndicator.Kind != "working" {
@@ -146,6 +370,22 @@ func (m *InteractiveMode) handleAgentEvent(ev agent.AgentEvent) {
 			m.clearStatusIndicator("")
 		}
 		m.tuiInst.RequestRender()
+
+	case agent.QueueUpdateEvent:
+		m.updatePendingMessagesDisplay()
+		m.tuiInst.RequestRender()
+
+	case agent.ThinkingLevelChangedEvent:
+		m.refreshThinkingLevel()
+		m.tuiInst.RequestRender()
+
+	case agent.BashExecutionUpdateEvent:
+		// The bash execution callback renders the command's output.
+
+	case agent.AgentSettledEvent:
+		// Move user bash output shown while the agent works into the chat when the run settles.
+		m.flushPendingBashBlocks()
+		m.checkShutdownRequested()
 
 	case agent.TurnEndEvent:
 		m.evTurnIndex = e.TurnIndex + 1
@@ -168,7 +408,7 @@ func (m *InteractiveMode) handleAgentEvent(ev agent.AgentEvent) {
 			// upstream: interactive-mode.ts handleEvent message_start renders every displayed custom message through addMessageToChat,
 			// whichever path delivered it (before_agent_start handler messages, queued steer/follow-up, nextTurn, a triggerTurn start).
 			if entry, display := customMessageEntryOf(custom); display {
-				m.appendCustomMessage(entry)
+				m.appendCustomMessage(entry, messageMeta{})
 				m.tuiInst.RequestRender()
 			}
 		}
@@ -182,10 +422,18 @@ func (m *InteractiveMode) handleAgentEvent(ev agent.AgentEvent) {
 		}
 
 	case agent.MessageUpdateEvent:
-		if m.evCurrentBlock != nil && e.Message.Assistant != nil {
-			updateAssistantMessageBlock(m.evCurrentBlock, e.Message.Assistant)
+		// Pi's whole message_update handler runs only while a message streams.
+		if m.evCurrentBlock == nil || e.Message.Assistant == nil {
+			break
+		}
+		updateAssistantMessageBlock(m.evCurrentBlock, e.Message.Assistant)
+		// pig additive (D625): while the adaptive policy paces the frames, a tool call delta that leaves its card's lines as the last frame drew them asks for no frame (unchanged, below): the frame would send the terminal nothing. Under Pi's interval every update asks for one here and one below, as Pi's handler does.
+		_, toolDelta := e.AssistantMessageEvent.(ai.ToolCallDeltaEvent)
+		skippable := toolDelta && m.framePacingInForce()
+		if !skippable {
 			m.tuiInst.RequestRender()
 		}
+		unchanged := false
 		var toolIndex int
 		var toolID, toolName string
 		var endCall ai.ToolCall
@@ -256,42 +504,40 @@ func (m *InteractiveMode) handleAgentEvent(ev agent.AgentEvent) {
 				m.appendToChat(comp)
 			} else {
 				m.toolMu.Unlock()
+				unchanged = skippable && hasStreamed && comp.CallShowsNoChange()
 			}
 		} else {
 			m.toolMu.Unlock()
 		}
-		m.tuiInst.RequestRender()
+		if !unchanged {
+			m.tuiInst.RequestRender()
+		}
 
 	case agent.MessageEndEvent:
+		// Pi ends message_end for a user message without rendering or touching the pending tools (interactive-mode.ts handleEvent).
+		if e.Message.User != nil {
+			// pig: the footer holds a stored context estimate (Pi's footer recomputes it on every render), so the user message_end refreshes it here: the prompt counts as soon as the message is recorded.
+			m.refreshFooterContextUsage()
+			break
+		}
 		defer m.refreshFooterContextUsage()
+		if e.Message.Assistant != nil && e.Message.Assistant.Usage != nil {
+			m.statusLine.SetTurnContextUsage(e.Message.Assistant.Usage)
+		}
+		// Pi finishes a message only while one streams; any other message_end just requests a frame.
+		if m.evCurrentBlock == nil || e.Message.Assistant == nil {
+			m.tuiInst.RequestRender()
+			break
+		}
+		// An aborted message already carries the text the mode's Session listener gave it before the Session persisted and published it (handleSessionEvent).
 		finished := e.Message.Assistant
-		if finished != nil && finished.StopReason == ai.StopReasonAborted {
-			// upstream: interactive-mode.ts:3544 replaces an aborted message's errorMessage before rendering it.
-			aborted := *finished
-			aborted.ErrorMessage = m.abortedMessageText()
-			finished = &aborted
-		}
-		if m.evCurrentBlock != nil && finished != nil {
-			updateAssistantMessageBlock(m.evCurrentBlock, finished)
-		}
-		if e.Message.Assistant != nil {
-			if e.Message.Assistant.Usage != nil {
-				m.statusLine.SetTurnContextUsage(e.Message.Assistant.Usage)
-			}
-			if m.showCacheMissNotices() {
-				if notice := formatCacheMissNotice(m.currentSession().detectCacheMiss(e.Message.Assistant)); notice != "" {
-					m.addCacheMissNotice(notice)
-				}
-			}
-			m.maybeSuggestBugReport(e.Message.Assistant)
-		}
+		updateAssistantMessageBlock(m.evCurrentBlock, finished)
 		// Mirrors upstream message_end (interactive-mode.ts:2774-2793):
 		// On abort/error → push the error into every pending tool component
 		// (the assistant message block's own error is suppressed when
 		// hasToolCalls=true, so tools are the only visual feedback).
 		// On normal completion → mark args complete (triggers diff rendering).
-		isAbortOrError := e.Message.Assistant != nil &&
-			(e.Message.Assistant.StopReason == "aborted" || e.Message.Assistant.StopReason == "error")
+		isAbortOrError := e.Message.Assistant.StopReason == "aborted" || e.Message.Assistant.StopReason == "error"
 		m.toolMu.Lock()
 		if isAbortOrError {
 			errMsg := finished.ErrorMessage
@@ -320,17 +566,20 @@ func (m *InteractiveMode) handleAgentEvent(ev agent.AgentEvent) {
 		// Clear pendingArgs for next message.
 		clear(m.pendingArgs)
 		m.toolMu.Unlock()
-		if e.Message.Assistant != nil {
-			if !isAbortOrError && m.evCurrentBlock != nil {
-				m.maybeShowThinkingDropNotice(e.Message.Assistant)
+		if isAbortOrError {
+			m.maybeSuggestBugReport(e.Message.Assistant)
+		} else {
+			m.maybeShowThinkingDropNotice(e.Message.Assistant)
+			if m.showCacheMissNotices() {
+				if notice := formatCacheMissNotice(m.currentSession().detectCacheMiss(e.Message.Assistant)); notice != "" {
+					m.addCacheMissNotice(notice)
+				}
 			}
-			m.previousThinkingDroppedCount = countDroppedThinkingBlocks(e.Message.Assistant)
 		}
-		if m.evCurrentBlock != nil {
-			m.evCurrentBlock.FinishStreaming() // its last delta arrived; keep no memos for the next one
-		}
+		m.previousDroppedReasoning, _ = countDroppedReasoning(e.Message.Assistant)
+		m.evCurrentBlock.FinishStreaming() // its last delta arrived; keep no memos for the next one
 		m.evCurrentBlock = nil
-		m.tuiInst.CancelPendingRender()
+		m.tuiInst.RequestRender()
 
 	case agent.ToolExecutionStartEvent:
 		// A call another tool made through ctx.executeTool(), for example from a codemode script, is shown inside its
@@ -348,12 +597,10 @@ func (m *InteractiveMode) handleAgentEvent(ev agent.AgentEvent) {
 		argsPreview := tui.HeaderForTool(e.ToolName, e.Args, m.opts.CWD)
 		m.toolMu.Lock()
 		if e.ToolName == "read" || e.ToolName == "write" {
-			var args map[string]any
-			_ = json.Unmarshal(e.Args, &args)
 			if m.toolFileCalls == nil {
 				m.toolFileCalls = make(map[string]ai.ToolCall)
 			}
-			m.toolFileCalls[e.ToolCallID] = ai.ToolCall{Name: e.ToolName, Arguments: args}
+			m.toolFileCalls[e.ToolCallID] = ai.ToolCall{Name: e.ToolName, Arguments: fileCallArguments(e.Args)}
 		}
 		comp := m.toolByID[e.ToolCallID]
 		if comp != nil {
@@ -381,7 +628,10 @@ func (m *InteractiveMode) handleAgentEvent(ev agent.AgentEvent) {
 			m.toolMu.Unlock()
 			m.appendToChat(comp)
 		}
-		m.tuiInst.Render()
+		// upstream: tool-execution.ts markExecutionStarted runs updateDisplay, the card's renderers, at the event, so a renderer's
+		// clock starts here; interactive-mode.ts:3754 then requests the frame, which the throttle draws.
+		comp.Render(m.tuiInst.Width())
+		m.tuiInst.RequestRender()
 
 	case agent.ToolExecutionUpdateEvent:
 		// Live streaming update from a long-running tool (e.g. bash).
@@ -447,12 +697,15 @@ func (m *InteractiveMode) handleAgentEvent(ev agent.AgentEvent) {
 		final.Result = retainToolResult(e.ToolName, result)
 		final.DurationMs = e.DurationMs
 		comp.UpdateResult(final, false)
-		m.tuiInst.Render()
+		// upstream: tool-execution.ts updateResult runs updateDisplay at the event; interactive-mode.ts:3773 then requests the
+		// frame, which the throttle draws.
+		comp.Render(m.tuiInst.Width())
+		m.tuiInst.RequestRender()
 
 	case agent.CompactionStartEvent:
 		// Central abort routing handles Esc and Ctrl+C during compaction.
 		if m.opts.Settings.GetShowTerminalProgress() {
-			setTerminalProgress(true)
+			m.setTerminalProgress(true)
 		}
 		m.isCompacting = true
 		m.showCompactionStatusIndicator(e.Reason)
@@ -463,10 +716,11 @@ func (m *InteractiveMode) handleAgentEvent(ev agent.AgentEvent) {
 		// Restore normal state; handle result.
 		// Mirrors upstream compaction_end handler (interactive-mode.ts:2795-2833).
 		if m.opts.Settings.GetShowTerminalProgress() {
-			setTerminalProgress(false)
+			m.setTerminalProgress(false)
 		}
 		m.isCompacting = false
 		m.clearStatusIndicator("compaction")
+		m.compactionStartedAt = time.Time{} // pig divergence (D652): the next compaction dates itself
 
 		switch {
 		case e.Aborted:
@@ -477,7 +731,7 @@ func (m *InteractiveMode) handleAgentEvent(ev agent.AgentEvent) {
 			} else {
 				m.showStatus("Auto-compaction cancelled")
 			}
-		case e.Summary != "":
+		case e.HasResult:
 			var entries []SessionEntry
 			if session := m.currentSession(); session != nil {
 				entries = session.BuildContextEntries()
@@ -498,14 +752,28 @@ func (m *InteractiveMode) handleAgentEvent(ev agent.AgentEvent) {
 		// turn-starting handleSubmit stay single-threaded with editor state.
 		// Retry recovery steers into the imminent Continue turn; other endings
 		// start a new turn from the first queued prompt when idle.
-		m.flushCompactionQueue(m.runCtx, !e.WillRetry)
+		m.flushCompactionQueue(m.runCtx, e.WillRetry)
 		m.tuiInst.Render()
 
 	case agent.AutoRetryStartEvent:
+		// pig additive (D654): a silent retry shows no status line and no final error, and Escape still cancels its delay, as in Pi.
+		if DefaultRetrySilent() {
+			m.clearStatusIndicator("")
+			m.retryCountdownStop = func() {}
+			m.retryEscapeHandler = true
+			break
+		}
 		m.showRetryStatusIndicator(e.Attempt, e.MaxAttempts, e.DelayMs)
+		// Escape cancels the retry delay until agent_start or auto_retry_end.
+		m.retryEscapeHandler = true
 		m.tuiInst.Render()
 
 	case agent.AutoRetryEndEvent:
+		if DefaultRetrySilent() {
+			m.retryCountdownStop = nil
+			m.retryEscapeHandler = false
+			break
+		}
 		m.clearStatusIndicator("retry")
 		// Mirrors upstream auto_retry_end: only a final failure, including a
 		// cancelled retry, is shown, as a persistent transcript error.
@@ -548,8 +816,8 @@ func (m *InteractiveMode) handleAgentEvent(ev agent.AgentEvent) {
 // coalesced/dropped post is re-applied by the next render. Mirrors upstream's
 // single-event-loop resize.
 
-// abortedMessageText is the text an aborted turn shows, naming the automatic retries it was aborted after.
-// upstream: packages/coding-agent/src/modes/interactive/interactive-mode.ts:3544 (message_end) and :4010 (renderSessionContext).
+// abortedMessageText is the text the tool cards of an aborted message show when a session is rendered from its entries, naming the automatic retries running now.
+// upstream: packages/coding-agent/src/modes/interactive/interactive-mode.ts:4212-4218 (renderSessionContext).
 func (m *InteractiveMode) abortedMessageText() string {
 	attempt := 0
 	if m.opts.SessionHandle != nil {
@@ -558,6 +826,8 @@ func (m *InteractiveMode) abortedMessageText() string {
 	return abortedMessageForRetries(attempt)
 }
 
+// abortedMessageForRetries is the errorMessage Pi's interactive mode gives an aborted message.
+// upstream: packages/coding-agent/src/modes/interactive/interactive-mode.ts:3690-3695 and :4213-4218.
 func abortedMessageForRetries(attempt int) string {
 	if attempt <= 0 {
 		return "Operation aborted"

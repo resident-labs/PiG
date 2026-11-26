@@ -84,7 +84,8 @@ func (s *Session) SetSessionFile(path string) error {
 		}
 		if empty {
 			if info.Size() > 0 {
-				return fail(fmt.Errorf("Session file is not a valid pi session: %s", resolved))
+				// pig divergence (D2): the message names pig where Pi's names pi ("Product name in messages").
+				return fail(fmt.Errorf("Session file is not a valid pig session: %s", resolved))
 			}
 			if next, err = newSessionWithOptions(cwd, nil, ""); err != nil {
 				return fail(err)
@@ -127,6 +128,7 @@ func (s *Session) replaceSessionLog(branched *Session) {
 	s.header = branched.header
 	s.effectiveCWD = branched.effectiveCWD
 	s.slots = branched.slots
+	s.ids, s.resident, s.searchRefs = branched.ids, branched.resident, branched.searchRefs
 	s.byID = branched.byID
 	s.danglingParents = branched.danglingParents
 	s.factArena = branched.factArena
@@ -148,6 +150,7 @@ func (s *Session) replaceSessionLog(branched *Session) {
 	s.stats = branched.stats
 	s.name = branched.name
 	s.undecodable = nil
+	s.renderIdentities.clear()
 	s.revision++
 	s.msgMu.Unlock()
 	s.mu.Unlock()

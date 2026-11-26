@@ -20,6 +20,7 @@ import (
 
 	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
 	"github.com/MichaelKinsy/PiG/internal/linkerexec"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 
 	"golang.org/x/mod/modfile"
 
@@ -415,7 +416,7 @@ func buildInputs(p *piglet.Piglet, cells []subprocess.CellSpec) ([]buildInput, e
 			})
 		}
 	}
-	slices.SortFunc(inputs, func(a, b buildInput) int {
+	sortx.Func(inputs, func(a, b buildInput) int {
 		if value := strings.Compare(a.Kind, b.Kind); value != 0 {
 			return value
 		}
@@ -687,7 +688,7 @@ func pigSourceIdentity(source pigSource) (string, string, error) {
 			continue
 		}
 		if err != nil {
-			return "", "", fmt.Errorf("lock Pig source %s: %w", relative, err)
+			return "", "", fmt.Errorf("lock PiG source %s: %w", relative, err)
 		}
 		if info.IsDir() {
 			continue
@@ -699,11 +700,11 @@ func pigSourceIdentity(source pigSource) (string, string, error) {
 		if info.Mode()&os.ModeSymlink != 0 {
 			target, err := os.Readlink(path)
 			if err != nil {
-				return "", "", fmt.Errorf("read Pig source symlink %s: %w", relative, err)
+				return "", "", fmt.Errorf("read PiG source symlink %s: %w", relative, err)
 			}
 			_, _ = hash.Write([]byte(target))
 		} else if err := copyFileInto(hash, path, buffer); err != nil {
-			return "", "", fmt.Errorf("read Pig source %s: %w", relative, err)
+			return "", "", fmt.Errorf("read PiG source %s: %w", relative, err)
 		}
 		_, _ = hash.Write([]byte{0})
 	}

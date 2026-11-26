@@ -21,22 +21,30 @@ import (
 )
 
 // startupModelRuntime is the ModelRuntime surface startup model selection
-// reads: the composed model list and per-provider configured auth.
+// reads: the composed model list, the models the published availability lists, and per-provider configured auth.
 type startupModelRuntime struct {
 	loaded  []codingagent.RuntimeModel
 	load    func() []codingagent.RuntimeModel
 	hasAuth func(providerID string) bool
 	auth    map[string]bool
+	// availableOf selects the entries of the composed models that the availability lists, in its order.
+	availableOf func([]codingagent.RuntimeModel) []codingagent.RuntimeModel
 }
 
+// newStartupModelRuntime is a runtime over a fixed model list whose availability is its providers' configured auth.
 func newStartupModelRuntime(models []codingagent.RuntimeModel, hasAuth func(providerID string) bool) *startupModelRuntime {
-	return &startupModelRuntime{loaded: models, hasAuth: hasAuth, auth: map[string]bool{}}
+	rt := &startupModelRuntime{loaded: models, hasAuth: hasAuth, auth: map[string]bool{}}
+	rt.availableOf = func(models []codingagent.RuntimeModel) []codingagent.RuntimeModel {
+		return slices.DeleteFunc(slices.Clone(models), func(model codingagent.RuntimeModel) bool { return !rt.HasConfiguredAuth(model.Provider) })
+	}
+	return rt
 }
 
-// newLazyStartupModelRuntime is newStartupModelRuntime over the models load lists when a selection first reads them: an explicit --model
-// resolves through ModelRuntime and reads none (main.ts:803-819 reads modelRuntime only where a step needs it).
-func newLazyStartupModelRuntime(load func() []codingagent.RuntimeModel, hasAuth func(providerID string) bool) *startupModelRuntime {
-	return &startupModelRuntime{load: load, hasAuth: hasAuth, auth: map[string]bool{}}
+// newLazyStartupModelRuntime is a runtime over the models load lists when a selection first reads them: an explicit --model
+// resolves through ModelRuntime and reads none (main.ts:803-819 reads modelRuntime only where a step needs it). availableOf is
+// ModelRuntime.AvailableRuntimeModels.
+func newLazyStartupModelRuntime(load func() []codingagent.RuntimeModel, hasAuth func(providerID string) bool, availableOf func([]codingagent.RuntimeModel) []codingagent.RuntimeModel) *startupModelRuntime {
+	return &startupModelRuntime{load: load, hasAuth: hasAuth, auth: map[string]bool{}, availableOf: availableOf}
 }
 
 // models returns the composed models, loading them on the first read.
@@ -83,16 +91,9 @@ func (rt *startupModelRuntime) getModel(providerID, modelID string) *codingagent
 	return &models[index]
 }
 
-// getAvailable mirrors upstream ModelRuntime.getAvailableSnapshot: the
-// composed models whose provider has configured auth.
+// getAvailable mirrors upstream ModelRuntime.getAvailableSnapshot: the composed models the published availability lists, which a provider may narrow per credential.
 func (rt *startupModelRuntime) getAvailable() []codingagent.RuntimeModel {
-	var available []codingagent.RuntimeModel
-	for _, model := range rt.models() {
-		if rt.HasConfiguredAuth(model.Provider) {
-			available = append(available, model)
-		}
-	}
-	return available
+	return rt.availableOf(rt.models())
 }
 
 // GetModel returns an exact composed model without reading authentication.
@@ -162,7 +163,7 @@ type startupModelOptions struct {
 	APIKey string
 }
 
-// startupModel keeps immediate scope warnings separate from deferred model warnings and errors. Selection and fallback continue after an explicit-model diagnostic so metadata can still use the runtime.
+// startupModel keeps the scope warnings, which the runtime's diagnostics list before the session option diagnostics, separate from the model warnings and errors. Selection and fallback continue after an explicit-model diagnostic so metadata can still use the runtime.
 type startupModel struct {
 	Model                *ai.Model
 	Thinking             string
@@ -176,7 +177,7 @@ type startupModel struct {
 func selectStartupModel(ctx context.Context, options startupModelOptions, settings codingagent.Settings, services *coding.AgentSessionServices) (startupModel, error) {
 	// upstream: main.ts:803-819 resolves against modelRuntime, whose catalog and auth include the virtual models the services registered (agent-session-services.ts:182-193).
 	modelRuntime := services.ModelRuntime()
-	rt := newLazyStartupModelRuntime(modelRuntime.RuntimeModels, modelRuntime.HasConfiguredAuth)
+	rt := newLazyStartupModelRuntime(modelRuntime.RuntimeModels, modelRuntime.HasConfiguredAuth, modelRuntime.AvailableRuntimeModels)
 	var result startupModel
 	selected, err := selectSessionOptionModel(rt, modelRuntime, options, settings, &result)
 	if err != nil {
@@ -227,7 +228,7 @@ func selectStartupModel(ctx context.Context, options startupModelOptions, settin
 			result.ModelFallbackMessage += ". Using " + selected.Provider + "/" + selected.ID
 		}
 	}
-	result.Model, err = buildModelFromRef(ctx, selected.Provider, selected.ID, services)
+	result.Model, err = buildSelectedModel(ctx, selected, services)
 	// A virtual model is the runtime's shared catalog entry and carries its reasoning from its definition (virtual-models.ts:159-176 createVirtualModel), so startup does not rewrite it.
 	if err == nil && selected.Reasoning && result.Model != nil && !coding.IsVirtualModel(result.Model) {
 		result.Model.ProviderMeta.Reasoning = true
@@ -285,11 +286,24 @@ func selectSessionOptionModel(rt *startupModelRuntime, modelRuntime *coding.Mode
 	return &chosen.Model, cliErr
 }
 
-// testFauxCLIModel selects the test-only test-faux provider for a --model naming it, without the registry resolution a real --model takes
-// (ResolveCliModel, which builds every runtime model). It exists only when PIG_TEST_FAUX=1. The provider is registered in the model registry
+// buildSelectedModel builds the session model of a startup selection. Pi gives the session the model its selection returned (main.ts:536-537
+// `options.model = resolved.model`). For an id no catalog carries that is resolveCliModel's copy of one of the provider's models
+// (model-resolver.ts:302-313 buildFallbackModel), which only the selection holds: the provider and id name no model to build.
+func buildSelectedModel(ctx context.Context, selected *codingagent.RuntimeModel, services *coding.AgentSessionServices) (*ai.Model, error) {
+	if fallback := selected.NativeModel; fallback != nil && services.ModelRuntime().GetModel(selected.Provider, selected.ID) == nil {
+		return coding.BuildFallbackModel(fallback, services)
+	}
+	return buildModelFromRef(ctx, selected.Provider, selected.ID, services)
+}
+
+// testFauxCLIModel selects the test-only test-faux provider's own model for a --model naming it, without the registry resolution a real --model
+// takes (ResolveCliModel, which builds every runtime model). It exists only when PIG_TEST_FAUX=1. The provider is registered in the model registry
 // (registerHarnessTestFaux), so every consumer of the registry sees it as Pi's harness-registered one; only this selection is a shortcut, and
 // the startup allocation ceilings (TestStartupAllocationBudget, test/perfgate), which only move down, are measured with it: the registry
-// resolution adds about 6,100 allocations and 380 KB to the warm first prompt.
+// resolution adds about 6,100 allocations and 380 KB to the warm first prompt. The resolution itself has its own ceilings, per provider shape
+// (TestStartupAllocationBudgetRealModel, which runs without PIG_TEST_FAUX). The shortcut stands for the resolution only where both select
+// the same model: an id the provider lists. Any other id is resolved like any provider's, as Pi resolves it for the provider its harness
+// registers from an extension: a copy of the listed model under the id, with the custom model id warning (model-resolver.ts:302-313, 518-532).
 func testFauxCLIModel(options startupModelOptions) (*codingagent.RuntimeModel, string, bool) {
 	if !coding.TestFauxProviderEnabled() {
 		return nil, "", false
@@ -305,6 +319,9 @@ func testFauxCLIModel(options startupModelOptions) (*codingagent.RuntimeModel, s
 	thinking := ""
 	if colon := strings.LastIndex(modelID, ":"); colon != -1 && validThinkingLevels[modelID[colon+1:]] { //portlint:allow utf16units colon is the byte index of ASCII ':' (0x3A), which never occurs inside a multibyte UTF-8 sequence, so the slices split at the same character as lastIndexOf/substring; the suffix is only used when it equals a thinking level (test-faux-only shortcut)
 		modelID, thinking = modelID[:colon], modelID[colon+1:] //portlint:allow utf16units colon is the byte index of ASCII ':' (0x3A), which never occurs inside a multibyte UTF-8 sequence, so the slices split at the same character as lastIndexOf/substring; the suffix is only used when it equals a thinking level (test-faux-only shortcut)
+	}
+	if !coding.IsTestFauxModel(modelID) {
+		return nil, "", false
 	}
 	return &codingagent.RuntimeModel{Provider: "test-faux", ID: modelID, Name: "Test Faux"}, thinking, true
 }

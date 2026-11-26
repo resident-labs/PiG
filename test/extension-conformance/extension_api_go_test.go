@@ -775,7 +775,7 @@ func TestExtensionAPIProviderModelTypesGo(t *testing.T) {
 				t.Fatalf("provider config = %+v (registered: %v)", config, ok)
 			}
 			chat, image, classifier := config.Models[0], config.Models[1], config.Models[2]
-			if chat.ID != "chat-1" || (chat.Type != "" && chat.Type != ai.ModelTypeChat) || chat.ContextWindow != 128000 || chat.MaxTokens != 4096 || !chat.Reasoning {
+			if chat.ID != "chat-1" || (chat.Type != "" && chat.Type != ai.ModelTypeChat) || chat.ContextWindow != 54321 || chat.MaxTokens != 4321 || !chat.Reasoning {
 				t.Fatalf("chat entry = %+v", chat)
 			}
 			if image.ID != "img-1" || image.Type != ai.ModelTypeImage || image.API != "openrouter-images" || !reflect.DeepEqual(image.Output, []string{"image", "text"}) {
@@ -794,20 +794,18 @@ func TestExtensionAPIToolEventsCarryParentAndStructuredContentGo(t *testing.T) {
 		t.Run(placement, func(t *testing.T) {
 			h := newExtensionAPIHarness(t, placement)
 			if _, err := h.runner.EmitToolCall(t.Context(), extension.CustomToolCallEvent{
-				ToolCallEventBase: extension.ToolCallEventBase{Type: "tool_call", ToolCallID: "call-1/1", ParentToolCallID: "call-1"}, ToolName: "helper", Input: map[string]any{},
+				Type: "tool_call", ToolCallID: "call-1/1", ParentToolCallID: "call-1", ToolName: "helper", Input: map[string]any{},
 			}); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := h.runner.EmitToolCall(t.Context(), extension.CustomToolCallEvent{
-				ToolCallEventBase: extension.ToolCallEventBase{Type: "tool_call", ToolCallID: "call-2"}, ToolName: "echo", Input: map[string]any{},
+				Type: "tool_call", ToolCallID: "call-2", ToolName: "echo", Input: map[string]any{},
 			}); err != nil {
 				t.Fatal(err)
 			}
 			result, err := h.runner.EmitToolResult(t.Context(), extension.CustomToolResultEvent{
-				ToolResultEventBase: extension.ToolResultEventBase{
-					Type: "tool_result", ToolCallID: "call-1/1", ParentToolCallID: "call-1", Input: map[string]any{},
-					Content: []any{map[string]any{"type": "text", "text": "helped"}}, StructuredContent: json.RawMessage(`{"n":3}`),
-				},
+				Type: "tool_result", ToolCallID: "call-1/1", ParentToolCallID: "call-1", Input: map[string]any{},
+				Content: []any{map[string]any{"type": "text", "text": "helped"}}, StructuredContent: json.RawMessage(`{"n":3}`),
 				ToolName: "helper",
 			})
 			if err != nil {

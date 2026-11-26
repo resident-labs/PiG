@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
+	"sync"
 	"testing"
 
 	"github.com/MichaelKinsy/PiG/chord/next/contracts"
@@ -16,7 +18,7 @@ import (
 // `tx.update`, `tx.delete`, `tx.updateWhere`, `tx.deleteWhere` and the `tx.get` overlay of them.
 //
 // Pi tests these writes where they are staged, on TableChanges (store/table-changes.test.ts, store/table-writes.test.ts:
-// `tx.update` is `this.#changes(table).update(key, set)`, packages/chord/src/next/documents/transaction.ts:280-287),
+// `tx.update` is `this.#changes(table).update(key, set)`, packages/chord/src/documents/transaction.ts:280-287),
 // and uses `tx.update` and `tx.updateWhere` through `self.tx` in the example test/next/examples/20-tables.ts; it has no
 // test that calls `tx.delete` or `tx.deleteWhere` itself. Each test below runs Pi's case, with its inputs and expected
 // results, on a transaction of the harness object (transaction_test.go) instead of a bare TableChanges.
@@ -91,7 +93,7 @@ func requireAbsent(t *testing.T, row store.Row, err error, what string) {
 }
 
 // TestTablesInATransactionReplayOwnPutUpdateAndDeleteOverTheCommittedRowWithGet runs `it("replays the
-// transaction's own put, update and delete over the committed row")` of packages/chord/test/next/store/table-changes.test.ts:52
+// transaction's own put, update and delete over the committed row")` of packages/chord/test/store/table-changes.test.ts:52
 // on `tx.put`, `tx.update`, `tx.delete` and `tx.get` of a transaction; and `it("an update of an absent key changes
 // nothing")` of table-changes.test.ts:65. The rows the transaction leaves are then the committed ones.
 func TestTablesInATransactionReplayOwnPutUpdateAndDeleteOverTheCommittedRowWithGet(t *testing.T) {
@@ -161,7 +163,7 @@ func TestTablesInATransactionDeleteTheRowWhenTheTransactionCommits(t *testing.T)
 
 // TestTablesInATransactionRefuseGetOnATableAfterAnUpdateWhereOrDeleteWhereOtherTablesAreUnaffected runs `it("is
 // refused on a table after an updateWhere or deleteWhere (W10); other tables are unaffected")` of
-// packages/chord/test/next/store/table-changes.test.ts:71 on `tx.updateWhere`, `tx.deleteWhere` and `tx.get`: Pi's three
+// packages/chord/test/store/table-changes.test.ts:71 on `tx.updateWhere`, `tx.deleteWhere` and `tx.get`: Pi's three
 // TableChanges (updated, deleted-from, untouched) are three tables of the transaction.
 func TestTablesInATransactionRefuseGetOnATableAfterAnUpdateWhereOrDeleteWhereOtherTablesAreUnaffected(t *testing.T) {
 	s := storedOn(t, nil, false, nil)
@@ -195,7 +197,7 @@ func TestTablesInATransactionRefuseGetOnATableAfterAnUpdateWhereOrDeleteWhereOth
 
 // TestTablesInATransactionUpdateWhereAndDeleteWhereAreOneStatementEachWithTheirSets runs `it("updateWhere and
 // deleteWhere are one statement each, recorded with where, set and count")` of
-// packages/chord/test/next/store/table-writes.test.ts:124 on `tx.put`, `tx.updateWhere` and `tx.deleteWhere`: five
+// packages/chord/test/store/table-writes.test.ts:124 on `tx.put`, `tx.updateWhere` and `tx.deleteWhere`: five
 // rows, the `a/` ones moved to `c/` by an expression set, `b/4` deleted; the two bulk writes, the outbox commit and
 // lastSeq are the four statements.
 func TestTablesInATransactionUpdateWhereAndDeleteWhereAreOneStatementEachWithTheirSets(t *testing.T) {
@@ -244,9 +246,9 @@ func TestTablesInATransactionUpdateWhereAndDeleteWhereAreOneStatementEachWithThe
 }
 
 // TestTablesInATransactionUpdateAndUpdateWhereRunTheTablesExample runs the `history` object of the example
-// packages/chord/test/next/examples/20-tables.ts: `record` is `tx.put` (20-tables.ts:53), `hit` is `tx.update` with an
-// expression set (packages/chord/test/next/examples/20-tables.ts:58), `finish` is `tx.updateWhere` with a prefix
-// condition (packages/chord/test/next/examples/20-tables.ts:63); five rows, e1 hit twice and `src/a` finished give two
+// packages/chord/test/examples/20-tables.ts: `record` is `tx.put` (20-tables.ts:53), `hit` is `tx.update` with an
+// expression set (packages/chord/test/examples/20-tables.ts:58), `finish` is `tx.updateWhere` with a prefix
+// condition (packages/chord/test/examples/20-tables.ts:63); five rows, e1 hit twice and `src/a` finished give two
 // hits of e1 and three finished rows, and the open ones page by `at` descending (e3, then e1).
 func TestTablesInATransactionUpdateAndUpdateWhereRunTheTablesExample(t *testing.T) {
 	s := storedOn(t, nil, false, nil)
@@ -290,8 +292,8 @@ func TestTablesInATransactionUpdateAndUpdateWhereRunTheTablesExample(t *testing.
 		t.Fatalf("hits of e1 = %v, want 2", row["hits"])
 	}
 	open := store.NewQuery(definition).
-		Where(func(row store.ColumnRefs) store.Condition { return store.Eq(row["done"], false) }).
-		OrderBy(func(row store.ColumnRefs) *store.ColumnRef { return row["at"] }, "desc")
+		Where(func(row, _ store.ColumnRefs) store.Condition { return store.Eq(row["done"], false) }).
+		OrderBy(func(row, _ store.ColumnRefs) *store.ColumnRef { return row["at"] }, "desc")
 	first, err := table.Page(background, open, 1, store.PageOptions{})
 	requireNoError(t, err)
 	next, err := table.Page(background, open, 1, store.PageOptions{After: first.Next})
@@ -299,9 +301,61 @@ func TestTablesInATransactionUpdateAndUpdateWhereRunTheTablesExample(t *testing.
 	if first.Items[0]["id"] != "e3" || next.Items[0]["id"] != "e1" {
 		t.Fatalf("open pages = %v, %v, want e3 then e1", first.Items, next.Items)
 	}
-	finished, err := table.Count(background, store.NewQuery(definition).Where(func(row store.ColumnRefs) store.Condition { return store.Eq(row["done"], true) }))
+	finished, err := table.Count(background, store.NewQuery(definition).Where(func(row, _ store.ColumnRefs) store.Condition { return store.Eq(row["done"], true) }))
 	requireNoError(t, err)
 	if finished != 3 {
 		t.Fatalf("finished = %d, want 3", finished)
 	}
+}
+
+// runSink is what a read hands its runs to.
+type runSink struct {
+	mu   sync.Mutex
+	runs []store.ReadRun
+}
+
+func (sink *runSink) Adopt(run store.ReadRun) {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	sink.runs = append(sink.runs, run)
+}
+
+func (sink *runSink) taken() []store.ReadRun {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	return slices.Clone(sink.runs)
+}
+
+// Pi packages/chord/src/documents/transaction.ts `#refreshQueries` (slice 14 §3.2) stages the refresh of the store's reads
+// whether or not a read exists now: "one opened while this commit waits is refreshed too". Pi has no test at the
+// transaction: its reads.test.ts and live-query.test.ts reach it through a host, a refresh built by hand, or
+// `pausedPut` (store/reads_test.go here). This test commits a transaction that wrote a table, with no read over it when the
+// commit was staged: a read opened while the commit waits in the queue runs in its step and its run is adopted.
+func TestTablesInATransactionTheReadRefreshIsStagedEvenWithoutAReadAReadOpenedWhileTheCommitWaitsRuns(t *testing.T) {
+	s := storedOn(t, nil, false, nil)
+	edits := changeTables(t, s, 1)[0]
+	held := newHeldWrite()
+	holding := make(chan error, 1)
+	go func() {
+		_, err := s.store.Commit([]store.StagedWrite{held}, openFence, background)
+		holding <- err
+	}()
+	<-held.entered
+	queued := goTx(s.attempts[0], func(tx Tx) (any, error) {
+		return nil, tx.Put(edits, store.Row{"id": "e1", "path": "a/1", "hits": int64(1)})
+	}, background)
+	waitFor(t, "the commit queued in the store", func() bool { return commitQueued(s.o) })
+	// The commit is staged and no read of the table exists: this one is opened now, with no result (never skipped).
+	sink := &runSink{}
+	spec := store.QuerySpec{Query: store.NewQuery(edits.Definition), Table: edits.Sql.Table, Projection: store.Projection{}, Owner: edits}
+	open := store.NewOpenQuery(store.ReadSite{Store: s.store, Batch: s.o.batch}, spec, store.ReadRows, func() {}, background)
+	open.Read(store.ReadKind{Kind: "rows", Range: store.Range{Limit: 5}}, sink)
+	held.release()
+	<-holding
+	requireNoError(t, awaitTx(t, queued).err)
+	runs := sink.taken()
+	if len(runs) != 1 || runs[0].Kind != "rows" || len(runs[0].Result.Rows) != 1 || runs[0].Result.Rows[0]["id"] != "e1" {
+		t.Fatalf("runs adopted = %+v, want the one run of the commit's step, with the row it wrote", runs)
+	}
+	open.Close()
 }

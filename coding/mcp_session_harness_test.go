@@ -5,6 +5,7 @@ package coding
 import (
 	"github.com/MichaelKinsy/PiG/coding/extension/factoryload"
 
+	"bytes"
 	"context"
 	"encoding/json"
 	"slices"
@@ -31,6 +32,15 @@ import (
 
 const mcpTinyPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
 
+func requireEqual[T any](t *testing.T, what string, got, want T) {
+	t.Helper()
+	gotJSON, _ := json.Marshal(got)
+	wantJSON, _ := json.Marshal(want)
+	if !bytes.Equal(gotJSON, wantJSON) {
+		t.Errorf("%s = %s, want %s", what, gotJSON, wantJSON)
+	}
+}
+
 var mcpServerTools = []map[string]any{
 	{
 		"name": "search", "description": "Search the docs.",
@@ -43,6 +53,24 @@ var mcpServerTools = []map[string]any{
 		"annotations": map[string]any{"title": "Fail", "destructiveHint": true, "readOnlyHint": false, "idempotentHint": "yes"},
 	},
 	{"name": "shot", "description": "Returns an image.", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{}}},
+}
+
+// mcpConnectedNames counts the connections of the fake server by server name (`connected` of the test).
+type mcpConnectedNames struct {
+	mu    sync.Mutex
+	names []string
+}
+
+func (c *mcpConnectedNames) add(name string) {
+	c.mu.Lock()
+	c.names = append(c.names, name)
+	c.mu.Unlock()
+}
+
+func (c *mcpConnectedNames) all() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.names)
 }
 
 type mcpCallLog struct {
@@ -62,11 +90,16 @@ func (l *mcpCallLog) all() []string {
 	return slices.Clone(l.calls)
 }
 
-// mcpFakeServerOptions are the options of createFakeServer: the server instructions and the delay of the answer to
-// `initialize`; a negative delay never answers.
+// mcpFakeServerOptions are the options of createFakeServer: the server instructions, the delay of the answer to
+// `initialize` (a negative delay never answers) and a gate that holds the answer.
 type mcpFakeServerOptions struct {
 	instructions    string
 	initializeDelay time.Duration
+	// initializeGate, when set, holds the answer to `initialize` until it is closed; the delay is then not used. A delay cannot
+	// force "the prompt starts before the server connects": its timer fires on its own thread as soon as the time has passed,
+	// so a prompt that starts later than that (a loaded host) finds the server connected. The test that orders a prompt
+	// against the connect closes the gate at the point it wants the server to answer.
+	initializeGate <-chan struct{}
 }
 
 // mcpFakeServer is createFakeServer of agent-session-mcp.test.ts: a minimal MCP server over an in-memory transport that
@@ -133,6 +166,14 @@ func mcpFakeServer(t testing.TB, calls *mcpCallLog, listTools func() []map[strin
 			_ = server.Send(context.Background(), mcp.NewResult(*message.ID, raw))
 		}
 		switch {
+		case message.Method == "initialize" && opts.initializeGate != nil:
+			go func() {
+				select {
+				case <-opts.initializeGate:
+					send(respond(message))
+				case <-t.Context().Done():
+				}
+			}()
 		case message.Method != "initialize" || opts.initializeDelay == 0:
 			// Upstream answers in a microtask, in arrival order: the request is handled here, in the delivery order, and only
 			// the reply leaves on its own goroutine (a listener must not Send to the transport that delivers to it).
@@ -198,6 +239,7 @@ type mcpSessionOptions struct {
 	autoEnableCodemode *bool
 	name               string
 	initializeDelay    time.Duration
+	initializeGate     <-chan struct{}
 	startupWait        *int
 	// config replaces the single configured server, for the tests of servers registered by extensions.
 	config *[]mcpext.McpServerEntry
@@ -266,7 +308,7 @@ func newMCPSession(t *testing.T, exposure extension.McpExposure, listTools func(
 	createTransport := opts.createTransport
 	if createTransport == nil && !opts.realTransport {
 		createTransport = func(mcpext.McpServerEntry, string, mcp.AuthProvider) (mcp.Transport, error) {
-			client, server := mcpFakeServer(t, s.calls, listTools, opts.resources, mcpFakeServerOptions{instructions: opts.instructions, initializeDelay: opts.initializeDelay})
+			client, server := mcpFakeServer(t, s.calls, listTools, opts.resources, mcpFakeServerOptions{instructions: opts.instructions, initializeDelay: opts.initializeDelay, initializeGate: opts.initializeGate})
 			s.mu.Lock()
 			s.servers = append(s.servers, server)
 			s.mu.Unlock()
@@ -310,6 +352,10 @@ func newMCPSession(t *testing.T, exposure extension.McpExposure, listTools func(
 	}
 	if err := s.session.BindExtensions(t.Context(), ExtensionBindings{UIContext: s.ui}); err != nil {
 		t.Fatal(err)
+	}
+	if opts.realTransport {
+		// Pi's AgentSessionRuntime.dispose emits session_shutdown before session.dispose; the MCP extension closes real transports and waits for child processes there (extensions/mcp/index.ts:1132-1139). Registered after newBoundaryHarness so LIFO cleanup stops children before session.Close and t.TempDir removal.
+		t.Cleanup(func() { s.session.EmitSessionShutdown("quit") })
 	}
 	return s
 }

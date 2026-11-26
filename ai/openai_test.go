@@ -596,9 +596,9 @@ func TestDetectCompat_Ollama(t *testing.T) {
 		t.Fatal("expected non-nil compat for ollama")
 		return
 	}
-	// openai-completions.ts detectCompat has no Ollama case: a local server is a standard provider.
-	if !*c.SupportsDeveloperRole {
-		t.Error("ollama gets the standard developer role setting")
+	// openai-completions.ts detectCompat defaults supportsDeveloperRole to true only for api.openai.com (Pi b82477b7b).
+	if *c.SupportsDeveloperRole {
+		t.Error("ollama should default supportsDeveloperRole to false")
 	}
 	if !*c.SupportsReasoningEffort {
 		t.Error("ollama gets the standard reasoning effort setting")
@@ -614,12 +614,12 @@ func TestDetectCompat_OpenRouter(t *testing.T) {
 		t.Fatal("expected non-nil compat for openrouter")
 		return
 	}
-	// detectCompat: only anthropic/ and openai/ OpenRouter models take the developer role.
+	// detectCompat: only api.openai.com defaults supportsDeveloperRole to true (Pi b82477b7b).
 	if *c.SupportsDeveloperRole {
 		t.Error("an unnamed openrouter model should not support developer role")
 	}
-	if !*detectOpenAICompletionsCompat("openrouter", "https://openrouter.ai/api/v1", "openai/gpt-5").SupportsDeveloperRole {
-		t.Error("an openrouter openai/ model supports developer role")
+	if *detectOpenAICompletionsCompat("openrouter", "https://openrouter.ai/api/v1", "openai/gpt-5").SupportsDeveloperRole {
+		t.Error("an openrouter openai/ model should default supportsDeveloperRole to false")
 	}
 	if c.ThinkingFormat != "openrouter" {
 		t.Errorf("openrouter thinkingFormat = %q, want openrouter", c.ThinkingFormat)
@@ -731,8 +731,8 @@ func TestSystemPromptRole_ReasoningModelOnOpenAI(t *testing.T) {
 func TestSystemPromptRole_ReasoningModelOnUnconfiguredLocalEndpoint(t *testing.T) {
 	p := &openAIProvider{cfg: OpenAIConfig{BaseURL: "http://localhost:11434/v1"}}
 	role := p.systemPromptRole(true)
-	if role != "developer" {
-		t.Errorf("unconfigured compatible endpoint role = %q, want Pi's default developer role", role)
+	if role != "system" {
+		t.Errorf("unconfigured compatible endpoint role = %q, want Pi b82477b7b default system role", role)
 	}
 }
 
@@ -743,7 +743,7 @@ func TestConvertMessagesWithCompat_DeepSeekAddsReasoningContent(t *testing.T) {
 	}}
 	messages, cmErr := p.convertMessagesWithCompat([]Message{AssistantMessage{Content: []AssistantContentBlock{
 		TextContent{Text: "answer"},
-	}}}, nil, "system", toolAnchors{}, true)
+	}}}, nil, "system", toolAnchors{}, true, 0)
 	if cmErr != nil {
 		t.Fatalf("convertMessagesWithCompat: %v", cmErr)
 	}
@@ -751,7 +751,7 @@ func TestConvertMessagesWithCompat_DeepSeekAddsReasoningContent(t *testing.T) {
 		t.Fatalf("expected empty reasoning_content on assistant message, got %+v", messages)
 	}
 	// openai-completions.ts convertMessages: the empty reasoning_content needs `model.reasoning` as well as the compat flag.
-	plain, cmErr := p.convertMessagesWithCompat([]Message{AssistantMessage{Content: []AssistantContentBlock{TextContent{Text: "answer"}}}}, nil, "system", toolAnchors{}, false)
+	plain, cmErr := p.convertMessagesWithCompat([]Message{AssistantMessage{Content: []AssistantContentBlock{TextContent{Text: "answer"}}}}, nil, "system", toolAnchors{}, false, 0)
 	if cmErr != nil || len(plain) != 1 || plain[0].ReasoningContent != nil {
 		t.Fatalf("a non-reasoning model gets no reasoning_content: %+v, %v", plain, cmErr)
 	}
@@ -797,7 +797,7 @@ func TestConvertMessagesWithCompat_OpencodeGoRemapsHistoricalReasoning(t *testin
 	messages, err := provider.convertMessagesWithCompat([]Message{AssistantMessage{Content: []AssistantContentBlock{
 		ThinkingContent{Thinking: "prior reasoning", ThinkingSignature: "reasoning"},
 		TextContent{Text: "answer"},
-	}}}, nil, "system", toolAnchors{}, false)
+	}}}, nil, "system", toolAnchors{}, false, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1026,7 +1026,7 @@ func TestConvertMessagesWithCompat_ThinkingAsText(t *testing.T) {
 			TextContent{Text: "Here's my answer"},
 		}},
 	}
-	out, cmErr := p.convertMessagesWithCompat(messages, nil, "system", toolAnchors{}, false)
+	out, cmErr := p.convertMessagesWithCompat(messages, nil, "system", toolAnchors{}, false, 0)
 	if cmErr != nil {
 		t.Fatalf("convertMessages: %v", cmErr)
 	}
@@ -1661,11 +1661,10 @@ func TestConvertMessages_UserImageIsImageURLDataURL(t *testing.T) {
 
 // TestOpenAICompletionsEmptyTools ports upstream empty-tools handling:
 // packages/ai/test/openai-completions-empty-tools.test.ts. The request `tools`
-// field is omitted when there are no active tools and no tool history, but must
-// be an explicit empty array once the conversation carries tool history so that
-// Anthropic-via-proxy (LiteLLM) backends accept the request.
+// field is omitted when there are no active tools, with or without tool history,
+// unless compat.requiresToolsWithToolHistory asks for the explicit empty array
+// that older LiteLLM in front of Anthropic needs (Pi 7a6bd5a97, #11891).
 func TestOpenAICompletionsEmptyTools(t *testing.T) {
-	p := &openAIProvider{cfg: OpenAIConfig{Model: "gpt-4o-mini", BaseURL: "https://api.openai.com/v1"}}
 	user := UserMessage{Content: UserText("hi")}
 	toolHistory := []Message{
 		user,
@@ -1674,20 +1673,25 @@ func TestOpenAICompletionsEmptyTools(t *testing.T) {
 	}
 	oneTool := []ToolSchema{{Name: "noop", Description: "d", Parameters: map[string]any{"type": "object"}}}
 
+	requiresTools := &OpenAICompat{RequiresToolsWithToolHistory: new(true)}
 	cases := []struct {
 		name      string
+		compat    *OpenAICompat
 		messages  []Message
 		tools     []ToolSchema
 		wantKey   bool
 		wantEmpty bool
 	}{
-		{"empty tools no history omits", []Message{user}, []ToolSchema{}, false, false},
-		{"nil tools no history omits", []Message{user}, nil, false, false},
-		{"empty tools with history emits empty array", toolHistory, []ToolSchema{}, true, true},
-		{"active tools emit populated array", []Message{user}, oneTool, true, false},
+		{"empty tools no history omits", nil, []Message{user}, []ToolSchema{}, false, false},
+		{"nil tools no history omits", nil, []Message{user}, nil, false, false},
+		{"empty tools with history omits by default", nil, toolHistory, []ToolSchema{}, false, false},
+		{"empty tools with history emits empty array when compat.requiresToolsWithToolHistory", requiresTools, toolHistory, []ToolSchema{}, true, true},
+		{"empty tools no history omits even when compat.requiresToolsWithToolHistory", requiresTools, []Message{user}, []ToolSchema{}, false, false},
+		{"active tools emit populated array", nil, []Message{user}, oneTool, true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			p := &openAIProvider{cfg: OpenAIConfig{Model: "gpt-4o-mini", BaseURL: "https://api.openai.com/v1", Compat: tc.compat}}
 			req := oaiRequest{Model: p.cfg.Model, Messages: []oaiMessage{{Role: "user", Content: "hi"}}, Stream: true}
 			tools, terr := p.resolveRequestTools(NormalizeContext(Context{Messages: tc.messages}), tc.tools)
 			if terr != nil {

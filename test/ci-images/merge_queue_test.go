@@ -95,6 +95,15 @@ func tierRows(t *testing.T) []tierRow {
 	if err != nil {
 		t.Fatal(err)
 	}
+	rows, err := parseTierRows(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rows
+}
+
+// parseTierRows reads the rows of ci-tiers.txt. A table with no rows is an error: every caller ranges over the rows.
+func parseTierRows(data []byte) ([]tierRow, error) {
 	var rows []tierRow
 	for line := range strings.SplitSeq(string(data), "\n") {
 		line = strings.TrimSpace(line)
@@ -110,7 +119,22 @@ func tierRows(t *testing.T) []tierRow {
 		}
 		rows = append(rows, tierRow{fields[0], fields[1], fields[2], fields[3]})
 	}
-	return rows
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("automation/ci/ci-tiers.txt has no rows (%d bytes read)", len(data))
+	}
+	return rows, nil
+}
+
+// A tier table with no rows is an error. The tests that hold ci.yml and .github/AGENTS.md to the table range over its rows, so an emptied table would pass every one of them.
+func TestTierTableWithNoRowsIsAnError(t *testing.T) {
+	for _, table := range []string{"", "# job | shard | tier | light target\n\n"} {
+		if rows, err := parseTierRows([]byte(table)); err == nil || !strings.Contains(err.Error(), "ci-tiers.txt") {
+			t.Errorf("table %q: rows = %v, err = %v; want an error that names ci-tiers.txt", table, rows, err)
+		}
+	}
+	if rows, err := parseTierRows([]byte("# comment\ntest | linux | merge | test-fast\n")); err != nil || len(rows) != 1 || rows[0] != (tierRow{"test", "linux", "merge", "test-fast"}) {
+		t.Fatalf("rows = %v, err = %v; want the one row", rows, err)
+	}
 }
 
 type workflowFile struct {
@@ -120,7 +144,15 @@ type workflowFile struct {
 		If             string
 		Needs          any
 		TimeoutMinutes int `yaml:"timeout-minutes"`
-		Steps          []struct {
+		Strategy       struct {
+			Matrix struct {
+				OS      []string
+				Group   []string
+				Shard   []string
+				Include any
+			}
+		}
+		Steps []struct {
 			Name string
 			If   string
 			Uses string
@@ -429,22 +461,22 @@ func TestLightPullRequestRunKeepsTheFastGatesUnderTheSameNames(t *testing.T) {
 
 	// The gates the light run keeps: compile and vet (the preflight job), lint of the changed files, the drift and contract gates,
 	// the sharded unit tests and one parity shard. The gates it leaves to the queue are the expensive suites.
-	lightGates := append(leaves("ci-preflight"), leaves("ci-bookkeeping")...)
+	lightGates := append(append(leaves("ci-preflight"), leaves("ci-preflight-platforms")...), leaves("ci-bookkeeping")...)
 	for _, entry := range light.Matrix["linux"] {
 		lightGates = append(lightGates, leaves(entry.Target)...)
 	}
-	for _, gate := range []string{"build", "vet", "lint-changed", "lint-scenarios", "port-map-drift", "correspondence-check", "interface-gaps", "test-changed", "test-fast-sharded", "test-cli-1", "test-cli-2", "test-subprocess", "parity-fast-1"} {
+	for _, gate := range []string{"build", "vet-native", "vet-platforms", "lint-changed", "go-fix-clean", "race-coverage", "model-data-check", "fixture-guard", "source-hygiene", "node-runtime-drift", "vendor-pi-dist-drift", "lint-scenarios", "port-map-drift", "correspondence-check", "interface-gaps", "test-changed", "test-fast-sharded-1", "test-fast-sharded-2", "test-cli-1", "test-cli-2", "test-subprocess", "parity-fast-1"} {
 		if !slices.Contains(lightGates, gate) {
 			t.Errorf("the light run does not run %s", gate)
 		}
 	}
-	for _, gate := range []string{"lint", "module-size", "test-race", "test-conformance-1", "test-conformance-2", "test-sdk-rs", "parity-fast-2", "portmap-check-1"} {
+	for _, gate := range []string{"lint", "module-size", "test-race", "test-conformance-1", "test-conformance-2", "test-conformance-3", "test-conformance-4", "test-sdk-rs", "parity-fast-2", "portmap-check-1"} {
 		if slices.Contains(lightGates, gate) {
 			t.Errorf("the light run runs %s, which belongs to the merge_group run", gate)
 		}
 	}
 	// Whatever the light run leaves out, the full run runs: nothing is dropped from what runs before a change lands.
-	fullGates := append(leaves("ci-preflight"), leaves("ci-bookkeeping")...)
+	fullGates := append(append(leaves("ci-preflight"), leaves("ci-preflight-platforms")...), leaves("ci-bookkeeping")...)
 	for _, entry := range full.Matrix["linux"] {
 		fullGates = append(fullGates, leaves(entry.Target)...)
 	}
@@ -527,7 +559,7 @@ func TestPlannerRejectsAMalformedTable(t *testing.T) {
 }
 
 // lightPlanResults are the job results of a light run that planned only the pr rows and found them green.
-var lightPlanResults = map[string]string{"FULL": "false", "RUN_NODE_RUNTIME": "false", "RUN_DURABLE_CF_HOST": "false", "RUN_DURABLE_CONTRACT": "false", "RUN_NODE_LOADER": "false", "NODE_RUNTIME": "skipped", "DURABLE_CF_HOST": "skipped", "DURABLE_CONTRACT": "skipped", "NODE_LOADER": "skipped", "WINDOWS_PLANNED": "false", "MACOS_PLANNED": "false", "WINDOWS": "skipped", "MACOS": "skipped"}
+var lightPlanResults = map[string]string{"FULL": "false", "RUN_NODE_RUNTIME": "false", "RUN_CHORD": "false", "RUN_DURABLE_CF_HOST": "false", "RUN_DURABLE_CONTRACT": "false", "RUN_NODE_LOADER": "false", "NODE_RUNTIME": "skipped", "CHORD": "skipped", "DURABLE_CF_HOST": "skipped", "DURABLE_CONTRACT": "skipped", "NODE_LOADER": "skipped", "WINDOWS_PLANNED": "false", "MACOS_PLANNED": "false", "WINDOWS": "skipped", "MACOS": "skipped"}
 
 // merge returns the union of the sets, later sets overriding earlier ones.
 func merge(sets ...map[string]string) map[string]string {
@@ -555,10 +587,10 @@ func ciResultRun(t *testing.T, set map[string]string, liveHead string) (string, 
 	values := map[string]string{
 		"EVENT": "merge_group", "PRODUCT": "true", "FULL": "true", "FULL_REQUIRED": "false",
 		"PR_NUMBER": "", "PR_HEAD_SHA": "", "REPO": "MichaelKinsy/PiG", "GH_TOKEN": "token",
-		"RUN_NODE_RUNTIME": "true", "RUN_NODE_LOADER": "true", "RUN_ANDROID": "true", "RUN_DURABLE_CF_HOST": "true", "RUN_DURABLE_CONTRACT": "true",
-		"CHANGES": "success", "DOCS": "skipped", "BOOKKEEPING": "success", "VERIFY": "success", "NODE_RUNTIME": "success",
+		"RUN_NODE_RUNTIME": "true", "RUN_CHORD": "true", "RUN_NODE_LOADER": "true", "RUN_ANDROID": "true", "RUN_DURABLE_CF_HOST": "true", "RUN_DURABLE_CONTRACT": "true",
+		"CHANGES": "success", "DOCS": "skipped", "BOOKKEEPING": "success", "VERIFY": "success", "NODE_RUNTIME": "success", "CHORD": "success",
 		"WINDOWS": "success", "MACOS": "success", "ANDROID": "success", "NODE_LOADER": "success",
-		"DURABLE_CF_HOST": "success", "DURABLE_CONTRACT": "success", "PREFLIGHT": "success",
+		"DURABLE_CF_HOST": "success", "DURABLE_CONTRACT": "success", "PREFLIGHT": "success", "PREFLIGHT_PLATFORMS": "success",
 		"VERDICT": "success", "WINDOWS_PLANNED": "true", "MACOS_PLANNED": "true",
 	}
 	for name := range declared {
@@ -601,11 +633,13 @@ func TestCIResultRequiresEveryPlannedJob(t *testing.T) {
 	}{
 		{"merge group with every job", nil, true},
 		{"merge group skipped queue-only job", map[string]string{"NODE_RUNTIME": "skipped"}, false},
+		{"merge group skipped chord surfaces", map[string]string{"CHORD": "skipped"}, false},
+		{"merge group failed chord surfaces", map[string]string{"CHORD": "failure"}, false},
 		{"merge group skipped durable host", map[string]string{"DURABLE_CF_HOST": "skipped"}, false},
 		{"merge group skipped durable contract", map[string]string{"DURABLE_CONTRACT": "skipped"}, false},
 		{"merge group failed Windows", map[string]string{"WINDOWS": "failure"}, false},
 		{"merge group that planned the light run", lightPlanResults, false},
-		{"merge group without a plan", map[string]string{"FULL": "", "RUN_NODE_RUNTIME": ""}, false},
+		{"merge group without a plan", map[string]string{"FULL": "", "RUN_NODE_RUNTIME": "", "RUN_CHORD": ""}, false},
 		{"push skipped queue-only job", map[string]string{"EVENT": "push", "NODE_RUNTIME": "skipped"}, false},
 		{"push with every job", map[string]string{"EVENT": "push"}, true},
 		{"full pull request", pullRequest, true},
@@ -613,7 +647,7 @@ func TestCIResultRequiresEveryPlannedJob(t *testing.T) {
 		{"light pull request behind a merge queue", merge(pullRequest, lightPlanResults), true},
 		{"light pull request skipped fast job", merge(pullRequest, lightPlanResults, map[string]string{"ANDROID": "skipped"}), false},
 		{"light pull request whose bookkeeping failed", merge(pullRequest, lightPlanResults, map[string]string{"BOOKKEEPING": "failure"}), false},
-		{"full pull request whose bookkeeping failed and stopped the jobs behind it", merge(pullRequest, map[string]string{"BOOKKEEPING": "failure", "PREFLIGHT": "skipped", "VERIFY": "failure", "WINDOWS": "skipped", "MACOS": "skipped"}), false},
+		{"full pull request whose bookkeeping failed and stopped the jobs behind it", merge(pullRequest, map[string]string{"BOOKKEEPING": "failure", "PREFLIGHT": "skipped", "PREFLIGHT_PLATFORMS": "skipped", "VERIFY": "failure", "WINDOWS": "skipped", "MACOS": "skipped"}), false},
 		{"merge group whose bookkeeping was skipped", map[string]string{"BOOKKEEPING": "skipped"}, false},
 		{"pull request the pre-flight rejected", merge(pullRequest, map[string]string{"VERDICT": "failure", "BOOKKEEPING": "skipped"}), false},
 		{"pull request the pre-flight never judged", merge(pullRequest, map[string]string{"VERDICT": "skipped"}), false},
@@ -627,7 +661,7 @@ func TestCIResultRequiresEveryPlannedJob(t *testing.T) {
 		{"full pull request that planned Windows but skipped it", merge(pullRequest, map[string]string{"WINDOWS": "skipped"}), false},
 		{"full pull request that planned macOS but skipped it", merge(pullRequest, map[string]string{"MACOS": "skipped"}), false},
 		{"light pull request whose planned-away Windows job ran and failed", merge(pullRequest, lightPlanResults, map[string]string{"WINDOWS": "failure"}), false},
-		{"docs-only merge group", map[string]string{"PRODUCT": "false", "DOCS": "success", "PREFLIGHT": "skipped", "NODE_RUNTIME": "skipped", "WINDOWS": "skipped", "MACOS": "skipped", "ANDROID": "skipped", "NODE_LOADER": "skipped", "DURABLE_CF_HOST": "skipped", "DURABLE_CONTRACT": "skipped"}, true},
+		{"docs-only merge group", map[string]string{"PRODUCT": "false", "DOCS": "success", "PREFLIGHT": "skipped", "PREFLIGHT_PLATFORMS": "skipped", "NODE_RUNTIME": "skipped", "CHORD": "skipped", "WINDOWS": "skipped", "MACOS": "skipped", "ANDROID": "skipped", "NODE_LOADER": "skipped", "DURABLE_CF_HOST": "skipped", "DURABLE_CONTRACT": "skipped"}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			output, err := ciResultRun(t, tc.set, "")
@@ -652,7 +686,7 @@ func TestLightRunCannotSatisfyCIResultWithoutAMergeQueue(t *testing.T) {
 	// Each way a light run's jobs can look green, including all of them skipped as for a change with no product files.
 	for name, set := range map[string]map[string]string{
 		"planned light, every light job green": lightPlanResults,
-		"no plan":                              {"FULL": "", "RUN_NODE_RUNTIME": "", "RUN_DURABLE_CF_HOST": "", "RUN_DURABLE_CONTRACT": ""},
+		"no plan":                              {"FULL": "", "RUN_NODE_RUNTIME": "", "RUN_CHORD": "", "RUN_DURABLE_CF_HOST": "", "RUN_DURABLE_CONTRACT": ""},
 	} {
 		if output, err := ciResultRun(t, merge(labelPR, set), "aaaa"); err == nil {
 			t.Errorf("%s: satisfied CI result\n%s", name, output)
@@ -663,7 +697,7 @@ func TestLightRunCannotSatisfyCIResultWithoutAMergeQueue(t *testing.T) {
 	if output, err := ciResultRun(t, labelPR, "aaaa"); err != nil {
 		t.Errorf("the full run on the pull request's head failed CI result: %v\n%s", err, output)
 	}
-	docsOnly := merge(labelPR, lightPlanResults, map[string]string{"PRODUCT": "false", "DOCS": "success", "PREFLIGHT": "skipped", "VERIFY": "success", "WINDOWS": "skipped", "MACOS": "skipped", "ANDROID": "skipped", "NODE_LOADER": "skipped", "RUN_ANDROID": "false", "RUN_NODE_LOADER": "false"})
+	docsOnly := merge(labelPR, lightPlanResults, map[string]string{"PRODUCT": "false", "DOCS": "success", "PREFLIGHT": "skipped", "PREFLIGHT_PLATFORMS": "skipped", "VERIFY": "success", "WINDOWS": "skipped", "MACOS": "skipped", "ANDROID": "skipped", "NODE_LOADER": "skipped", "RUN_ANDROID": "false", "RUN_NODE_LOADER": "false"})
 	if output, err := ciResultRun(t, docsOnly, "aaaa"); err != nil {
 		t.Errorf("a docs-only light run needed the full label: %v\n%s", err, output)
 	}
@@ -691,7 +725,7 @@ func TestFullRunOnAnOlderHeadDoesNotCountForANewerHead(t *testing.T) {
 		t.Errorf("a run that could not read the pull request's head satisfied CI result\n%s", output)
 	}
 	// The run for the newer head is its own run: without the full plan it fails, whatever ran on the older head.
-	lightOnNew := map[string]string{"EVENT": "pull_request", "VERDICT": "success", "FULL_REQUIRED": "true", "PR_NUMBER": "7", "PR_HEAD_SHA": "newhead", "FULL": "false", "RUN_NODE_RUNTIME": "false", "RUN_DURABLE_CF_HOST": "false", "RUN_DURABLE_CONTRACT": "false", "NODE_RUNTIME": "skipped", "DURABLE_CF_HOST": "skipped", "DURABLE_CONTRACT": "skipped"}
+	lightOnNew := map[string]string{"EVENT": "pull_request", "VERDICT": "success", "FULL_REQUIRED": "true", "PR_NUMBER": "7", "PR_HEAD_SHA": "newhead", "FULL": "false", "RUN_NODE_RUNTIME": "false", "RUN_CHORD": "false", "RUN_DURABLE_CF_HOST": "false", "RUN_DURABLE_CONTRACT": "false", "NODE_RUNTIME": "skipped", "CHORD": "skipped", "DURABLE_CF_HOST": "skipped", "DURABLE_CONTRACT": "skipped"}
 	if output, err := ciResultRun(t, lightOnNew, "newhead"); err == nil {
 		t.Fatalf("a light run on newhead satisfied CI result\n%s", output)
 	}
@@ -908,7 +942,7 @@ func TestAgentsDocRendersTheTierTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	singles := map[string]string{"Node extensions": "node-runtime", "Durable Cloudflare host": "durable-cf-host", "Durable contract": "durable-contract", "Android build": "android", "Node loader": "node-loader"}
+	singles := map[string]string{"Node extensions": "node-runtime", "Chord surfaces": "chord", "Durable Cloudflare host": "durable-cf-host", "Durable contract": "durable-contract", "Android build": "android", "Node loader": "node-loader"}
 	prefixes := map[string]string{"Linux / ": "linux", "Windows ": "windows", "macOS ": "macos"}
 	documented := map[[2]string]string{}
 	for line := range strings.SplitSeq(string(data), "\n") {

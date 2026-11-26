@@ -23,7 +23,7 @@ import (
 //
 // Returns an error if entryID is unknown.
 func (s *Session) Fork(entryID string) error {
-	if err := s.inner.Branch(entryID); err != nil {
+	if err := s.inner.Load().Branch(entryID); err != nil {
 		return fmt.Errorf("coding: fork %s: %w", entryID, err)
 	}
 	s.refreshContext()
@@ -45,7 +45,7 @@ func (s *Session) ForkToNewSession(userMsgEntryID string) error {
 // to the new file, and returns the selected message text.
 func (s *Session) ForkToNewSessionWithText(userMsgEntryID string) (string, error) {
 	sm := newSessionManagerForDir(s.services, s.sessionDir)
-	newSess, selectedText, err := sm.ForkToNewSession(s.inner, userMsgEntryID)
+	newSess, selectedText, err := sm.ForkToNewSession(s.inner.Load(), userMsgEntryID)
 	if err != nil {
 		return "", fmt.Errorf("coding: fork %s: %w", userMsgEntryID, err)
 	}
@@ -69,7 +69,7 @@ func (s *Session) prepareNewSession(parentSession string) (*icodingagent.Session
 		return nil, fmt.Errorf("coding: new session id: %w", err)
 	}
 	var next *icodingagent.Session
-	if s.noSession {
+	if s.noSession.Load() {
 		next = icodingagent.NewSession(id, s.services.CWD(), parentSession)
 	} else {
 		next, err = newSessionManagerForDir(s.services, s.sessionDir).Create(id, parentSession)
@@ -112,17 +112,18 @@ func (s *Session) CloneInPlace() error {
 	return nil
 }
 
-// Clone snapshots the current path-to-leaf as a new session JSONL on disk, dropping orphan branches and recording the source as parentSession. File-backed Sessions must already be saved. The original Session is unchanged; the caller owns closing the returned Session.
+// Clone snapshots the current path-to-leaf as a new session JSONL on disk, dropping orphan branches and recording the source as parentSession. File-backed Sessions must already be saved. The original Session is unchanged; the caller owns closing the returned Session. If the source Session built its own resource loader and has already been closed, Clone returns an error because that owned loader is closed with the Session; a Session with a supplied loader still clones onto the caller's loader.
 func (s *Session) Clone() (*Session, error) {
-	leaf := s.inner.GetLeafID()
+	in := s.inner.Load()
+	leaf := in.GetLeafID()
 	if leaf == nil {
 		return nil, fmt.Errorf("coding: clone: session is empty")
 	}
-	if err := s.inner.CheckSavedForFork(); err != nil {
+	if err := in.CheckSavedForFork(); err != nil {
 		return nil, err
 	}
 	sm := newSessionManagerForDir(s.services, s.sessionDir)
-	cloned, err := sm.Clone(s.inner, *leaf)
+	cloned, err := sm.Clone(in, *leaf)
 	if err != nil {
 		return nil, fmt.Errorf("coding: clone: %w", err)
 	}
@@ -132,29 +133,37 @@ func (s *Session) Clone() (*Session, error) {
 	// caller hooks, thinking budgets, model runtime and event buffer as any
 	// other Session; its agent state is the cloned path-to-leaf.
 	opts := SessionOptions{
-		ScopedModels:       s.ScopedModels(),
-		Model:              s.Model(),
-		Tools:              s.tools,
-		AllowedTools:       s.toolRegistry.allowed,
-		ExcludedTools:      s.toolRegistry.excluded,
-		ToolScope:          s.toolRegistry.scope,
-		toolRegistry:       &s.toolRegistry,
-		skipExtensionTools: s.toolRegistry.skipExtensions,
-		SkipBuiltinTools:   true,
-		BeforeToolCall:     s.callerHooks.beforeToolCall,
-		AfterToolCall:      s.callerHooks.afterToolCall,
-		Runner:             s.currentRunner(),
-		runnerShared:       true,
-		SessionDir:         s.sessionDir,
-		NoSession:          s.noSession,
-		EventBufferSize:    s.callerHooks.eventBufferSize,
-		Transport:          s.callerHooks.transport,
-		existing:           cloned,
-		ResourceLoader:     s.ResourceLoader(),
-		extensionHost:      s.extensionHost,
+		ScopedModels:           s.ScopedModels(),
+		Model:                  s.Model(),
+		Tools:                  s.tools,
+		AllowedTools:           s.toolRegistry.allowed,
+		ExcludedTools:          s.toolRegistry.excluded,
+		ToolScope:              s.toolRegistry.scope,
+		InitialActiveToolNames: s.ActiveToolNames(),
+		toolRegistry:           &s.toolRegistry,
+		skipExtensionTools:     s.toolRegistry.skipExtensions,
+		SkipBuiltinTools:       true,
+		BeforeToolCall:         s.callerHooks.beforeToolCall,
+		AfterToolCall:          s.callerHooks.afterToolCall,
+		Runner:                 s.currentRunner(),
+		runnerShared:           true,
+		SessionDir:             s.sessionDir,
+		NoSession:              s.noSession.Load(),
+		EventBufferSize:        s.callerHooks.eventBufferSize,
+		Transport:              s.callerHooks.transport,
+		existing:               cloned,
+		ResourceLoader:         s.ResourceLoader(),
+		extensionHost:          s.extensionHost,
 	}
 	if ref := s.resourceLoader.Load(); ref != nil {
-		opts.boundResourceLoader = &resourceLoaderRef{loader: ref.loader, promptFromLoader: ref.promptFromLoader}
+		bound := &resourceLoaderRef{loader: ref.loader, promptFromLoader: ref.promptFromLoader}
+		if ref.owned != nil {
+			if !ref.owned.acquire() {
+				return nil, fmt.Errorf("coding: clone: session is closed")
+			}
+			bound.owned = ref.owned
+		}
+		opts.boundResourceLoader = bound
 	}
 	opts.SystemPromptResources = s.systemPromptResources.Load()
 	// A Session that builds its default prompt keeps building it from its tools and loader, as a replacement AgentSession does (agent-session.ts _rebuildSystemPrompt); any other prompt is the caller's and is copied.
@@ -180,20 +189,20 @@ func (s *Session) Clone() (*Session, error) {
 // Entries returns all session entries in append order. The returned slice is a
 // defensive copy; mutating it does not affect the session.
 func (s *Session) Entries() []icodingagent.SessionEntry {
-	return s.inner.GetEntries()
+	return s.inner.Load().GetEntries()
 }
 
 // Tree returns the session's branch tree as a SessionTreeNode. The
 // returned structure is a defensive copy; mutating it does not affect
 // the session's state. The node uses the internal codingagent tree type.
 func (s *Session) Tree() *icodingagent.SessionTreeNode {
-	return &icodingagent.SessionTreeNode{Children: s.inner.GetTree()}
+	return &icodingagent.SessionTreeNode{Children: s.inner.Load().GetTree()}
 }
 
 // LeafID returns the current leaf entry id, or nil if the session is
 // empty (no entries yet).
 func (s *Session) LeafID() *string {
-	return s.inner.GetLeafID()
+	return s.inner.Load().GetLeafID()
 }
 
 // SetName persists a session name as a SessionInfoEntry on disk. It rejects ECMAScript-trimmed empty names. The name surfaces in ListSessions / Runtime.ListSessions output and in the resume picker UI.
@@ -287,14 +296,15 @@ func (s *Session) DispatchSlash(line string) ([]string, error) {
 		},
 		SkillNames: func() []string { return nil },
 		SessionInfo: func() (string, string, int) {
-			return s.inner.ID(), s.inner.CWD(), len(s.agent.Messages())
+			in := s.inner.Load()
+			return in.ID(), in.CWD(), len(s.agent.Messages())
 		},
 		LastAssistant: func() string { return s.lastAssistantText() },
 		CopyClipboard: func(_ string) error { return fmt.Errorf("clipboard not available in headless mode") },
 		CostSummary:   func() string { return "" },
 
 		// Session-management callbacks (text-path versions; no overlays).
-		CurrentSession: func() *icodingagent.Session { return s.inner },
+		CurrentSession: func() *icodingagent.Session { return s.inner.Load() },
 		SetSessionName: func(name string) error { return s.SetName(name) },
 		ForkAtEntry:    func(entryID string) error { return s.Fork(entryID) },
 		ForkToNewSession: func(entryID string) error {

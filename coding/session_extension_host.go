@@ -244,11 +244,11 @@ func BindSessionExtensionActions(runner *inproc.Runner, bridge *subprocess.UIBri
 	if stage != nil {
 		// The staged sendMessage replaces the Session's own binding for subprocess extensions as the runner's does for in-process ones.
 		bridge.SetHostAction("sendMessage", func(message extension.CustomMessageRef, opts subprocess.SendMessageOptions) error {
-			return actions.SendMessage(message, &extension.SendMessageOptions{TriggerTurn: opts.TriggerTurn, DeliverAs: extension.DeliverAs(opts.DeliverAs)})
+			return actions.SendMessage(message, &extension.SendMessageOptions{TriggerTurn: opts.TriggerTurn, DeliverAs: extension.DeliverAs(opts.DeliverAs), AfterRun: opts.AfterRun})
 		})
 	}
 	bridge.SetHostAction("sendUserMessage", func(content any, opts subprocess.SendUserMessageOptions) error {
-		return actions.SendUserMessage(content, &extension.SendUserMessageOptions{DeliverAs: extension.DeliverAs(opts.DeliverAs)})
+		return actions.SendUserMessage(content, &extension.SendUserMessageOptions{DeliverAs: extension.DeliverAs(opts.DeliverAs), ExpandPromptTemplates: opts.ExpandPromptTemplates, AfterRun: opts.AfterRun})
 	})
 	bridge.SetHostAction("refreshTools", func() error {
 		if sess := current(); sess != nil {
@@ -277,18 +277,29 @@ func BindSessionExtensionActions(runner *inproc.Runner, bridge *subprocess.UIBri
 	bridge.SetHostAction("getSystemPromptOptions", func() extension.BuildSystemPromptOptions {
 		return *sessionContext.GetSystemPromptOptions()
 	})
+	// The base options are replaced when what they derive from changes and edited in place by in-process extensions; the key names each state of their contents.
+	bridge.SetHostAction("getSystemPromptOptionsKey", func() any {
+		if sess := current(); sess != nil {
+			return sess.systemPromptOptionsKey()
+		}
+		return nil
+	})
 	// Pi binds setModel, setThinkingLevel, isProjectTrusted and compact to the Session in every mode (agent-session.ts:3343-3349, 3355, 3369-3379 _bindExtensionCore).
-	bridge.SetHostAction("setModel", func(ctx context.Context, spec string) (bool, error) {
+	bridge.SetHostAction(subprocess.CallSetModel, func(ctx context.Context, object *ai.Model) (bool, error) {
 		extension.CallInitiated(ctx)
 		sess := current()
 		if sess == nil {
 			return false, ErrSessionNotReady
 		}
-		model, err := BuildModel(spec, sess.Services())
-		if err != nil {
-			return false, err
+		return actions.SetModel(ctx, sess.modelRuntime.BindModelObject(object))
+	})
+	bridge.SetHostAction(subprocess.CallResolveModel, func(ctx context.Context, spec string) (*ai.Model, error) {
+		extension.CallInitiated(ctx)
+		sess := current()
+		if sess == nil {
+			return nil, ErrSessionNotReady
 		}
-		return actions.SetModel(ctx, model)
+		return BuildModel(spec, sess.Services())
 	})
 	bridge.SetHostAction("setThinkingLevel", func(level string) { actions.SetThinkingLevel(extension.ThinkingLevel(level)) })
 	bridge.SetHostAction("isProjectTrusted", func() bool {
@@ -438,9 +449,16 @@ func BindSessionReadActions(bridge *subprocess.UIBridge, current func() *Session
 		}
 		return page, next, next < total, leafID
 	})
+	bridge.SetHostAction("getMessageEntries", func(cursor int) ([]sessionentry.MessageSeq, int) {
+		sess := current()
+		if sess == nil {
+			return nil, 0
+		}
+		return sess.Inner().MessageEntriesAfter(cursor)
+	})
 	// pi.setLabel is the handler the Session binds into its runner's runtime (agent-session.ts:3419 _bindExtensionCore); a subprocess extension
-	// reaches that one handler. An empty label clears it (types.ts:2106 SetLabelHandler takes `string | undefined`).
-	bridge.SetHostAction("setLabel", func(entryID, label string) error {
+	// reaches that one handler with the label as it gave it: a string (an empty one included), null, or none.
+	bridge.SetHostAction("setLabel", func(entryID string, label *string, null bool) error {
 		sess := current()
 		if sess == nil {
 			return ErrSessionNotReady
@@ -449,11 +467,7 @@ func BindSessionReadActions(bridge *subprocess.UIBridge, current func() *Session
 		if runner == nil || runner.Runtime().SetLabel == nil {
 			return ErrSessionNotReady
 		}
-		var value *string
-		if label != "" {
-			value = &label
-		}
-		return runner.Runtime().SetLabel(entryID, value)
+		return runner.Runtime().ApplyLabel(entryID, label, null)
 	})
 	var info icodingagent.ExtensionSessionInfoMemo
 	bridge.SetHostAction("sessionRead", func(method string, args json.RawMessage) (any, error) {
@@ -496,9 +510,11 @@ func WatchHostState(bridge *subprocess.UIBridge, session *Session) func() {
 		return func() {}
 	}
 	stopSession := session.ObserveReplicatedState(bridge.HostStateChanged)
+	stopScope := session.ObserveReplicatedStateScope(bridge.HostStateChanging, bridge.HostStateSettled)
 	stopTheme := tui.ObserveActiveTheme(bridge.HostStateChanged)
 	return func() {
 		stopSession()
+		stopScope()
 		stopTheme()
 	}
 }

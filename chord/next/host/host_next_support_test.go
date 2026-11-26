@@ -19,6 +19,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/data"
 	"github.com/MichaelKinsy/PiG/chord/next/documents"
 	"github.com/MichaelKinsy/PiG/chord/next/link"
+	"github.com/MichaelKinsy/PiG/chord/next/state"
 	"github.com/MichaelKinsy/PiG/chord/next/store"
 	"github.com/MichaelKinsy/PiG/chord/nextnode"
 	"github.com/MichaelKinsy/PiG/chord/sqlite"
@@ -26,7 +27,7 @@ import (
 	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
-// Ports packages/chord/test/next/support.ts: hosts, links, raw peers, notes types, relays and stores for the slice
+// Ports packages/chord/test/support.ts: hosts, links, raw peers, notes types, relays and stores for the slice
 // tests of host, jobs and remote. Names are Pi's, camelCase.
 //
 // Go forms (the contract the other D5a test files follow):
@@ -202,7 +203,9 @@ type loadedOptions struct {
 	Context      context.Context
 	CloseTimeout *time.Duration
 	ReadyTimeout *time.Duration
-	Store        store.Store
+	// ReloadDrainTimeout is `reloadDrainTimeout`.
+	ReloadDrainTimeout *time.Duration
+	Store              store.Store
 	// Serve is `restartable`'s `serve`: serves other types on the same host.
 	Serve func(host FacetHost)
 	// Loop drives the host (Pi's fake timers); nil is the real loop.
@@ -316,12 +319,13 @@ func loaded(t testing.TB, setup func(host FacetHost, self FacetSelf) error, opti
 	t.Helper()
 	errs := &hostErrors{}
 	host := newHost(t, HostOptions{
-		Telemetry:    telemetryOf(options.Telemetry),
-		CloseTimeout: options.CloseTimeout,
-		ReadyTimeout: options.ReadyTimeout,
-		Store:        options.Store,
-		OnError:      errs.push,
-		loop:         options.Loop,
+		Telemetry:          telemetryOf(options.Telemetry),
+		CloseTimeout:       options.CloseTimeout,
+		ReadyTimeout:       options.ReadyTimeout,
+		ReloadDrainTimeout: options.ReloadDrainTimeout,
+		Store:              options.Store,
+		OnError:            errs.push,
+		loop:               options.Loop,
 	})
 	ctx := options.Context
 	if ctx == nil {
@@ -400,9 +404,11 @@ func newTransactionGate() *transactionGate {
 	return &transactionGate{entered: make(chan struct{}), release: make(chan struct{})}
 }
 
+// hit holds the transaction until Release: the wait is a park of the task that runs the commit (a test's delivered() does not
+// wait for a commit the test holds: Pi's pending `await held`).
 func (gate *transactionGate) hit() {
 	gate.once.Do(func() { close(gate.entered) })
-	<-gate.release
+	_, _ = chordctx.Receive(context.Background(), gate.release)
 }
 
 // Entered is closed when the held transaction reached its hold.
@@ -578,9 +584,11 @@ func (owner *testOwner) Label() string             { return "app.store" }
 func (owner *testOwner) Scope() any                { return owner.scope }
 func (owner *testOwner) AssertLive() error         { return nil }
 func (owner *testOwner) Fail(err *data.ChordError) { owner.failures = append(owner.failures, err) }
-func tableOwner() *testOwner                       { return &testOwner{scope: new(struct{})} }
+func tableOwner() *testOwner {
+	return &testOwner{scope: new(struct{})}
+}
 func openFence() store.CommitFence {
-	return store.CommitFence{Admit: func() bool { return true }, Adopt: func(int64, []int64) error { return nil }}
+	return store.CommitFence{Admit: func() bool { return true }, Adopt: func(int64, []int64, int) error { return nil }}
 }
 
 // rejection is the error err is, as ChordError JSON when it is one; the test fails when err is nil.
@@ -717,6 +725,13 @@ func (queue *heldQueue) drain() {
 	}
 }
 
+// pending is the number of jobs posted and not run yet.
+func (queue *heldQueue) pending() int {
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	return len(queue.jobs)
+}
+
 // hold stops the queue before its next job.
 func (queue *heldQueue) hold() {
 	queue.mu.Lock()
@@ -793,6 +808,8 @@ type rawPeerOptions struct {
 	// NoHello is `hello: false`.
 	NoHello bool
 	Calls   int
+	// NoCalls is `calls: null`: its hello announces no call window (a trusted link's).
+	NoCalls bool
 	// NoAck is `ack: false`.
 	NoAck bool
 	Codec link.Codec
@@ -849,6 +866,9 @@ func newRawPeer(t testing.TB, end link.Link, options rawPeerOptions) *RawPeer {
 		calls := options.Calls
 		if calls == 0 {
 			calls = 256
+		}
+		if options.NoCalls {
+			calls = 0
 		}
 		peer.send(&link.HelloMessage{Protocol: data.ProtocolVersion, Incarnation: rawPeerIncarnation, Calls: calls})
 	}
@@ -938,6 +958,7 @@ type wireIndexes struct {
 	Variant int
 	State   map[string]int
 	Methods map[string]int
+	Events  map[string]int
 	names   contracts.VariantNames
 }
 
@@ -956,7 +977,7 @@ func wireNames(t testing.TB, typ *contracts.Contract, variant string) wireIndexe
 		}
 		return out
 	}
-	return wireIndexes{Variant: slices.Index(order, variant), State: indexes(names.State), Methods: indexes(names.Methods), names: names}
+	return wireIndexes{Variant: slices.Index(order, variant), State: indexes(names.State), Methods: indexes(names.Methods), Events: indexes(names.Events), names: names}
 }
 
 // Named is a message's members by index as an object by name, their parts parsed (`ops` or `value` per member).
@@ -998,7 +1019,15 @@ type rawLinkedOptions struct {
 	Compression  link.Compression
 	// Parent is `role: "parent"`: the raw peer is the host's parent (`connect`), not its child (`accept`, the default).
 	Parent bool
-	Loop   sectionLoop
+	// Trusted is `trusted: true` on the link: its calls' old-work mark is honoured.
+	Trusted bool
+	// CallWindow and EventWindow are the host's `callWindow` and `eventWindow` (nil: its defaults).
+	CallWindow, EventWindow *int
+	// NoAck is `ack: false`: the raw peer does not acknowledge `bound` and `state` by itself.
+	NoAck bool
+	Loop  sectionLoop
+	// Telemetry is the server's adapter (Pi's `{ telemetry }`); nil has none.
+	Telemetry telemetry.TelemetryContext
 }
 
 // rawLinkedHost is what `rawLinked` returns: Pi's `{ server, peer, errors }`.
@@ -1017,7 +1046,10 @@ func rawLinked(t testing.TB, setup func(host FacetHost) error, options rawLinked
 		Principal:    serverPrincipal(),
 		ReadyTimeout: options.ReadyTimeout,
 		Compression:  options.Compression,
+		CallWindow:   options.CallWindow,
+		EventWindow:  options.EventWindow,
 		OnError:      errs.push,
+		Telemetry:    options.Telemetry,
 		loop:         options.Loop,
 	})
 	mustLoad(t)(server.Load([]HostFacet{{Name: "@test/app", Facet: DefineFacet(func(host FacetHost, _ FacetSelf) error {
@@ -1028,13 +1060,13 @@ func rawLinked(t testing.TB, setup func(host FacetHost) error, options rawLinked
 	if child == nil {
 		child = ownerPrincipal()
 	}
-	linkOptions := LinkOptions{Principal: child, Codec: testCodec(), Limits: options.Limits}
+	linkOptions := LinkOptions{Principal: child, Codec: testCodec(), Limits: options.Limits, Trusted: options.Trusted}
 	if options.Parent {
 		must(t, server.Connect(a, linkOptions, background))
 	} else {
 		must(t, server.Accept(a, linkOptions, background))
 	}
-	return &rawLinkedHost{Server: server, Peer: newRawPeer(t, b, rawPeerOptions{NoHello: options.NoHello}), Errors: errs}
+	return &rawLinkedHost{Server: server, Peer: newRawPeer(t, b, rawPeerOptions{NoHello: options.NoHello, NoAck: options.NoAck}), Errors: errs}
 }
 
 // notesVariants are the variants of the notes types: an editor variant for owners, a reader one for guests.
@@ -1198,7 +1230,7 @@ func serveNotes(host FacetHost, typ *contracts.Contract) (*notesProbe, error) {
 				probe.changed = nil
 			}
 			probe.mu.Unlock()
-			UntilAborted(ctx)
+			_, _ = chordctx.Receive(ctx, ctx.Done())
 			return nil, nil
 		}
 		members := map[string]chord.Watchable[delta.JsonValue]{"notes": notes, "count": count}
@@ -1288,7 +1320,7 @@ type rawProviderHost struct {
 func rawProvider(t testing.TB, options rawLinkedOptions) *rawProviderHost {
 	t.Helper()
 	errs := &hostErrors{}
-	client := newHost(t, HostOptions{ReadyTimeout: options.ReadyTimeout, Compression: options.Compression, OnError: errs.push, loop: options.Loop})
+	client := newHost(t, HostOptions{ReadyTimeout: options.ReadyTimeout, Compression: options.Compression, OnError: errs.push, Telemetry: options.Telemetry, loop: options.Loop})
 	mustLoad(t)(client.Load(nil, background))
 	return &rawProviderHost{Client: client, Peer: rawParent(t, client, options.Limits), Errors: errs}
 }
@@ -1376,11 +1408,13 @@ type resolved struct {
 	Trusted   bool
 	Codec     link.Codec
 	Limits    link.PartLimits
+	// Opened is `resolve`'s `opened`: told the peer's incarnation at the handshake.
+	Opened func(incarnation string)
 }
 
 // link is the ResolvedLink of r: Limits nil when none are set.
 func (r resolved) link() ResolvedLink {
-	resolvedLink := ResolvedLink{Link: r.Link, Principal: r.Principal, Trusted: r.Trusted, Codec: r.Codec}
+	resolvedLink := ResolvedLink{Link: r.Link, Principal: r.Principal, Trusted: r.Trusted, Codec: r.Codec, Opened: r.Opened}
 	if r.Limits.Part != nil || r.Limits.Decoded != nil {
 		limits := r.Limits
 		resolvedLink.Limits = &limits
@@ -1469,12 +1503,19 @@ type relayedOptions struct {
 	// AuthorizeErr is used instead of Authorize when set: an authorize that throws.
 	AuthorizeErr func(principal data.Principal, address contracts.Address) (bool, error)
 	Trusted      bool
+	// WorkerCallWindow is the workers' `callWindow` (announced on their route links unless trusted).
+	WorkerCallWindow *int
 	// TabCodec and RouteCodec are `codecs.tab` and `codecs.route`.
 	TabCodec, RouteCodec link.Codec
 	Server               func(host FacetHost) error
 	Worker               func(host FacetHost) error
+	// RoutePair makes each route link (the server's end first); nil is link.MemoryLinkPair. A test that holds its
+	// queue takes Pi's microtask order by hand: what the hosts post waits until it releases (see heldQueue).
+	RoutePair func() (*link.MemoryLink, *link.MemoryLink)
 	// Resolve wraps the default one (`worker()` makes the worker).
 	Resolve func(address contracts.Address, worker func() resolved, ctx context.Context) (resolved, error)
+	// Admit is the route's admission (slice 14 §2.3); nil: none.
+	Admit   RouteAdmit
 	Context context.Context
 	// RevokedBy is the server's and the workers' `revokedBy`; ServerRevokedBy is the server's when it differs.
 	RevokedBy       RevokedBy[delta.JsonValue]
@@ -1485,6 +1526,8 @@ type relayedOptions struct {
 	Limits link.PartLimits
 	// Loop drives all three kinds of host (Pi's fake timers); nil is the real loop.
 	Loop sectionLoop
+	// Telemetry is the telemetry adapter of each host: tab, server, workers.
+	Telemetry struct{ Tab, Server, Worker telemetry.TelemetryContext }
 }
 
 // relay builds Pi's `relayed(options)`: three hosts, a tab connected to a server, and a server routing `Session` to an
@@ -1507,6 +1550,7 @@ func relay(t testing.TB, options relayedOptions) *relayed {
 		RevokedBy:   serverRevoked,
 		Compression: options.ServerCompression,
 		OnError:     result.Errors.Server.push,
+		Telemetry:   options.Telemetry.Server,
 		loop:        options.Loop,
 	})
 	result.Server = server
@@ -1518,7 +1562,11 @@ func relay(t testing.TB, options relayedOptions) *relayed {
 		result.mu.Lock()
 		result.resolves = append(result.resolves, address.Key)
 		result.mu.Unlock()
-		a, b := link.MemoryLinkPair()
+		makePair := options.RoutePair
+		if makePair == nil {
+			makePair = link.MemoryLinkPair
+		}
+		a, b := makePair()
 		session, _ := address.Params.Value("id").(string)
 		principal := workerPrincipal(session)
 		host := newHost(t, HostOptions{
@@ -1526,7 +1574,9 @@ func relay(t testing.TB, options relayedOptions) *relayed {
 			Principal:   principal,
 			RevokedBy:   options.RevokedBy,
 			Compression: options.WorkerCompression,
+			CallWindow:  options.WorkerCallWindow,
 			OnError:     result.Errors.Worker.push,
+			Telemetry:   options.Telemetry.Worker,
 			loop:        options.Loop,
 		})
 		must(t, host.Connect(b, LinkOptions{Principal: serverPrincipal(), Trusted: options.Trusted, Codec: codec}, ctx))
@@ -1539,13 +1589,14 @@ func relay(t testing.TB, options relayedOptions) *relayed {
 			}
 			return nil
 		})
-		// `void host.load(...)`: an unawaited promise. Pi's `transported()` lets it settle (it drains every microtask); a Go
-		// goroutine is not drained by a link's queue, so WorkerLoaded is the wait on it.
+		// `void host.load(...)`: an unawaited promise, an owned task of the worker's loop that `deliveredOn` joins (Pi's
+		// `transported()` lets it settle: it drains every microtask); WorkerLoaded is the wait on its end.
 		loaded := make(chan struct{})
-		go func() {
+		load := func() {
 			defer close(loaded)
 			_, _ = host.Load([]HostFacet{{Name: "@test/worker", Facet: facet}}, ctx)
-		}()
+		}
+		goTask(host.(*chordHost).loop(), load, load)
 		result.loads.Store(address.Key, loaded)
 		result.Workers.Store(address.Key, host)
 		result.mu.Lock()
@@ -1572,6 +1623,7 @@ func relay(t testing.TB, options relayedOptions) *relayed {
 	}
 	result.Route = mustRoute(t)(server.Route(Session, RouteOptions{
 		Authorize: authorize,
+		Admit:     options.Admit,
 		Resolve: func(address contracts.Address, routing context.Context) (ResolvedLink, error) {
 			// A resolve once the test ended (a re-resolve of a link the closing hosts dropped) makes no worker, as Pi's test ends
 			// before its hosts' close can start one. The test's context is canceled before its first cleanup runs, whichever
@@ -1589,7 +1641,7 @@ func relay(t testing.TB, options relayedOptions) *relayed {
 		}
 		return nil
 	})}}, ctx))
-	tab := newHost(t, HostOptions{Compression: options.TabCompression, OnError: result.Errors.Tab.push, loop: options.Loop})
+	tab := newHost(t, HostOptions{Compression: options.TabCompression, Telemetry: options.Telemetry.Tab, OnError: result.Errors.Tab.push, loop: options.Loop})
 	mustLoad(t)(tab.Load(nil, ctx))
 	a, b := link.MemoryLinkPair()
 	// A worker may be resolving already (a host object of the server started it during its load): its resolve appends to
@@ -1615,6 +1667,7 @@ func relay(t testing.TB, options relayedOptions) *relayed {
 // rawWorkerOptions is the options of `rawWorkers`.
 type rawWorkerOptions struct {
 	Calls   int
+	NoCalls bool
 	NoAck   bool
 	Trusted bool
 	Limits  link.PartLimits
@@ -1629,6 +1682,8 @@ type rawWorkers struct {
 	mu      sync.Mutex
 	// peers are the raw peers in the order of the calls that made them.
 	peers []*RawPeer
+	// ends are both ends of every link Resolve made: Transported flushes them.
+	ends []*link.MemoryLink
 	// made is closed (and replaced) whenever Resolve makes a peer.
 	made chan struct{}
 }
@@ -1672,9 +1727,10 @@ func (w *rawWorkers) Peers() []*RawPeer {
 // Resolve is the `resolve` of relayedOptions: it makes a raw peer for the address.
 func (w *rawWorkers) Resolve(address contracts.Address, _ func() resolved, _ context.Context) (resolved, error) {
 	a, b := link.MemoryLinkPair()
-	peer := newRawPeer(w.t, b, rawPeerOptions{Calls: w.options.Calls, NoAck: w.options.NoAck})
+	peer := newRawPeer(w.t, b, rawPeerOptions{Calls: w.options.Calls, NoCalls: w.options.NoCalls, NoAck: w.options.NoAck})
 	w.mu.Lock()
 	w.peers = append(w.peers, peer)
+	w.ends = append(w.ends, a, b)
 	if w.made != nil {
 		close(w.made)
 		w.made = nil
@@ -1686,8 +1742,16 @@ func (w *rawWorkers) Resolve(address contracts.Address, _ func() resolved, _ con
 	}, nil
 }
 
+// Transported is Pi's `transported()` for the links of the raw workers made so far.
+func (w *rawWorkers) Transported() {
+	w.mu.Lock()
+	ends := append([]*link.MemoryLink(nil), w.ends...)
+	w.mu.Unlock()
+	transported(ends...)
+}
+
 // incarnationOf is a host's incarnation, which its handshakes send.
-func incarnationOf(host Host) string { return host.(*chordHost).incarnation }
+func incarnationOf(host Host) string { return host.Incarnation() }
 
 // countingCompression is Pi's `countInflated()`: a compression whose Inflate output bytes are counted. Go forced
 // difference: Pi stubs the global `DecompressionStream` that a host without compression uses for async inflates; Go's
@@ -1718,4 +1782,60 @@ func (c *countingCompression) Bytes() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.bytes
+}
+
+// MatchV2 is `Match` with the paddle's values carrying a sample time: an older consumer gets them mapped.
+var MatchV2 = mustContract(contracts.Evolve(Match, func(e *contracts.RemoteEditor) *contracts.RemoteEditor {
+	return e.Event("player", "paddle", contracts.Obj(contracts.Prop("y", contracts.Num()), contracts.Prop("t", contracts.Num())))
+}))
+
+// matchProbe is what a test reaches of each match attempt: its paddle source, its score's writable and its `self`.
+type matchProbe struct {
+	mu      sync.Mutex
+	paddles []contracts.EventSource[delta.JsonValue]
+	scores  []state.Writable[any]
+	selves  []Self
+}
+
+func (p *matchProbe) paddle(index int) contracts.EventSource[delta.JsonValue] {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.paddles[index]
+}
+
+func (p *matchProbe) score(index int) state.Writable[any] {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.scores[index]
+}
+
+func (p *matchProbe) self(index int) Self {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.selves[index]
+}
+
+// serveMatch serves `Match`; guests get the watcher variant.
+func serveMatch(host FacetHost, probe *matchProbe) error {
+	return host.Serve(Match, func(_ *delta.JsonObject, principal data.Principal, self Self) (contracts.Implementation, error) {
+		paddle := self.Events()
+		ball := self.Events()
+		writable := self.Writable(0.0)
+		probe.mu.Lock()
+		probe.paddles = append(probe.paddles, paddle)
+		probe.scores = append(probe.scores, writable)
+		probe.selves = append(probe.selves, self)
+		probe.mu.Unlock()
+		score := self.Derive([]any{writable}, func(values []any) (delta.JsonValue, error) { return values[0], nil })
+		if principalKind(principal) == "guest" {
+			return contracts.Implementation{Variant: "watcher", Members: contracts.VariantImplementation{
+				State: map[string]chord.Watchable[delta.JsonValue]{"score": score},
+			}}, nil
+		}
+		return contracts.Implementation{Variant: "player", Members: contracts.VariantImplementation{
+			State:   map[string]chord.Watchable[delta.JsonValue]{"score": score},
+			Events:  map[string]contracts.EventMember[delta.JsonValue]{"paddle": paddle, "ball": ball},
+			Methods: map[string]contracts.MethodFunction{"bump": func(delta.JsonValue, context.Context) (delta.JsonValue, error) { return nil, nil }},
+		}}, nil
+	}, ServeOptions{})
 }

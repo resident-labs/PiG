@@ -23,7 +23,7 @@ import base64
 import hashlib
 import threading
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, TypeAlias, Union
 
 __all__ = [
@@ -143,6 +143,9 @@ class _Encoder:
         if not isinstance(node, _Node):
             raise TypeError(f"kit: {node!r} is not a kit node")
         out: dict[str, Any] = {"kind": node.kind}
+        # Every kind may carry an id; the kinds that need one write it with their fields.
+        if node.id:
+            out["id"] = node.id
         out.update(node._fields(self, depth))
         return out
 
@@ -152,6 +155,8 @@ class _Encoder:
 
 class _Node:
     kind = ""
+    #: The node's id: an a11y, focus or drawing record of a mounted view names a node by it. None sends none.
+    id: str | None = None
 
     def _fields(self, enc: _Encoder, depth: int) -> dict[str, Any]:
         raise NotImplementedError
@@ -169,7 +174,8 @@ class Container(_Node):
 
     kind = "container"
 
-    def __init__(self, children: list[Node] | None = None) -> None:
+    def __init__(self, children: list[Node] | None = None, *, id: str | None = None) -> None:  # noqa: A002 - the wire's name
+        self.id = id
         self.children: list[Node] = list(children or [])
 
     def add_child(self, child: Node) -> Container:
@@ -187,7 +193,8 @@ class Box(_Node):
 
     kind = "box"
 
-    def __init__(self, padding_x: int = 1, padding_y: int = 1, *, bg: str | None = None, children: list[Node] | None = None) -> None:
+    def __init__(self, padding_x: int = 1, padding_y: int = 1, *, bg: str | None = None, children: list[Node] | None = None, id: str | None = None) -> None:  # noqa: A002 - the wire's name
+        self.id = id
         self.padding_x = int(padding_x)
         self.padding_y = int(padding_y)
         self.bg = bg
@@ -210,7 +217,8 @@ class Text(_Node):
 
     kind = "text"
 
-    def __init__(self, text: str = "", padding_x: int = 1, padding_y: int = 1, *, bg: str | None = None) -> None:
+    def __init__(self, text: str = "", padding_x: int = 1, padding_y: int = 1, *, bg: str | None = None, id: str | None = None) -> None:  # noqa: A002 - the wire's name
+        self.id = id
         self.text = str(text)
         self.padding_x = int(padding_x)
         self.padding_y = int(padding_y)
@@ -227,7 +235,8 @@ class TruncatedText(_Node):
 
     kind = "truncated-text"
 
-    def __init__(self, text: str, padding_x: int = 0, padding_y: int = 0) -> None:
+    def __init__(self, text: str, padding_x: int = 0, padding_y: int = 0, *, id: str | None = None) -> None:  # noqa: A002 - the wire's name
+        self.id = id
         self.text = str(text)
         self.padding_x = int(padding_x)
         self.padding_y = int(padding_y)
@@ -272,7 +281,9 @@ class Markdown(_Node):
         *,
         default_text_style: TextStyle | None = None,
         render_latex: bool | None = None,
+        id: str | None = None,  # noqa: A002 - the wire's name
     ) -> None:
+        self.id = id
         self.text = str(text)
         self.padding_x = int(padding_x)
         self.padding_y = int(padding_y)
@@ -292,7 +303,8 @@ class Spacer(_Node):
 
     kind = "spacer"
 
-    def __init__(self, lines: int = 1) -> None:
+    def __init__(self, lines: int = 1, *, id: str | None = None) -> None:  # noqa: A002 - the wire's name
+        self.id = id
         self.lines = int(lines)
 
     def _fields(self, enc: _Encoder, depth: int) -> dict[str, Any]:
@@ -305,7 +317,8 @@ class DynamicBorder(_Node):
 
     kind = "dynamic-border"
 
-    def __init__(self, color: str = "border") -> None:
+    def __init__(self, color: str = "border", *, id: str | None = None) -> None:  # noqa: A002 - the wire's name
+        self.id = id
         self.color = str(color)
 
     def _fields(self, enc: _Encoder, depth: int) -> dict[str, Any]:
@@ -453,12 +466,16 @@ class Image(_Node):
         *,
         max_width_cells: int | None = None,
         max_height_cells: int | None = None,
+        image_id: int | None = None,
         filename: str | None = None,
         fallback_color: str | None = None,
+        id: str | None = None,  # noqa: A002 - the wire's name
     ) -> None:
+        self.id = id
         self._image = _ImageData(data, mime_type)
         self.max_width_cells = max_width_cells
         self.max_height_cells = max_height_cells
+        self.image_id = image_id  # the Kitty image id (upstream ImageOptions.imageId); None: the host allocates one
         self.filename = filename
         self.fallback_color = fallback_color
 
@@ -476,6 +493,7 @@ class Image(_Node):
         out: dict[str, Any] = {"ref": self._image.ref, "mimeType": self._image.mime_type}
         _put(out, "maxWidthCells", self.max_width_cells)
         _put(out, "maxHeightCells", self.max_height_cells)
+        _put(out, "imageId", self.image_id)
         _put(out, "filename", self.filename)
         _put(out, "fallbackColor", self.fallback_color)
         enc.add_image(self._image)
@@ -512,7 +530,9 @@ class Loader(_Node):
         message_color: str | None = None,
         indicator: LoaderIndicator | None = None,
         frame: int | None = None,
+        id: str | None = None,  # noqa: A002 - the wire's name
     ) -> None:
+        self.id = id
         self.message = str(message)
         self.spinner_color = spinner_color
         self.message_color = message_color
@@ -552,7 +572,8 @@ class StackEntry:
 
 
 class _Stack(_Node):
-    def __init__(self, children: list[Node | StackEntry] | None = None, *, gap: int | None = None, align: Align | None = None) -> None:
+    def __init__(self, children: list[Node | StackEntry] | None = None, *, gap: int | None = None, align: Align | None = None, id: str | None = None) -> None:  # noqa: A002 - the wire's name
+        self.id = id
         self.children: list[Node | StackEntry] = list(children or [])
         self.gap = gap
         self.align = align
@@ -635,7 +656,8 @@ class Lines(_Node):
 
     kind = "lines"
 
-    def __init__(self, content: list[str], *, list: List | None = None) -> None:  # noqa: A002 - the wire's name
+    def __init__(self, content: list[str], *, list: List | None = None, id: str | None = None) -> None:  # noqa: A002 - the wire's names
+        self.id = id
         self.content = [str(line) for line in content]
         self.list = list
         self._image: _ImageData | None = None
@@ -683,7 +705,8 @@ class UserMessage(_Node):
 
     kind = "user-message"
 
-    def __init__(self, text: str, output_pad: int = 1) -> None:
+    def __init__(self, text: str, output_pad: int = 1, *, id: str | None = None) -> None:  # noqa: A002 - the wire's name
+        self.id = id
         self.text = str(text)
         self.output_pad = int(output_pad)
 
@@ -1024,7 +1047,8 @@ class Diff(_Node):
 
     kind = "diff"
 
-    def __init__(self, diff: str, *, file_path: str = "", padding_x: int = 0, padding_y: int = 0) -> None:
+    def __init__(self, diff: str, *, file_path: str = "", padding_x: int = 0, padding_y: int = 0, id: str | None = None) -> None:  # noqa: A002 - the wire's name
+        self.id = id
         self.diff = str(diff)
         self.file_path = str(file_path)
         self.padding_x = int(padding_x)
@@ -1725,3 +1749,94 @@ class MouseRegion(_Node):
 
 
 __all__ += ["MouseRegion", "ScrollView"]
+
+
+@dataclass
+class GridChip:
+    """One event of a :class:`GridCell`: its text (at most 256 bytes) and its
+    colour (a theme token, ``#rrggbb`` or ``#rrggbbaa``)."""
+
+    text: str
+    color: str | None = None
+
+    def _encode(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"text": self.text}
+        _put(out, "color", self.color)
+        return out
+
+
+@dataclass
+class GridCell:
+    """One cell of a :class:`Grid`. ``value`` names it in the intent a choice
+    raises (at most 256 bytes; a cell without one cannot be chosen), ``label``
+    is its first line (at most 64 bytes), ``mark`` ``"current"`` draws it as
+    today, ``dim`` as outside the shown range, and ``color`` tints the label (a
+    theme token, ``#rrggbb`` or ``#rrggbbaa``). ``chips`` are the events it
+    shows (at most 8) and ``more`` counts the events the sender left out (0 to
+    9999). A member left ``None``, ``False`` or empty is not sent."""
+
+    value: str | None = None
+    label: str | None = None
+    mark: str | None = None
+    dim: bool = False
+    color: str | None = None
+    chips: list[GridChip] = field(default_factory=list)
+    more: int | None = None
+
+    def _encode(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        _put(out, "value", self.value)
+        _put(out, "label", self.label)
+        _put(out, "mark", self.mark)
+        if self.dim:
+            out["dim"] = True
+        _put(out, "color", self.color)
+        if self.chips:
+            out["chips"] = [chip._encode() for chip in self.chips]
+        _put(out, "more", self.more)
+        return out
+
+
+class Grid(_Node):
+    """The grid node of D614 (the cell form): a calendar-style grid of equal
+    columns whose cells are data, not nodes, so a month of events is one node.
+    The host is its only validator and answers a mount or an update that
+    breaks a rule with code ``invalid``: ``columns`` is 1 to 16, ``head`` is
+    absent or one label a column (64 bytes each), ``chip_rows`` 1 to 8
+    (``None`` takes the host's 3), at most 128 cells in at most 32 rows (the
+    last row may be short), cell values unique and ``selected`` one of them.
+    ``id`` is required and unique within the view; an intent whose
+    ``node_key`` is that id is raised with ``{"value": <the cell's value>}``
+    when the user chooses a cell."""
+
+    kind = "grid"
+
+    def __init__(
+        self,
+        id: str,  # noqa: A002 - the wire's name
+        columns: int,
+        cells: Sequence[GridCell],
+        *,
+        head: Sequence[str] | None = None,
+        chip_rows: int | None = None,
+        selected: str | None = None,
+    ) -> None:
+        self.id = str(id)
+        self.columns = columns
+        self.cells = list(cells)
+        self.head = list(head) if head is not None else None
+        self.chip_rows = chip_rows
+        self.selected = selected
+
+    def _fields(self, enc: _Encoder, depth: int) -> dict[str, Any]:
+        out: dict[str, Any] = {"id": self.id, "columns": self.columns}
+        _put(out, "chipRows", self.chip_rows)
+        if self.head:
+            out["head"] = list(self.head)
+        if self.cells:
+            out["cells"] = [cell._encode() for cell in self.cells]
+        _put(out, "selected", self.selected)
+        return out
+
+
+__all__ += ["Grid", "GridCell", "GridChip"]

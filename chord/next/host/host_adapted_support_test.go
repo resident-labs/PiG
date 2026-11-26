@@ -8,6 +8,7 @@ import (
 	"weak"
 
 	"github.com/MichaelKinsy/PiG/chord"
+	chordctx "github.com/MichaelKinsy/PiG/chord/context"
 	"github.com/MichaelKinsy/PiG/chord/delta"
 	"github.com/MichaelKinsy/PiG/chord/next/contracts"
 	"github.com/MichaelKinsy/PiG/chord/next/data"
@@ -149,8 +150,8 @@ func adaptedMade(host Host, version int, key bool) []weak.Pointer[adaptedMembers
 			if object.phase.attempt != nil {
 				attempts[object.phase.attempt] = true
 			}
-			if object.phase.swap != nil && object.phase.swap.old != nil {
-				attempts[object.phase.swap.old] = true
+			if object.old != nil {
+				attempts[object.old] = true
 			}
 		}
 		for each := range attempts {
@@ -184,16 +185,14 @@ func newAdaptedGate() *adaptedGate {
 	return &adaptedGate{entered: newSignal(), opened: make(chan struct{})}
 }
 
-// open is `() => {}`'s native: `self.open(async () => gate.promise, () => {})`.
+// open is `() => {}`'s native: `self.open(async () => gate.promise, () => {})`. The wait is chordctx.Receive: the open's task
+// is parked on the gate, which a test's delivered() does not wait for (Pi's `await gate.promise` pending), and ends at the
+// open's abort.
 func (g *adaptedGate) native(self Self) {
 	self.Open(func(ctx context.Context) (any, error) {
 		g.entered.fire()
-		select {
-		case <-g.opened:
-			return nil, nil
-		case <-ctx.Done():
-			return nil, context.Cause(ctx)
-		}
+		_, err := chordctx.Receive(ctx, g.opened)
+		return nil, err
 	}, func(any, NativeCloseReason, context.Context) error { return nil })
 }
 

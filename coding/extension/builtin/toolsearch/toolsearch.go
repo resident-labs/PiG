@@ -11,6 +11,7 @@ package toolsearch
 import (
 	"encoding/json"
 	"math"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/internal/jsmath"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/schemaref"
 	"github.com/MichaelKinsy/PiG/internal/searchtext"
 )
 
@@ -50,11 +52,21 @@ type Ranker interface {
 // Tokenize is Pi's tokenize: Unicode word segmentation of the NFC-normalized text with identifier boundaries, without English stop words and with singular forms (searchtext.Tokenize).
 func Tokenize(text string) []string { return searchtext.Tokenize(text) }
 
-// schemaText collects schema descriptions and property names, recursively.
-func schemaText(schema any, parts *[]string) {
+// schemaText collects schema descriptions and property names, recursively, following local `$ref`s into root. seen holds the subschemas already
+// reached through a reference, so recursive and shared definitions are read once, and definitions no property references are not read (Pi 6d3e342b2,
+// #11803).
+func schemaText(schema, root any, parts *[]string, seen map[uintptr]bool) {
 	object, ok := schema.(map[string]any)
 	if !ok {
 		return
+	}
+	if ref, ok := object["$ref"].(string); ok {
+		if target, ok := schemaref.Resolve(ref, root); ok {
+			if targetObject, isObject := target.(map[string]any); isObject && !seen[reflect.ValueOf(targetObject).Pointer()] {
+				seen[reflect.ValueOf(targetObject).Pointer()] = true
+				schemaText(target, root, parts, seen)
+			}
+		}
 	}
 	if description, ok := object["description"].(string); ok {
 		*parts = append(*parts, description)
@@ -62,14 +74,14 @@ func schemaText(schema any, parts *[]string) {
 	if properties, ok := object["properties"].(map[string]any); ok {
 		for _, name := range slices.Sorted(mapsKeys(properties)) {
 			*parts = append(*parts, name)
-			schemaText(properties[name], parts)
+			schemaText(properties[name], root, parts, seen)
 		}
 	}
-	schemaText(object["items"], parts)
+	schemaText(object["items"], root, parts, seen)
 	for _, key := range []string{"anyOf", "oneOf", "allOf"} {
 		if variants, ok := object[key].([]any); ok {
 			for _, variant := range variants {
-				schemaText(variant, parts)
+				schemaText(variant, root, parts, seen)
 			}
 		}
 	}
@@ -90,7 +102,11 @@ func CreateDocument(tool extension.ToolInfo, namespace *extension.ToolNamespace)
 	parts := []string{tool.Description}
 	var parameters any
 	if len(tool.Parameters) > 0 && json.Unmarshal(tool.Parameters, &parameters) == nil {
-		schemaText(parameters, &parts)
+		seen := map[uintptr]bool{}
+		if root, ok := parameters.(map[string]any); ok {
+			seen[reflect.ValueOf(root).Pointer()] = true
+		}
+		schemaText(parameters, parameters, &parts, seen)
 	}
 	var namespaceText string
 	if namespace != nil {
@@ -254,7 +270,7 @@ func (r *Bm25Ranker) Rank(query string, documents []Document, limit int) []Match
 		if len(document.localNameTerms) > 0 && !slices.ContainsFunc(document.localNameTerms, func(term string) bool { return !slices.Contains(queryTerms, term) }) {
 			score += fullNameBonus
 		}
-		ranked = append(ranked, rankedMatch{Match: Match{Name: document.name, Score: score}, exact: isExactNameQuery(exactQuery, document.name), covered: covered})
+		ranked = append(ranked, rankedMatch{Name: document.name, Score: score, exact: isExactNameQuery(exactQuery, document.name), covered: covered})
 	}
 	sort.SliceStable(ranked, func(a, b int) bool {
 		if ranked[a].exact != ranked[b].exact {

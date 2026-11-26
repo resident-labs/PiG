@@ -53,6 +53,13 @@ function isNewer(lastModified, localGeneratedAt) {
 function remoteModels(entry, localGeneratedAt) {
     return entry && isNewer(entry.lastModified, localGeneratedAt) ? entry.models : [];
 }
+/**
+ * Request one provider's catalog from pi.dev. The User-Agent carries this pi's version, and pi.dev
+ * serves the newest catalog published for a minimum version at or below it (see
+ * `scripts/model-catalog-minimum-version.mjs` and `selectModelCatalog()` in
+ * `scripts/model-catalog-protocol.ts`). So a client receives catalogs published after its release,
+ * and those catalogs must work with this client's code.
+ */
 function requestCatalog(providerId, catalogBaseUrl, signal, validator) {
     const url = new URL(`/api/models/providers/${encodeURIComponent(providerId)}`, catalogBaseUrl);
     url.searchParams.set("types", REMOTE_CATALOG_MODEL_TYPES.join(","));
@@ -72,6 +79,8 @@ export function withRemoteCatalog(provider, catalogBaseUrl = DEFAULT_CATALOG_BAS
         ...provider,
         getModels: () => mergeModels(provider.getModels(), dynamicModels.filter((model) => isModelType(model, "chat"))),
         getAllModels: () => mergeModels(provider.getAllModels?.() ?? provider.getModels(), dynamicModels),
+        // pi.dev serves the catalog, so a stale provider login must not block or fail its refresh.
+        refreshModelsAuth: "configured",
         refreshModels: async (context) => {
             const stored = context.stored;
             const restored = remoteModels(stored, localGeneratedAt).filter((model) => model.provider === provider.id);

@@ -18,11 +18,11 @@
 "ai.stream.toolcall_delta.bytes" = 3600
 
 # ai: bytes per SSE delta record through the HTTP client, decoder, builder and event stream (TestProviderStreamPerFrameAllocationGate); the allocation count per record is TestStreamFrameAllocationCeilings'.
-"ai.provider_frame.openai-completions-text.bytes" = 3660
-"ai.provider_frame.openai-completions-toolcall.bytes" = 7920
-"ai.provider_frame.openai-responses-text.bytes" = 3250
-"ai.provider_frame.anthropic-text.bytes" = 3800
-"ai.provider_frame.anthropic-toolcall.bytes" = 6580
+"ai.provider_frame.openai-completions-text.bytes" = 1300
+"ai.provider_frame.openai-completions-toolcall.bytes" = 2950
+"ai.provider_frame.openai-responses-text.bytes" = 1420
+"ai.provider_frame.anthropic-text.bytes" = 1280
+"ai.provider_frame.anthropic-toolcall.bytes" = 2800
 
 # ai: bytes of one short streamed openai-completions request and response through the real HTTP client (TestProviderResponseAllocationGate); a body read costs the bytes it carries, not the 64 KiB read size.
 "ai.provider_response.openai-completions.bytes" = 45400
@@ -70,10 +70,10 @@
 "process.print_tools.gc_cycles" = 0
 "process.print_tools.goroutines_created" = 120
 "process.print_tools.auth_stats" = 16
-"ai.provider_frame.google-text.bytes" = 4460
-"ai.provider_frame.mistral-text.bytes" = 4460
-# Codex Responses over SSE (its own decoder, continuation iterator and per-event clones): measured 4548-4656 B per frame on linux/amd64.
-"ai.provider_frame.openai-codex-responses-text.bytes" = 4900
+"ai.provider_frame.google-text.bytes" = 1960
+"ai.provider_frame.mistral-text.bytes" = 1560
+# Codex Responses over SSE (its own decoder, continuation iterator and per-event clones): measured 1906-2004 B per frame on linux/amd64.
+"ai.provider_frame.openai-codex-responses-text.bytes" = 2050
 
 # coding: goroutine wake-ups (a parked goroutine made runnable through the scheduler, runtime/trace; an iter.Pull coroutine switch is not one) per 16-byte tool-call arguments delta of a write streamed through a Session in -p text mode, marginal between 1k and 2k deltas, at GOMAXPROCS=1 (TestStreamWakesPerDelta). "text" streams from the faux provider, "extension" adds one in-process message_update handler, "openai_text" streams openai-completions from a local HTTP server, one flushed SSE record per delta. Measured at 4cfaf24153: 5.36, 5.36, 11.9; LW roadmap S1, S2 and S3 take them to at most 1.
 "coding.pipeline.text.wakes_per_delta" = 5.5
@@ -111,15 +111,23 @@
 "tui.stream_frame.allocs_growth_per_100_tokens" = 142
 
 # session: loading a persisted session, per JSONL line (TestSessionLoadPerLineAllocationGate).
-"session.load_line.allocs" = 94
-"session.load_line.bytes" = 6800
-"session.load_line.retained_bytes" = 2000
+"session.load_line.allocs" = 6.5
+"session.load_line.bytes" = 440
+"session.load_line.retained_bytes" = 96
 
 # session: one turn (two appends and one context build), and what each existing entry adds to it (TestSessionTurnAllocationGate).
-"session.turn.allocs" = 3140
-"session.turn.bytes" = 500000
-"session.turn.allocs_per_existing_entry" = 5.2
-"session.turn.bytes_per_existing_entry" = 900
+"session.turn.allocs" = 76
+"session.turn.bytes" = 23000
+"session.turn.allocs_per_existing_entry" = 0.05
+"session.turn.bytes_per_existing_entry" = 36
+"session.context_copy.allocs_per_entry" = 3.2
+"session.context_copy.bytes_per_entry" = 640
+"session.long.resume_allocs_per_line" = 12.5
+"session.long.resume_heap_bytes" = 2900000
+"session.long.first_turn_heap_bytes" = 15200000
+"session.long.turn_allocs" = 76
+"session.long.turn_allocs_growth" = 1
+"session.long.turn_bytes_per_existing_entry" = 37
 
 # coding: a later Session turn at history N, 10N, 100N (TestSessionTurnScalingExponents): allocations independent of the history, bytes linear (copies of the context slice).
 "coding.session_turn.allocs_exponent" = 0.05
@@ -135,8 +143,8 @@
 "mcp.tool_call_over_servers.bytes_exponent" = 0.05
 
 # extension host: one event request to an extension and its response, host side (TestExtensionEventRoundTripAllocationGate).
-"extension.event_roundtrip.allocs" = 21
-"extension.event_roundtrip.bytes" = 1550
+"extension.event_roundtrip.allocs" = 2.5
+"extension.event_roundtrip.bytes" = 420
 
 # extension host: goroutine wake-ups per event dispatch (state push + event request + the runtime's started/completed/response), host
 # goroutines only (TestConnDispatchReadsAndWakesPerEvent). The fake runtime's wakes are the harness's and depend on OS scheduling
@@ -145,23 +153,42 @@
 "extension.dispatch.host_wakes" = 2.5
 
 # process: whole-process counts from PIG_PROFILE=metrics under GOMAXPROCS=1 (test/perfgate). Allocation counts vary a few percent with goroutine interleaving; the ceilings carry that margin.
-"process.print.allocs" = 24500
-"process.print.bytes" = 3900000
+"process.print.allocs" = 15300
+"process.print.bytes" = 2200000
 "process.print.gc_cycles" = 2
-"process.print.heap_live_bytes" = 1850000
+"process.print.heap_live_bytes" = 1100000
 "process.print.max_rss_bytes" = 50000000
 "process.print.goroutines_at_exit" = 3
 "process.print.fds_left_open" = 2
 "process.print.children_at_exit" = 0
 "process.print.temp_entries_at_exit" = 0
-"process.rpc_startup.allocs" = 22800
-"process.rpc_startup.bytes" = 2950000
+# process: the same print-mode round trip with the model resolved through the catalog and the provider's credential (no PIG_TEST_FAUX, hermetic provider server), one key pair per provider shape
+# (coding/cli TestStartupAllocationBudgetRealModel): an API-key provider of the Responses API (openai), an OAuth provider (openai-codex, whose "auto" transport tries a WebSocket first, as Pi's does), a custom
+# OpenAI-compatible provider with its own base URL, and the default model of an API-key provider (deepseek, no --model). Each ceiling is a bound from a measured snapshot, not an exact count: the largest of the
+# fifty minima-of-three of a 150-run measurement on tern-ci (xd670, 2026-11-16: api_key 31,554 objects / 5,360,728 bytes, oauth 24,528 / 5,298,816, openai_compatible 20,092 / 3,372,344, default_model 20,830 / 3,176,800)
+# plus under 1.5%. The runs differ by 24-46 objects and about 10 KB: the sync.Map hash tries of the process lay out a few nodes differently with each map's random hash seed (internal/sync.newIndirectNode
+# differed by 12 between the lowest and the highest run) and the runtime starts one more OS thread in some runs (about 5 KB). The snapshot is regenerated by `make perf-scoreboard-measure`.
+# The api_key and oauth bounds were lowered when the metadata readers began to share one converted catalog snapshot (internal/codingagent builtinChatModels), derived the same way from fifty minima-of-three
+# of the cured tree on xd6702 (2026-11-16): api_key at most 30,395 objects / 5,181,872 bytes, oauth at most 24,292 / 5,265,096, plus under 1.5%; the other two shapes did not move (20,096 / 3,371,712 and 20,796 / 3,170,648).
+# The catalog gained six chat models (GPT-6.2 Astra and Sol of openai, azure and openai-codex: 1663 -> 1669, as the pinned Pi's catalog holds them) and the api_key and oauth shapes convert every built-in chat model at start (builtinChatModels), so those two grew by the cost of six rows (about 90 objects, 13 KB each); the other two shapes did not move.
+# Measured with the same 150-run method (go test -count=50, largest of fifty minima-of-three) at the base b79b8ca2e2 and at the tip, xd670, 2026-11-17: api_key 30,419 -> 30,955 objects and 5,219,040 -> 5,299,920 bytes; oauth 24,313 -> 24,958 and 5,300,568 -> 5,396,888;
+# openai_compatible 20,118 -> 20,119 and 3,408,608 -> 3,408,896; default_model 20,827 -> 20,831 and 3,209,984 -> 3,210,464. Each of the four moved bounds is the old bound plus that growth, rounded up.
+"process.print_real_model.api_key.allocs" = 31390
+"process.print_real_model.api_key.bytes" = 5341000
+"process.print_real_model.oauth.allocs" = 25350
+"process.print_real_model.oauth.bytes" = 5447000
+"process.print_real_model.openai_compatible.allocs" = 20400
+"process.print_real_model.openai_compatible.bytes" = 3425000
+"process.print_real_model.default_model.allocs" = 21150
+"process.print_real_model.default_model.bytes" = 3225000
+"process.rpc_startup.allocs" = 13000
+"process.rpc_startup.bytes" = 1850000
 "process.rpc_startup.children_at_exit" = 0
 "process.rpc_startup.temp_entries_at_exit" = 0
 "process.rpc_turn.allocs" = 3150
 "process.rpc_turn.bytes" = 335000
-"process.rpc_ext10_turn.allocs" = 16000
-"process.rpc_ext10_turn.bytes" = 3620000
+"process.rpc_ext10_turn.allocs" = 4900
+"process.rpc_ext10_turn.bytes" = 780000
 "process.rpc_ext10_turn.allocs_growth" = 1.12
 # process: the same turn at one and three extensions (TestRPCExtensionTurnProcessGateByExtensionCount), so the per-extension and the fixed cost are gated apart. Each ceiling is the measured maximum of four runs plus about 6%.
 "process.rpc_ext1_turn.allocs" = 4200
@@ -171,6 +198,12 @@
 "process.rpc_ext0_turn.allocs" = 3100
 "process.rpc_ext0_turn.bytes" = 305000
 "process.rpc_ext0_turn.allocs_growth" = 1.3
+
+# process: what one streamed message_update costs the host per subscribing TypeScript extension, over a 24-delta faux stream to one and to four extensions less the same turn with agent_end subscribers, per update and subscriber (TestRPCMessageUpdateProcessGate). The shared encoding of the update is paid once, so the cost per subscriber falls as subscribers are added. Measured on go1.27.4: 122 / 23,920 at one subscriber and 55 / 9,005 at four; the ceilings add about 6%.
+"process.rpc_message_update_ext1.allocs" = 130
+"process.rpc_message_update_ext1.bytes" = 25500
+"process.rpc_message_update_ext4.allocs" = 59
+"process.rpc_message_update_ext4.bytes" = 9600
 "fused.dispatch_k1.allocs" = 1330
 "fused.dispatch_k3.allocs" = 3010
 "fused.dispatch_k10.allocs" = 8560
@@ -188,11 +221,21 @@
 
 # binary: stripped stock pig per release platform (TestReleaseBinarySizeGate).
 # 0.5.2 batch: owner-approved 2026-10-21, ceilings raised to the measured sizes (rounded up to 8 KiB): linux_amd64 67,009,312 -> 69918720 (+4.3%), linux_arm64 62,821,600 -> 65413120, darwin_arm64 64,504,688 -> 67190784, windows_amd64 68,666,240 -> 71606272. Train 3 alone measured 66,826,400 on linux_amd64; the growth is train 4: the Python and Rust SDK sources embedded in the binary (extensions/sdk-py 0.78 -> 1.41 MB, extensions/sdk-rs 1.2 -> 2.0 MB) and about 1.4 MB of new Go code (SDK tui kit, pi-ai helpers, session graph, TLS distrust, classifier images). Shrink in 0.5.3.
-"binary.pig.linux_amd64.bytes" = 69918720
-"binary.pig.linux_arm64.bytes" = 65413120
-"binary.pig.darwin_arm64.bytes" = 67190784
+# pig ceilings, 0.7.1 SizeClimb lowering (2026-11-06; owner rule: a ceiling only moves down. Each step below is a lowering against the step before it, with the exception named in the next comment: the widthx revert and the sortx variant raise the ceilings against c5be8dc4f0, and they stay below the 0.7.0-era ceilings). The 0.5.2 values above are superseded; the ceilings below are the measured sizes rounded up to 4 KiB. Measured, stripped as the gate builds it (linux_amd64 / linux_arm64 / darwin_arm64 / windows_amd64): 0.7.0 (989927eff4) 69,218,464 / 64,553,120 / 66,391,074 / 70,961,152; the typebox step (4625b4cc3d: one checker for Value.Check and Value.Errors, no JSON Schema validator) 69,476,512 / 64,815,264 / 66,624,018 / 71,219,200, ceilings 69,480,448 / 64,819,200 / 66,625,536 / 71,221,248 (they were 69,918,720 / 65,413,120 / 67,190,784 / 71,606,272); the collate, width and upgrade-driver steps (9fddab05ab) 66,457,760 / 61,931,680 / 63,681,298 / 68,167,168, ceilings 66,461,696 / 61,935,616 / 63,684,608 / 68,169,728; the dictionary-index and sortx steps (c5be8dc4f0) 64,323,744 / 59,965,600 / 61,739,074 / 66,021,888, ceilings as below. Net against 0.7.0: -4,894,720 / -4,587,520 / -4,652,000 / -4,939,264 bytes.
+# 0.7.1 SizeClimb, widthx dropped (2026-11-06, lane owner's call): the one-engine widthx change (e4d43b5422) was reverted, so the SDK width copy and its emoji table link twice again (+106,496 linux_amd64 stripped). The 12 ceilings below are the measured sizes rounded up to 4 KiB at the revert, above the c5be8dc4f0 values (the sortx step grew the binary) and below the 0.7.0-era ceilings. Stripped pig linux_amd64 / linux_arm64 / darwin_arm64 / windows_amd64: 64,602,272 / 60,227,744 / 61,990,402 / 66,298,368 at 9a3611d3de, 64,708,768 / 60,358,816 / 62,139,362 / 66,420,736 after the revert. 0.7.0: 69,218,464 / 64,553,120 / 66,391,074 / 70,961,152.
+# pig ceilings, 0.7.1 SizeStep2 lowering (2026-11-06; a lowering needs no approval): the same rule (measured stripped sizes rounded up to 4 KiB) with the embedded data moved to one zstd frame each (agent docs pages, SDK bundles, changelog) and the word dictionaries stored as in-place tries. Measured on the SizeClimb tip 9a3611d3de (linux_amd64 / linux_arm64 / darwin_arm64 / windows_amd64): 64,602,272 / 60,227,744 / 61,990,402 / 66,298,368; with SizeStep2: 61,620,384 / 57,278,624 / 58,979,858 / 63,315,968. After the widthx revert (e1a1f1c5dc; ceilings rounded up to 4 KiB, as SizeClimb's): 61,730,976 / 57,409,696 / 59,128,818 / 63,438,336 against SizeClimb's own 64,712,704 / 60,362,752 / 62,140,416 / 66,420,736.
+# linux_amd64 and windows_amd64: owner-approved 2026-11-13 (the owner's delegation of 2026-11-13T14:17:56Z: size raises under 0.25% with a measured cause) for the ports of Pi main and the view endpoint. Stripped size 61,796,512 (linux_amd64) over 61,734,912 -> ceiling 61,800,448 (+65,536 B, +0.11%); 63,511,552 (windows_amd64) over 63,438,848 -> ceiling 63,512,576 (+73,728 B, +0.12%). Symbol growth since 926e3dc30012 (linux_amd64, 61,317,280 there): coding/uiview +112.4 KB, internal/codingagent +38.6 KB, coding/extension/host/subprocess +37.2 KB, go:func +32.4 KB, internal/viewcarrier +27.2 KB, ai +5.0 KB.
+# Catalog refresh to live data (row 188; the owner's decision line of 2026-11-15T15:19:41Z in handoffs/0.8.0/OWNER-DECISIONS.md, "R and go", refreshes the catalog to live data; each raise is under 0.25% (the largest +0.1999%), the owner's size rule): the catalog is Pi's generator over the committed recording of 2026-11-15T15:26:04Z
+# (automation/gen/catalog-source), 1663 chat / 72 image / 72 classifier models, instead of the published 1.5.2 snapshot (1643 / 66 / 64). The data is in every binary (ai/catalog_records, the Node runtime's vendored data); the recording itself is in none.
+# Ceilings below are the measured stripped sizes at the refresh rounded up to 4 KiB: headless.default.darwin_arm64 33818930 -> 33837056; headless.default.linux_amd64 35328160 -> 35344384; headless.default.linux_arm64 32706720 -> 32772096; headless.default.windows_amd64 36665856 -> 36679680; headless.stripped.darwin_arm64 27870978 -> 27885568; headless.stripped.linux_amd64 29339808 -> 29347840; headless.stripped.windows_amd64 30648832 -> 30662656; pig.darwin_arm64 59476882 -> 59494400; pig.linux_amd64 62234784 -> 62242816; pig.windows_amd64 63916032 -> 63926272. The rows not named keep their ceiling (they did not grow past it).
+# batch 4 close (owner rule, 2026-11-19): every one of the twelve binary rows below (the four pig rows and the eight headless rows) is the size measured on the closed tip 5f69da7010 plus 262,144 bytes (256 KiB) of room. Measured pig linux_amd64 62,603,424 / linux_arm64 58,065,056 / darwin_arm64 59,847,794 / windows_amd64 64,325,120; headless default 35,561,632 / 32,964,768 / 34,037,074 / 36,928,512 and stripped 29,536,416 / 27,132,064 / 28,089,314 / 30,885,888 (same platform order). A ceiling still only moves down afterwards.
+# release candidate of the chain 42-49 (owner rule, 2026-11-19, applied to the release candidate): every one of the twelve binary rows is again the size measured on the tip d6277db5a2 plus 262,144 bytes (256 KiB). Measured pig linux_amd64 62,660,768 / linux_arm64 58,065,056 / darwin_arm64 59,915,570 / windows_amd64 64,385,024; headless default 35,610,784 / 33,095,840 / 34,087,906 / 36,980,224 and stripped 29,585,568 / 27,132,064 / 28,123,746 / 30,933,504 (same platform order). Two rows (pig linux_arm64, headless.stripped linux_arm64) are unchanged: measured + 262,144 equals the batch 4 ceiling. A ceiling still only moves down afterwards.
+# release 0.8.0 (owner rule, 2026-11-19, applied to the release candidate): the 4 pig rows are measured on the 0.8.0 tip (after folding 880 changelog fragments into CHANGELOG.md.zst + Pi v1.6.0) plus 262,144 bytes (256 KiB): linux_amd64 63,008,928 -> 63,271,072; linux_arm64 58,458,272 -> 58,720,416; darwin_arm64 60,249,282 -> 60,511,426; windows_amd64 64,714,752 -> 64,976,896. All 8 headless rows remained under their ceilings.
+"binary.pig.linux_amd64.bytes" = 63271072
+"binary.pig.linux_arm64.bytes" = 58720416
+"binary.pig.darwin_arm64.bytes" = 60511426
 # windows_amd64: owner-approved 2026-10-16 for the Pi v1.3.0 pin. Stripped size 72,289,792 at 9db1ecc0a3 -> 72,310,272 (+20,480 B); symbol growth: type data +12.8 KB, ai +6.1 KB, go/types +2.8 KB, tui/widthx +1.5 KB, coding/cli +0.6 KB.
-"binary.pig.windows_amd64.bytes" = 71606272
+"binary.pig.windows_amd64.bytes" = 64976896
 
 # binary: the headless embed example (examples/headless: session API, MCP, one provider, no terminal) per release platform, stripped as released (TestHeadlessEmbedBinarySizeGate). "default" is a plain build; "stripped" passes every strip tag except pig_strip_mcp. Measured at the change that stopped the Node view kit's editor builder (tui.Editor and the 6.3 MB word dictionaries behind it) and the announcement image (539 KB) from linking into programs that never draw an interactive editor, rounded up to 8 KiB with one 4 KiB page of linker alignment as headroom (the same program built by the test and by hand differed by a page). A ceiling only moves down. The default ceilings were lowered when Amazon Bedrock (ai/providers/bedrock, the AWS SDK) stopped linking into a plain import of ai: measured at that change, rounded the same way (linux_amd64 40,148,992 -> 36,675,584 B).
 # linux_amd64 and darwin_arm64 (default): owner-approved 2026-10-27 for the Pi b3a29f11 pin. Stripped size 36,675,744 (linux_amd64) over 36,675,584 -> ceiling 36,683,776 (+8,192 B); 35,259,074 (darwin_arm64) over 35,250,176 -> ceiling 35,266,560 (+16,384 B). Symbol growth (go tool nm -size, batch vs head, linux_amd64): internal/codingagent +877 B, tui +526 B, ai +427 B, all ported Pi b3a29f11 code.
@@ -204,20 +247,21 @@
 # headless ceilings, owner approved 2026-10-30 (Michael Kinsy), Photon formats TIFF/ICO/PNM/DDS/HDR/farbfeld (fix/follow-photon-decode-d): linux_amd64 default 36,937,728 approved by the owner; the other targets are measured by TestHeadlessEmbedBinarySizeGate on the integration head ba33bfe21a and rounded up to 8 KiB: default linux_arm64 34,406,560, darwin_arm64 35,508,658, windows_amd64 38,262,784; stripped linux_amd64 30,421,152, darwin_arm64 29,012,818, windows_amd64 31,728,128 (stripped linux_arm64 is unchanged).
 # headless ceilings, owner rule (measured size rounded up to 8 KiB; owner-approved 2026-10-30 for the Photon format decoders) moved again for Photon's BMP, GIF and PNG decoders (fix/follow-photon-decode-e) on integration head c7fef98b6d: default linux_amd64 36,982,944, linux_arm64 34,537,632, darwin_arm64 35,559,554, windows_amd64 38,311,424; stripped linux_amd64 30,466,208, darwin_arm64 29,063,506, windows_amd64 31,777,280 (stripped linux_arm64 unchanged). At ba33bfe21a they measured 36,933,792, 34,406,560, 35,508,658, 38,262,784 and 30,421,152, 29,012,818, 31,728,128.
 # headless ceilings, owner rule (measured size rounded up to 8 KiB; OWNER APPROVED 2026-10-31 to apply once after the merge-back of the 0.6.0 line into next) on the merged head ca413772f0: measured by TestHeadlessEmbedBinarySizeGate default linux_amd64 37,028,000, darwin_arm64 35,593,986, windows_amd64 38,358,528, stripped linux_amd64 30,515,360, linux_arm64 28,115,104, darwin_arm64 29,114,466, windows_amd64 31,823,872 B; default linux_arm64 (34,537,632) stays at its ceiling 34,545,664.
-"binary.headless.default.linux_amd64.bytes" = 37036032
-"binary.headless.default.linux_arm64.bytes" = 34545664
-"binary.headless.default.darwin_arm64.bytes" = 35594240
-"binary.headless.default.windows_amd64.bytes" = 38363136
-"binary.headless.stripped.linux_amd64.bytes" = 30523392
+# headless ceilings, 0.7.1 SizeClimb lowering (2026-11-06; owner rule: a ceiling only moves down; the headless ceilings were raised against c5be8dc4f0 by the widthx revert and the sortx variant, and stay below the 0.7.0-era ceilings: after the revert, default 35,451,040 / 32,964,768 / 34,020,050 / 36,775,936 and stripped 29,032,608 / 26,673,312 / 27,644,258 / 30,338,560 for linux_amd64 / linux_arm64 / darwin_arm64 / windows_amd64), first measured at c5be8dc4f0 as TestHeadlessEmbedBinarySizeGate builds the program and rounded up to 4 KiB (linux_amd64 / linux_arm64 / darwin_arm64 / windows_amd64). Default 35,233,952 / 32,768,160 / 33,806,418 / 36,548,096, ceilings below; the ceilings were 37,036,032 / 34,545,664 / 35,594,240 / 38,363,136 before the 0.7.1 steps, 36,868,096 / 34,410,496 / 35,446,784 / 38,191,104 after the typebox step (4625b4cc3d) and 35,401,728 / 32,903,168 / 33,927,168 / 36,724,736 after the collate, width and upgrade-driver steps (9fddab05ab). Stripped 28,815,520 / 26,476,704 / 27,430,770 / 30,110,208, ceilings below; the ceilings were 30,523,392 / 28,123,136 / 29,122,560 / 31,825,920 before, 30,449,664 / 28,053,504 / 29,073,408 / 31,756,288 after the typebox step and 28,991,488 / 26,611,712 / 27,549,696 / 30,285,824 after the collate, width and upgrade-driver steps. The older comments above name ceilings that these replace.
+"binary.headless.default.linux_amd64.bytes" = 35872928
+"binary.headless.default.linux_arm64.bytes" = 33357984
+"binary.headless.default.darwin_arm64.bytes" = 34350050
+"binary.headless.default.windows_amd64.bytes" = 37242368
+"binary.headless.stripped.linux_amd64.bytes" = 29847712
 # default linux_amd64, darwin_arm64 and windows_amd64, owner-approved 2026-10-29 (Michael Kinsy) for the 0.6.0 features that landed after the closed-Piglet-Binary approval (ext-autocomplete-v2, ownThinkingRuns across the SDKs, SDK key vectors, the MCP close fix): measured by TestHeadlessEmbedBinarySizeGate on the 0.6.0 head linux_amd64 36,724,896, darwin_arm64 35,310,370 and windows_amd64 38,052,352 B, each rounded up to 8 KiB: linux_amd64 36,732,928, darwin_arm64 35,315,712, windows_amd64 38,060,032; linux_arm64 is unchanged. On this line the ceilings above (Photon decoders) are the ones in force; the merged head is measured against them.
-"binary.headless.stripped.linux_arm64.bytes" = 28123136
-"binary.headless.stripped.darwin_arm64.bytes" = 29122560
-"binary.headless.stripped.windows_amd64.bytes" = 31825920
+"binary.headless.stripped.linux_arm64.bytes" = 27394208
+"binary.headless.stripped.darwin_arm64.bytes" = 28385890
+"binary.headless.stripped.windows_amd64.bytes" = 31195648
 
-# process: interactive start to the first ready frame, then Ctrl+D (test/integration TestInteractiveFirstFrameProcessGate, integration tag, tmux). The idle time between the frame and Ctrl+D adds timer work, so the margin is wider.
+# process: interactive start to the first ready frame, then Ctrl+D (test/integration TestInteractiveFirstFrameProcessGate, integration tag, tmux). The idle time between the frame and Ctrl+D adds timer work, so the margin is wider. heap_live_bytes: the test starts pig in test/integration, so the repository's AGENTS.md (59,822 B) is in the system prompt and the figure moves with that file. Measured on the Linux lab host (xd6702, tern-ci image, linux/amd64, GOMAXPROCS=1) with the prompt held once by the CLI, the Session and the interactive mode: 8 runs 2,024,080-2,025,328 B (it was 2,153,264-2,157,104 B in 24 runs of three commits with three copies); the ceiling is the largest plus 2.7%, the margin the former 2,150,000 had over its measurement of 2,093,008 B, rounded to the nearest 10 KB.
 "process.interactive_first_frame.allocs" = 22700
 "process.interactive_first_frame.bytes" = 5650000
-"process.interactive_first_frame.heap_live_bytes" = 2150000
+"process.interactive_first_frame.heap_live_bytes" = 2080000
 "process.interactive_first_frame.children_at_exit" = 0
 
 # compaction: preparing a compaction, per branch entry (TestCompactionPreparePerEntryAllocationGate).

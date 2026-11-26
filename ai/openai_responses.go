@@ -16,13 +16,18 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/MichaelKinsy/PiG/internal/jsjson"
 	"github.com/MichaelKinsy/PiG/internal/jsnumber"
+	"github.com/MichaelKinsy/PiG/internal/jsonparse"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 
 	"github.com/MichaelKinsy/PiG/internal/coding/pigidentity"
 	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
+	"github.com/MichaelKinsy/PiG/internal/jsonwire"
+	"github.com/MichaelKinsy/PiG/internal/orderedjson"
 )
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -53,6 +58,9 @@ type OpenAIResponsesConfig struct {
 	SamplingParams map[string]any
 	// SamplingParamsByThinkingLevel overrides SamplingParams for the effective thinking level.
 	SamplingParamsByThinkingLevel SamplingParamsByThinkingLevel
+	// SamplingParamsOrder and SamplingParamsByThinkingLevelOrder are Model.SamplingParamsOrder and Model.SamplingParamsByThinkingLevelOrder.
+	SamplingParamsOrder                []string
+	SamplingParamsByThinkingLevelOrder map[ModelThinkingLevel][]string
 	// ThinkingLevelMap supplies an explicit map when selected ModelMetadata is absent.
 	ThinkingLevelMap ThinkingLevelMap
 	// APIKeyHeader is the header name used for the API key.
@@ -144,24 +152,40 @@ const configurationUpdateRequestEffort = "medium"
 
 // configurationUpdateEffort is upstream getConfigurationUpdateEffort: the mapped effort to send in configuration_update
 // items, or "" to send it as reasoning.effort. It needs the model's supportsMidConvoEffort compat and a requested level;
-// Sign in with ChatGPT rejects the items.
+// Sign in with ChatGPT rejects the items, and Azure does not read it.
 func (p *openAIResponsesProvider) configurationUpdateEffort(compat responsesCompat, opts StreamOptions, apiKey string) string {
-	// Only the openai-responses module reads it; the Azure and Codex modules do not.
-	if p.api() != APIOpenAIResponses || !compat.SupportsMidConvoEffort || p.isChatGPTSignIn(apiKey) {
+	if !compat.SupportsMidConvoEffort {
 		return ""
 	}
-	model := p.resolvedModel()
-	level := ModelThinkingLevel(opts.ReasoningEffort)
-	if level == "" && opts.Thinking != "" {
-		level = ClampThinkingLevel(model, ModelThinkingLevel(opts.Thinking))
-	}
-	if level == "" || level == ThinkingOff {
+	switch p.api() {
+	case APIOpenAIResponses:
+		if p.isChatGPTSignIn(apiKey) {
+			return ""
+		}
+		model := p.resolvedModel()
+		level := ModelThinkingLevel(opts.ReasoningEffort)
+		if level == "" && opts.Thinking != "" {
+			level = ClampThinkingLevel(model, ModelThinkingLevel(opts.Thinking))
+		}
+		if level == "" || level == ThinkingOff {
+			return ""
+		}
+		if mapped, ok := model.ThinkingLevelMap[level]; ok && mapped != nil {
+			return *mapped
+		}
+		return string(level)
+	case APIOpenAICodexResponses:
+		requested := cmp.Or(opts.ReasoningEffort, strings.TrimPrefix(string(opts.Thinking), string(ThinkingOff)))
+		if requested == "" {
+			return ""
+		}
+		if effort := resolveCodexReasoningEffort(p.resolvedModel(), requested); effort != nil {
+			return *effort
+		}
+		return ""
+	default:
 		return ""
 	}
-	if mapped, ok := model.ThinkingLevelMap[level]; ok && mapped != nil {
-		return *mapped
-	}
-	return string(level)
 }
 
 // isChatGPTSignIn reports whether apiKey is a Sign in with ChatGPT access token: OpenAI API keys start with `sk-`, so a different credential sent directly to OpenAI is one.
@@ -193,12 +217,14 @@ type responsesCompat struct {
 	SupportsExplicitPromptCacheMode bool
 	SupportsToolSearch              bool
 	SupportsMidConvoEffort          bool
+	PromptCacheKeyMode              PromptCacheKeyMode
 }
 
 func getResponsesCompat(compat *OpenAIResponsesCompat, strictModeDefault bool) responsesCompat {
 	out := responsesCompat{
 		SupportsLongCacheRetention: true,
 		SupportsStrictMode:         strictModeDefault,
+		PromptCacheKeyMode:         PromptCacheKeyAuto,
 	}
 	if compat == nil {
 		return out
@@ -217,6 +243,7 @@ func getResponsesCompat(compat *OpenAIResponsesCompat, strictModeDefault bool) r
 	out.SupportsExplicitPromptCacheMode = compat.SupportsExplicitPromptCacheMode != nil && *compat.SupportsExplicitPromptCacheMode
 	out.SupportsToolSearch = compat.SupportsToolSearch != nil && *compat.SupportsToolSearch
 	out.SupportsMidConvoEffort = compat.SupportsMidConvoEffort != nil && *compat.SupportsMidConvoEffort
+	out.PromptCacheKeyMode = cmp.Or(compat.PromptCacheKeyMode, PromptCacheKeyAuto)
 	return out
 }
 
@@ -280,6 +307,42 @@ type ResponsesInputItem struct {
 
 	// For type=configuration_update
 	Reasoning *respReasoningEffort `json:"reasoning,omitempty"`
+
+	// stored is a replayed item as JSON.stringify writes the object its stored text holds: Pi pushes JSON.parse(thinkingSignature) into
+	// the input (openai-responses-shared.ts:337-338), so the item goes out with the members it was stored with, in their order.
+	stored json.RawMessage
+}
+
+// MarshalJSON writes the item with its members in the order Pi creates them.
+func (item ResponsesInputItem) MarshalJSON() ([]byte, error) {
+	return jsstring.MarshalKeepingSurrogates(item.wire())
+}
+
+// wire is the value MarshalJSON writes. The two items of a client tool search are the literals of openai-responses-shared.ts:251-264:
+// type, call_id, execution, status, then arguments or tools.
+func (item ResponsesInputItem) wire() any {
+	switch {
+	case item.stored != nil:
+		return item.stored
+	case item.Type == "tool_search_call":
+		return struct {
+			Type      string          `json:"type"`
+			CallID    string          `json:"call_id"`
+			Execution string          `json:"execution"`
+			Status    string          `json:"status"`
+			Arguments json.RawMessage `json:"arguments"`
+		}{item.Type, item.CallID, item.Execution, item.Status, item.Arguments}
+	case item.Type == "tool_search_output":
+		return struct {
+			Type      string          `json:"type"`
+			CallID    string          `json:"call_id"`
+			Execution string          `json:"execution"`
+			Status    string          `json:"status"`
+			Tools     []ResponsesTool `json:"tools,omitempty"` //portlint:allow emptydrop the item exists only for a system message that adds tools (openai-responses-shared.ts:233-235)
+		}{item.Type, item.CallID, item.Execution, item.Status, item.Tools}
+	}
+	type fields ResponsesInputItem
+	return fields(item)
 }
 
 // respReasoningEffort is the reasoning member of a configuration_update item.
@@ -312,7 +375,8 @@ func (t ResponsesTool) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(wire)
+	// The name and the description are written as JSON.stringify writes them: a lone UTF-16 surrogate as its escape (openai-responses-shared.ts:386-393).
+	return jsstring.MarshalKeepingSurrogates(wire)
 }
 
 // responsesToolWire is the value ResponsesTool's MarshalJSON writes.
@@ -376,8 +440,7 @@ type respRequest struct {
 	ToolChoice           any               `json:"tool_choice,omitempty"`
 	Reasoning            *respReasoning    `json:"reasoning,omitempty"`
 	Include              []string          `json:"include,omitempty"`
-	// Instructions, Text and ParallelToolCalls are Codex members.
-	Instructions      string            `json:"instructions,omitempty"`
+	// Text and ParallelToolCalls are Codex members.
 	Text              map[string]string `json:"text,omitempty"`
 	ParallelToolCalls *bool             `json:"parallel_tool_calls,omitempty"`
 
@@ -387,7 +450,7 @@ type respRequest struct {
 
 // MarshalJSON writes the body in the member order of the builder that made it.
 func (req respRequest) MarshalJSON() ([]byte, error) {
-	return marshalStringify(req.wire())
+	return jsstring.MarshalKeepingSurrogates(req.wire())
 }
 
 // wire is the value MarshalJSON writes.
@@ -400,22 +463,21 @@ func (req respRequest) wire() any {
 		Model                string            `json:"model"`
 		Store                *bool             `json:"store,omitempty"`
 		Stream               bool              `json:"stream"`
-		Instructions         string            `json:"instructions,omitempty"`
 		Input                json.RawMessage   `json:"input"`
 		Text                 map[string]string `json:"text,omitempty"`    //portlint:allow emptydrop always the one-member {verbosity} object (openai-codex-responses.ts:560, openai_responses.go:1295)
 		Include              []string          `json:"include,omitempty"` //portlint:allow emptydrop always ["reasoning.encrypted_content"] (openai-codex-responses.ts:561)
 		PromptCacheKey       string            `json:"prompt_cache_key,omitempty"`
 		ToolChoice           any               `json:"tool_choice,omitempty"`
 		ParallelToolCalls    *bool             `json:"parallel_tool_calls,omitempty"`
+		MaxOutputTokens      int               `json:"max_output_tokens,omitempty"`
 		Temperature          *float64          `json:"temperature,omitempty"`
 		ServiceTier          string            `json:"service_tier,omitempty"`
 		Tools                []ResponsesTool   `json:"tools,omitempty"` //portlint:allow emptydrop Pi sets tools only when requestTools is non-empty (openai-codex-responses.ts:575-581)
 		Reasoning            *respReasoning    `json:"reasoning,omitempty"`
-		MaxOutputTokens      int               `json:"max_output_tokens,omitempty"`
 		PromptCacheRetention string            `json:"prompt_cache_retention,omitempty"`
 		PromptCacheOptions   map[string]string `json:"prompt_cache_options,omitempty"` //portlint:allow emptydrop getPromptCacheOptions returns a non-empty object or undefined (openai-responses.ts:106-112)
-	}{req.Model, req.Store, req.Stream, req.Instructions, req.Input, req.Text, req.Include, req.PromptCacheKey, req.ToolChoice, req.ParallelToolCalls,
-		req.Temperature, req.ServiceTier, req.Tools, req.Reasoning, req.MaxOutputTokens, req.PromptCacheRetention, req.PromptCacheOptions}
+	}{req.Model, req.Store, req.Stream, req.Input, req.Text, req.Include, req.PromptCacheKey, req.ToolChoice, req.ParallelToolCalls,
+		req.MaxOutputTokens, req.Temperature, req.ServiceTier, req.Tools, req.Reasoning, req.PromptCacheRetention, req.PromptCacheOptions}
 }
 
 // ─── SSE event types ─────────────────────────────────────────────────────────
@@ -461,6 +523,8 @@ type respResponseObj struct {
 	ServiceTier       string           `json:"service_tier,omitempty"`
 	Error             *respError       `json:"error,omitempty"`
 	IncompleteDetails *respIncomplete  `json:"incomplete_details,omitempty"`
+	// InputTransformations carries response.input_transformations (Pi 03de604b8).
+	InputTransformations any `json:"input_transformations,omitempty"`
 }
 
 type respUsage struct {
@@ -541,10 +605,12 @@ func (p *openAIResponsesProvider) resolveResponsesModel() (*GeneratedModel, bool
 func (p *openAIResponsesProvider) samplingModel(opts StreamOptions) *Model {
 	resolved := p.resolvedModel()
 	return &Model{
-		ProviderMeta:                  ProviderMetadata{Reasoning: p.cfg.IsReasoning || opts.IsReasoning},
-		ThinkingLevelMap:              resolved.ThinkingLevelMap,
-		SamplingParams:                p.cfg.SamplingParams,
-		SamplingParamsByThinkingLevel: p.cfg.SamplingParamsByThinkingLevel,
+		ProviderMeta:                       ProviderMetadata{Reasoning: p.cfg.IsReasoning || opts.IsReasoning},
+		ThinkingLevelMap:                   resolved.ThinkingLevelMap,
+		SamplingParams:                     p.cfg.SamplingParams,
+		SamplingParamsByThinkingLevel:      p.cfg.SamplingParamsByThinkingLevel,
+		SamplingParamsOrder:                p.cfg.SamplingParamsOrder,
+		SamplingParamsByThinkingLevelOrder: p.cfg.SamplingParamsByThinkingLevelOrder,
 	}
 }
 
@@ -577,25 +643,36 @@ func (p *openAIResponsesProvider) resolvedModel() *Model {
 	return model
 }
 
+// resolveCodexReasoningEffort is openai-codex-responses.ts resolveReasoningEffort:
+// provider-native effort for a requested level, or nil when the model takes no reasoning field for it.
+func resolveCodexReasoningEffort(model *Model, requested string) *string {
+	levels := model.ThinkingLevelMap
+	if requested == "none" {
+		if off, ok := levels[ThinkingOff]; ok {
+			return off
+		}
+		return new("none")
+	}
+	if mapped := levels[ModelThinkingLevel(requested)]; mapped != nil {
+		return mapped
+	}
+	return new(requested)
+}
+
 // applyCodexReasoning is openai-codex-responses.ts buildRequestBody's reasoning: a given effort is mapped through the model's levels ("none" through
 // its off entry) and sent unless that maps to null, with the summary defaulting to "auto"; with no effort a reasoning model whose off is not null sends
 // its off effort. A summary alone requests nothing.
-func (p *openAIResponsesProvider) applyCodexReasoning(req *respRequest, opts StreamOptions) {
+func (p *openAIResponsesProvider) applyCodexReasoning(req *respRequest, opts StreamOptions, configurationUpdateEffort string) {
 	model := p.resolvedModel()
 	levels := model.ThinkingLevelMap
 	// streamSimple's reasoning level (already clamped to the model) is the effort unless it is off.
 	requested := cmp.Or(opts.ReasoningEffort, strings.TrimPrefix(string(opts.Thinking), string(ThinkingOff)))
 	if requested != "" {
 		var effort *string
-		if requested == "none" {
-			effort = new("none")
-			if off, ok := levels[ThinkingOff]; ok {
-				effort = off
-			}
-		} else if mapped := levels[ModelThinkingLevel(requested)]; mapped != nil {
-			effort = mapped
+		if configurationUpdateEffort != "" {
+			effort = new(configurationUpdateRequestEffort)
 		} else {
-			effort = new(requested)
+			effort = resolveCodexReasoningEffort(model, requested)
 		}
 		if effort != nil {
 			req.Reasoning = &respReasoning{Effort: *effort, Summary: cmp.Or(opts.ReasoningSummary, "auto")}
@@ -746,8 +823,6 @@ type responsesOutputText struct {
 
 // ConvertResponsesMessagesOptions mirrors upstream ConvertResponsesMessagesOptions (openai-responses-shared.ts:124).
 type ConvertResponsesMessagesOptions struct {
-	// IncludeSystemPrompt nil is true: the transcript's leading system message becomes the first input item.
-	IncludeSystemPrompt *bool
 	// GrammarToolInputProperties maps a grammar tool's name to the argument property its custom input carries.
 	GrammarToolInputProperties map[string]string
 	// SupportsMidConvoSystemMessages sends later system messages in place; otherwise they fold into the leading prompt.
@@ -961,14 +1036,13 @@ func (state *responsesToolChanges) systemMessageInstruction(message SystemMessag
 
 // convertMessages converts messages as a whole transcript with every tool declared at the request's top level.
 func (p *openAIResponsesProvider) convertMessages(messages []Message, grammarProps map[string]string) ([]ResponsesInputItem, error) {
-	return p.messageConverter(getResponsesCompat(p.cfg.Compat, p.cfg.StrictModeDefault), grammarProps).convertAnchored(messages, ResolveTranscriptTools(messages, TranscriptToolSupportNone), true)
+	return p.messageConverter(getResponsesCompat(p.cfg.Compat, p.cfg.StrictModeDefault), grammarProps).convertAnchored(messages, ResolveTranscriptTools(messages, TranscriptToolSupportNone))
 }
 
 // convertAnchored converts the whole transcript, the leading system message included. transcriptTools is
 // ResolveTranscriptTools over it: the first FoldedSystemMessages system messages leave their tool changes to the request's
-// tool list, every later one carries its own in place. The leading system message's text is written only with
-// includeSystemPrompt; its tools are declared either way.
-func (c responsesMessageConverter) convertAnchored(messages []Message, transcriptTools TranscriptTools, includeSystemPrompt bool) ([]ResponsesInputItem, error) {
+// tool list, every later one carries its own in place.
+func (c responsesMessageConverter) convertAnchored(messages []Message, transcriptTools TranscriptTools) ([]ResponsesInputItem, error) {
 	items := []ResponsesInputItem{}
 	messageIndex := 0
 	systemIndex := 0
@@ -989,11 +1063,9 @@ func (c responsesMessageConverter) convertAnchored(messages []Message, transcrip
 				}
 				items = append(items, additions...)
 			}
-			if !isLeadingSystemMessage || includeSystemPrompt {
-				if text := changes.systemMessageInstruction(message, isLeadingSystemMessage, anchorsToolChanges); text != "" {
-					content, _ := json.Marshal(sanitizeSurrogates(text))
-					items = append(items, ResponsesInputItem{Role: c.instructionRole, Content: content})
-				}
+			if text := changes.systemMessageInstruction(message, isLeadingSystemMessage, anchorsToolChanges); text != "" {
+				content, _ := json.Marshal(sanitizeSurrogates(text))
+				items = append(items, ResponsesInputItem{Role: c.instructionRole, Content: content})
 			}
 		case UserMessage:
 			var parts []any
@@ -1034,10 +1106,22 @@ func (c responsesMessageConverter) convertAnchored(messages []Message, transcrip
 				switch block := block.(type) {
 				case ThinkingContent:
 					if block.ThinkingSignature != "" {
-						var reasoning ResponsesInputItem
-						if json.Unmarshal([]byte(block.ThinkingSignature), &reasoning) == nil && reasoning.Type == "reasoning" {
-							items = append(items, reasoning)
+						// output.push(JSON.parse(block.thinkingSignature)): whatever the stored text holds is the item, and text that
+						// does not parse ends the request with JSON.parse's SyntaxError (openai-responses-shared.ts:337-338).
+						stored, err := jsonstringify.Canonicalize([]byte(block.ThinkingSignature))
+						if err != nil {
+							if message := jsonparse.SyntaxError([]byte(block.ThinkingSignature)); message != nil {
+								return nil, errors.New(jsstring.FromUTF16(message))
+							}
+							return nil, err
 						}
+						// The members the converter reads; a stored value that is not an object of this shape has none.
+						var reasoning ResponsesInputItem
+						if json.Unmarshal(stored, &reasoning) != nil {
+							reasoning = ResponsesInputItem{}
+						}
+						reasoning.stored = stored
+						items = append(items, reasoning)
 					}
 				case TextContent:
 					text := sanitizeSurrogates(block.Text)
@@ -1166,8 +1250,8 @@ func omitEmptyResponsesCallIDs(messages []Message) []Message {
 	return prepareProviderToolFlow(TranscriptContext{messages: blanked}).messages
 }
 
-// ConvertResponsesMessages converts a transcript to the Responses API "input" array for model: the leading system message (unless
-// options.IncludeSystemPrompt is false), user, assistant and tool-result messages, with tool-call ids normalized for the providers
+// ConvertResponsesMessages converts a transcript to the Responses API "input" array for model: the leading system message,
+// user, assistant and tool-result messages, with tool-call ids normalized for the providers
 // in allowedToolCallProviders. Tools are declared as GetResponsesToolSupport says: in additional_tools items, in synthetic tool
 // search items, or not at all (the request's tool list carries them).
 // Ports packages/ai/src/api/openai-responses-shared.ts convertResponsesMessages.
@@ -1191,7 +1275,7 @@ func ConvertResponsesMessages(model *Model, transcript TranscriptContext, allowe
 		allowedToolCallProviders: allowedToolCallProviders,
 		options:                  options,
 	}
-	return converter.convertAnchored(messages, transcriptTools, options.IncludeSystemPrompt == nil || *options.IncludeSystemPrompt)
+	return converter.convertAnchored(messages, transcriptTools)
 }
 
 // responsesToolCallProviders lists the openai-responses providers whose models
@@ -1440,13 +1524,15 @@ func (p *openAIResponsesProvider) Stream(ctx context.Context, transcript Transcr
 	configurationUpdateEffort := p.configurationUpdateEffort(compat, opts, apiKey)
 	converter := p.messageConverter(compat, grammarProps)
 	converter.options.ConfigurationUpdateEffort = configurationUpdateEffort
-	// Codex sends the leading system message as `instructions`; its tools stay in the input either way.
-	msgs, err := converter.convertAnchored(messages, transcriptTools, !p.cfg.Codex)
+	// The system prompt goes into a leading developer item, not top-level `instructions`, as in Codex (#12273).
+	msgs, err := converter.convertAnchored(messages, transcriptTools)
 	if err != nil {
 		return nil, err
 	}
 
-	inputJSON, marshalErr := json.Marshal(msgs)
+	// An item names a called tool, and the name can hold a lone UTF-16 surrogate that Pi does not sanitize (openai-responses-shared.ts convertResponsesMessages,
+	// the function_call item): the items are written as JSON.stringify writes them.
+	inputJSON, marshalErr := jsstring.MarshalKeepingSurrogates(msgs)
 	if marshalErr != nil {
 		return nil, fmt.Errorf("openai-responses: marshal input: %w", marshalErr)
 	}
@@ -1469,15 +1555,13 @@ func (p *openAIResponsesProvider) Stream(ctx context.Context, transcript Transcr
 	}
 	store := false
 	req.Store = &store
-	req.ServiceTier = opts.ServiceTier
+	// azure-openai-responses.ts buildParams (:204-262) writes its own request: no service tier, no cache retention or cache options, a
+	// prompt cache key whatever the retention, and max_output_tokens whatever the model's compat says.
+	azure := p.api() == APIAzureOpenAIResponses
+	if !azure {
+		req.ServiceTier = opts.ServiceTier
+	}
 	if p.cfg.Codex {
-		req.Instructions = "You are a helpful assistant."
-		// openai-codex-responses.ts buildParams reads the initial system message of the resolved transcript, before transformMessages drops an errored or aborted turn ahead of it.
-		if initial := borrowedInitialSystemMessage(resolvedMessages(transcript, compat.SupportsMidConvoSystemMessages)); initial != nil {
-			if prompt := GetCurrentSystemPrompt([]Message{*initial}); prompt != "" {
-				req.Instructions = prompt
-			}
-		}
 		req.Text = map[string]string{"verbosity": cmp.Or(opts.TextVerbosity, "low")}
 		req.ToolChoice = "auto"
 		parallel := true
@@ -1498,7 +1582,7 @@ func (p *openAIResponsesProvider) Stream(ctx context.Context, transcript Transcr
 		req.Tools = convertedTools
 	}
 	omitUnsupportedFields := p.isChatGPTSignIn(apiKey)
-	if !p.cfg.Codex && !omitUnsupportedFields && opts.MaxTokens > 0 && (p.cfg.Compat == nil || p.cfg.Compat.SupportsMaxOutputTokens == nil || *p.cfg.Compat.SupportsMaxOutputTokens) {
+	if !omitUnsupportedFields && opts.MaxTokens > 0 && (azure || p.cfg.Compat == nil || p.cfg.Compat.SupportsMaxOutputTokens == nil || *p.cfg.Compat.SupportsMaxOutputTokens) {
 		// OpenAI Responses rejects max_output_tokens below 16 (earendil-works/pi#6265).
 		req.MaxOutputTokens = max(opts.MaxTokens, openAIResponsesMinOutputTokens)
 	}
@@ -1509,7 +1593,7 @@ func (p *openAIResponsesProvider) Stream(ctx context.Context, transcript Transcr
 	// An omitted effort remains omitted; the model's off mapping controls the default request.
 	// upstream: packages/ai/src/api/openai-responses.ts:buildParams
 	if p.cfg.Codex {
-		p.applyCodexReasoning(&req, opts)
+		p.applyCodexReasoning(&req, opts, configurationUpdateEffort)
 	} else if p.cfg.IsReasoning || opts.IsReasoning {
 		model := p.resolvedModel()
 		if model.Capabilities.MaxThinking == "" {
@@ -1571,11 +1655,11 @@ func (p *openAIResponsesProvider) Stream(ctx context.Context, transcript Transcr
 	if !p.cfg.Codex {
 		cacheRetention = string(resolveCompletionsCacheRetention(opts.CacheRetention, mergeProviderEnv(p.cfg.Env, opts.Env)))
 	}
-	if opts.SessionID != "" && cacheRetention != "none" {
+	if opts.SessionID != "" && (azure || cacheRetention != "none") && (p.cfg.Codex || compat.PromptCacheKeyMode != PromptCacheKeyDisabled) {
 		req.PromptCacheKey = ClampOpenAIPromptCacheKey(opts.SessionID)
 	}
 	// Retention and write policy do not depend on a session-affinity key.
-	if !p.cfg.Codex && !omitUnsupportedFields {
+	if !p.cfg.Codex && !azure && !omitUnsupportedFields {
 		if ret := getPromptCacheRetention(compat, cacheRetention); ret != nil {
 			req.PromptCacheRetention = *ret
 		}
@@ -1586,7 +1670,7 @@ func (p *openAIResponsesProvider) Stream(ctx context.Context, transcript Transcr
 	// Last so model and request sampling parameters override named request fields (openai-responses.ts:383-385 buildParams).
 	// openai-codex-responses.ts buildRequestBody applies no sampling parameters.
 	if !p.cfg.Codex {
-		if keys, samplingParams := resolveSamplingParamsInOrder(p.samplingModel(opts), responsesSamplingLevel(opts), opts.SamplingParams); samplingParams != nil {
+		if keys, samplingParams := resolveSamplingParamsInOrder(p.samplingModel(opts), responsesSamplingLevel(opts), opts.SamplingParams, opts.SamplingParamsOrder); samplingParams != nil {
 			assigned, err := assignSamplingParams(req, respRequestLiteralKeys, keys, samplingParams)
 			if err != nil {
 				return nil, fmt.Errorf("openai-responses: %w", err)
@@ -1644,7 +1728,7 @@ func (p *openAIResponsesProvider) Stream(ctx context.Context, transcript Transcr
 	endpointURL := strings.TrimRight(baseURL, "/")
 	if !p.cfg.BaseURLIsEndpoint && !p.cfg.Codex {
 		var err error
-		if endpointURL, err = sdkBuildURL(baseURL, "/responses"); err != nil {
+		if endpointURL, err = openaiBuildURL(baseURL, "/responses"); err != nil {
 			return nil, err
 		}
 	} else if !p.cfg.BaseURLIsEndpoint {
@@ -1657,7 +1741,7 @@ func (p *openAIResponsesProvider) Stream(ctx context.Context, transcript Transcr
 		if cacheRetention != "none" {
 			cacheSessionID = opts.SessionID
 		}
-		webSocketStream, fallback, err := p.startCodexWebSocket(ctx, endpointURL, body.Bytes(), apiKey, accountID, cacheSessionID, grammarProps, opts)
+		webSocketStream, fallback, err := p.startCodexWebSocket(ctx, endpointURL, body.Bytes(), apiKey, accountID, cacheSessionID, grammarProps, configurationUpdateEffort, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -1758,6 +1842,7 @@ func (p *openAIResponsesProvider) Stream(ctx context.Context, transcript Transcr
 		api = outputAPI(p.cfg.ModelMetadata, api)
 	}
 	builder := newObservedProviderBuilder(ctx, api, p.cfg.ProviderID, p.cfg.Model)
+	builder.transportCauseDetail = true
 	builder.modelCost = opts.ModelCost
 	builder.requestServiceTier = requestServiceTierOf(opts)
 	builder.setResponseMetadata("", "", "", configurationUpdateEffort, nil)
@@ -1769,6 +1854,7 @@ func (p *openAIResponsesProvider) Stream(ctx context.Context, transcript Transcr
 	requestContext, abort := context.WithCancel(httpReq.Context())
 	builder.abort = abort
 	httpReq = httpReq.WithContext(requestContext)
+	//portlint:allow asyncorder Pi's stream() starts a detached async IIFE and returns the stream (openai-responses.ts:164, :272); the stream owns this goroutine, which sends the request and runs the body pipeline as a turn of the stream's continuation executor (responseTurn in streamResponse), the ordering point with the consumer; coding's TestRPC33ObservationMatrix holds every observation of an immediate, delayed or held consumer of this API to Pi's, TestAzureResponsesTickOrder the ticks of the Azure rows
 	go builder.runResponse(func() error { return p.streamResponse(ctx, httpReq, opts, builder, grammarProps) })
 	return builder.stream, nil
 }
@@ -1817,6 +1903,7 @@ func (p *openAIResponsesProvider) streamResponse(ctx context.Context, httpReq *h
 			if p.api() == APIAzureOpenAIResponses {
 				name = "Azure OpenAI"
 			}
+			noteFailureResponse(ctx, resp)
 			return openAIHTTPError(resp.StatusCode, b, name+" API error")
 		}
 		if !p.cfg.Codex {
@@ -2062,7 +2149,7 @@ func processResponsesStream(ctx context.Context, decoder providerSSEDecoder, bui
 
 		// processResponsesStream awaits the observer with any parsed value and then reads `event.type` (openai-responses-shared.ts:599-601): a null
 		// throws there, and a number, string, boolean or array matches no branch.
-		if top := strings.TrimLeft(data, " \t\r\n"); !codex && top != "" && top[0] != '{' && json.Valid([]byte(top)) {
+		if top := strings.TrimLeft(data, " \t\r\n"); !codex && top != "" && top[0] != '{' && jsonwire.Valid(top) {
 			if err := builder.observeProviderEvent([]byte(data)); err != nil {
 				builder.failUnfinished(StopReasonError, err)
 				return
@@ -2080,7 +2167,7 @@ func processResponsesStream(ctx context.Context, decoder providerSSEDecoder, bui
 			event = fast
 		} else {
 			text := jsjson.NormalizeIntegers([]byte(data))
-			if err := json.Unmarshal(text, &event); err != nil {
+			if err := jsstring.UnmarshalKeepingSurrogates(text, &event); err != nil {
 				normalized, normalizable := []byte(nil), false
 				// mapCodexEvents yields every event but its terminal and error ones unchanged into processResponsesStream (openai-codex-responses.ts:743-788),
 				// so a Codex event reads its members as openai-responses does.
@@ -2299,6 +2386,7 @@ func processResponsesStream(ctx context.Context, decoder providerSSEDecoder, bui
 					builder.partial.Content[contentIndex] = block
 				}
 			}
+			appendOpenAIReasoningRemovals(builder.partial, event.Response.InputTransformations)
 			var usage *Usage
 			if u := event.Response.Usage; u != nil {
 				cached := 0
@@ -2566,4 +2654,44 @@ func mapRespStatus(status, incompleteReason string) (StopReason, string) {
 // sampling parameter that overrode the request field (openai-responses.ts:196, openai-codex-responses.ts:674).
 func requestServiceTierOf(opts StreamOptions) string {
 	return opts.ServiceTier
+}
+
+// appendOpenAIReasoningRemovals records replayed reasoning items OpenAI withheld from the model,
+// leaving out turn_boundary removals (openai-responses-shared.ts appendReasoningRemovals).
+func appendOpenAIReasoningRemovals(output *AssistantMessage, raw any) {
+	items, ok := raw.([]any)
+	if !ok {
+		return
+	}
+	removals := make([]any, 0)
+	order := make([]*orderedjson.Object, 0)
+	for _, entry := range items {
+		obj, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		if obj["type"] != "reasoning" || obj["action"] != "removed" || obj["reason"] == "turn_boundary" {
+			continue
+		}
+		projected := map[string]any{}
+		members := orderedjson.New()
+		for _, key := range []string{"type", "id", "action", "reason"} {
+			if value, exists := obj[key]; exists {
+				projected[key] = value
+				_ = members.SetValue(key, value)
+			}
+		}
+		removals = append(removals, projected)
+		order = append(order, members)
+	}
+	if len(removals) == 0 {
+		return
+	}
+	orderBytes, _ := json.Marshal(order)
+	details := newDiagnosticDetails()
+	details.set("transformations", removals, orderBytes)
+	AppendAssistantMessageDiagnostic(output, details.attach(AssistantMessageDiagnostic{
+		Type:      "openai_input_transformations",
+		Timestamp: time.Now().UnixMilli(), //portlint:allow clock openai-responses-shared.ts:851 `timestamp: Date.now()`; the package's clock seams belong to OAuth and backoff structs, not to diagnostics
+	}))
 }

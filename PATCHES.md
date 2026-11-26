@@ -1,11 +1,10 @@
 # Dyna patches
 
-This is resident-labs/PiG, Dyna's fork of PiG. The branch `dyna` is the pinned PiG release plus the patches below; Dyna's
-`next/go.mod` replaces `github.com/MichaelKinsy/PiG` with an exact commit of it. Each patch is small, additive and leaves
-every existing behaviour as it was, so it can be offered upstream as it stands. A patch's code names it as
-`dyna patch P<n>`.
+This is resident-labs/PiG, Dyna's fork of PiG. The branch `dyna` tracks upstream plus the patches below. Dyna's `next/go.mod` replaces `github.com/MichaelKinsy/PiG` with an exact fork commit. The owner keeps these patches on the fork.
 
-Base: PiG v0.7.0 + main (40b509fbdf).
+Base: PiG v0.8.0 + main (`a00da1e2d67b82ba4d52183454f58fe27d06a7b1`), pinned to Pi v1.6.0. The PiG module requires Go 1.27.0; its verification toolchain is Go 1.27.4.
+
+This merge adds no Dyna Google or Gemini routing. The separate Dyna pin bump must compile the actual embedding callers on Go 1.27 before deployment. Upstream issue #575 (eagerly decoded `custom` records during JSONL open) remains a follow-up; this merge does not change that indexing behavior.
 
 ## P1 Members on a user message
 
@@ -190,7 +189,9 @@ What: `packagemanager.WithContext(ctx)` is an `InstallOption` that runs the proc
 
 Why: a host that reloads a loader under a deadline, as Dyna's box does to check a Package before it keeps it, cannot otherwise stop the install: the reload's goroutine kept running npm or git, and wrote into a folder the host had already removed.
 
-Locked by: `TestDefaultLoaderEndsAnInstallWithItsContext` (coding): a fake npm that hangs on `install` makes `ReloadWith` return the deadline's error within seconds, and the process is gone. `TestDefaultLoaderEndsAGitInstallWithItsContext` (coding) does the same for a git Package whose clone, checkout or dependency install hangs.
+The loader preserves upstream's progress reporting and inherited or captured command output while passing the reload context to configured and temporary Package installs.
+
+Locked by: `TestDefaultLoaderEndsAnInstallWithItsContext` (coding) for inherited output, captured output, and a temporary Package, and `TestDefaultLoaderEndsAGitInstallWithItsContext` for git clone, checkout, and dependency install. A hung child is reaped and `ReloadWith` returns the deadline error.
 
 Upstream: not offered (owner's decision pending).
 
@@ -278,6 +279,10 @@ Locked by: `TestCompactLiveExtendsTheLiveRequest`, `TestCompactLiveDropsTheOldes
 
 Upstream: not offered (owner's decision, 2026-11-04).
 
+## P17 List allowed enum values in validation errors (upstreamed)
+
+Upstream's `pi-schema` implementation already includes the allowed values. `TestEnumErrorNamesTheAllowedValues` keeps that behavior locked on the fork.
+
 ## P18 Select only system-message bodies when restoring the tool loadout (upstreamed in main)
 
 What: upstream `main` (`40b509fbdf`) added `Session.GetBranchSystemMessages()` in `internal/codingagent/session.go`, which filters branch slot metadata before decoding in the same way. `coding/session.go` uses `inner.GetBranchSystemMessages()`; `GetSystemMessages` and the lock tests remain in place.
@@ -286,12 +291,24 @@ Locked by: TestSystemMessagesMatchWholeBranchAcrossCompactionAndForks and TestP1
 
 Upstream: not offered (owner decision, 2026-11-04).
 
+## P19 Show the persistent store's size in codemode help
+
+Codemode's Go tool description and shared docs state the `store()` limit. The generated Node bundle follows the upstream pin: a previous wording-only edit to loose vendored files was never in the embedded runtime archive. It is not carried as a generated-file edit. The native Go codemode string-return path continues to prefer the displayed text (including truncation notices) and retains upstream error/result semantics.
+
 ## P20 Smaller tool output budgets for embedded sessions
 
 What: `SessionOptions.ReadMaxLines` and `ReadMaxBytes` override the native read tool's caps without changing file reads, image handling or paging. `codemode.Options.DefaultMaxOutputTokens` sets the script output budget and mentions it in the help; a script can still set `max_output_tokens` itself. Zero preserves PiG's limits.
 
 Why: Dyna keeps tool output in later requests, so smaller defaults reduce recurring input while users can still recover the full result.
 
-Locked by: `TestReadConfiguredOutputCaps` and `TestConfiguredOutputBudget`.
+Locked by: `TestReadConfiguredOutputCaps` (whole-file and streamed reads, including pagination and a first line over the byte budget) and `TestConfiguredOutputBudget`.
 
 Upstream: not offered (owner decision, 2026-11-04).
+
+## Later changes
+
+- `AgentOptions.BeforeRequest`, `Agent.SetBeforeRequest` and `AgentLoopConfig.BeforeRequest` keep the gate ahead of steering delivery and stop the run on error (`TestBeforeRequestHoldsFirstRequestAndReadsQueuedSteer`, `TestBeforeRequestFailureEndsRun`).
+- Codemode store reads replay only new entries when the old leaf is still an ancestor. A cold read follows entry metadata without decoding irrelevant histories (`TestBranchStoreCacheReadsOnlyNewEntries`, `TestBranchStoreCacheColdUsesMetadata`, and the branch-cache differential test).
+- The P1 queue carries a labeled message through upstream's delivery-time image normalization (`TestSessionResizesImagesInQueuedSteeringAndFollowUpMessages`). P4 and P18 use the current atomic Session manager; P7/P11 preserve the system head while keeping upstream's null or raw extension usage fields. P16 keeps live prefix reuse and the standalone serialized fallback (`TestCompactStandaloneKeepsTheProviderOverflow`); D167 remains available for the upstream compaction helper and branch summarization.
+- D131 and D192 carry the fork's existing Responses behavior and remain listed in `automation/ci/divergence-reapproval-pending.txt`. The approval on 2026-11-26 binds D10004 and D10007 to the already shipped shared ten-minute transfer deadline (P4) and the 80-name/action deferred-tools prompt limits (P7), respectively. This changes no runtime behavior.
+- On `resident-labs/PiG` only, DCO and historical test-expectation lint subtract the ancestors of the resolved commit fetched from canonical `MichaelKinsy/PiG` main from the ordinary base-to-head range. Fork commits stay in scope, including merges for DCO. Fork DCO runs after the Bookkeeping shard verdict, so a sign-off failure still fails CI without skipping the Linux build and tests. Current-tree gates, including golden provenance, are unchanged. The checkout fetches the canonical `extensions/sdk/v0.8.0` tag for the module-pin gate; it does not publish the tag on the fork. The fork has no GitHub dependency graph, so only GitHub's Dependency review job is skipped there; other security checks still run.

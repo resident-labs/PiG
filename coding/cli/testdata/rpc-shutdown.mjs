@@ -2,10 +2,10 @@ import { appendFileSync, existsSync, readFile as readFileCallback } from "node:f
 import { readFile } from "node:fs/promises";
 
 // Records every lifecycle event the extension receives. echo_bridge reports a
-// tool update and stays in flight until its run is aborted. session_shutdown
+// tool update and stays in flight until its run is aborted (RPC_SHUTDOWN_TOOL_DEAF: for ever). session_shutdown
 // reports that it started through a notification. Then RPC_SHUTDOWN_BLOCK
 // makes it wait on a promise that never settles, RPC_SHUTDOWN_SLOW makes it wait that many milliseconds, RPC_SHUTDOWN_HOLD also keeps
-// the event loop alive, and RPC_SHUTDOWN_DIALOG makes it wait on a select.
+// the event loop alive, and RPC_SHUTDOWN_DIALOG makes it wait on a select, and RPC_SHUTDOWN_SEND_AFTER makes it send a user message.
 // The ask command waits on a select; the quit command calls ctx.shutdown().
 export default function (pi) {
   if (process.env.RPC_SHUTDOWN_BAD_RESOURCE) {
@@ -70,6 +70,10 @@ export default function (pi) {
     if (process.env.RPC_SHUTDOWN_HOLD_QUIT && event.reason === "quit") {
       await new Promise(() => { setInterval(() => {}, 60_000); });
     }
+    // RPC_SHUTDOWN_NOTIFY_AFTER delays the notification, which is the first record the dispose writes to stdout, by that many milliseconds.
+    if (process.env.RPC_SHUTDOWN_NOTIFY_AFTER) {
+      await new Promise(resolve => setTimeout(resolve, Number(process.env.RPC_SHUTDOWN_NOTIFY_AFTER)));
+    }
     ctx.ui.notify("session_shutdown started", "info");
     if (process.env.RPC_SHUTDOWN_SLOW) {
       await new Promise(resolve => setTimeout(resolve, Number(process.env.RPC_SHUTDOWN_SLOW)));
@@ -85,6 +89,14 @@ export default function (pi) {
     if (process.env.RPC_SHUTDOWN_DIALOG) {
       record("dialog:" + (await ctx.ui.select("Shutdown dialog", ["keep"])));
     }
+    // RPC_SHUTDOWN_SEND_AFTER starts a run from the handler, as an extension that sends a message while it shuts down does, and waits that many milliseconds for the run to go on.
+    if (process.env.RPC_SHUTDOWN_SEND_AFTER) {
+      record("send");
+      pi.sendUserMessage("sent during shutdown");
+      await new Promise(resolve => setTimeout(resolve, Number(process.env.RPC_SHUTDOWN_SEND_AFTER)));
+    }
+    // RPC_SHUTDOWN_RECORD_DONE reports that the handler ran to its end.
+    if (process.env.RPC_SHUTDOWN_RECORD_DONE) record("session_shutdown:done");
   });
   pi.registerCommand("ask", {
     description: "Wait on a select",
@@ -190,6 +202,8 @@ export default function (pi) {
     async execute(_id, _args, signal, onUpdate) {
       record("tool_running");
       onUpdate?.({ content: [{ type: "text", text: "running" }], details: {} });
+      // RPC_SHUTDOWN_TOOL_DEAF makes the tool ignore its abort signal: it settles nothing and holds no handle, so only a drained event loop ends the process.
+      if (process.env.RPC_SHUTDOWN_TOOL_DEAF) await new Promise(() => {});
       await new Promise((resolve) => {
         if (signal?.aborted) return resolve();
         signal?.addEventListener("abort", () => resolve(), { once: true });

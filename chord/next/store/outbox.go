@@ -13,7 +13,7 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
-// Ports packages/chord/src/next/store/outbox.ts
+// Ports packages/chord/src/store/outbox.ts
 //
 // The outbox (slice 6a §2; decisions "The outbox is optional, internal and versioned", small items 3-4): the store's
 // commits as the sync layer reads them, one `{ seq, writes }` per commit from its floor on, in the current format.
@@ -190,15 +190,27 @@ func parseRecordedWrites(text string) (raw delta.JsonValue, writes []StoreWrite,
 	if err != nil {
 		return nil, nil, err
 	}
+	return raw, typedWrites(raw), nil
+}
+
+// NewOutboxCommit is the commit with seq, nextID and the recorded writes raw (parsed JSON, whatever its shape), as the
+// outbox hands it out: Raw as given, Writes its typed view (see parseRecordedWrites). The sync layer builds the commits of
+// a log line with it.
+func NewOutboxCommit(seq, nextID int64, raw delta.JsonValue) OutboxCommit {
+	return OutboxCommit{Seq: seq, NextID: nextID, Raw: raw, Writes: typedWrites(raw)}
+}
+
+// typedWrites is the typed view of recorded writes raw: each element of an array, nil when raw is no array.
+func typedWrites(raw delta.JsonValue) []StoreWrite {
 	items, ok := raw.([]any)
 	if !ok {
-		return raw, nil, nil
+		return nil
 	}
-	writes = make([]StoreWrite, len(items))
+	writes := make([]StoreWrite, len(items))
 	for index, item := range items {
 		writes[index] = typedWrite(item)
 	}
-	return raw, writes, nil
+	return writes
 }
 
 // typedWrite is a recorded element as the write it decodes to when that write is the same JSON, else as an UnknownWrite

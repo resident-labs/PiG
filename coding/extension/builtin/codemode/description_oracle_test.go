@@ -11,6 +11,7 @@ import (
 
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/coding/extension/builtin/codemode"
+	"github.com/MichaelKinsy/PiG/internal/pigstrip"
 	"github.com/MichaelKinsy/PiG/internal/pioracle"
 )
 
@@ -57,11 +58,25 @@ emit(input.map((p) => {
 	} catch (e) { return { text: "", err: String(e && e.message) }; }
 }));
 `, probes, &want, "HOME=/home/oracle")
+	// P19 (PATCHES.md): expect exactly the fork's truncation and store guidance, then compare the full description.
+	const resultText = "resolves to a string, or an object"
+	const storeText = "keep JSON values across codemode calls."
 	bad := 0
 	for i, p := range probes {
 		got, errText := goDescription(p)
 		// The docs path names the agent directory, which the Pi process and this test place differently.
 		got, wantText := docsPath.ReplaceAllString(got, "Read <docs> first"), docsPath.ReplaceAllString(want[i].Text, "Read <docs> first")
+		if want[i].Err == "" {
+			if !strings.Contains(wantText, resultText) || !strings.Contains(wantText, storeText) {
+				t.Fatalf("probe %d: Pi changed the help text patched by P19: %q", i, wantText)
+			}
+			wantText = strings.Replace(wantText, resultText, "resolves to a string, the text you would see with any truncation notice, or an object", 1)
+			wantText = strings.Replace(wantText, storeText, "keep small JSON values (up to 256 KB, such as IDs or summaries) across codemode calls; large data goes to a file.", 1)
+		}
+		if pigstrip.Has(pigstrip.ListFeatures, pigstrip.Docs) {
+			// pig additive (D92): a build that strips docs writes no page, so the models line points to none.
+			wantText = strings.ReplaceAll(wantText, " Read <docs> first.", "")
+		}
 		if got != wantText || errText != want[i].Err {
 			if bad++; bad <= 3 {
 				t.Errorf("probe %d (%d tools, models=%v, budget=%v): err=%q want %q\n%s", i, len(p.Tools), p.Models, p.Budget, errText, want[i].Err, firstDifference(got, wantText))
@@ -224,11 +239,7 @@ func goDescription(p descriptionProbe) (string, string) {
 	for _, d := range p.Deferred {
 		options.Deferred[d] = true
 	}
-	got, err := codemode.CreateDescription(tools, options)
-	if err != nil {
-		return got, err.Error()
-	}
-	return got, ""
+	return codemode.CreateDescription(tools, options), ""
 }
 
 // TestCodemodeDescriptionProbesDump prints the corpus for the Pi side of the extensions-runtime/79 parity scenario.

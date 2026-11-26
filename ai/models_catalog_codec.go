@@ -4,14 +4,19 @@ package ai
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/MichaelKinsy/PiG/internal/jsjson"
+	"github.com/MichaelKinsy/PiG/internal/jsonopts"
 )
 
 // modelsCatalogRecord is the data-only Model<Api> stored by provider publication; bound backend objects never enter the catalog file.
@@ -85,25 +90,26 @@ type catalogPair struct {
 
 // orderedCatalogPairs reads a JSON object's members in document order.
 func orderedCatalogPairs(data []byte) ([]catalogPair, error) {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	token, err := decoder.Token()
+	decoder := jsontext.NewDecoder(bytes.NewReader(data), jsonopts.Parse)
+	token, err := decoder.ReadToken()
 	if err != nil {
 		return nil, err
 	}
-	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+	if token.Kind() != '{' {
 		return nil, errors.New("not a JSON object")
 	}
 	var pairs []catalogPair
-	for decoder.More() {
-		keyToken, err := decoder.Token()
+	for decoder.PeekKind() != '}' {
+		keyToken, err := decoder.ReadToken()
 		if err != nil {
 			return nil, err
 		}
-		var value json.RawMessage
-		if err := decoder.Decode(&value); err != nil {
+		key := keyToken.String() // a Token and the bytes ReadValue returns are void after the next call on the decoder
+		value, err := decoder.ReadValue()
+		if err != nil {
 			return nil, err
 		}
-		pairs = append(pairs, catalogPair{key: keyToken.(string), value: bytes.Clone(value)})
+		pairs = append(pairs, catalogPair{key: key, value: bytes.Clone(value)})
 	}
 	return pairs, nil
 }
@@ -132,6 +138,15 @@ func anyModelRecord(model AnyModel) (record any, shape **catalogShape, err error
 
 // marshalCatalogModel is the persisted JSON of one model. A model decoded from a catalog re-encodes with its unknown fields and its field order.
 func marshalCatalogModel(model AnyModel) (json.RawMessage, error) {
+	if record, ok := unchangedBundledRecord(model); ok {
+		return json.RawMessage(ResolveCatalogRecord(record)), nil
+	}
+	return marshalCatalogModelByEncoding(model)
+}
+
+// marshalCatalogModelByEncoding is marshalCatalogModel for any model: it decides what a built-in model changed by encoding it, and so also encodes
+// a model that unchangedBundledRecord does not recognize.
+func marshalCatalogModelByEncoding(model AnyModel) (json.RawMessage, error) {
 	record, shape, err := anyModelRecord(model)
 	if err != nil {
 		return nil, err
@@ -148,8 +163,8 @@ func marshalCatalogModel(model AnyModel) (json.RawMessage, error) {
 		if recordJSON, err = marshalStoreJSON(record); err != nil {
 			return nil, err
 		}
-		if bytes.Equal(recordJSON, baseline) {
-			return json.RawMessage(typed.catalogRecord), nil
+		if sha256.Sum256(recordJSON) == baseline {
+			return json.RawMessage(ResolveCatalogRecord(typed.catalogRecord)), nil
 		}
 	}
 	built, err := modelCatalogShape(model, *shape)
@@ -206,7 +221,7 @@ func marshalCatalogModel(model AnyModel) (json.RawMessage, error) {
 		merged = append(merged, pair)
 	}
 	if typed, ok := model.(*Model); ok && unchanged && typed.catalogRecord != "" {
-		return json.RawMessage(typed.catalogRecord), nil
+		return json.RawMessage(ResolveCatalogRecord(typed.catalogRecord)), nil
 	}
 	return encodeCatalogPairs(merged)
 }
@@ -219,45 +234,65 @@ func modelCatalogShape(model AnyModel, decoded *catalogShape) (*catalogShape, er
 	if decoded != nil || !ok || typed.catalogRecord == "" {
 		return decoded, nil
 	}
-	entry, _, err := decodeCatalogModel([]byte(typed.catalogRecord))
+	entry, _, err := decodeCatalogModel([]byte(ResolveCatalogRecord(typed.catalogRecord)))
 	if err != nil {
 		return nil, err
 	}
 	return entry.(*Model).catalog, nil
 }
 
-// catalogRecordBaseline is the typed record encoding of the model decoded from record, a catalog record: what the model
-// encodes as while every member is at its decoded value. A built-in record's baseline is kept, one small encoding per
-// record, so the cache is bounded by the catalog.
-func catalogRecordBaseline(record string) ([]byte, error) {
-	if cached, found := catalogRecordBaselines.Load(record); found {
-		return cached.([]byte), nil
+// catalogRecordBaseline is the SHA-256 of the typed record encoding of the model decoded from record, a catalog record: what the model
+// encodes as while every member is at its decoded value. A model is unchanged exactly when the digest of its own typed record encoding
+// equals it, so the encoding itself is not kept. A built-in record's digest is kept in catalogRecordBaselines.
+func catalogRecordBaseline(record string) ([sha256.Size]byte, error) {
+	var slot *catalogBaseline
+	if isCatalogRecordRef(record) {
+		slot = &catalogRecordBaselines[int(record[1])<<8|int(record[2])] //portlint:allow utf16units a catalog reference is NUL and a row index in two bytes (isCatalogRecordRef); it never leaves Go
+		if slot.ready.Load() {
+			return slot.sum, nil
+		}
 	}
-	entry, known, err := decodeCatalogTyped([]byte(record))
+	content := ResolveCatalogRecord(record)
+	entry, known, err := decodeCatalogTyped([]byte(content))
 	if err != nil {
-		return nil, err
+		return [sha256.Size]byte{}, err
 	}
 	if !known {
-		return nil, fmt.Errorf("decode stored model: unknown model type in %q", record)
+		return [sha256.Size]byte{}, fmt.Errorf("decode stored model: unknown model type in %q", content)
 	}
 	typedRecord, _, err := anyModelRecord(entry)
 	if err != nil {
-		return nil, err
+		return [sha256.Size]byte{}, err
 	}
 	baseline, err := marshalStoreJSON(typedRecord)
 	if err != nil {
-		return nil, err
+		return [sha256.Size]byte{}, err
 	}
-	if _, builtin := builtinCatalogRecords()[record]; builtin {
-		catalogRecordBaselines.Store(record, baseline)
+	sum := sha256.Sum256(baseline)
+	if slot != nil {
+		catalogBaselineMu.Lock()
+		if !slot.ready.Load() {
+			slot.sum = sum
+			slot.ready.Store(true)
+		}
+		catalogBaselineMu.Unlock()
 	}
-	return baseline, nil
+	return sum, nil
 }
 
 // CatalogRecordOf is the catalog record model was made from, its built-in catalog entry or the models store record it was
 // decoded from, as a JSON object in the record's member order, or "" for a model of neither. A model built from it again
-// (GeneratedModel.Record) encodes with CatalogModelJSON in that order.
+// (GeneratedModel.Record) encodes with CatalogModelJSON in that order. A built-in entry's record expands its chunk of the
+// compressed catalog (ResolveCatalogRecord); CatalogRecordRefOf does not.
 func CatalogRecordOf(model *Model) string {
+	return ResolveCatalogRecord(CatalogRecordRefOf(model))
+}
+
+// CatalogRecordRefOf is CatalogRecordOf without the expansion: a built-in entry's record stays the reference it is stored as,
+// which stands for the same record. Two models made from the same record have equal references, so a caller that compares
+// records, tests them for "" or hands one to GeneratedModel.Record needs no JSON; one that reads the content calls
+// ResolveCatalogRecord.
+func CatalogRecordRefOf(model *Model) string {
 	switch {
 	case model == nil:
 		return ""
@@ -322,27 +357,73 @@ func ExtensionModelRecord(definition json.RawMessage, api API, providerID, baseU
 	return compact.String()
 }
 
-// catalogRecordBaselines holds the baseline ([]byte, see catalogRecordBaseline) of each built-in catalog record
-// (GeneratedModel.Record) that has been encoded, keyed by the record. A baseline is read-only once computed. Only records
-// compiled into the binary are cached, so the cache is bounded by the catalog: a models store record (a Radius gateway's
-// catalog, CatalogRecordOf) changes with each refresh and is decoded each time.
-var catalogRecordBaselines sync.Map
+// catalogBaseline is the digest of one built-in record's baseline (catalogRecordBaseline). sum is written once, under catalogBaselineMu,
+// before ready is set, and is read-only after.
+type catalogBaseline struct {
+	sum   [sha256.Size]byte
+	ready atomic.Bool
+}
 
-// builtinCatalogRecords is the set of GeneratedModel.Record values.
-var builtinCatalogRecords = sync.OnceValue(func() map[string]struct{} {
-	records := make(map[string]struct{}, len(GeneratedModels))
-	for i := range GeneratedModels {
-		if record := GeneratedModels[i].Record; record != "" {
-			records[record] = struct{}{}
-		}
+// catalogRecordBaselines holds the baseline digest of each built-in catalog record (GeneratedModel.Record) that has been encoded, by row. It is a fixed
+// array in the binary's data, 32 bytes a row, not a map of encodings on the heap: only records compiled into the binary are cached, so it is bounded
+// by the catalog, and a models store record (a Radius gateway's catalog, CatalogRecordOf) changes with each refresh and is decoded each time.
+var (
+	catalogRecordBaselines [len(generatedRows)]catalogBaseline
+	catalogBaselineMu      sync.Mutex
+)
+
+// catalogEntryView is the typed model of the built-in entry that record, a model's catalog record, stands for, as GeneratedModel.ToModel makes it
+// without its copies: the row a reference names, or that row's routing variant (deriveCatalogRecord). It is nil for a record that is JSON (an
+// extension's or a models store record) and for a reference no row holds.
+func catalogEntryView(record string) *Model {
+	//portlint:allow utf16units a catalog record is an internal byte string (a NUL tag, a two byte row, the id and name), never a JS string: bytes are the unit on both sides
+	if len(record) < 3 || record[0] != 0 {
+		return nil
 	}
-	return records
-})
+	//portlint:allow utf16units a catalog record is an internal byte string (a NUL tag, a two byte row, the id and name), never a JS string: bytes are the unit on both sides
+	row := int(record[1])<<8 | int(record[2])
+	if row >= len(generatedRows) {
+		return nil
+	}
+	view := generatedRows[row].catalogView()
+	//portlint:allow utf16units a catalog record is an internal byte string (a NUL tag, a two byte row, the id and name), never a JS string: bytes are the unit on both sides
+	if len(record) > 3 {
+		//portlint:allow utf16units a catalog record is an internal byte string (a NUL tag, a two byte row, the id and name), never a JS string: bytes are the unit on both sides
+		id, name, ok := strings.Cut(record[4:], "\x00")
+		//portlint:allow utf16units a catalog record is an internal byte string (a NUL tag, a two byte row, the id and name), never a JS string: bytes are the unit on both sides
+		if record[3] != 0 || !ok {
+			return nil
+		}
+		view.ID, view.DisplayName = id, name
+	}
+	view.catalogRecord = record
+	return view
+}
+
+// unchangedBundledRecord is the catalog record of a model that is exactly the model its catalog entry makes (GeneratedModel.ToModel): the record
+// encodes it. Whether a built-in model is unchanged is decided by comparing it with its entry's typed model, not by encoding both and comparing the
+// digests: that costs a JSON encoding of the model and, for a routing variant, which has no baseline of its own, a decoding and an encoding of its
+// record, and the whole catalog is encoded at each start of an extension host. A model that differs in any member, or has no entry, reports false
+// and takes the encoding path, which decides the same.
+func unchangedBundledRecord(model AnyModel) (string, bool) {
+	typed, ok := model.(*Model)
+	if !ok || typed == nil || typed.catalogRecord == "" || typed.catalog != nil {
+		return "", false
+	}
+	view := catalogEntryView(typed.catalogRecord)
+	if view == nil || !reflect.DeepEqual(typed, view) {
+		return "", false
+	}
+	return typed.catalogRecord, true
+}
 
 // CatalogModelJSON is the JSON object of a model that came from a catalog record, the built-in catalog or a models
 // store, as Pi serializes that model object: the record's members in the record's order, with the record's own bytes for
 // every member the model still holds at its catalog value. ok is false for a model without a record.
 func CatalogModelJSON(model AnyModel) (data json.RawMessage, ok bool, err error) {
+	if record, unchanged := unchangedBundledRecord(model); unchanged {
+		return json.RawMessage(ResolveCatalogRecord(record)), true, nil
+	}
 	_, shape, err := anyModelRecord(model)
 	if err != nil {
 		return nil, false, err

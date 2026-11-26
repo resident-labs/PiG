@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 
 	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/orderedjson"
 )
 
@@ -196,12 +197,26 @@ type SessionBeforeTreeResultSummary struct {
 	Details any    `json:"details,omitempty"`
 	// Usage is the pi-ai Usage of the extension's summarization call.
 	Usage *ai.Usage `json:"usage,omitempty"`
+	// UsageNull marks a nil Usage as an explicit null: Pi's branchWithSummary stores the null and the entry holds `"usage":null`
+	// (session-manager.ts:1611-1630). `details` holds a null in the value itself: json.RawMessage("null").
+	UsageNull bool `json:"-"`
+	// UsageRaw is the usage object as the extension wrote it, which Pi stores in the entry (agent-session.ts navigateTree
+	// `summaryUsage = extensionSummary.usage`): its member order and the members Usage has no field for. Set by the decode of a result that has a usage.
+	UsageRaw json.RawMessage `json:"-"`
 }
 
-// UnmarshalJSON keeps the member order of the `details` object the extension wrote.
+// UnmarshalJSON keeps the member order of the `details` object the extension wrote, a null `details` or `usage` apart from an absent one, and the usage object as written.
 func (s *SessionBeforeTreeResultSummary) UnmarshalJSON(data []byte) error {
 	type plain SessionBeforeTreeResultSummary
-	return orderedjson.UnmarshalFields(data, (*plain)(s), "details")
+	if err := orderedjson.UnmarshalFields(data, (*plain)(s), "details"); err != nil {
+		return err
+	}
+	s.UsageNull = s.Usage == nil && orderedjson.IsNullMember(data, "usage")
+	s.UsageRaw = nil
+	if s.Usage != nil {
+		s.UsageRaw = orderedjson.ContainerMember(data, "usage")
+	}
+	return nil
 }
 
 // SessionTreeEvent: upstream types.ts SessionTreeEvent.
@@ -346,7 +361,7 @@ func (p *SystemPrompt) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(prompt) //perf:ok a getter value: the prompt exists only once rendered, once per before_agent_start event encoded (a user prompt)
+	return jsstring.MarshalKeepingSurrogates(prompt) //perf:ok a getter value: the prompt exists only once rendered, once per before_agent_start event encoded (a user prompt)
 }
 
 // MarshalJSON writes the run's trigger members, then type, systemPromptOptions and systemPrompt, the order Pi's event has (V8 defines the getter of runner.ts's object literal, which spreads the trigger, after its data members). systemPrompt is the prompt the options render now.
@@ -356,7 +371,7 @@ func (e BeforeAgentStartEvent) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	if e.MessageType == BeforeAgentStartCustom {
-		return json.Marshal(struct {
+		return jsstring.MarshalKeepingSurrogates(struct {
 			MessageType         BeforeAgentStartMessageType `json:"messageType"`
 			Message             *CustomMessage              `json:"message"`
 			Type                string                      `json:"type"`
@@ -364,7 +379,7 @@ func (e BeforeAgentStartEvent) MarshalJSON() ([]byte, error) {
 			SystemPrompt        string                      `json:"systemPrompt"`
 		}{BeforeAgentStartCustom, e.Message, e.Type, e.SystemPromptOptions, systemPrompt})
 	}
-	return json.Marshal(struct {
+	return jsstring.MarshalKeepingSurrogates(struct {
 		MessageType         BeforeAgentStartMessageType `json:"messageType"`
 		Prompt              string                      `json:"prompt"`
 		Images              []ImageContent              `json:"images,omitzero"`
@@ -408,13 +423,24 @@ type CustomMessageRef struct {
 	CustomType string `json:"customType"`
 	Content    any    `json:"content"`
 	Display    bool   `json:"display"`
-	Details    any    `json:"details,omitempty"`
+	// DisplayAbsent marks a message whose writer left display out: Pi's message then has no display member, and neither has its session entry.
+	DisplayAbsent bool `json:"-"`
+	// DisplayNull marks a message whose writer set display to null, which the declaration does not allow and Pi does not check: its message and its
+	// session entry hold `"display":null`, which readers take for false.
+	DisplayNull bool `json:"-"`
+	Details     any  `json:"details,omitempty"`
 }
 
-// UnmarshalJSON keeps the member order of the `details` object the extension wrote.
-func (m *CustomMessageRef) UnmarshalJSON(data []byte) error {
+// UnmarshalJSON keeps the member order of the `content` blocks and `details` object the extension wrote: Pi appends the objects themselves. It also keeps a
+// message without `display` apart from one whose display is false.
+func (r *CustomMessageRef) UnmarshalJSON(data []byte) error {
 	type plain CustomMessageRef
-	return orderedjson.UnmarshalFields(data, (*plain)(m), "details")
+	if err := orderedjson.UnmarshalFields(data, (*plain)(r), "content", "details"); err != nil {
+		return err
+	}
+	r.DisplayAbsent = !r.Display && !orderedjson.HasMember(data, "display")
+	r.DisplayNull = !r.Display && orderedjson.IsNullMember(data, "display")
+	return nil
 }
 
 // AgentStartEvent: upstream types.ts AgentStartEvent.
@@ -438,7 +464,7 @@ type AgentBeforeSettleEvent struct {
 // MarshalJSON writes the members in Pi's order: type, outcome, then the boundary's entries, continue and context (extensions/runner.ts emitBoundary).
 func (e AgentBeforeSettleEvent) MarshalJSON() ([]byte, error) {
 	//perf:ok once per agent settle, not per delta: the wrapper only fixes Pi's member order
-	return json.Marshal(struct {
+	return jsstring.MarshalKeepingSurrogates(struct {
 		Type     string                 `json:"type"`
 		Outcome  AgentActivityOutcome   `json:"outcome"`
 		Entries  []SessionBoundaryDraft `json:"entries"`
@@ -520,17 +546,33 @@ const (
 // SessionBoundaryDraft is the wire representation of upstream's closed
 // SessionBoundaryDraft union. Fields apply according to Type.
 type SessionBoundaryDraft struct {
-	Type             SessionBoundaryDraftType `json:"type"`
-	CustomType       string                   `json:"customType,omitempty"`
-	Data             any                      `json:"data,omitempty"`
-	Content          any                      `json:"content,omitempty"`
-	Display          bool                     `json:"display,omitempty"`
-	Details          any                      `json:"details,omitempty"`
-	TargetID         string                   `json:"targetId,omitempty"`
-	Replacement      json.RawMessage          `json:"replacement,omitempty"`
-	Summary          string                   `json:"summary,omitempty"`
-	FirstKeptEntryID *string                  `json:"firstKeptEntryId,omitempty"`
-	Usage            *ai.Usage                `json:"usage,omitempty"`
+	Type        SessionBoundaryDraftType `json:"type"`
+	CustomType  string                   `json:"customType,omitempty"`
+	Data        any                      `json:"data,omitempty"`
+	Content     any                      `json:"content,omitempty"`
+	Display     bool                     `json:"display,omitempty"`
+	Details     any                      `json:"details,omitempty"`
+	TargetID    string                   `json:"targetId,omitempty"`
+	Replacement json.RawMessage          `json:"replacement,omitempty"`
+	// ReplacementUndefined marks a context_edit draft decoded from a handler's result that has no `replacement` member. Pi's appendContextEdit takes null
+	// (omit the target) and rejects undefined (session-manager.ts:1371-1379), so the decode keeps the two apart. A draft built in Go has no undefined: its
+	// nil Replacement is null.
+	ReplacementUndefined bool      `json:"-"`
+	Summary              string    `json:"summary,omitempty"`
+	FirstKeptEntryID     *string   `json:"firstKeptEntryId,omitempty"`
+	Usage                *ai.Usage `json:"usage,omitempty"`
+	// DisplayAbsent marks a custom_message draft whose writer left display out: Pi's appendCustomMessageEntry stores undefined and the entry has no display
+	// member (session-manager.ts:1350-1366).
+	DisplayAbsent bool `json:"-"`
+	// DisplayNull marks a custom_message draft whose writer set display to null: Pi's appendCustomMessageEntry stores the null and the entry holds
+	// `"display":null`.
+	DisplayNull bool `json:"-"`
+	// UsageNull marks a compaction draft's nil Usage as an explicit null: Pi's appendCompaction stores the null and the entry holds `"usage":null`
+	// (session-manager.ts:1283-1295). `data` and `details` hold a null in the value itself: json.RawMessage("null").
+	UsageNull bool `json:"-"`
+	// UsageRaw is a compaction draft's usage object as the extension wrote it, which Pi's appendCompaction stores: its member order and the members
+	// Usage has no field for. Set by the decode of a draft that has a usage.
+	UsageRaw json.RawMessage `json:"-"`
 }
 
 // MarshalJSON preserves each upstream union member's required fields,
@@ -538,47 +580,125 @@ type SessionBoundaryDraft struct {
 func (d SessionBoundaryDraft) MarshalJSON() ([]byte, error) {
 	switch d.Type {
 	case SessionBoundaryDraftCustom:
-		return json.Marshal(struct {
+		return jsstring.MarshalKeepingSurrogates(struct {
 			Type       SessionBoundaryDraftType `json:"type"`
 			CustomType string                   `json:"customType"`
 			Data       any                      `json:"data,omitempty"`
 		}{d.Type, d.CustomType, d.Data})
 	case SessionBoundaryDraftCustomMessage:
-		return json.Marshal(struct {
+		return jsstring.MarshalKeepingSurrogates(struct {
 			Type       SessionBoundaryDraftType `json:"type"`
 			CustomType string                   `json:"customType"`
-			Content    any                      `json:"content"`
-			Display    bool                     `json:"display"`
+			Content    any                      `json:"content,omitempty"`
+			Display    any                      `json:"display,omitempty"`
 			Details    any                      `json:"details,omitempty"`
-		}{d.Type, d.CustomType, d.Content, d.Display, d.Details})
+		}{d.Type, d.CustomType, d.Content, draftDisplay(d.Display, d.DisplayAbsent, d.DisplayNull), d.Details})
 	case SessionBoundaryDraftContextEdit:
+		// One struct writes both forms: `omitempty` leaves the member out only for an empty value, and only the undefined draft has one, because a defined
+		// draft without a value is given null here.
 		replacement := d.Replacement
-		if len(replacement) == 0 {
+		switch {
+		case d.ReplacementUndefined:
+			// The next handler is handed the draft as the extension wrote it, without the member.
+			replacement = nil
+		case len(replacement) == 0:
 			replacement = json.RawMessage("null")
 		}
-		return json.Marshal(struct {
+		return jsstring.MarshalKeepingSurrogates(struct {
 			Type        SessionBoundaryDraftType `json:"type"`
 			TargetID    string                   `json:"targetId"`
-			Replacement json.RawMessage          `json:"replacement"`
+			Replacement json.RawMessage          `json:"replacement,omitempty"`
 		}{d.Type, d.TargetID, replacement})
 	case SessionBoundaryDraftCompaction:
-		return json.Marshal(struct {
+		return jsstring.MarshalKeepingSurrogates(struct {
 			Type             SessionBoundaryDraftType `json:"type"`
 			Summary          string                   `json:"summary"`
 			FirstKeptEntryID *string                  `json:"firstKeptEntryId"`
 			Details          any                      `json:"details,omitempty"`
-			Usage            *ai.Usage                `json:"usage,omitempty"`
-		}{d.Type, d.Summary, d.FirstKeptEntryID, d.Details, d.Usage})
+			Usage            any                      `json:"usage,omitempty"`
+		}{d.Type, d.Summary, d.FirstKeptEntryID, d.Details, draftUsage(d.Usage, d.UsageRaw, d.UsageNull)})
 	default:
 		type plain SessionBoundaryDraft
-		return json.Marshal(plain(d))
+		return jsstring.MarshalKeepingSurrogates(plain(d))
 	}
 }
 
-// UnmarshalJSON keeps the member order of the `data` and `details` objects the extension wrote.
+// draftDisplay is what a custom_message draft's display member encodes: the boolean, null for a draft written with a null one, and no member for a
+// draft written without one.
+func draftDisplay(display, absent, null bool) any {
+	switch {
+	case absent:
+		return nil
+	case null:
+		return orderedjson.Null()
+	}
+	return display
+}
+
+// DisplayMember is the display member of the custom message the draft becomes: the boolean, orderedjson.Null for a draft written with a null one, and
+// nil for a draft written without one.
+func (d SessionBoundaryDraft) DisplayMember() any {
+	return draftDisplay(d.Display, d.DisplayAbsent, d.DisplayNull)
+}
+
+// ContentMember is the content of the custom message a sendMessage call builds: Pi's sendCustomMessage reads `message.content ?? []`
+// (agent-session.ts:2468), so a content that is null or left out is an empty list, in the message and in its session entry.
+func (r CustomMessageRef) ContentMember() any {
+	if r.Content == nil || orderedjson.IsNull(r.Content) {
+		return []any{}
+	}
+	return r.Content
+}
+
+// DisplayMember is the display member of the custom message: the boolean, orderedjson.Null for a message written with a null one, and nil for a
+// message written without one.
+func (r CustomMessageRef) DisplayMember() any {
+	return draftDisplay(r.Display, r.DisplayAbsent, r.DisplayNull)
+}
+
+// draftUsage is what a compaction draft's usage member encodes: the usage, as its author wrote it when the draft holds that object, null for one
+// written as null, and no member otherwise.
+func draftUsage(usage *ai.Usage, raw json.RawMessage, null bool) any {
+	switch {
+	case usage != nil && raw != nil:
+		return raw
+	case usage != nil:
+		return usage
+	case null:
+		return orderedjson.Null()
+	}
+	return nil
+}
+
+// UnmarshalJSON keeps the member order of the `data` and `details` objects and of the `content` blocks the extension wrote: Pi appends the objects themselves and
+// writes their members in insertion order. It also keeps a null `data`, `details` or `usage` apart from an absent one (orderedjson.Null, UsageNull), and a
+// context_edit's absent `replacement` apart from a null one (ReplacementUndefined).
 func (d *SessionBoundaryDraft) UnmarshalJSON(data []byte) error {
 	type plain SessionBoundaryDraft
-	return orderedjson.UnmarshalFields(data, (*plain)(d), "data", "details")
+	d.ReplacementUndefined = false
+	if err := orderedjson.UnmarshalFields(data, (*plain)(d), "data", "details", "content"); err != nil {
+		return err
+	}
+	d.UsageNull = d.Usage == nil && orderedjson.IsNullMember(data, "usage")
+	d.UsageRaw = nil
+	if d.Usage != nil {
+		d.UsageRaw = orderedjson.ContainerMember(data, "usage")
+	}
+	d.DisplayAbsent = d.Type == SessionBoundaryDraftCustomMessage && !d.Display && !orderedjson.HasMember(data, "display")
+	d.DisplayNull = d.Type == SessionBoundaryDraftCustomMessage && !d.Display && orderedjson.IsNullMember(data, "display")
+	if d.Type != SessionBoundaryDraftContextEdit || len(d.Replacement) > 0 {
+		return nil
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		return err
+	}
+	if _, present := members["replacement"]; present {
+		d.Replacement = json.RawMessage("null")
+	} else {
+		d.ReplacementUndefined = true
+	}
+	return nil
 }
 
 // ProjectedSessionEntry is one boundary preview entry and its model-visible messages.
@@ -655,7 +775,7 @@ func (e TurnEndEvent) MarshalJSON() ([]byte, error) {
 		out.Outcome, out.Entries, out.Continue, out.Context = &state.Outcome, &state.Entries, &state.Continue, &state.Context
 	}
 	//perf:ok once per turn end, not per delta: the wrapper only fixes Pi's member order
-	return json.Marshal(out)
+	return jsstring.MarshalKeepingSurrogates(out)
 }
 
 // MessageStartEvent: upstream types.ts MessageStartEvent.
@@ -702,7 +822,7 @@ func (e ToolExecutionStartEvent) MarshalJSON() ([]byte, error) {
 	if e.WireArgs != nil {
 		e.Args = e.WireArgs
 	}
-	return json.Marshal(plain(e))
+	return jsstring.MarshalKeepingSurrogates(plain(e))
 }
 
 // WireMembers is a wire value that encodes as a JSON object. It names the members in the order the object writes them and holds each value, so the host can compare one such value with the one it sent before without encoding it again. Its MarshalJSON writes the same object.
@@ -735,7 +855,7 @@ func (e ToolExecutionUpdateEvent) MarshalJSON() ([]byte, error) {
 	if e.WirePartialResult != nil {
 		e.PartialResult = e.WirePartialResult
 	}
-	return json.Marshal(plain(e))
+	return jsstring.MarshalKeepingSurrogates(plain(e))
 }
 
 // ToolExecutionEndEvent: upstream types.ts ToolExecutionEndEvent.
@@ -761,7 +881,7 @@ func (e ToolExecutionEndEvent) MarshalJSON() ([]byte, error) {
 	if e.WireResult != nil {
 		e.Result = e.WireResult
 	}
-	return json.Marshal(plain(e))
+	return jsstring.MarshalKeepingSurrogates(plain(e))
 }
 
 // ─── Model Events ────────────────────────────────────────────────────────
@@ -998,6 +1118,28 @@ type ToolResultEventBase struct {
 	// Usage is the usage of the tool execution itself, if available
 	// (upstream `usage?: Usage`).
 	Usage any `json:"usage,omitempty"`
+	// Edits is where an extension process's handler reports the members of the event it edited in place (see [ToolResultEdits]); the Runner sets it for each handler it calls.
+	Edits *ToolResultEdits `json:"-"`
+}
+
+// ToolResultEdits is what a tool_result handler in an extension process left in the event it was handed. Pi hands every handler of the chain the one currentEvent, so a member a handler assigns on it is what the next handler sees, and an edit made to an object the caller handed over (a block of the content, a member of the details) is also in the caller's result; a member assigned another value reaches the caller only through a result a handler returned (runner.ts emitToolResult). An extension process cannot share the event, so its reply names the members it left different from the ones it received and, of those, the ones it edited in the object it received instead of replacing.
+type ToolResultEdits struct {
+	// Members holds the new value of each member Changed names.
+	Members ToolResultEventResult
+	// Changed names the members the handler left different from the ones it received: "content", "details", "isError", "structuredContent" or "usage".
+	Changed []string
+	// Shared names the members of Changed the handler edited in the object it received (a deep edit), which Pi's caller holds too.
+	Shared []string
+}
+
+func (b ToolResultEventBase) editsSink() *ToolResultEdits { return b.Edits }
+
+// ToolResultEditsSink is where the handler of event reports its in-place edits, or nil when the event has none.
+func ToolResultEditsSink(event any) *ToolResultEdits {
+	if sink, ok := event.(interface{ editsSink() *ToolResultEdits }); ok {
+		return sink.editsSink()
+	}
+	return nil
 }
 
 // ToolDetailsConverter is implemented by a built-in tool's internal result
@@ -1048,10 +1190,15 @@ type BashToolDetails struct {
 // PowerShellToolDetails is the bash details shape (upstream powershell.ts).
 type PowerShellToolDetails = BashToolDetails
 
-// ReadToolDetails mirrors upstream read.ts:28. Attached only when output
-// was truncated (or the first line exceeded the byte limit).
+// ReadToolDetails mirrors upstream read.ts ReadToolDetails. Attached when output
+// was truncated (or the first line exceeded the byte limit), or when an image
+// was read while a model without image input was selected.
 type ReadToolDetails struct {
 	Truncation *TruncationResult `json:"truncation,omitempty"`
+	// ImageUnsupportedByModel is the id of the model that was selected when the
+	// image was read, if it has no image input. Shown to the user only: the
+	// model gets pi-ai's placeholder per request. Nil when the member is absent.
+	ImageUnsupportedByModel *string `json:"imageUnsupportedByModel,omitempty"`
 }
 
 // GrepToolDetails mirrors upstream grep.ts:41. Sparse fields retain the requested numeric limit without rounding.

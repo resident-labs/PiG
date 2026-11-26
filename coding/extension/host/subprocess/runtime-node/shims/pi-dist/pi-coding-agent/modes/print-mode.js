@@ -7,6 +7,7 @@
  */
 import { flushRawStdout, waitForRawStdoutBackpressure, writeRawStdout } from "../core/output-guard.js";
 import { killTrackedDetachedChildren } from "../utils/shell.js";
+import { writeDiagnosticsToStderr } from "./diagnostics-stderr.js";
 import { toJsonEvent } from "./json-event.js";
 /**
  * Run in print (single-shot) mode.
@@ -18,26 +19,31 @@ export async function runPrintMode(runtimeHost, options) {
     let session = runtimeHost.session;
     let unsubscribe;
     let unsubscribeBackpressure;
-    let disposed = false;
+    let disposing;
+    // SIGTERM/SIGHUP received so far. Only a repeated signal forces exit during disposal.
+    let signalCount = 0;
     const signalCleanupHandlers = [];
-    const disposeRuntime = async () => {
-        if (disposed)
-            return;
-        disposed = true;
-        unsubscribe?.();
-        unsubscribeBackpressure?.();
-        await runtimeHost.dispose();
+    // Callers share one disposal, so a signal during the final disposal waits for it to finish.
+    const disposeRuntime = () => {
+        disposing ??= (async () => {
+            unsubscribe?.();
+            unsubscribeBackpressure?.();
+            await runtimeHost.dispose();
+        })();
+        return disposing;
     };
     const registerSignalHandlers = () => {
-        const signals = ["SIGTERM"];
-        if (process.platform !== "win32") {
-            signals.push("SIGHUP");
-        }
+        // Pi 31b407dc63 (post-v1.5.2), backported by automation/gen/pi-post-release-backports.mjs.
+        const signals = ["SIGTERM", "SIGHUP"];
         for (const signal of signals) {
+            const exitCode = signal === "SIGHUP" ? 129 : 143;
             const handler = () => {
+                signalCount++;
                 killTrackedDetachedChildren();
+                if (signalCount > 1)
+                    process.exit(exitCode);
                 void disposeRuntime().finally(() => {
-                    process.exit(signal === "SIGHUP" ? 129 : 143);
+                    process.exit(exitCode);
                 });
             };
             process.on(signal, handler);
@@ -47,9 +53,24 @@ export async function runPrintMode(runtimeHost, options) {
     registerSignalHandlers();
     runtimeHost.setRebindSession(async () => {
         await rebindSession();
+        writeDiagnosticsToStderr(runtimeHost.takeUnreportedDiagnostics());
     });
     const rebindSession = async () => {
         session = runtimeHost.session;
+        // Subscribe before binding so events emitted by session_start handlers (e.g. appended entries) reach the JSON output.
+        unsubscribe?.();
+        unsubscribeBackpressure?.();
+        unsubscribe = session.subscribe((event) => {
+            if (mode === "json") {
+                writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`);
+            }
+        });
+        unsubscribeBackpressure =
+            mode === "json"
+                ? session.agent.subscribe(async () => {
+                    await waitForRawStdoutBackpressure();
+                })
+                : undefined;
         await session.bindExtensions({
             mode: mode === "json" ? "json" : "print",
             commandContextActions: {
@@ -79,19 +100,6 @@ export async function runPrintMode(runtimeHost, options) {
                 console.error(`Extension error (${err.extensionPath}): ${err.error}`);
             },
         });
-        unsubscribe?.();
-        unsubscribeBackpressure?.();
-        unsubscribe = session.subscribe((event) => {
-            if (mode === "json") {
-                writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`);
-            }
-        });
-        unsubscribeBackpressure =
-            mode === "json"
-                ? session.agent.subscribe(async () => {
-                    await waitForRawStdoutBackpressure();
-                })
-                : undefined;
     };
     try {
         if (mode === "json") {
@@ -136,10 +144,12 @@ export async function runPrintMode(runtimeHost, options) {
         return 1;
     }
     finally {
+        // Keep the signal handlers until disposal is done: without one, a signal would kill the
+        // process mid-dispose (for example during a pending MCP token refresh).
+        await disposeRuntime();
         for (const cleanup of signalCleanupHandlers) {
             cleanup();
         }
-        await disposeRuntime();
         await flushRawStdout();
     }
 }

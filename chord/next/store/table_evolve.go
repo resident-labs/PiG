@@ -4,19 +4,17 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-
-	"github.com/MichaelKinsy/PiG/chord/next/contracts"
 )
 
-// Ports packages/chord/src/next/store/table-evolve.ts
+// Ports packages/chord/src/store/table-evolve.ts
 //
 // `EvolveTable(previous, (t) => t…)` (slice 6a §9; decision "Second spec review: the majority"): the next version of
 // a table from the edits of one migration. At runtime one editor records the edits, checks each as it is made, and
 // materializes the new version at the end.
 //
-// Go forced differences: the editor's types (TableTailEditor, TableEditor, AddedColumn, PatchOf, Renamed, With,
-// Without, WithJson, Next) order the edits and track columns, key and version in the type system; they are designed
-// out, and TableEditor is one concrete type whose runtime checks (an edit after the data step, a second data step,
+// Go forced differences: the editor's types AddedColumn, PatchOf, Renamed, RenamedKey, With, Without, WithJson track
+// columns, key and version in the type system; they are designed out. TableTailEditor orders the edits (see it), and
+// TableEditor is one concrete type whose runtime checks (an edit after the data step, a second data step,
 // unknown columns, ...) are all kept. Every edit returns its editor so edits chain, and the first failing edit is
 // kept: later edits of the chain are skipped and EvolveTable returns that error (upstream: the first failing edit
 // throws out of `edit`), as chord/next/contracts' editors do.
@@ -32,9 +30,16 @@ type UpdateStep struct {
 // EvolveTable appends the next version (`previous.Version + 1`) with the edits edit makes; edit must return the
 // editor it was given. Every version is materialized and fingerprinted here; the object serves the newest, and its
 // activation migrates a store at an older version through each one.
-func EvolveTable(previous *TableDefinition, edit func(t *TableEditor) *TableEditor) (*TableDefinition, error) {
-	editor := newEditor(previous)
-	editErr := contracts.EditWith(editor, edit, previous.Name+": evolveTable")
+func EvolveTable(previous *TableDefinition, edit func(t *TableEditor) TableTailEditor, options ...EvolveOptions) (*TableDefinition, error) {
+	var chosen EvolveOptions
+	if len(options) > 0 {
+		chosen = options[0]
+	}
+	editor := newEditor(previous, chosen)
+	var editErr error
+	if edit(editor) != TableTailEditor(editor) {
+		editErr = fmt.Errorf("%s: evolveTable must return the editor it was given", previous.Name)
+	}
 	if editor.err != nil {
 		return nil, editor.err
 	}
@@ -43,6 +48,29 @@ func EvolveTable(previous *TableDefinition, edit func(t *TableEditor) *TableEdit
 	}
 	return editor.finish()
 }
+
+// EvolveOptions is what EvolveTable takes besides the edits.
+type EvolveOptions struct {
+	// Exposes is the column set the new version exposes: the previous version's when left out.
+	Exposes *ColumnSet
+	// ExposesNone drops the column set (`exposes: "none"`).
+	ExposesNone bool
+}
+
+// TableTailEditor is the edits after the data step: `Drop`, `Index` and `DropIndex`. Pi's types order the edits
+// (`rename`, `add` and `json` before the data step, these after it) and track the columns and key through the chain; Go
+// orders them the same way (Rows and Update return a TableTailEditor, which has no Rename, Add or Json) and tracks
+// neither: the checks at runtime are the same ones, so the type-only `~columns` and `~key` members have no Go form.
+type TableTailEditor interface {
+	// Drop drops a non-key column; its indexes are dropped first, in the same commit.
+	Drop(name string) TableTailEditor
+	// Index adds an index ([a-z0-9_]+) over non-`opt` `str` or `int` columns; it ends with the key.
+	Index(name string, columns []string) TableTailEditor
+	// DropIndex drops an index.
+	DropIndex(name string) TableTailEditor
+}
+
+var _ TableTailEditor = (*TableEditor)(nil)
 
 const (
 	phaseBefore = iota
@@ -64,11 +92,21 @@ type TableEditor struct {
 	step   *DataStep
 	after  []TableEdit
 	err    error
+	// exposes is the set the finished version exposes; the versions a data step reads expose none.
+	exposes *ColumnSet
 }
 
-func newEditor(previous *TableDefinition) *TableEditor {
+func newEditor(previous *TableDefinition, options EvolveOptions) *TableEditor {
+	exposes := previous.Exposes
+	switch {
+	case options.ExposesNone:
+		exposes = nil
+	case options.Exposes != nil:
+		exposes = options.Exposes
+	}
 	return &TableEditor{
 		previous: previous,
+		exposes:  exposes,
 		what:     fmt.Sprintf("%s version %d", previous.Name, previous.Version+1),
 		schemas:  append([]ColumnProp(nil), previous.Schemas...),
 		key:      append([]string(nil), previous.Key...),
@@ -207,7 +245,7 @@ func (e *TableEditor) Json(name string, column ColumnSchema) *TableEditor {
 
 // Rows is the data step: patch gets each row as the columns stand here and returns new values of non-key columns
 // (an empty patch stamps the row only); synchronous and pure, run in chunks of 100 in key order.
-func (e *TableEditor) Rows(patch func(row Row) (any, error)) *TableEditor {
+func (e *TableEditor) Rows(patch func(row Row) (any, error)) TableTailEditor {
 	if e.err != nil {
 		return e
 	}
@@ -227,7 +265,7 @@ func (e *TableEditor) Rows(patch func(row Row) (any, error)) *TableEditor {
 }
 
 // Update is the data step as one `updateWhere` over the rows not migrated yet.
-func (e *TableEditor) Update(step UpdateStep) *TableEditor {
+func (e *TableEditor) Update(step UpdateStep) TableTailEditor {
 	if e.err != nil {
 		return e
 	}
@@ -264,7 +302,7 @@ func (e *TableEditor) Update(step UpdateStep) *TableEditor {
 }
 
 // Drop drops a non-key column; its indexes are dropped first, in the same commit.
-func (e *TableEditor) Drop(name string) *TableEditor {
+func (e *TableEditor) Drop(name string) TableTailEditor {
 	if e.err != nil {
 		return e
 	}
@@ -296,7 +334,7 @@ func (e *TableEditor) Drop(name string) *TableEditor {
 }
 
 // Index adds an index (`[a-z0-9_]+`) over non-`opt` `str` or `int` columns; it ends with the key.
-func (e *TableEditor) Index(name string, columns []string) *TableEditor {
+func (e *TableEditor) Index(name string, columns []string) TableTailEditor {
 	if e.err != nil {
 		return e
 	}
@@ -327,7 +365,7 @@ func (e *TableEditor) Index(name string, columns []string) *TableEditor {
 }
 
 // DropIndex drops an index.
-func (e *TableEditor) DropIndex(name string) *TableEditor {
+func (e *TableEditor) DropIndex(name string) TableTailEditor {
 	if e.err != nil {
 		return e
 	}
@@ -349,7 +387,9 @@ func (e *TableEditor) DropIndex(name string) *TableEditor {
 // finish is the new version, materialized and fingerprinted, linked to the previous one and the migration from it.
 func (e *TableEditor) finish() (*TableDefinition, error) {
 	migration := Migration{Before: e.before, Step: e.step, After: e.after}
-	return NewTableDefinition(e.previous.Name, e.options(), &Evolution{Previous: e.previous, Migration: migration})
+	options := e.options()
+	options.Exposes = e.exposes
+	return NewTableDefinition(e.previous.Name, options, &Evolution{Previous: e.previous, Migration: migration})
 }
 
 // current is the table as the edits so far leave it, at the new version: what a data step reads and writes.

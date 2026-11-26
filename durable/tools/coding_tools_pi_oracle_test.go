@@ -192,12 +192,21 @@ func TestReadOfImagesMatchesPi(t *testing.T) {
 		if gotOut, wantOut := normalized(t, got.Output), normalized(t, rawList(pi.Output)); !reflect.DeepEqual(gotOut, wantOut) && (len(got.Output) != 0 || len(pi.Output) != 0) {
 			t.Errorf("%s: PiG output %v, Pi %v", c.name, gotOut, wantOut)
 		}
+		// Pi 4be4cb4f5e9c: details name a model without image input, and nothing else of an image read (the oracle script reports no details).
+		wantDetails := "null"
+		if c.model == visionless && !pi.IsError {
+			wantDetails = `{"imageUnsupportedByModel":"test"}`
+		}
+		if raw, err := json.Marshal(got.Details); err != nil || string(raw) != wantDetails || got.HasDetails != (wantDetails != "null") {
+			t.Errorf("%s: PiG details %s (has %v), %v, want %s", c.name, raw, got.HasDetails, err, wantDetails)
+		}
 		if len(got.Diagnostics) != len(pi.Diagnostics) {
 			t.Errorf("%s: PiG diagnostics %+v, Pi %+v", c.name, got.Diagnostics, pi.Diagnostics)
 			continue
 		}
 		for j, d := range got.Diagnostics {
-			if want := pi.Diagnostics[j]; string(d.Severity) != want.Severity || d.Code != want.Code || d.Message != want.Message {
+			want := pi.Diagnostics[j]
+			if string(d.Severity) != want.Severity || d.Code != want.Code || d.Message != want.Message {
 				t.Errorf("%s: diagnostic %d: PiG %+v, Pi %+v", c.name, j, d, want)
 			}
 		}

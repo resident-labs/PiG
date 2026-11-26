@@ -1,10 +1,14 @@
 package host
 
-import "slices"
+import (
+	"math"
+	"slices"
+)
 
-// Ports packages/chord/src/next/remote/calls.ts. The call window (§3, decision log "Flow control: an ack-clocked
-// window"): at most the peer's N calls in flight on a link from this host; further calls wait in one FIFO queue, sent in
-// order as replies free slots.
+// Ports packages/chord/src/remote/calls.ts. The call window (§3, decision log "Flow control: an ack-clocked
+// window"; decision "Call windows only for untrusted links"): at most the peer's N calls of one origin in flight on a
+// link; further calls wait in one FIFO queue, sent in order as replies free slots. A peer that announced no window
+// takes every call at once.
 
 // queuedCall is a call waiting for a slot: its hold (a rebind or release takes it out) and what sends it. A call must be
 // comparable (a pointer): the window takes one out by identity.
@@ -14,10 +18,11 @@ type queuedCall interface {
 	send()
 }
 
-// callWindow is the calls of one link's consumer side. limit is the peer's N from its `hello` (0 before it, so every
-// call waits). A relay forwards its downstream calls at once, so only this host's own calls are counted here. Pi's
-// `Set<C>` is a slice in insertion order: a call is in it once, and a call queued while the window drains is visited by
-// the drain, as a JavaScript Set iteration visits it.
+// callWindow is the calls of one origin on one link: a link's consumer side for this host's own calls, or a relay's queue
+// of one downstream origin's calls towards one upstream link. limit is the peer's N from its `hello`: 0 before it (so
+// every call waits), math.MaxInt when it announced none (a trusted link: every call goes at once). Pi's `Set<C>` is a
+// slice in insertion order: a call is in it once, and a call queued while the window drains is visited by the drain, as
+// a JavaScript Set iteration visits it.
 type callWindow[C queuedCall] struct {
 	limit    int
 	inFlight int
@@ -36,13 +41,17 @@ func (w *callWindow[C]) submit(call C) {
 	}
 }
 
-// opened: the peer's window arrived with its `hello`: waiting calls go out.
+// opened: the peer's window arrived with its `hello` (0: none announced, a window is at least 1): waiting calls go out.
 func (w *callWindow[C]) opened(limit int) {
+	if limit == 0 {
+		limit = math.MaxInt
+	}
 	w.limit = limit
 	w.drain()
 }
 
-// freed: a call in flight ended (its reply, its abort sent, its hold released or gone): its slot is free.
+// freed: a call in flight ended (its reply, its abort sent, its hold released or gone): its slot is free. A caller taking
+// waiting calls out at the same time takes them out first (remove, removeHold), so the slot never sends one.
 func (w *callWindow[C]) freed() {
 	w.inFlight--
 	w.drain()
@@ -57,10 +66,18 @@ func (w *callWindow[C]) remove(call C) {
 
 // removeHold takes every waiting call of hold out and returns them (its hold rebinds or was released).
 func (w *callWindow[C]) removeHold(hold int) []C {
+	return w.removeWhere(func(call C) bool { return call.holdID() == hold })
+}
+
+// removeWhere takes every waiting call matches accepts out and returns them, in order: one owner's calls when a
+// reference sharing a hold releases.
+func (w *callWindow[C]) removeWhere(matches func(C) bool) []C {
 	var removed []C
-	kept := w.waiting[:0:0]
+	// A new array, and none when nothing is left: a zero-length slice of the old one would keep it, and with it every
+	// call taken out (its arguments, its result, the binding that made it), until the next append.
+	var kept []C
 	for _, call := range w.waiting {
-		if call.holdID() == hold {
+		if matches(call) {
 			removed = append(removed, call)
 		} else {
 			kept = append(kept, call)
@@ -84,6 +101,9 @@ func (w *callWindow[C]) drain() {
 			return
 		}
 		call := w.waiting[0]
+		// Cleared before the reslice: the backing array would keep the call it sent until it is replaced.
+		var none C
+		w.waiting[0] = none
 		w.waiting = w.waiting[1:]
 		w.inFlight++
 		call.send()

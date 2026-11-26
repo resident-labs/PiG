@@ -8,6 +8,11 @@
 // Without -src it ports packages/ai/catalog/generate.ts: it fetches models.dev (v2), OpenRouter, Vercel AI Gateway, NVIDIA NIM and
 // Radius, builds every provider's catalog (internal/modelgen/providers) and writes the provider data files (-data-output) and
 // the public catalog JSON (-json-output), byte for byte as Pi's generator writes them.
+//
+// The responses it builds from come from the network, from -record/-replay (a directory of recorded responses), or from a catalog source,
+// the committed recording the repository's catalogs are made of (automation/gen/catalog-source): -record-source fetches live and replaces
+// the source when the run succeeds (make model-catalogs-live), -replay-source runs offline over it and writes the manifest generatedAt the
+// source's fetch time, so a regeneration writes the same bytes on any day.
 package main
 
 import (
@@ -15,6 +20,7 @@ import (
 	"bytes"
 	"cmp"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"flag"
 	"fmt"
@@ -30,6 +36,7 @@ import (
 	"time"
 
 	"github.com/MichaelKinsy/PiG/internal/jsnumber"
+	"github.com/MichaelKinsy/PiG/internal/jsonopts"
 )
 
 type modelRow struct {
@@ -75,6 +82,9 @@ type ModelCompat struct {
 	MaxTokensField                              string                     `json:"maxTokensField,omitempty"`
 	RequiresToolResultName                      *bool                      `json:"requiresToolResultName,omitempty"`
 	RequiresAssistantAfterToolResult            *bool                      `json:"requiresAssistantAfterToolResult,omitempty"`
+	RequiresNonNullAssistantContent             *bool                      `json:"requiresNonNullAssistantContent,omitempty"`
+	RequiresToolsWithToolHistory                *bool                      `json:"requiresToolsWithToolHistory,omitempty"`
+	PromptCacheKeyMode                          string                     `json:"promptCacheKeyMode,omitempty"`
 	RequiresThinkingAsText                      *bool                      `json:"requiresThinkingAsText,omitempty"`
 	RequiresReasoningContentOnAssistantMessages *bool                      `json:"requiresReasoningContentOnAssistantMessages,omitempty"`
 	ThinkingFormat                              string                     `json:"thinkingFormat,omitempty"`
@@ -126,6 +136,56 @@ var (
 	reDataImport = regexp.MustCompile(`import\s+values\s+from\s+"(\./data/[^"]+\.json)"`)
 )
 
+// runGeneration runs the generator over live responses, a recording, or a catalog source, and returns the exit status. It owns the
+// scratch directories, so the process exit leaves none behind.
+func runGeneration(options generatorOptions, record, replay, recordSourceDir, replaySourceDir string) int {
+	modes := 0
+	for _, mode := range []string{record, replay, recordSourceDir, replaySourceDir} {
+		if mode != "" {
+			modes++
+		}
+	}
+	if modes > 1 {
+		fmt.Fprintln(os.Stderr, "Error: -record, -replay, -record-source and -replay-source cannot be combined")
+		return 1
+	}
+	var finish func() error
+	switch {
+	case recordSourceDir != "":
+		var cleanup func()
+		var err error
+		if finish, cleanup, err = recordSource(recordSourceDir); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			return 1
+		}
+		defer cleanup()
+	case replaySourceDir != "":
+		cleanup, err := replaySource(replaySourceDir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			return 1
+		}
+		defer cleanup()
+	default:
+		if err := configureFixtures(record, replay); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			return 1
+		}
+	}
+	if err := generateModels(options); err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		return 1
+	}
+	if finish != nil {
+		if err := finish(); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			return 1
+		}
+		fmt.Println("Recorded the catalog source under", recordSourceDir)
+	}
+	return 0
+}
+
 func main() {
 	src := flag.String("src", "", "path to upstream models.generated.ts or .js: emit the Go catalogs from it")
 	out := flag.String("out", "ai/models_generated.go", "output Go file for chat models")
@@ -140,24 +200,27 @@ func main() {
 	pretty := flag.Bool("pretty", false, "generation: indent JSON output")
 	record := flag.String("record", "", "generation: store every upstream response under this directory")
 	replay := flag.String("replay", "", "generation: serve the responses recorded under this directory instead of fetching")
+	recordSourceDir := flag.String("record-source", "", "generation: fetch live and, when the run succeeds, replace the catalog source (responses.tar.gz and meta.json) in this directory")
+	replaySourceDir := flag.String("replay-source", "", "generation: serve the catalog source in this directory instead of fetching; the manifest generatedAt is its fetch time")
+	mergeSourceDir := flag.String("merge-source", "", "take the models named by -merge-ids from one live models.dev fetch into the catalog source in this directory; every other byte of the recording stays")
+	mergeIDs := flag.String("merge-ids", "", "with -merge-source: comma-separated <provider>/<model> ids of the models.dev response")
 	flag.Parse()
+	if *mergeSourceDir != "" {
+		if *src != "" || *strict || *dataOnly || *jsonOnly || *jsonOutput != "" || *dataOutput != "" || *record != "" || *replay != "" || *recordSourceDir != "" || *replaySourceDir != "" {
+			fmt.Fprintln(os.Stderr, "gen-models: -merge-source cannot be combined with another mode")
+			os.Exit(2)
+		}
+		os.Exit(runMergeSource(*mergeSourceDir, *mergeIDs))
+	}
 	if *src == "" {
-		if *strict || *dataOnly || *jsonOnly || *jsonOutput != "" || *dataOutput != "" || *record != "" || *replay != "" {
-			if err := configureFixtures(*record, *replay); err != nil {
-				fmt.Fprintln(os.Stderr, "Error:", err)
-				os.Exit(1)
-			}
-			if err := generateModels(generatorOptions{strict: *strict, dataOnly: *dataOnly, jsonOnly: *jsonOnly, jsonOutputDir: *jsonOutput, dataOutputDir: *dataOutput, pretty: *pretty}); err != nil {
-				fmt.Fprintln(os.Stderr, "Error:", err)
-				os.Exit(1)
-			}
-			return
+		if *strict || *dataOnly || *jsonOnly || *jsonOutput != "" || *dataOutput != "" || *record != "" || *replay != "" || *recordSourceDir != "" || *replaySourceDir != "" {
+			os.Exit(runGeneration(generatorOptions{strict: *strict, dataOnly: *dataOnly, jsonOnly: *jsonOnly, jsonOutputDir: *jsonOutput, dataOutputDir: *dataOutput, pretty: *pretty}, *record, *replay, *recordSourceDir, *replaySourceDir))
 		}
 		fmt.Fprintln(os.Stderr, "gen-models: -src is required")
 		os.Exit(2)
 	}
-	if *strict || *dataOnly || *jsonOnly || *jsonOutput != "" || *dataOutput != "" || *record != "" || *replay != "" {
-		fmt.Fprintln(os.Stderr, "gen-models: -strict, -data-only, -json-only, -json-output, -data-output, -record and -replay generate catalog data and cannot be combined with -src")
+	if *strict || *dataOnly || *jsonOnly || *jsonOutput != "" || *dataOutput != "" || *record != "" || *replay != "" || *recordSourceDir != "" || *replaySourceDir != "" {
+		fmt.Fprintln(os.Stderr, "gen-models: -strict, -data-only, -json-only, -json-output, -data-output, -record, -replay, -record-source and -replay-source generate catalog data and cannot be combined with -src")
 		os.Exit(2)
 	}
 	if *imageOut == "" {
@@ -441,36 +504,33 @@ func parseDataJSON(path string) ([]modelRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	token, err := decoder.Token()
+	decoder := jsontext.NewDecoder(bytes.NewReader(data), jsonopts.Parse)
+	token, err := decoder.ReadToken()
 	if err != nil {
 		return nil, fmt.Errorf("decode catalog root: %w", err)
 	}
-	if token != json.Delim('{') {
+	if token.Kind() != '{' {
 		return nil, fmt.Errorf("catalog root is %v, want object", token)
 	}
 	var models []jsonModel
 	seen := make(map[string]string)
-	for decoder.More() {
-		keyToken, err := decoder.Token()
+	for decoder.PeekKind() != '}' {
+		keyToken, err := decoder.ReadToken()
 		if err != nil {
 			return nil, err
 		}
-		api, ok := keyToken.(string)
-		if !ok {
-			return nil, fmt.Errorf("catalog key is %T, want string", keyToken)
-		}
-		var encoded json.RawMessage
-		if err := decoder.Decode(&encoded); err != nil {
+		api := keyToken.String() // a Token and the bytes ReadValue returns are void after the next call on the decoder
+		encoded, err := decoder.ReadValue()
+		if err != nil {
 			return nil, fmt.Errorf("%s: %w", api, err)
 		}
-		group, err := decodeJSONModelGroup(encoded, seen)
+		group, err := decodeJSONModelGroup(encoded, seen) // reads encoded before the decoder moves; keeps none of it
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", api, err)
 		}
 		models = append(models, group...)
 	}
-	if _, err := decoder.Token(); err != nil {
+	if _, err := decoder.ReadToken(); err != nil {
 		return nil, err
 	}
 	rows := make([]modelRow, 0, len(models))
@@ -512,28 +572,26 @@ func parseDataJSON(path string) ([]modelRow, error) {
 
 // decodeJSONModelGroup decodes one API group. seen maps every "<type>:<id>" key of the file to its API group.
 func decodeJSONModelGroup(data []byte, seen map[string]string) ([]jsonModel, error) {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	token, err := decoder.Token()
+	decoder := jsontext.NewDecoder(bytes.NewReader(data), jsonopts.Parse)
+	token, err := decoder.ReadToken()
 	if err != nil {
 		return nil, fmt.Errorf("decode model group: %w", err)
 	}
-	if token != json.Delim('{') {
+	if token.Kind() != '{' {
 		return nil, fmt.Errorf("model group root is %v, want object", token)
 	}
 	var models []jsonModel
-	for decoder.More() {
-		keyToken, err := decoder.Token()
+	for decoder.PeekKind() != '}' {
+		keyToken, err := decoder.ReadToken()
 		if err != nil {
 			return nil, err
 		}
-		key, ok := keyToken.(string)
-		if !ok {
-			return nil, fmt.Errorf("model key is %T, want string", keyToken)
-		}
-		var encoded json.RawMessage
-		if err := decoder.Decode(&encoded); err != nil {
+		key := keyToken.String() // a Token and the bytes ReadValue returns are void after the next call on the decoder
+		value, err := decoder.ReadValue()
+		if err != nil {
 			return nil, fmt.Errorf("%s: %w", key, err)
 		}
+		encoded := json.RawMessage(bytes.Clone(value)) // the next call on the decoder voids value
 		model, err := decodeJSONModel(encoded)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", key, err)
@@ -552,7 +610,7 @@ func decodeJSONModelGroup(data []byte, seen map[string]string) ([]jsonModel, err
 		seen[key] = model.API
 		models = append(models, model)
 	}
-	if _, err := decoder.Token(); err != nil {
+	if _, err := decoder.ReadToken(); err != nil {
 		return nil, err
 	}
 	return models, nil
@@ -737,7 +795,7 @@ func emit(path, src string, rows []modelRow) error {
 	b.WriteString("\tEnabled              *bool\n")
 	b.WriteString("\tLab                  string\n")
 	b.WriteString("\tProviders            []ModelCatalogProvider\n")
-	b.WriteString("\t// Record is the entry's JSON as Pi's catalog data spells it: the model object Pi serializes, member order included.\n")
+	b.WriteString("\t// Record is the entry's JSON as Pi's catalog data spells it: the model object Pi serializes, member order included. A built-in row holds a three-byte reference (NUL, row index high and low byte) to its record in the compressed chunks of catalog_records/; ResolveCatalogRecord returns the JSON, so no read of it may skip that call.\n")
 	b.WriteString("\tRecord string\n")
 	b.WriteString("}\n\n")
 	fmt.Fprintf(&b, "// GeneratedModels is the static catalog (%d entries). generatedCatalog gives its rows the shared maps the tables below hold.\n", len(rows))
@@ -802,7 +860,9 @@ func emit(path, src string, rows []modelRow) error {
 		if len(r.Providers) > 0 {
 			fmt.Fprintf(&b, "\t\tProviders: %s,\n", catalogProvidersLiteral(r.Providers))
 		}
-		fmt.Fprintf(&b, "\t\tRecord: %q,\n", r.Record)
+		if r.Record != "" {
+			fmt.Fprintf(&b, "\t\tRecord: %q,\n", catalogRecordRef(i))
+		}
 		b.WriteString("\t},\n")
 	}
 	b.WriteString("}\n")
@@ -817,7 +877,10 @@ func emit(path, src string, rows []modelRow) error {
 	if err != nil {
 		return fmt.Errorf("format generated source: %w", err)
 	}
-	return os.WriteFile(path, formatted, 0o644)
+	if err := os.WriteFile(path, formatted, 0o644); err != nil {
+		return err
+	}
+	return writeCatalogRecordChunks(filepath.Join(filepath.Dir(path), "catalog_records"), rows)
 }
 
 // unsupportedFields names the model fields a row of its type cannot carry. ImageModel and ClassifierModel hold the base
@@ -1116,6 +1179,12 @@ func compatLiteral(jsonText string) string {
 	if compat.RequiresAssistantAfterToolResult != nil {
 		fields = append(fields, fmt.Sprintf("RequiresAssistantAfterToolResult:%s", boolPtrLit(*compat.RequiresAssistantAfterToolResult)))
 	}
+	if compat.RequiresNonNullAssistantContent != nil {
+		fields = append(fields, fmt.Sprintf("RequiresNonNullAssistantContent:%s", boolPtrLit(*compat.RequiresNonNullAssistantContent)))
+	}
+	if compat.RequiresToolsWithToolHistory != nil {
+		fields = append(fields, fmt.Sprintf("RequiresToolsWithToolHistory:%s", boolPtrLit(*compat.RequiresToolsWithToolHistory)))
+	}
 	if compat.RequiresThinkingAsText != nil {
 		fields = append(fields, fmt.Sprintf("RequiresThinkingAsText:%s", boolPtrLit(*compat.RequiresThinkingAsText)))
 	}
@@ -1189,6 +1258,9 @@ func compatLiteral(jsonText string) string {
 	}
 	if compat.SessionAffinityFormat != "" {
 		fields = append(fields, fmt.Sprintf("SessionAffinityFormat:%q", compat.SessionAffinityFormat))
+	}
+	if compat.PromptCacheKeyMode != "" {
+		fields = append(fields, fmt.Sprintf("PromptCacheKeyMode:%q", compat.PromptCacheKeyMode))
 	}
 	if compat.SupportsToolSearch != nil {
 		fields = append(fields, fmt.Sprintf("SupportsToolSearch:%s", boolPtrLit(*compat.SupportsToolSearch)))
@@ -1348,9 +1420,9 @@ func catalogResolver() string {
 	b.WriteString("\n// generatedCatalog sets the maps of generatedRows and returns them as the catalog.\nfunc generatedCatalog() []GeneratedModel {\n")
 	for _, table := range catalogMapTables {
 		if table.own && len(table.list) > 0 {
-			fmt.Fprintf(&b, "\tfor _, ref := range %sRefs {\n\t\tgeneratedRows[ref.row].%s = generatedMap(%sPairs[ref.element])\n\t}\n", table.name, table.field, table.name)
+			fmt.Fprintf(&b, "\tfor _, ref := range %sRefs[:] {\n\t\tgeneratedRows[ref.row].%s = generatedMap(%sPairs[ref.element])\n\t}\n", table.name, table.field, table.name)
 		} else if table.field != "" && len(table.list) > 0 {
-			fmt.Fprintf(&b, "\tgeneratedBuildMaps(%s[:], %sPairs[:])\n\tfor _, ref := range %sRefs {\n\t\tgeneratedRows[ref.row].%s = %s[ref.element]\n\t}\n", table.name, table.name, table.name, table.field, table.name)
+			fmt.Fprintf(&b, "\tgeneratedBuildMaps(%s[:], %sPairs[:])\n\tfor _, ref := range %sRefs[:] {\n\t\tgeneratedRows[ref.row].%s = %s[ref.element]\n\t}\n", table.name, table.name, table.name, table.field, table.name)
 		}
 	}
 	b.WriteString("\treturn generatedRows[:]\n}\n")

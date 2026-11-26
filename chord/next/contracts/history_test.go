@@ -7,8 +7,8 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/contracts"
 )
 
-// pi: packages/chord/src/next/contracts/history.ts
-// Ports packages/chord/test/next/contracts/history.test.ts. Upstream's history is a type-level structure
+// pi: packages/chord/src/contracts/history.ts
+// Ports packages/chord/test/contracts/history.test.ts. Upstream's history is a type-level structure
 // (Increment, CurrentStep, OlderVersions, StepAt, ChangesAfter, tested with expectTypeOf only); Go does not type it,
 // so the cases are runtime tests (ChangesAfter: TestChangesAfter in derived_runtime_test.go). At
 // runtime a contract holds its versions as numbers and the changes of each version (contracts.VersionData), so the
@@ -91,5 +91,21 @@ func TestMemberHelpers(t *testing.T) {
 	}
 	if _, ok := contracts.MethodAt(variants, "notes"); ok {
 		t.Error("a state member is no method")
+	}
+}
+
+// MemberNames of the queries side is the runtime form of `keyof VariantShape`'s `queries` (slice 14 §3.1: history.ts VariantShape.queries).
+func TestMemberNamesOfQueriesMembers(t *testing.T) {
+	notes := contracts.Obj(contracts.Prop("text", contracts.Str()))
+	contract := local(t, "app.store", 1, noParams(),
+		contracts.Mem("notes", contracts.Queries(notes, []contracts.Property{contracts.Prop("all", contracts.Obj())})),
+		contracts.Mem("title", contracts.Str()),
+		contracts.Mem("boards", contracts.Queries(notes, []contracts.Property{})))
+	variants := currentVariants(t, contract)
+	if got := contracts.MemberNames(variants, contracts.MemberSideQueries); !reflect.DeepEqual(got, []string{"notes", "boards"}) {
+		t.Errorf("queries names = %v", got)
+	}
+	if got := contracts.MemberNames(variants, contracts.MemberSideState); !reflect.DeepEqual(got, []string{"title"}) {
+		t.Errorf("state names = %v", got)
 	}
 }

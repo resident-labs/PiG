@@ -13,7 +13,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/sqlite"
 )
 
-// Ports packages/chord/test/next/store/table-handle.test.ts: table handles (slice 6a §7): reads outside a
+// Ports packages/chord/test/store/table-handle.test.ts: table handles (slice 6a §7): reads outside a
 // transaction, and cells the code cannot read.
 
 func handleEdits(t *testing.T) *TableDefinition {
@@ -59,6 +59,7 @@ func filledHandle(t *testing.T, count int, owner ...*testOwner) (*ChordStore, *T
 	return store, edits, definition
 }
 
+// pi: packages/chord/src/store/page.ts
 func TestTableHandle(t *testing.T) {
 	t.Run("reads outside a transaction", func(t *testing.T) {
 		t.Run("get takes a key object and reads committed rows as stored", func(t *testing.T) {
@@ -78,8 +79,8 @@ func TestTableHandle(t *testing.T) {
 		t.Run("page fetches limit + 1 for next, and the cursor continues in order with the key tie-break", func(t *testing.T) {
 			_, edits, definition := filledHandle(t, 10)
 			q := NewQuery(definition).
-				Where(func(e ColumnRefs) Condition { return Prefix(e["path"], "p/") }).
-				OrderBy(func(e ColumnRefs) *ColumnRef { return e["path"] }, "desc")
+				Where(func(e, _ ColumnRefs) Condition { return Prefix(e["path"], "p/") }).
+				OrderBy(func(e, _ ColumnRefs) *ColumnRef { return e["path"] }, "desc")
 			noError(t, q.Err())
 			label := func(row Row) string { return fmt.Sprintf("%s:%s", row["path"], row["id"]) }
 			var seen []string
@@ -124,7 +125,7 @@ func TestTableHandle(t *testing.T) {
 
 		t.Run("rows reads every page; count counts", func(t *testing.T) {
 			_, edits, definition := filledHandle(t, 250)
-			rows := edits.Rows(background, NewQuery(definition).Where(func(e ColumnRefs) Condition { return Gte(e["at"], 10) }))
+			rows := edits.Rows(background, NewQuery(definition).Where(func(e, _ ColumnRefs) Condition { return Gte(e["at"], 10) }))
 			defer rows.Close()
 			var ids []string
 			for {
@@ -138,12 +139,12 @@ func TestTableHandle(t *testing.T) {
 			if len(ids) != 240 || ids[0] != "e010" {
 				t.Fatalf("rows = %d first %q, want 240 first e010", len(ids), ids[0])
 			}
-			count, err := edits.Count(background, NewQuery(definition).Where(func(e ColumnRefs) Condition { return Eq(e["path"], "p/0") }))
+			count, err := edits.Count(background, NewQuery(definition).Where(func(e, _ ColumnRefs) Condition { return Eq(e["path"], "p/0") }))
 			noError(t, err)
 			if count != 84 {
 				t.Fatalf("count(p/0) = %d, want 84", count)
 			}
-			count, err = edits.Count(background, NewQuery(definition).Where(func(e ColumnRefs) Condition { return IsNull(e["note"]) }))
+			count, err = edits.Count(background, NewQuery(definition).Where(func(e, _ ColumnRefs) Condition { return IsNull(e["note"]) }))
 			noError(t, err)
 			if count != 250 {
 				t.Fatalf("count(note is null) = %d, want 250", count)
@@ -201,7 +202,7 @@ func TestTableHandle(t *testing.T) {
 			store := memoryStore(t)
 			definition := handleEdits(t)
 			old := tableIn(t, store, definition)
-			v2, err := EvolveTable(definition, func(e *TableEditor) *TableEditor { return e.Rename("note", "comment") })
+			v2, err := EvolveTable(definition, func(e *TableEditor) TableTailEditor { return e.Rename("note", "comment") })
 			noError(t, err)
 			tableIn(t, store, v2)
 			_, err = old.Get(background, Row{"id": "e0"})
@@ -218,7 +219,7 @@ func TestTableHandle(t *testing.T) {
 		t.Run("refuses an old handle's read made while the migration's commit runs, rather than issuing obsolete SQL", func(t *testing.T) {
 			v1, err := DefineTable("race", TableOptions{Version: 1, Columns: []ColumnProp{Col("id", Str()), Col("old", Str())}, Key: []string{"id"}})
 			noError(t, err)
-			v2, err := EvolveTable(v1, func(e *TableEditor) *TableEditor { return e.Rename("old", "new") })
+			v2, err := EvolveTable(v1, func(e *TableEditor) TableTailEditor { return e.Rename("old", "new") })
 			noError(t, err)
 			store, hold := gatedStore(t)
 			old := tableIn(t, store, v1)

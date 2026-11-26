@@ -322,11 +322,11 @@ func (p *toolRenderProxy) SetRendererFallback(fallback func(width int) []string)
 	p.mu.Unlock()
 }
 
-// IsDirty reports a frame that arrived after the last Render.
+// IsDirty reports a frame that arrived after the last Render, or an authoritative view whose loader animates on its own.
 func (p *toolRenderProxy) IsDirty() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.dirty
+	return p.dirty || (p.linesWidth > 0 && p.view.animates())
 }
 
 func (p *toolRenderProxy) update(payload RenderToolPayload) {
@@ -517,7 +517,7 @@ func (p *toolRenderProxy) request(payload RenderToolPayload) (lines []string, fa
 		return nil, true, true, nil
 	}
 	// A rejected view keeps the last frame, as a missing answer does.
-	lines, ok = p.view.apply(p.session.conn, p.repaint, result, payload.Width)
+	lines, ok = p.view.apply(p.session.conn, p.repaint, "", nil, result, payload.Width)
 	return lines, false, ok, nil
 }
 

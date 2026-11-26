@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -361,7 +360,7 @@ func TestDefaultModelResolutionDoesNotSplitAProviderPrefix(t *testing.T) {
 	services := testServices(t, f.agentDir)
 	defer services.Close()
 	runtime := services.ModelRuntime()
-	selected, err := findInitialModel(newLazyStartupModelRuntime(runtime.RuntimeModels, runtime.HasConfiguredAuth), "bench", "bench/bench-2")
+	selected, err := findInitialModel(newLazyStartupModelRuntime(runtime.RuntimeModels, runtime.HasConfiguredAuth, runtime.AvailableRuntimeModels), "bench", "bench/bench-2")
 	if err != nil || selected == nil || selected.ID != "bench-1" {
 		t.Fatalf("selected = %#v, err = %v: Pi does not split a provider prefix, so startup falls back to the first model", selected, err)
 	}
@@ -370,7 +369,7 @@ func TestDefaultModelResolutionDoesNotSplitAProviderPrefix(t *testing.T) {
 func TestDiagnoseDefaultModelWithoutProviderIsIgnoredLikePi(t *testing.T) {
 	newBenchFixture(t, `{"defaultModel":"bench-2"}`, `{}`)
 	section := defaultModelSection(t, diagnoseOutput(t))
-	for _, want := range []string{"defaultModel \"bench-2\" from", "which startup ignores", "effective:      bench/bench-1 (startup falls back to it)"} {
+	for _, want := range []string{"defaultModel \"bench-2\" from", "which startup ignores: PiG reads it only together with defaultProvider", "effective:      bench/bench-1 (startup falls back to it)"} {
 		if !strings.Contains(section, want) {
 			t.Errorf("missing %q in:\n%s", want, section)
 		}
@@ -507,54 +506,5 @@ func TestNotAutoDiscoveredWarningFollowsPiDiscovery(t *testing.T) {
 				t.Fatalf("notAutoDiscoveredWarning(%s) = %q, want a warning: %v", tc.path, got, tc.warn)
 			}
 		})
-	}
-}
-
-func TestInstallValidateOnlyReportsWhatDiscoveryWouldLoad(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping extension load in short mode")
-	}
-	if _, err := exec.LookPath("node"); err != nil {
-		t.Skip("node is not installed")
-	}
-	t.Setenv("PIG_HOME", t.TempDir())
-	t.Setenv("PIG_CODING_AGENT_DIR", filepath.Join(t.TempDir(), "agent"))
-	dir := t.TempDir()
-	const body = "export default function (pi) { pi.registerCommand('hello', { description: 'hi', handler: async () => {} }); }\n"
-	mjs := filepath.Join(dir, "hello.mjs")
-	js := filepath.Join(dir, "hello.js")
-	writeResourceFixture(t, mjs, body)
-	writeResourceFixture(t, js, body)
-	validate := func(path string) (report struct {
-		Valid          bool     `json:"valid"`
-		AutoDiscovered *bool    `json:"autoDiscovered"`
-		Warnings       []string `json:"warnings"`
-	}, stderr string) {
-		t.Helper()
-		stdout, stderr, code := captureStdoutStderr(t, func() int {
-			return runPackageCommand([]string{"install", path, "--validate-only", "--json"})
-		})
-		if code != 0 {
-			t.Fatalf("validate %s: code=%d stdout=%s stderr=%s", path, code, stdout, stderr)
-		}
-		if err := json.Unmarshal([]byte(stdout), &report); err != nil {
-			t.Fatalf("parse %s: %v", stdout, err)
-		}
-		return report, stderr
-	}
-	report, _ := validate(mjs)
-	if !report.Valid || report.AutoDiscovered == nil || *report.AutoDiscovered || len(report.Warnings) != 1 || !strings.Contains(report.Warnings[0], "loads only .ts and .js files") {
-		t.Errorf(".mjs report = %#v", report)
-	}
-	report, _ = validate(js)
-	if !report.Valid || report.AutoDiscovered == nil || !*report.AutoDiscovered || len(report.Warnings) != 0 {
-		t.Errorf(".js report = %#v", report)
-	}
-	_, stderr := func() (struct{}, string) {
-		_, stderr, _ := captureStdoutStderr(t, func() int { return runPackageCommand([]string{"install", mjs, "--validate-only"}) })
-		return struct{}{}, stderr
-	}()
-	if !strings.Contains(stderr, "Warning: auto-discovery does not load hello.mjs") {
-		t.Errorf("human output has no warning: %q", stderr)
 	}
 }

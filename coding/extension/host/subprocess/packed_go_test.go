@@ -402,11 +402,13 @@ func TestHost_ReloadSupersededNativePackedProcessExitIsStale(t *testing.T) {
 
 // TestHost_KillingPackedProcessNeverClaimsItRemainedAlive is the direct
 // regression test for ATTACK-POINTS #5: killing a real packed Go process
-// used to race two notice paths (each member's own connection-close handler
-// vs. watchPackedProcess), and whichever member's handler won the race
-// falsely reported "packed member connection closed while shared process
-// remained alive" even though the whole process had just been killed. It
-// also covers #9: the notice must surface the packed cell's stderr log path.
+// reaches the host as each member's closed connection and as the process's
+// exit, and a member whose connection handler came first was reported with
+// "packed member connection closed while shared process remained alive"
+// even though the whole process had just been killed. The end of the process
+// is its watcher's to report: each member's notice is the quarantine notice
+// that names both. It also covers #9: the notice must surface the packed
+// cell's stderr log path.
 func TestHost_KillingPackedProcessNeverClaimsItRemainedAlive(t *testing.T) {
 	rootA := writePackedFactoryModule(t, "example.com/killpack/a", "kill-a", "tool_a")
 	rootB := writePackedFactoryModule(t, "example.com/killpack/b", "kill-b", "tool_b")
@@ -461,32 +463,17 @@ func TestHost_KillingPackedProcessNeverClaimsItRemainedAlive(t *testing.T) {
 	if len(reasons) != 2 {
 		t.Fatalf("crash notices = %#v, want notices for both kill-a and kill-b", reasons)
 	}
-	// Which of the two racing detectors (this member's own connection-close
-	// handler, or watchPackedProcess reaping the killed process) reaches a
-	// given member first is nondeterministic. A member's notice is therefore
-	// either the plain connection-close form, a quarantine notice naming all
-	// members still attached when the process exit is observed, or (when the
-	// sibling handler removed itself first) a quarantine notice naming only
-	// this remaining member. Every form is accurate about what that detector
-	// stopped. What must never appear is the ATTACK-POINTS #5 lie that the
-	// shared process "remained alive".
-	logSuffix := "(stderr: " + stderrLogPath + ")"
+	// A member's connection handler waits for the process and leaves its end to the watcher, so no member is reported with the plain
+	// connection-closed notice, whichever of the two the host saw first (TestProcessDeathIsReportedOnceInEitherOrder orders them).
+	killedErr := "signal: killed"
+	if runtime.GOOS == "windows" {
+		// Windows has no POSIX signals: Process.Kill calls TerminateProcess with exit code 1, which Go reports as "exit status 1".
+		killedErr = "exit status 1"
+	}
+	want := "packed process exited: " + killedErr + "; kill-a, kill-b stopped; /reload restarts them (stderr: " + stderrLogPath + ")"
 	for name, reason := range reasons {
-		if strings.Contains(reason, "remained alive") {
-			t.Fatalf("%s crash reason falsely claims the shared process remained alive: %q", name, reason)
-		}
-		if !strings.HasSuffix(reason, logSuffix) {
-			t.Fatalf("%s crash reason %q does not surface the stderr log path %q", name, reason, stderrLogPath)
-		}
-		// Native packed members are not restarted automatically, so every notice names the recovery: the user sees only whichever detector won.
-		if !strings.Contains(reason, "/reload restarts") {
-			t.Fatalf("%s crash reason %q does not say that /reload restarts the stopped extension", name, reason)
-		}
-		plain := "packed member connection closed; /reload restarts it " + logSuffix
-		quarantined := strings.Contains(reason, "/reload restarts them") &&
-			(strings.Contains(reason, "kill-a, kill-b stopped") || strings.Contains(reason, name+" stopped"))
-		if reason != plain && !quarantined {
-			t.Fatalf("%s crash reason %q is neither the plain connection-closed notice nor an accurate quarantine notice", name, reason)
+		if reason != want {
+			t.Fatalf("%s crash reason = %q, want %q", name, reason, want)
 		}
 	}
 }
@@ -697,7 +684,7 @@ func TestHost_MixedFusedPackedAndIsolatedExtensions(t *testing.T) {
 	}
 
 	mixedRunner := inproc.NewRunner(host.Extensions(), t.TempDir())
-	boundary, err := mixedRunner.EmitBoundary(ctx, &extension.AgentBeforeSettleEvent{Type: "agent_before_settle", BoundaryState: extension.BoundaryState{Outcome: extension.AgentActivityCompleted}},
+	boundary, err := mixedRunner.EmitBoundary(ctx, &extension.AgentBeforeSettleEvent{Type: "agent_before_settle", Outcome: extension.AgentActivityCompleted},
 		func(entries []extension.SessionBoundaryDraft) (extension.BoundaryContextPreview, error) {
 			return extension.BoundaryContextPreview{ContextEntries: make([]extension.ProjectedSessionEntry, len(entries)), CanContinue: len(entries) > 0}, nil
 		})
@@ -824,15 +811,14 @@ func packedTestModelStream() (*ai.AssistantMessageEventStream, error) {
 	return stream, nil
 }
 
-func TestAC59PackedSDKFocusedComponentsOwnInput(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping packed SDK builds in short mode")
-	}
-	t.Parallel()
-	tests := []struct {
-		name    string
-		configs func(*testing.T) []ExtConfig
-	}{
+// focusedPackedSDKCase is a packed SDK fixture whose `focused` command awaits a ui.custom overlay: two extensions of one SDK, so a shared cell holds both.
+type focusedPackedSDKCase struct {
+	name    string
+	configs func(*testing.T) []ExtConfig
+}
+
+func focusedPackedSDKCases() []focusedPackedSDKCase {
+	return []focusedPackedSDKCase{
 		{"go", func(t *testing.T) []ExtConfig {
 			return []ExtConfig{
 				packedFactoryConfig("focused-go-a", writePackedFactoryModule(t, "example.com/focused/goa", "focused-go-a", "tool-a", true), "example.com/focused/goa", "ha"),
@@ -859,6 +845,14 @@ func TestAC59PackedSDKFocusedComponentsOwnInput(t *testing.T) {
 			}
 		}},
 	}
+}
+
+func TestAC59PackedSDKFocusedComponentsOwnInput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping packed SDK builds in short mode")
+	}
+	t.Parallel()
+	tests := focusedPackedSDKCases()
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			configs := tc.configs(t)
@@ -998,18 +992,28 @@ func TestAC59PackedSDKFocusedComponentsOwnInput(t *testing.T) {
 			if _, err := host.Reload(ctx); err != nil {
 				t.Fatal(err)
 			}
+			// Pi's reload removes the overlay and leaves the command awaiting it (interactive-mode.ts:2592-2598 resetExtensionUI): the screen shows nothing, the
+			// call stays pending, and the session's end ends it. Probed on Pi 1.5.2 by extensions-runtime scenarios 109 and 110.
+			select {
+			case <-reloadHandle.Retired():
+			case <-time.After(5 * time.Second):
+				t.Fatal("reload did not take the focused overlay off the screen")
+			}
 			select {
 			case <-reloadHandle.Done():
-			case <-time.After(5 * time.Second):
-				t.Fatal("reload did not close focused overlay")
+				t.Fatal("reload closed the focused overlay's call; Pi leaves it pending")
+			default:
 			}
 			select {
 			case err := <-reloadDone:
-				if err == nil {
-					t.Fatal("focused command reported success after reload removed its extension")
-				}
+				t.Fatalf("focused command returned after the reload that removed its extension: %v; Pi leaves it awaiting", err)
+			case <-time.After(300 * time.Millisecond):
+			}
+			host.Shutdown("session ended")
+			select {
+			case <-reloadDone:
 			case <-time.After(5 * time.Second):
-				t.Fatal("focused command remained blocked after reload")
+				t.Fatal("focused command remained blocked after the session ended")
 			}
 		})
 	}
@@ -1127,7 +1131,7 @@ func TestPackedSDKFocusedComponentAndSessionActionsMatch(t *testing.T) {
 					}
 				}
 			}
-			boundary, err := runner.EmitBoundary(ctx, &extension.AgentBeforeSettleEvent{Type: "agent_before_settle", BoundaryState: extension.BoundaryState{Outcome: extension.AgentActivityCompleted}},
+			boundary, err := runner.EmitBoundary(ctx, &extension.AgentBeforeSettleEvent{Type: "agent_before_settle", Outcome: extension.AgentActivityCompleted},
 				func(entries []extension.SessionBoundaryDraft) (extension.BoundaryContextPreview, error) {
 					return extension.BoundaryContextPreview{ContextEntries: make([]extension.ProjectedSessionEntry, len(entries)), CanContinue: len(entries) > 0}, nil
 				})

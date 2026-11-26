@@ -5,6 +5,7 @@ package cli
 import (
 	"errors"
 	"os/exec"
+	"slices"
 	"syscall"
 	"testing"
 	"time"
@@ -63,51 +64,29 @@ func TestRPCSignalPendingPromiseKeepsReadingInput(t *testing.T) {
 	}
 }
 
-// Pi 0.87.1 removes its signal handlers when shutdown() starts
-// (rpc-mode.ts:733-735), so SIGTERM during a stdin-end dispose whose
-// session_shutdown handler keeps the event loop alive takes the default
-// action: the process is terminated by the signal.
-func TestRPCSignalDuringInputEndShutdownDiesBySignal(t *testing.T) {
-	p, _ := startRPCShutdownFixture(t, "RPC_SHUTDOWN_HOLD=1")
-	awaitReady(p)
-	p.closeInput()
-	awaitRPCShutdownStarted(p)
-	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
-	if status := waitForRPCTermination(t, p); !status.Signaled() || status.Signal() != syscall.SIGTERM {
-		t.Fatalf("wait status = %v, want termination by SIGTERM", status)
-	}
-}
-
-// A second SIGTERM during a signal-triggered dispose takes the default action
-// too.
-func TestRPCSecondSignalDiesBySignal(t *testing.T) {
-	p, _ := startRPCShutdownFixture(t, "RPC_SHUTDOWN_HOLD=1")
-	awaitReady(p)
-	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
-	awaitRPCShutdownStarted(p)
-	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
-	if status := waitForRPCTermination(t, p); !status.Signaled() || status.Signal() != syscall.SIGTERM {
-		t.Fatalf("wait status = %v, want termination by SIGTERM", status)
-	}
-}
-
-// Pi 0.87.1 rpc-mode.ts:728-731: stdin end while a signal-triggered dispose
-// is still running re-enters shutdown(), which exits 0 at once.
-func TestRPCInputEndDuringSignalShutdownExitsZero(t *testing.T) {
-	p, _ := startRPCShutdownFixture(t, "RPC_SHUTDOWN_HOLD=1")
-	awaitReady(p)
-	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
-	awaitRPCShutdownStarted(p)
-	p.closeInput()
-	if status := waitForRPCTermination(t, p); !status.Exited() || status.ExitStatus() != 0 {
-		t.Fatalf("wait status = %v, want exit 0", status)
+// A termination signal during a tool call runs the same dispose as stdin end: Pi awaits session.abort() before
+// session_shutdown (agent-session-runtime.ts:409-417), so the aborted run's turn boundaries, agent_end and agent_settled
+// reach the extension first. The signal's handler kills the tracked children (rpc-mode.ts:383-391) and, for SIGTERM, exits
+// 143 without flushing stdout, so only the events are compared, and no Session event reaches stdout: its forwarder was
+// removed when shutdown started.
+func TestRPCSignalMidPromptDeliversPiShutdownSequence(t *testing.T) {
+	for _, impl := range rpcShutdownImplementations {
+		t.Run(impl.name, func(t *testing.T) {
+			p, report := impl.start(t)
+			startInFlightPrompt(p)
+			if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+				t.Fatal(err)
+			}
+			afterSignal := drainRPCOutput(p)
+			requireExited(t, waitForRPCTermination(t, p), 143)
+			for _, r := range afterSignal {
+				if r["type"] != "extension_ui_request" {
+					t.Fatalf("stdout after the signal has %v; only the shutdown handler's notification may follow", r)
+				}
+			}
+			if events := readRPCShutdownReport(t, report); !slices.Equal(events, rpcMidPromptInputEndExtensionEvents) {
+				t.Fatalf("extension events = %v, want %v", events, rpcMidPromptInputEndExtensionEvents)
+			}
+		})
 	}
 }

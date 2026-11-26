@@ -49,14 +49,14 @@ func TestFindInitialModelUsesAvailableSnapshotAndSavedIdentity(t *testing.T) {
 	}{
 		{
 			name:       "configured catalog default is unavailable",
-			models:     []RuntimeModel{{Provider: "openai", ID: "gpt-6.1-sol"}},
+			models:     []RuntimeModel{{Provider: "openai", ID: providerDefault("openai")}},
 			available:  []RuntimeModel{{Provider: "custom-endpoint", ID: "second"}, {Provider: "custom-endpoint", ID: "first"}},
 			configured: map[string]bool{"openai": true}, want: "custom-endpoint/second", thinking: DefaultThinkingLevel,
 			calls: []string{"available"},
 		},
 		{
 			name:   "empty snapshot does not reconstruct configured catalog",
-			models: []RuntimeModel{{Provider: "openai", ID: "gpt-6.1-sol"}}, configured: map[string]bool{"openai": true},
+			models: []RuntimeModel{{Provider: "openai", ID: providerDefault("openai")}}, configured: map[string]bool{"openai": true},
 			thinking: DefaultThinkingLevel, calls: []string{"available"},
 		},
 		{
@@ -76,8 +76,8 @@ func TestFindInitialModelUsesAvailableSnapshotAndSavedIdentity(t *testing.T) {
 		},
 		{
 			name:      "provider declaration order precedes snapshot order",
-			available: []RuntimeModel{{Provider: "openai", ID: "gpt-6.1-sol"}, {Provider: "anthropic", ID: "claude-opus-4-8"}},
-			want:      "anthropic/claude-opus-4-8", thinking: DefaultThinkingLevel, calls: []string{"available"},
+			available: []RuntimeModel{{Provider: "openai", ID: providerDefault("openai")}, {Provider: "anthropic", ID: "claude-opus-5-5"}},
+			want:      "anthropic/claude-opus-5-5", thinking: DefaultThinkingLevel, calls: []string{"available"},
 		},
 	} {
 		t.Run(row.name, func(t *testing.T) {

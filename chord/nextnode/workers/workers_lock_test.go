@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,8 +16,8 @@ import (
 	chordctx "github.com/MichaelKinsy/PiG/chord/context"
 )
 
-// pi: packages/chord/src/next-node/workers/lock.ts
-// Ports packages/chord/test/next-node/workers/lock.test.ts: one holder at a time, a waiter taking the lock when the
+// pi: packages/chord/src/node/workers/lock.ts
+// Ports packages/chord/test/node/workers/lock.test.ts: one holder at a time, a waiter taking the lock when the
 // holder releases it (told by its connection's close, no polling), a waiter's abort; socket file locks.
 
 func TestProcessLockMakesASecondTakerWaitUntilTheHolderReleasesThenTakesIt(t *testing.T) {
@@ -138,11 +139,16 @@ func TestProcessLockForgetsAWaiterWhoseConnectionClosedBeforeItsOwnRelease(t *te
 	}
 }
 
-// shortLockDir is `mkdtemp(join(tmpdir(), "chord-lock-file-"))` of lock.test.ts: a directory whose socket path fits in sun_path
-// (t.TempDir() carries the test's name, which a macOS TMPDIR makes too long for a socket path).
+// shortLockDir is `inTemporaryDirectory` of lock.test.ts: a fresh temporary directory, under /tmp (os.TempDir on Windows), as
+// `socketPath` falls back to: a socket file's path must fit in sun_path (103 bytes on macOS), and a deep TMPDIR, such as an
+// isolated one inside macOS's /var/folders/..., does not leave room for it (t.TempDir() carries the test's name, which makes it longer).
 func shortLockDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "chord-lock-file-")
+	base := "/tmp"
+	if runtime.GOOS == "windows" {
+		base = os.TempDir()
+	}
+	dir, err := os.MkdirTemp(base, "chord-lock-file-")
 	if err != nil {
 		t.Fatal(err)
 	}

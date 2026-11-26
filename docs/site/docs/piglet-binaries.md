@@ -89,7 +89,7 @@ pig piglet list
 ```
 
 ```text
-0.5.0+1.2.0
+1.2.0
 ```
 
 ```text
@@ -311,13 +311,45 @@ Advantages:
 
 Costs:
 
-- the Binary must be rebuilt when the extension changes;
+- the Binary must be rebuilt when the extension changes (see [Editing a fused member's source](#editing-a-fused-members-source) for development);
 - the artifact is target specific;
 - the extension shares the PiG process failure boundary;
 - fused code requires stricter review;
 - only compatible Go factories can fuse.
 
 Fused behavior must match source subprocess behavior. Fusion is a delivery optimization, not a second extension API.
+
+### Editing a fused member's source
+
+By default a Binary runs the copy of each fused member that was compiled into it. An edit of the member's source has no effect, at a start or on `/reload`, until you build the Binary again.
+
+Set `build.fusedReload: source` in the Piglet to develop a fused member against its Binary:
+
+```yaml
+build:
+  extensionRealization: fused
+  fusedReload: source
+```
+
+The build then records, for each fused member, a digest of the member's source. When you give the Binary that member's source under the member's name, for example `pig-reviewer -e ./review` for the member `review`, a start and every `/reload` compare the source with the digest:
+
+- **Unchanged source:** the fused copy runs, as without the key.
+- **Changed source:** the member runs as an ordinary isolated subprocess extension built from the source, with the build that `pig -e ./review` uses. On `/reload` the fused copy is stopped with everything it registered, and the member keeps its name, its place in handler order and its entry in the extension list. It stays a subprocess, across restarts, until `pig piglet build` fuses the edited source. PiG never rewrites the installed Binary and starts no build in the background.
+- **Changed source and no Go toolchain, or a source that cannot be read:** the fused copy runs and PiG reports one warning where it reports a failed extension load, at a start and on `/reload`. The warning names the member and the remedy, for example `source at ./review differs from the fused copy; no Go toolchain: running the fused copy: cannot build go extension: the "go" toolchain is not installed; install it, or run this extension from a Piglet Binary or prebuilt package (which need no toolchain)`.
+
+`/reload --explain` shows `subprocess, rebuilt from <dir>` for a member that runs from its source, and `fused (source differs; toolchain missing)` or `fused (source unreadable)` for one that could not.
+
+The digest covers what `go build` reads from the member's module: `go.mod`, `go.sum`, the non-test Go, C and assembly sources of every package, the files they embed, and the same set of each module the member's `go.mod` replaces with a local directory. It does not cover `_test.go` files, `testdata`, `vendor`, nested modules, directories that start with `.` or `_`, or other files, so editing a test or a README does not move the member out of the Binary. It holds file content only: a touched file, or the same source checked out at another path, compares equal.
+
+Costs to expect:
+
+- The first start or `/reload` after an edit compiles the member: about 0.34 s for a small extension on the measured host, almost all of it the Go compile and link. The result is cached, so a later start or reload of the same source runs no build.
+- A member that runs from its source is a subprocess: each call into it costs about 35 microseconds more than a fused call, and its process holds about 12 MB.
+- A start that compares sources reads the member's source files once.
+
+One thing a reload cannot undo: the fused copy's code stays linked into the process. PiG stops everything the copy registered, but a goroutine or timer that the member started itself keeps running beside the new copy unless the member stops it. Stop such work in the member's `session_shutdown` handler, as a Pi extension must (Pi cannot unload a module either). As a subprocess the same leak is hidden by the process exit, so check it before you fuse the member again.
+
+A child session that an extension creates loads none of the Binary's fused members by default, as it loads no extension it was not given a path for. To give it one, the extension lists `builtin:<member>` in the child's `additionalExtensionPaths` (Go `AdditionalExtensionPaths`), the form Pi uses for a built-in extension. The member loads once through the same fused path, `resources.extensionNames` selects it by member name, and a child of that child gets it only if it lists the path again, so a member that creates children does not load itself in each of them. A Binary that fuses no such member rejects the path as an unknown built-in extension, as Pi does.
 
 ## Fused members with external Go modules
 
@@ -365,7 +397,7 @@ A prebuilt native subprocess component can avoid a target-side compiler. An inte
 
 A Piglet Binary can carry TypeScript and JavaScript extensions. The build packs each Node extension's sources into one archive per Node cell and embeds the archive in the Binary. It archives a directory extension whole, including its `node_modules`, but not its `.git` directory, and it archives a single-file extension as that file alone. A symbolic link that points outside the extension directory fails the build (a link to the directory itself is kept), because the Binary would run without the code the link points to. Keep an extension's local imports and dependencies inside its directory.
 
-The Binary does not contain Node. It runs the extension with the Node on the user's `PATH`, which must be version 22.13 or newer, the same requirement Stock PiG has. At startup the Binary checks the archive against the digest in its embedded cell manifest and extracts it once per digest under `piglet-binary-cells/node/` in the PiG configuration directory (`~/.pig` by default). A later start reuses that directory and does not check its files again, so a file changed or deleted there stays changed until you delete the `<digest>` directory; the next start then extracts the archive again. It then plans, starts, and reloads the extension through the same Node cell path that Stock PiG uses for the same extension. The extension registers the same tools, commands, and handlers, in the same order.
+The Binary does not contain Node. It runs the extension with the Node on the user's `PATH`, which must be version 22.13 or newer, the same requirement Stock PiG has. At startup the Binary checks the archive against the digest in its embedded cell manifest and extracts it once per digest under `piglet-binary-cells/node/` in the PiG configuration directory (`~/.pig` by default). Every later start compares that directory with the archive in the Binary, as it compares an embedded Go, Rust or Python cell binary with its embedded bytes: each file's bytes, executable bit and mode, each link's target, exactly the archive's files in every folder, and no link where a folder or file belongs. A clean directory is left alone. A file changed, deleted, added or replaced by a link, a widened mode, or a `node_modules` or `package.json` next to `sources` makes the Binary extract the archive again, and one line on stderr, `pig: warning: the extracted Node sources in <folder> differ from the Binary's archive (changed: sources/<path>); extracted them again`, names the first difference; two Binaries starting at once do not disturb each other. A `node_modules`, `package.json`, `tsconfig.json` or `jsconfig.json` in `piglet-binary-cells/node` or `piglet-binary-cells` stops the start and names the path, since extracting again cannot remove it; the PiG configuration directory itself and the folders above it are not checked. The check runs at startup, not at a `/reload`. On Windows a differing directory whose files a running Node holds cannot be replaced, and the start fails naming the path. The check reads every extracted file at every start, and its time goes to the system calls per file, not to the bytes. Measured on Linux (median of 20 starts, a loaded host), it adds about 0.3 ms to a start with an extension of 10 to 13 files, 9 ms with 561 files and 1.9 MB, 16 ms with 1,064 files and 28.5 MB, and 73 ms with 3,665 files and 17.5 MB; the last is a constructed extension over the MCP SDK with its `node_modules`. No Piglet that ships with PiG has a Node extension. An extension must keep its data outside its extracted sources, in the agent directory (`getAgentDir()`), because a file written inside them is replaced at the next start. It then plans, starts, and reloads the extension through the same Node cell path that Stock PiG uses for the same extension. The extension registers the same tools, commands, and handlers, in the same order.
 
 The component plan records a Node extension as a subprocess component with binary materialization and a `node` runtime requirement. The signed manifest lists the archive among its embedded files, and the signature covers its bytes.
 
@@ -445,11 +477,13 @@ On every interactive start, PiG calls the member's `Open` after the terminal ent
 
 The input editor arrives as an editor node with its text, its cursor in UTF-16 code units, a placeholder and whether it is sendable. PiG draws no ANSI border around it, since the frontend frames it. Above it comes a working node while PiG works, compacts, summarizes a branch or waits to retry: its kind, its message, and an extension's spinner frames and interval, without the current frame, so the frontend animates the spinner. Below it come the lines of its completion list and the components under it, then a footer node while PiG's footer shows: the working directory, git branch and session name, the session's token and cost totals, the cache-hit rate, the context usage, the model with its provider and thinking level, and the extension statuses. A footer that an extension sets replaces the footer node and arrives as lines. While a component PiG does not model replaces the editor, or an overlay that takes the keys shows, the dock arrives as lines. The session acts on the editor through `Env`: `Edit` replaces a range of its text as one undo step, `Undo` steps back through the editor's own history, and `Send` submits a prompt through the path Enter takes, so commands, multi-line prompts and steering behave as typed. PiG runs these on its own loop in the order they arrive, ignores an edit computed against text that has changed since, and reports the editor sendable only once its input loop runs and while the editor has the keys.
 
+A session reaches the extensions' own views with `Env.Click` and `Env.Wheel`: a click or a wheel turn at a cell of an extension's overlay or dock view (named by `Node`, `Row` and `Column`, or by a `ViewPath` into the node's `View`) is handed to the extension's component as the terminal event Pi's fullscreen mode would send there, so a native list or scroll view of an extension keeps working. `Wheel.Delta` is the lines to scroll, negative up, with no acceleration applied; a wheel that no extension component takes does nothing. Both do nothing outside fullscreen mode, where a terminal reports no mouse.
+
 A selector or dialog that takes the editor's place, such as `/model`, `/resume`, `/tree`, `/fork`, `/login`, the thinking level picker or an extension's select or confirm dialog, arrives in its place as a selector node: its title and description, the search text, the items shown in the order the arrow keys step through them with a label, a detail, a check for the current or enabled entry and a tree depth, the selected item, its tabs (such as the scope of the model and session lists), a status message, a loading flag and a confirm question. `/settings` arrives as a settings node: each setting with its value, the values it cycles through, and whether it opens a submenu, which then arrives as a selector under the same id. Keys still reach the selector as typed. A session acts on one with `Env.Act`: highlight, choose, dismiss, filter, switch tab or set a value. PiG performs each action as the keys it stands for, so the selector behaves exactly as with the keyboard. Overlays, such as an extension's custom component shown as an overlay, arrive in an overlay region as overlay nodes with their lines, width, anchor and whether they take the keys. Components PiG does not model, such as an extension's input or editor dialog, the login dialog, and the session rename and tree label fields, arrive as lines.
 
 The first frame also names the session file, the file the session persists to, or none for a session that is not persisted (`--no-session`). A later frame names it again only when it changes, such as after `/new`, `/resume`, `/fork` or `/clone`. A frontend can pass it on, for example to let another program read the conversation.
 
-A session is also the terminal that PiG's interactive mode reports its program status to: working while a run or compaction goes on, blocked while a dialog or a login waits for the user, then done, error or idle (the OSC 7501 Program Status Protocol of Pi 1.5.0). A session that implements `frontend.ProgramStatusSession` receives each change through `ProgramStatus` as the report Pi writes to a supporting terminal, including the report that clears the status. PiG calls it on its owner loop in the order the status changed, so it must return without blocking. It clears the status before `Suspend` and `Close` and reports the latest one again after `Resume`. A session without the method receives nothing. Either way, while a session may draw, PiG writes neither the OSC 7501 support query nor a report to the terminal itself.
+A session is also the terminal that PiG's interactive mode reports its program status to: working while a run or compaction goes on, blocked while a dialog or a login waits for the user, then done, error or idle (the OSC 7501 Program Status Protocol of Pi 1.6.0). A session that implements `frontend.ProgramStatusSession` receives each change through `ProgramStatus` as the report Pi writes to a supporting terminal, including the report that clears the status. PiG calls it on its owner loop in the order the status changed, so it must return without blocking. It clears the status before `Suspend` and `Close` and reports the latest one again after `Resume`. A session without the method receives nothing. Either way, while a session may draw, PiG writes neither the OSC 7501 support query nor a report to the terminal itself.
 
 When a session asks to fall back, or fails to draw a frame, PiG closes it, repaints with its configured terminal renderer and shows a warning. While a session draws, PiG refuses to switch the TUI mode. `--print`, JSON and RPC modes never consult the member.
 
@@ -458,6 +492,15 @@ The member's source is part of the Binary's identity: its tree digest is a `fron
 ## Stripped built-ins
 
 A Piglet's `strip` list (D92, see [Piglets](piglets.md#strip-built-ins)) carries into its Binary. The native builder passes one Go build tag per stripped built-in extension, model API and compile-out feature (`pig_strip_<id>`, for example `pig_strip_mcp` or `pig_strip_node_extensions`), so the Binary does not link that code; the build prints the tags it uses. The baked Piglet keeps the list, so the Binary also disables the runtime-only entries (tools, commands, `themes`, `skills`, `prompt-templates`) at startup. A Piglet cannot compile out an extension runtime its own extensions run on: a Node or Python extension, or a Go or Rust extension the Binary builds at runtime, fails the build with the strip entry named. A Piglet whose strip list removes every built-in tool and `/quit` together does not build either (see [Piglets](piglets.md#strip-built-ins)).
+
+A Binary built without a model API runs without that API's provider. A provider whose built-in models are all on stripped APIs is absent: `amazon-bedrock` without `bedrock-converse-stream`, `google-vertex` without `google-vertex`, `mistral` without `mistral-conversations`. `--list-models`, `/model`, RPC `get_available_models`, `/login` and an extension's model registry do not show it, and the built-in provider collection that an extension's pi-ai `stream` and `complete` calls use, in the extension process and through the provider bridge of its detached helpers, does not hold it. Requests to every other provider run as in Stock PiG. Naming the stripped provider fails with the strip message and exit status 1:
+
+```text
+$ pig-core --model google-vertex/gemini-2.5-flash -p hi
+Error: Provider google-vertex: API google-vertex is stripped from the Piglet "pig-core" (strip.apis: google-vertex); to keep it, remove google-vertex from strip.apis in the Piglet manifest and rebuild
+```
+
+A `--models` pattern that matches only its models prints `Warning: No models match pattern "google-vertex/*"`. A saved default model of a stripped provider (`defaultProvider` and `defaultModel` in settings) is not available, so the session starts on the first available model.
 
 Stripping cuts size and startup work. On darwin/arm64 a Piglet Binary with one fused Go extension is 62.2 MB; stripping MCP, codemode, llama.cpp, tool-search and three provider APIs makes it 54.2 MB, and stripping every binary ID makes it 31.7 MB.
 

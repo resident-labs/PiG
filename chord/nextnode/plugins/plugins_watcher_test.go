@@ -1,16 +1,14 @@
 package plugins
 
-// pi: packages/chord/src/next-node/plugins/watcher.ts
+// pi: packages/chord/src/node/plugins/watcher.ts
 
 import (
 	"context"
-	"maps"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
-	"slices"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -19,12 +17,14 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/delta"
 	"github.com/MichaelKinsy/PiG/chord/next/host"
 	"github.com/MichaelKinsy/PiG/chord/next/state"
+	"github.com/MichaelKinsy/PiG/chord/nextnode/plugins/model"
+	"github.com/MichaelKinsy/PiG/chord/nextnode/plugins/pluginstest"
 	"github.com/MichaelKinsy/PiG/internal/testenv"
 )
 
-// Ports packages/chord/test/next-node/plugins/watcher.test.ts. Tests of the watcher (slice 7c §5): dirty marks from the
-// files facets used and from plugin directories, `install`, `set`, `base`, a change during a build keeping its mark,
-// `node_modules` and `.git` ignored, real file events, and the marks as a JSON watchable.
+// Ports packages/chord/test/node/plugins/watcher.test.ts. Tests of the watcher (slice 7c §5, slice 12 §4): dirty marks
+// from the files facets used and from plugin directories, `install`, `set`, `base`, a change during a build keeping its mark,
+// `node_modules` and `.git` ignored, real file events, the marks as a JSON watchable, and single-file plugins' files.
 
 // watcherFixture is what `watched()` returns: a root with plugins and a base directory, their watcher, and the host loop
 // its batch runs on (the sections of the watcher's methods and of its file events).
@@ -37,10 +37,6 @@ type watcherFixture struct {
 	scheduler *chord.DeliveryScheduler
 	mu        sync.Mutex
 	failures  []error
-	// barrier is a directory outside the root and the base code that the watcher watches too, where settle makes the
-	// directories that tell it the events of everything before them were handled; sentinels counts them.
-	barrier   string
-	sentinels int
 }
 
 // run runs work as a section of the loop: what the host's callers of the watcher do.
@@ -97,10 +93,27 @@ func stateOf(t testing.TB, object *delta.JsonObject) PluginsState {
 // watcherOn is a watcher of root and base on a fresh loop, closed and joined when the test ends.
 func watcherOn(t *testing.T, root, base string) *watcherFixture {
 	t.Helper()
+	return watcherOver(t, []string{root}, base)
+}
+
+// watcherOver is a watcher of roots (root is the first, "" for none) and base on a fresh loop, closed and joined when the
+// test ends.
+func watcherOver(t *testing.T, roots []string, base string) *watcherFixture {
+	t.Helper()
+	return watcherOverNotifier(t, roots, base, nil)
+}
+
+// watcherOverNotifier is watcherOver on the system watcher makeNotifier makes (nil: fsnotify's).
+func watcherOverNotifier(t *testing.T, roots []string, base string, makeNotifier func() (notifier, error)) *watcherFixture {
+	t.Helper()
+	root := ""
+	if len(roots) > 0 {
+		root = roots[0]
+	}
 	f := &watcherFixture{t: t, root: root, base: base, loop: host.NewLoop(), scheduler: chord.NewDeliveryScheduler()}
-	batch := state.NewBatch(func(state.BatchError) {}, nil).UseScheduler(f.scheduler).UseMicrotasks(f.loop.Queue).UseSection(f.loop.Run)
+	batch := state.NewBatch(func(state.BatchError) {}, nil).UseScheduler(f.scheduler).UseMicrotasks(f.loop.Queue).UseSection(f.loop.Run, f.loop.InSection)
 	f.watcher = newPluginWatcher(watcherOptions{
-		Roots: []string{root}, Base: []string{base}, Kinds: kinds,
+		Roots: roots, Base: []string{base}, Kinds: kinds, Notifier: makeNotifier,
 		Failed: func(err error) {
 			f.mu.Lock()
 			defer f.mu.Unlock()
@@ -123,21 +136,21 @@ func watched(t *testing.T) *watcherFixture {
 	writePlugin(t, root, "a", "@test/a", map[string]string{"worker.ts": "", "own.ts": ""}, nil)
 	writePlugin(t, root, "b", "@test/b", map[string]string{"server.ts": ""}, nil)
 	f := watcherOn(t, root, base)
-	discovery, err := DiscoverPlugins([]string{root}, DiscoveryOptions{Kinds: kinds}, background)
+	discovery, err := model.DiscoverPlugins([]model.PluginRoot{{Path: root}}, model.DiscoveryOptions{Kinds: kinds}, background)
 	if err != nil {
 		t.Fatal(err)
 	}
 	f.run(func() { f.watcher.know(discovery, f.watcher.discoverySnapshot()) })
 	contract := filepath.Join(root, "contracts", "contract.ts")
-	used := func(plugin, facet string, files ...string) BuiltFacet {
-		inputs := make([]BuildInput, len(files))
+	used := func(plugin, facet string, files ...string) model.BuiltFacet {
+		inputs := make([]model.BuildInput, len(files))
 		for i, file := range files {
-			inputs[i] = BuildInput{File: file}
+			inputs[i] = model.BuildInput{File: file}
 		}
-		return BuiltFacet{Kind: BuiltFacetScript, Plugin: plugin, Facet: facet, Inputs: inputs, Copied: []string{contract}, Assets: []Asset{}}
+		return model.BuiltFacet{Kind: model.BuiltFacetScript, Plugin: plugin, Facet: facet, Inputs: inputs, Copied: []string{contract}, Assets: []model.Asset{}}
 	}
 	f.run(func() {
-		f.watcher.used([]BuiltFacet{
+		f.watcher.used([]model.BuiltFacet{
 			used("@test/a", "worker", filepath.Join(root, "a", "worker.ts"), contract),
 			used("@test/b", "server", filepath.Join(root, "b", "server.ts"), contract),
 		})
@@ -150,43 +163,31 @@ func watched(t *testing.T) *watcherFixture {
 	return f
 }
 
-// settle returns once the watcher handled the events of every file operation made before the call: a directory made in the
-// barrier's directory, which the watcher watches, is watched when its event was handled, and the events of one file system
-// arrive in order (see settle, the barrier of a component's watcher). On Windows each watched directory is opened and closed
-// first, which has the file system report the last-write time of the directories whose entries changed before the barrier
-// does (see settleDirectoryStamps).
+// settle returns once the watcher handled the events of every file operation made before the call (pluginstest.Settle, the
+// barrier a component's watcher has too).
 func (f *watcherFixture) settle() {
 	f.t.Helper()
-	if f.barrier == "" {
-		f.barrier = f.t.TempDir()
-	}
+	pluginstest.Settle(f.t, f)
+}
+
+// WatchTree, Watches and ComparingBase are the barrier's questions (pluginstest.Watcher), asked in a section of the loop.
+func (f *watcherFixture) WatchTree(dir string) ([]string, bool) {
+	var watched []string
 	var watching bool
-	var directories []string
-	f.run(func() {
-		if f.watcher.fs == nil {
-			return
-		}
-		watching = true
-		// A discovery drops the trees that are no root's, base's or linked plugin's: the barrier's is put back each time.
-		f.watcher.watchTree(f.barrier)
-		directories = slices.Collect(maps.Keys(f.watcher.watched))
-	})
-	if !watching {
-		return
-	}
-	if runtime.GOOS == "windows" {
-		settleDirectoryStamps(directories)
-	}
-	f.sentinels++
-	sentinel := filepath.Join(f.barrier, "sentinel-"+strconv.Itoa(f.sentinels))
-	if err := os.Mkdir(sentinel, 0o755); err != nil {
-		f.t.Fatal(err)
-	}
-	eventually(f.t, 15*time.Second, "the watcher to handle a directory made after the edits", func() bool {
-		var reached bool
-		f.run(func() { _, reached = f.watcher.watched[sentinel] })
-		return reached
-	})
+	f.run(func() { watched, watching = f.watcher.alsoWatch(dir) })
+	return watched, watching
+}
+
+func (f *watcherFixture) Watches(dir string) bool {
+	var watches bool
+	f.run(func() { watches = f.watcher.watches(dir) })
+	return watches
+}
+
+func (f *watcherFixture) ComparingBase() bool {
+	var comparing bool
+	f.run(func() { comparing = f.watcher.comparingBase() })
+	return comparing
 }
 
 // forget clears every mark the watcher holds: what a case sees is what it does from here.
@@ -196,7 +197,8 @@ func (f *watcherFixture) forget() { f.run(func() { forgetMarks(f.watcher) }) }
 func forgetMarks(w *pluginWatcher) {
 	clear(w.dirty)
 	clear(w.install)
-	w.set, w.manifest, w.baseChanged = 0, 0, false
+	w.set, w.manifest = 0, 0
+	clear(w.differing)
 	w.marksChanged()
 }
 
@@ -219,7 +221,7 @@ func (f *watcherFixture) mark(path string) { f.run(func() { f.watcher.mark(path)
 // know has the watcher learn a new discovery of the root, as the component does after discovering again.
 func (f *watcherFixture) know(seen DiscoverySnapshot) {
 	f.t.Helper()
-	discovery, err := DiscoverPlugins([]string{f.root}, DiscoveryOptions{Kinds: kinds}, background)
+	discovery, err := model.DiscoverPlugins([]model.PluginRoot{{Path: f.root}}, model.DiscoveryOptions{Kinds: kinds}, background)
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -309,10 +311,9 @@ func TestTheWatchersMarksAsksForDiscoveryForADirectoryUnderARootAndAFacetFileAtA
 	if marks := f.marks(); !marks.Set || !reflect.DeepEqual(marks.Dirty, list("@test/b")) {
 		t.Fatalf("marks = %+v, want set and @test/b dirty", marks)
 	}
+	writeFiles(t, f.base, map[string]string{"core.ts": "export {};"})
 	f.mark(filepath.Join(f.base, "core.ts"))
-	if marks := f.marks(); !marks.Base {
-		t.Fatalf("marks = %+v, want base", marks)
-	}
+	eventually(t, 5*time.Second, "base", func() bool { return f.marks().Base })
 	f.close()
 }
 
@@ -385,6 +386,36 @@ func TestTheWatchersMarksFromRealFileEventsPublishingTheMarksToAWatch(t *testing
 	f.close()
 }
 
+// watcher.test.ts › the watcher and single-file plugins (slice 12 §4) › dirties a single-file plugin for a change of its file; a
+// file appearing or disappearing at a root's top sets set.
+func TestTheWatcherAndSingleFilePluginsDirtiesASingleFilePluginForAChangeOfItsFileAFileAppearingOrDisappearingAtARootsTopSetsSet(t *testing.T) {
+	f := watched(t)
+	writeFiles(t, f.root, map[string]string{"hello.server.ts": ""})
+	f.settle()
+	f.mark(filepath.Join(f.root, "hello.server.ts"))
+	expectMarks(t, f.marks(), PluginsState{Dirty: list(), Install: list(), Set: true})
+	seen := f.discoverySnapshot()
+	f.know(seen)
+	expectMarks(t, f.marks(), PluginsState{Dirty: list(), Install: list()})
+	// Its own file: only it is dirty (not every plugin of the root its directory is).
+	f.mark(filepath.Join(f.root, "hello.server.ts"))
+	expectMarks(t, f.marks(), PluginsState{Dirty: list("hello"), Install: list()})
+	writeFiles(t, f.root, map[string]string{"hello.web.tsx": ""})
+	f.settle()
+	f.mark(filepath.Join(f.root, "hello.web.tsx"))
+	if marks := f.marks(); !marks.Set {
+		t.Fatalf("marks = %+v, want set", marks)
+	}
+	f.know(f.discoverySnapshot())
+	if err := os.Remove(filepath.Join(f.root, "hello.server.ts")); err != nil {
+		t.Fatal(err)
+	}
+	f.settle()
+	f.mark(filepath.Join(f.root, "hello.server.ts"))
+	expectMarks(t, f.marks(), PluginsState{Dirty: list("hello"), Install: list(), Set: true})
+	f.close()
+}
+
 func TestTheWatcherFixRound1NeverLetsAnOlderBuildsAppliedSnapshotClearANewerEditsMarkAstra(t *testing.T) {
 	f := watched(t)
 	file := filepath.Join(f.root, "a", "own.ts")
@@ -446,8 +477,10 @@ func TestTheWatcherAndLinksSurvivesALinkLoopCreatedUnderARootItsStatNeverEscapes
 func TestTheWatcherRemovingAWatchedRootOrBaseDirectoryMarksSetAndBaseAsFsWatchReportsIt(t *testing.T) {
 	root := realOf(t, tempRoot(t))
 	base := realOf(t, tempRoot(t))
+	// The base directory's source file is what the watcher recorded at its start: the directory's removal is its loss.
+	writeFiles(t, base, map[string]string{"core.ts": "export {};"})
 	f := watcherOn(t, root, base)
-	// Nothing in them: only their own removal is an event, which `fs.watch` names by the directory's base name under it.
+	// Nothing in the root: only its own removal is an event, which `fs.watch` names by the directory's base name under it.
 	if err := os.Remove(root); err != nil {
 		t.Fatal(err)
 	}
@@ -455,7 +488,7 @@ func TestTheWatcherRemovingAWatchedRootOrBaseDirectoryMarksSetAndBaseAsFsWatchRe
 	if f.marks().Base {
 		t.Fatal("base set by a root's removal")
 	}
-	if err := os.Remove(base); err != nil {
+	if err := os.RemoveAll(base); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, 5*time.Second, "base", func() bool { return f.marks().Base })
@@ -484,4 +517,153 @@ func TestTheWatcherAfterCloseOnlyAPluginLinkedFromOutsideGetsItsWatchAgain(t *te
 	})
 	writeFiles(t, dir, map[string]string{"own.ts": "export {};"})
 	eventually(t, 5*time.Second, `dirty ["@test/linked"]`, func() bool { return reflect.DeepEqual(f.marks().Dirty, list("@test/linked")) })
+}
+
+// Not a port: closing the fsnotify watcher is slow where it removes a watch per entry (kqueue, on a large directory), and a
+// failure to watch ends the watching in a section of the host, which holds the host's lock. The close of the watcher must run
+// outside the section: here it is held back, and the host stays free (its sections run, the failure is reported) until it
+// is let go; join waits for it.
+func TestTheWatcherClosesTheSystemWatcherOutsideTheHostsLockAndJoinWaitsForIt(t *testing.T) {
+	base := realOf(t, tempRoot(t))
+	f := watcherOver(t, nil, base)
+	closing, release, closed := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	f.watcher.closeFS = func(watcher notifier) {
+		close(closing)
+		<-release
+		_ = watcher.Close()
+		close(closed)
+	}
+	// Once the test ends the fixture's cleanup joins: the hook must have been let go by then.
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	free := make(chan struct{})
+	go func() {
+		f.run(func() { f.watcher.failed(errors.New("a watch failed")) })
+		f.run(func() {}) // a later section of the host: it enters while the watcher is still closing
+		close(free)
+	}()
+	select {
+	case <-free:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the host's lock was held while the system watcher closed")
+	}
+	select {
+	case <-closing:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the system watcher was not closed")
+	}
+	if len(f.failed()) != 1 {
+		t.Fatalf("failures = %v, want the one watch failure reported", f.failed())
+	}
+	joined := make(chan struct{})
+	go func() { f.watcher.join(); close(joined) }()
+	select {
+	case <-joined:
+		t.Fatal("join returned before the system watcher was closed")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-joined:
+	case <-time.After(10 * time.Second):
+		t.Fatal("join did not return after the system watcher was closed")
+	}
+	<-closed
+}
+
+// discoveryAfterWatchTree is a fixture's watcher as the barrier asks it, with a discovery of the root landing right after each
+// WatchTree: the order of a build that discovers again beside a test's barrier.
+type discoveryAfterWatchTree struct{ *watcherFixture }
+
+func (w discoveryAfterWatchTree) WatchTree(dir string) ([]string, bool) {
+	watched, watching := w.watcherFixture.WatchTree(dir)
+	w.know(w.discoverySnapshot())
+	return watched, watching
+}
+
+// No Pi counterpart: Pi's watcher watches no tree on request (watcher.ts:177-181 drops every tree that is no root's, base's or
+// linked plugin's, and nothing asks it for another). A tree the watcher was asked to watch (alsoWatch: the tests' barrier's) stays
+// watched across discoveries, in both orders of the request and a discovery, with the directories under it; a directory made in
+// it afterwards gets its watch when its event is handled.
+func TestATreeTheWatcherWasAskedToWatchStaysWatchedAcrossDiscoveries(t *testing.T) {
+	orders := []struct {
+		name  string
+		steps func(f *watcherFixture, tree string) bool
+	}{
+		{"asked, then a discovery", func(f *watcherFixture, tree string) bool {
+			_, watching := f.WatchTree(tree)
+			f.know(f.discoverySnapshot())
+			return watching
+		}},
+		{"a discovery, then asked", func(f *watcherFixture, tree string) bool {
+			f.know(f.discoverySnapshot())
+			_, watching := f.WatchTree(tree)
+			return watching
+		}},
+	}
+	for _, order := range orders {
+		t.Run(order.name, func(t *testing.T) {
+			f := watched(t)
+			tree := realOf(t, t.TempDir())
+			inside := filepath.Join(tree, "inside")
+			if err := os.Mkdir(inside, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if !order.steps(f, tree) {
+				t.Fatal("the watcher watches nothing")
+			}
+			for _, dir := range []string{tree, inside} {
+				if !f.Watches(dir) {
+					t.Fatalf("%s is not watched", dir)
+				}
+			}
+			made := filepath.Join(tree, "made")
+			if err := os.Mkdir(made, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			eventually(t, 5*time.Second, "a watch on the directory made in the tree", func() bool { return f.Watches(made) })
+		})
+	}
+}
+
+// watcher.ts:177-181: a discovery drops the tree of a plugin directory linked from outside the roots once its link is gone
+// from the root. A tree the watcher was asked to watch changes nothing of that, and stays.
+func TestADiscoveryDropsTheTreeOfAPluginWhoseLinkIsGoneAndKeepsATreeTheWatcherWasAskedToWatch(t *testing.T) {
+	elsewhere := realOf(t, tempRoot(t))
+	dir := realOf(t, writePlugin(t, elsewhere, "linked", "@test/linked", map[string]string{"worker.ts": ""}, nil))
+	root := realOf(t, tempRoot(t))
+	link := filepath.Join(root, "link")
+	testenv.RequireDirectoryLink(t, dir, link)
+	f := watcherOn(t, root, realOf(t, tempRoot(t)))
+	asked := realOf(t, t.TempDir())
+	if _, watching := f.WatchTree(asked); !watching {
+		t.Fatal("the watcher watches nothing")
+	}
+	f.know(f.discoverySnapshot())
+	if !f.Watches(dir) {
+		t.Fatal("the linked plugin's directory is not watched")
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	f.know(f.discoverySnapshot())
+	if f.Watches(dir) {
+		t.Fatal("the discovery kept the tree of a plugin whose link is gone")
+	}
+	if !f.Watches(asked) {
+		t.Fatal("the discovery dropped the tree the watcher was asked to watch")
+	}
+}
+
+// The barrier (pluginstest.Settle) returns when a discovery lands between its WatchTree and the directory it makes. The build of
+// an apply that runs beside a test's edit discovers at any moment (reload_rollout_test.go, two rollouts back to back): such a
+// discovery dropped the barrier's tree, the directory made next got no watch, and Settle timed out.
+func TestTheBarrierReturnsWhenADiscoveryLandsBetweenItsWatchTreeAndItsDirectory(t *testing.T) {
+	f := watched(t)
+	pluginstest.Settle(t, discoveryAfterWatchTree{f})
 }

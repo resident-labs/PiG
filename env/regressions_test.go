@@ -137,12 +137,12 @@ func TestRemoteWatcherOutlivesTheContextThatOpenedIt(t *testing.T) {
 
 // remote-env.ts exec: a daemon `timeout` error is `timeout:${timeout}`, `timeout:undefined` without a timeout.
 func TestExecFailureOfATimeoutWithoutATimeout(t *testing.T) {
-	failure := execFailure(NewRemoteError(Json{"code": "timeout", "message": "timed out"}), nil)
+	failure := execFailure(NewRemoteError(Json{"code": "timeout", "message": "timed out"}), nil, nil)
 	if failure.Code != durableenv.ExecutionErrorTimeout || failure.Message != "timeout:undefined" {
 		t.Fatalf("execFailure = %s %q, want timeout `timeout:undefined`", failure.Code, failure.Message)
 	}
 	five := 5.0
-	if failure := execFailure(NewRemoteError(Json{"code": "timeout"}), &five); failure.Message != "timeout:5" {
+	if failure := execFailure(NewRemoteError(Json{"code": "timeout"}), &five, nil); failure.Message != "timeout:5" {
 		t.Fatalf("execFailure message = %q, want `timeout:5`", failure.Message)
 	}
 }
@@ -156,9 +156,8 @@ func TestSshConnectionReportsItsRemoteWhileAStartIsDetecting(t *testing.T) {
 	marker := filepath.Join(directory, "started")
 	program := filepath.Join(directory, "ssh")
 	writeProgram(t, program, "#!/bin/sh\n: > '"+marker+"'\nexec sleep 30\n")
-	connection, remote := sshConnectionPair(SshConnectOptions{SshTarget: SshTarget{
-		Host: "h", Ssh: &program, KnownHostsFile: filepath.Join(directory, "known_hosts"), HostKeyAlias: "pi-env-test",
-	}})
+	connection, remote := sshConnectionPair(SshConnectOptions{
+		Host: "h", Ssh: &program, KnownHostsFile: filepath.Join(directory, "known_hosts"), HostKeyAlias: "pi-env-test"})
 	started := make(chan error, 1)
 	go func() {
 		_, err := connection.Info(background)

@@ -20,15 +20,16 @@ type bodyReadOwner struct {
 type bodyReadOperation struct {
 	// yield suspends the read coroutine and hands a signal to the goroutine that resumed it.
 	yield func(bodyReadSignal) bool
-	// owner is the goroutine the read coroutine runs on, set before the first read starts.
-	owner uint64
+	// owner is the token of the goroutine the read coroutine runs on, set before the first read starts. pending compares it on every
+	// read that waits for the network, so it is the goroutine's record address and not its ID, which a stack header costs 20 microseconds to format.
+	owner uintptr
 	// announced records that this read already reported its network wait; reset for every read.
 	announced atomic.Bool
 }
 
 // pending is the connection's report that a read is about to wait for the network. It suspends the read at its first network wait, so the goroutine that started the read learns it is pending without waiting for the network; that goroutine then blocks in the read. A report from any goroutine but the coroutine's own is not this read's wait and is ignored: the connection read it belongs to is not the read the consumer is waiting for.
 func (operation *bodyReadOperation) pending() {
-	if operation.announced.Load() || operation.owner != goroutineid.Current() {
+	if operation.announced.Load() || operation.owner != goroutineid.Token() {
 		return
 	}
 	operation.announce()
@@ -71,21 +72,29 @@ func (owner *bodyReadOwner) pending() {
 	}
 }
 
-func httpBodyReadOwner(conn net.Conn) *bodyReadOwner {
-	var owner *bodyReadOwner
+// dialedConn is the provider connection under conn's TLS and proxy layers, or nil when conn has none.
+func dialedConn(conn net.Conn) *idleTimeoutConn {
+	var dialed *idleTimeoutConn
 	for {
 		switch current := conn.(type) {
 		case *idleTimeoutConn:
-			owner = &current.bodyRead
+			dialed = current
 			conn = current.Conn
 		case *tls.Conn:
 			conn = current.NetConn()
 		case *proxyBufferedConn:
 			conn = current.Conn
 		default:
-			return owner
+			return dialed
 		}
 	}
+}
+
+func httpBodyReadOwner(conn net.Conn) *bodyReadOwner {
+	if dialed := dialedConn(conn); dialed != nil {
+		return &dialed.bodyRead
+	}
+	return nil
 }
 
 type observedResponseBody struct {

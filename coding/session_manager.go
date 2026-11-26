@@ -11,6 +11,13 @@ import (
 // SessionManager is the actual append-only Session log used by the runtime. Sharing this pointer shares entry identity, branching and persistence, not a copied projection.
 type SessionManager = icodingagent.Session
 
+// BranchRef locates one entry of a branch without reading its body: the value SessionManager.BranchRefs returns. It holds no file handle and no
+// part of the log, and its ID names the same entry for the life of the SessionManager.
+type BranchRef = icodingagent.BranchRef
+
+// RecordChangedError is the error SessionManager.ReadEntries returns for an entry whose record cannot be read back as it was indexed; find it with errors.As.
+type RecordChangedError = icodingagent.RecordChangedError
+
 // NewInMemorySessionManager creates a Session log with no persistence path. An empty cwd resolves to the process working directory.
 func NewInMemorySessionManager(cwd string) (*SessionManager, error) {
 	resolved, err := icodingagent.ResolvePath(cwd, "")
@@ -25,4 +32,4 @@ func NewInMemorySessionManager(cwd string) (*SessionManager, error) {
 }
 
 // SessionManager returns the backing log. A supplied manager is used directly; appends through either handle are visible through the other.
-func (s *Session) SessionManager() *SessionManager { return s.inner }
+func (s *Session) SessionManager() *SessionManager { return s.inner.Load() }

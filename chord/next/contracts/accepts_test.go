@@ -8,7 +8,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/contracts"
 )
 
-// Ports packages/chord/test/next/contracts/accepts.test.ts.
+// Ports packages/chord/test/contracts/accepts.test.ts.
 //
 // Designed out: AcceptsTable<C> and the mapping types (Static<...>) are type-level only, so every @ts-expect-error
 // line asserts nothing at runtime. A Go table is data (contracts.AcceptsTable of contracts.VersionMappings) whose
@@ -360,5 +360,26 @@ func TestAcceptsKeyedMappings(t *testing.T) {
 		wantError(t, err, `store accepts[1].keyed.drafts: expected "refuse"`)
 		_, err = contracts.CheckAccepts(store, nil)
 		wantNoError(t, err)
+	})
+}
+
+func TestAcceptsKeyKindChanged(t *testing.T) {
+	note := func() contracts.Schema { return contracts.Obj(contracts.Prop("text", contracts.Str())) }
+
+	t.Run("a keyed member's key kind changed is only refused: a value mapping cannot map keys", func(t *testing.T) {
+		store := local(t, "store", 1, noParams(), contracts.Mem("notes", contracts.Keyed(note())))
+		v2 := must(evolveLocal(store, func(e *contracts.LocalEditor) *contracts.LocalEditor { return e.Keyed("notes", note(), session) }))
+		entry := func(mapping contracts.KeyedMapping) contracts.AcceptsTable {
+			return table(version("1", contracts.VersionMappings{Keyed: []contracts.Entry[contracts.KeyedMapping]{{Name: "notes", Value: mapping}}}))
+		}
+		checked := must(contracts.CheckAccepts(v2, entry(contracts.KeyedMapping{Refuse: true})))
+		if len(checked.Versions) != 1 {
+			t.Fatalf("versions = %+v", checked.Versions)
+		}
+		_, err := contracts.CheckAccepts(v2, entry(contracts.KeyedMapping{Func: fn}))
+		wantError(t, err, `store accepts[1].keyed.notes: expected "refuse" (its key kind changed: a value mapping cannot map keys)`)
+		if v2.Fingerprint == store.Fingerprint {
+			t.Fatal("changing the key kind kept the fingerprint")
+		}
 	})
 }

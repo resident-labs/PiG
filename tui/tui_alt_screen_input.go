@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 
 	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
@@ -246,7 +247,7 @@ func (t *TuiAltScreen) scrollToPrompt(direction int) {
 	for row := sv.ScrollTop() + direction; row >= 0 && row < len(lines); row += direction {
 		if osc133PromptStart.MatchString(lines[row]) {
 			sv.ScrollTo(row)
-			t.RequestRender()
+			t.requestViewRender()
 			return
 		}
 	}
@@ -572,7 +573,7 @@ func (t *TuiAltScreen) applySearchHighlights(screen []string, layout *LayoutFram
 			continue
 		}
 		lineWidth := widthx.VisibleWidth(line)
-		slices.SortStableFunc(ranges, func(a, b searchHighlightRange) int { return b.startCol - a.startCol })
+		sortx.Stable(ranges, func(a, b searchHighlightRange) int { return b.startCol - a.startCol })
 		for _, r := range ranges {
 			startCol, endCol := min(r.startCol, lineWidth), min(r.endCol, lineWidth)
 			if endCol <= startCol {

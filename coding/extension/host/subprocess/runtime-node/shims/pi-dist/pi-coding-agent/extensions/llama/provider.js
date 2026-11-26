@@ -4,7 +4,7 @@ import { typesafeSystemOneApi } from "../../../pi-ai/api/typesafe-system-one.laz
 import { stream, streamSimple } from "../../../pi-ai/sdk-bundle/compat.js";
 import { LlamaClient, llamaInferenceUrl, normalizeLlamaServerUrl, } from "./client.js";
 export const LLAMA_PROVIDER_ID = "llama.cpp";
-export const DEFAULT_LLAMA_SERVER_URL = "http://127.0.0.1:8080";
+export const DEFAULT_LLAMA_SERVER_URL = "http://127.0.0.1:9931";
 function credentialServerUrl(credential) {
     const value = credential?.env?.LLAMA_BASE_URL;
     return typeof value === "string" && value.trim() ? normalizeLlamaServerUrl(value) : undefined;
@@ -71,10 +71,12 @@ function isChatModel(model) {
 /**
  * A llama.cpp model used as a classifier. Decision models answer natively through llama.cpp's
  * System One endpoint (`/v1/systemone`). Chat models fall back to `llama-cpp-classify`, which reads
- * answers from next-token label probabilities.
+ * answers from next-token label probabilities and takes no images. llama.cpp reads System One images
+ * from the `images` list of data URLs, not from TypeSafe's `assets`.
  */
 function toPiClassifierModel(model, serverUrl, cachedContextWindow) {
     const decision = isDecisionModel(model);
+    const image = decision && model.architecture?.input_modalities?.includes("image") === true;
     return {
         type: "classifier",
         id: model.id,
@@ -82,9 +84,10 @@ function toPiClassifierModel(model, serverUrl, cachedContextWindow) {
         api: decision ? "typesafe-system-one" : "llama-cpp-classify",
         provider: LLAMA_PROVIDER_ID,
         baseUrl: decision ? llamaInferenceUrl(serverUrl) : serverUrl,
-        input: ["text"],
+        input: image ? ["text", "image"] : ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: contextWindowOf(model, cachedContextWindow),
+        ...(image && { compat: { imageInput: "images", sendImageOptInHeader: false } }),
     };
 }
 function isLlamaClassifierModel(model) {
@@ -109,7 +112,6 @@ function toPiModel(model, serverUrl, props, cachedContextWindow) {
         maxTokens: contextWindow,
         compat: {
             supportsStore: false,
-            supportsDeveloperRole: false,
             supportsReasoningEffort: false,
             supportsUsageInStreaming: true,
             supportsStrictMode: false,

@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/version"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -16,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MichaelKinsy/PiG/internal/configroot"
@@ -153,7 +156,7 @@ func buildGoPackedCell(ctx context.Context, cacheRoot, key string, extensions []
 	if err != nil {
 		return nil, err
 	}
-	if cell, ok := reuseGoPackedCell(cacheRoot, key, normalized, preferredSDKRoot); ok {
+	if cell, ok := reuseGoPackedCell(ctx, cacheRoot, key, normalized, preferredSDKRoot); ok {
 		return cell, nil
 	}
 	lockCandidates := []string{preferredSDKRoot, os.Getenv("PIG_SDK_GO_ROOT")}
@@ -239,12 +242,14 @@ func buildGoPackedCell(ctx context.Context, cacheRoot, key string, extensions []
 // process restages the SDK names no published entry and the caller falls back
 // to the leased path. A hit therefore proves the entry was built from exactly
 // the SDK content just read, which is what the leased lookup would return.
-func reuseGoPackedCell(cacheRoot, key string, normalized []GoExtension, preferredSDKRoot string) (*GoPackedCell, bool) {
+// The cells of one load read the SDK tree once between them (WithLoadTreeHashes),
+// so for them the content just read is the content the load's first cell read.
+func reuseGoPackedCell(ctx context.Context, cacheRoot, key string, normalized []GoExtension, preferredSDKRoot string) (*GoPackedCell, bool) {
 	sdkRoot, err := findSDKRootWithPreferred(normalized, preferredSDKRoot)
 	if err != nil {
 		return nil, false
 	}
-	hash := goPackedCellHash(cacheRoot, key, normalized, sdkRoot)
+	hash := goPackedCellHashOfSDK(cacheRoot, key, normalized, loadTreeHash(ctx, sdkRoot))
 	if strings.HasPrefix(hash, "error:") {
 		return nil, false
 	}
@@ -304,7 +309,11 @@ func normalizeGoExtensions(extensions []GoExtension, requireFactory bool) ([]GoE
 }
 
 func goPackedCellHash(cacheRoot, key string, extensions []GoExtension, sdkRoot string) string {
-	sdkHash := hashTree(sdkRoot)
+	return goPackedCellHashOfSDK(cacheRoot, key, extensions, hashTree(sdkRoot))
+}
+
+// goPackedCellHashOfSDK is goPackedCellHash for an SDK tree whose hashTree the caller holds.
+func goPackedCellHashOfSDK(cacheRoot, key string, extensions []GoExtension, sdkHash string) string {
 	if strings.HasPrefix(sdkHash, "error:") {
 		return sdkHash
 	}
@@ -352,22 +361,251 @@ func findSDKRoot(extensions []GoExtension) (string, error) {
 	return findSDKRootWithPreferred(extensions, "")
 }
 
+// goRunnerSDKRequirements parses the generated packed Go runner template once
+// to derive the package-level `sdk.<Ident>` functions and `runnable` methods
+// that the template invokes, so adding any new SDK call to renderGoRunner
+// automatically tightens SDK compatibility checks with no separate hardcoded list.
+var goRunnerSDKRequirements = sync.OnceValues(func() ([]string, []string) {
+	return extractRunnerSDKRequirements(renderGoRunner(nil))
+})
+
+// extractRunnerSDKRequirements parses a rendered packed Go runner source and
+// returns the sorted package-level `sdk.<Ident>` selectors and `runnable`
+// interface method names it depends on.
+func extractRunnerSDKRequirements(runnerSrc string) (pkgSymbols, runnableMethods []string) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "runner.go", runnerSrc, 0)
+	if err != nil {
+		return nil, nil
+	}
+	pkgSeen := map[string]struct{}{}
+	methodSeen := map[string]struct{}{}
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.SelectorExpr:
+			if id, ok := node.X.(*ast.Ident); ok && id.Name == "sdk" && node.Sel != nil {
+				pkgSeen[node.Sel.Name] = struct{}{}
+			}
+		case *ast.TypeSpec:
+			if node.Name != nil && node.Name.Name == "runnable" {
+				if iface, ok := node.Type.(*ast.InterfaceType); ok && iface.Methods != nil {
+					for _, field := range iface.Methods.List {
+						for _, name := range field.Names {
+							methodSeen[name.Name] = struct{}{}
+						}
+					}
+				}
+			}
+		}
+		return true
+	})
+	for name := range pkgSeen {
+		pkgSymbols = append(pkgSymbols, name)
+	}
+	for name := range methodSeen {
+		runnableMethods = append(runnableMethods, name)
+	}
+	sort.Strings(pkgSymbols)
+	sort.Strings(runnableMethods)
+	return pkgSymbols, runnableMethods
+}
+
+// missingGoSDKRunnerSymbols checks dir (a candidate Go SDK module root) against
+// the package-level `sdk.<Ident>` symbols and `runnable` methods derived from
+// the packed runner template. Synthetic test fixtures that write only go.mod or
+// minimal files without an Extension runtime (no runnable method declared) return
+// nil; any real SDK source tree must export every required symbol.
+// sdkSymbolWitnesses records the specific .go files in an SDK directory that
+// proved every required runner symbol is exported. Re-checking only those
+// witness files by size and modification time avoids re-reading the directory
+// or re-parsing 125+ SDK source files on warm reloads.
+//
+// Soundness: only positive ("compatible") verdicts are cached. Adding another
+// .go file to the same package cannot remove an exported declaration from an
+// unchanged witness file, so a compatible verdict can turn incompatible only if
+// a witness file is edited, removed, or replaced (which changes its stat size or
+// mtime or fails stat, triggering a full directory rescan). Incompatible verdicts
+// are never cached, so adding a missing symbol is observed immediately. Like
+// sdk_tree_memo.go, mtime+size validation guards newly written files with
+// racyTreeWindow and cannot detect a same-size edit whose mtime is preserved
+// identically past that window.
+type sdkSymbolWitnesses struct {
+	files []treeStamp
+}
+
+// maxMemoizedSDKSymbolChecks bounds the process-wide compatible-SDK witness cache.
+// pig additive (D20): the shared cell cache and its keys have no upstream equivalent.
+const maxMemoizedSDKSymbolChecks = 32
+
+var memoizedSDKSymbolChecks struct {
+	mu     sync.Mutex
+	byRoot map[string]*sdkSymbolWitnesses
+}
+
+func sdkWitnessesMatch(witnesses []treeStamp) bool {
+	for _, w := range witnesses {
+		info, err := os.Stat(w.path) //perf:ok warm witness-file stamp check avoids re-parsing 125+ SDK Go files
+		if err != nil || info.Size() != w.size || info.ModTime().UnixNano() != w.mtime {
+			return false
+		}
+	}
+	return len(witnesses) > 0
+}
+
+func missingGoSDKRunnerSymbols(dir string, pkgSymbols, runnableMethods []string) []string {
+	missing, _ := inspectGoSDKRunnerSymbols(dir, pkgSymbols, runnableMethods)
+	return missing
+}
+
+func inspectGoSDKRunnerSymbols(dir string, pkgSymbols, runnableMethods []string) ([]string, []treeStamp) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, nil
+	}
+	fset := token.NewFileSet()
+	exportedPkg := map[string]string{}
+	exportedMethods := map[string]string{}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		fullPath := filepath.Join(dir, name)
+		file, err := parser.ParseFile(fset, fullPath, nil, 0)
+		if err != nil {
+			continue
+		}
+		for _, decl := range file.Decls {
+			switch d := decl.(type) {
+			case *ast.FuncDecl:
+				if d.Name == nil || !d.Name.IsExported() {
+					continue
+				}
+				if d.Recv == nil {
+					exportedPkg[d.Name.Name] = fullPath
+				} else {
+					exportedMethods[d.Name.Name] = fullPath
+				}
+			case *ast.GenDecl:
+				for _, spec := range d.Specs {
+					switch sp := spec.(type) {
+					case *ast.TypeSpec:
+						if sp.Name != nil && sp.Name.IsExported() {
+							exportedPkg[sp.Name.Name] = fullPath
+						}
+					case *ast.ValueSpec:
+						for _, id := range sp.Names {
+							if id.IsExported() {
+								exportedPkg[id.Name] = fullPath
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	// Treat marker-only or minimal fixtures (no runnable method declared) as synthetic test roots.
+	hasRuntime := false
+	for _, m := range runnableMethods {
+		if _, ok := exportedMethods[m]; ok {
+			hasRuntime = true
+			break
+		}
+	}
+	if !hasRuntime {
+		return nil, nil
+	}
+	var missing []string
+	witnessPaths := map[string]struct{}{}
+	for _, sym := range pkgSymbols {
+		if path, ok := exportedPkg[sym]; !ok {
+			missing = append(missing, "sdk."+sym)
+		} else {
+			witnessPaths[path] = struct{}{}
+		}
+	}
+	for _, m := range runnableMethods {
+		if path, ok := exportedMethods[m]; !ok {
+			missing = append(missing, "Extension."+m)
+		} else {
+			witnessPaths[path] = struct{}{}
+		}
+	}
+	if len(missing) > 0 || len(witnessPaths) == 0 {
+		return missing, nil
+	}
+	var witnesses []treeStamp
+	for path := range witnessPaths {
+		info, err := os.Stat(path) //perf:ok records witness-file stamp once on cold SDK scan
+		if err != nil {
+			return nil, nil
+		}
+		witnesses = append(witnesses, stampOf(path, info))
+	}
+	return nil, witnesses
+}
+
+func missingRunnerSymbolsForSDK(dir string) []string {
+	clean := filepath.Clean(dir)
+	memoizedSDKSymbolChecks.mu.Lock()
+	cached := memoizedSDKSymbolChecks.byRoot[clean]
+	memoizedSDKSymbolChecks.mu.Unlock()
+	if cached != nil && sdkWitnessesMatch(cached.files) {
+		return nil
+	}
+	began := treeMemoClock()
+	pkgSymbols, runnableMethods := goRunnerSDKRequirements()
+	missing, witnesses := inspectGoSDKRunnerSymbols(clean, pkgSymbols, runnableMethods)
+	if len(missing) == 0 && len(witnesses) > 0 && !anyRacy(witnesses, began) {
+		memoizedSDKSymbolChecks.mu.Lock()
+		if _, known := memoizedSDKSymbolChecks.byRoot[clean]; memoizedSDKSymbolChecks.byRoot == nil || (!known && len(memoizedSDKSymbolChecks.byRoot) >= maxMemoizedSDKSymbolChecks) {
+			memoizedSDKSymbolChecks.byRoot = make(map[string]*sdkSymbolWitnesses, 4)
+		}
+		memoizedSDKSymbolChecks.byRoot[clean] = &sdkSymbolWitnesses{files: witnesses}
+		memoizedSDKSymbolChecks.mu.Unlock()
+	}
+	return missing
+}
+
 func findSDKRootWithPreferred(extensions []GoExtension, preferred string) (string, error) {
+	var incompatiblePath, incompatibleSource string
+	var incompatibleMissing []string
+	accept := func(candidate, source string) bool {
+		if !statHasFile(candidate, "go.mod") {
+			return false
+		}
+		missing := missingRunnerSymbolsForSDK(candidate)
+		if len(missing) == 0 {
+			return true
+		}
+		if incompatiblePath == "" {
+			incompatiblePath = candidate
+			incompatibleSource = source
+			incompatibleMissing = missing
+		}
+		return false
+	}
+
 	for _, ext := range extensions {
-		if candidate := goSDKPathOverride(ext.Root, currentGoStagedSDK(preferred)); candidate != "" {
-			return candidate, nil
+		if candidate := goSDKPathOverrideRaw(ext.Root, currentGoStagedSDK(preferred)); candidate != "" {
+			if accept(candidate, "extension go.mod replace in "+ext.Root) {
+				return candidate, nil
+			}
 		}
 	}
 	if preferred = strings.TrimSpace(preferred); preferred != "" {
 		if abs, err := filepath.Abs(preferred); err == nil {
-			if _, err := os.Stat(filepath.Join(abs, "go.mod")); err == nil {
+			if accept(abs, "staged SDK") {
 				return abs, nil
 			}
 		}
 	}
 	if root := strings.TrimSpace(os.Getenv("PIG_SDK_GO_ROOT")); root != "" {
 		if abs, err := filepath.Abs(root); err == nil {
-			if _, err := os.Stat(filepath.Join(abs, "go.mod")); err == nil {
+			if accept(abs, "PIG_SDK_GO_ROOT") {
 				return abs, nil
 			}
 		}
@@ -377,7 +615,7 @@ func findSDKRootWithPreferred(extensions []GoExtension, preferred string) (strin
 		return "", err
 	}
 	for _, sdk := range stagedGoSDKRoots() {
-		if _, err := os.Stat(filepath.Join(sdk, "go.mod")); err == nil {
+		if accept(sdk, "staged SDK") {
 			return sdk, nil
 		}
 	}
@@ -386,7 +624,7 @@ func findSDKRootWithPreferred(extensions []GoExtension, preferred string) (strin
 		for dir := wd; ; dir = filepath.Dir(dir) {
 			data, err := os.ReadFile(filepath.Join(dir, "go.mod"))
 			if err == nil && strings.Contains(string(data), "module github.com/MichaelKinsy/PiG") {
-				if sdk := filepath.Join(dir, "extensions", "sdk"); statHasFile(sdk, "go.mod") {
+				if sdk := filepath.Join(dir, "extensions", "sdk"); accept(sdk, "working-directory PiG checkout") {
 					return sdk, nil
 				}
 			}
@@ -398,9 +636,12 @@ func findSDKRootWithPreferred(extensions []GoExtension, preferred string) (strin
 	}
 	for _, root := range installedPigSourceRoots() {
 		sdk := filepath.Join(root, "extensions", "sdk")
-		if _, err := os.Stat(filepath.Join(sdk, "go.mod")); err == nil {
+		if accept(sdk, "installed PiG source") {
 			return sdk, nil
 		}
+	}
+	if incompatiblePath != "" {
+		return "", fmt.Errorf("Go SDK at %s (from %s) is older than this pig binary (missing %s) and no compatible staged SDK was found; remove the stale SDK override or update the PiG checkout", incompatiblePath, incompatibleSource, strings.Join(incompatibleMissing, ", "))
 	}
 	return "", fmt.Errorf("cannot locate github.com/MichaelKinsy/PiG SDK; install pig (so ~/.pig/source exists), run inside the pig source tree, or set PIG_SDK_GO_ROOT")
 }
@@ -421,8 +662,17 @@ func currentGoStagedSDK(preferred string) string {
 }
 
 // goSDKPathOverride returns an extension module's explicit local SDK replace
-// unless it is missing or a retired staging of stagedDir's config root.
+// unless it is missing, a retired staging of stagedDir's config root, or an
+// older SDK tree incompatible with this binary's runner template.
 func goSDKPathOverride(root, stagedDir string) string {
+	candidate := goSDKPathOverrideRaw(root, stagedDir)
+	if candidate == "" || len(missingRunnerSymbolsForSDK(candidate)) > 0 {
+		return ""
+	}
+	return candidate
+}
+
+func goSDKPathOverrideRaw(root, stagedDir string) string {
 	data, err := os.ReadFile(filepath.Join(root, "go.mod"))
 	if err != nil {
 		return ""
@@ -440,7 +690,7 @@ func goSDKPathOverride(root, stagedDir string) string {
 			candidate = filepath.Join(root, candidate)
 		}
 		candidate = filepath.Clean(candidate)
-		if _, err := os.Stat(filepath.Join(candidate, "go.mod")); err != nil {
+		if !statHasFile(candidate, "go.mod") {
 			continue
 		}
 		// A replace into the config root's SDK staging area that misses the
@@ -497,7 +747,7 @@ func installedPigSourceRoots() []string {
 
 func renderGoMod(extensions []GoExtension, sdkRoot string) string {
 	var b strings.Builder
-	b.WriteString("module pig.generated/packed-cell\n\ngo 1.26.0\n\n")
+	fmt.Fprintf(&b, "module pig.generated/packed-cell\n\ngo %s\n\n", goDirectiveFor(extensions))
 	fmt.Fprintf(&b, "require github.com/MichaelKinsy/PiG/extensions/sdk %s // indirect\n", sdkVersionFor(extensions))
 	legacySDK := requiresLegacyGoSDK(extensions)
 	if legacySDK {
@@ -585,6 +835,35 @@ func goModuleRoots(extensions []GoExtension) []string {
 	}
 	slices.Sort(roots)
 	return slices.Compact(roots)
+}
+
+// packedCellGoFloor is the language floor of the generated module: the extension SDK's.
+const packedCellGoFloor = "1.26.0"
+
+// goDirectiveFor returns the go directive of the generated module: the SDK floor, or the highest directive an extension module or
+// workspace module declares. The go command rejects a main module that declares less than a module it requires ("updates to go.mod
+// needed"), and a module that requires the root PiG module, as the Porter extension does, declares the root's floor.
+func goDirectiveFor(extensions []GoExtension) string {
+	floor := packedCellGoFloor
+	for _, root := range goModuleRoots(extensions) {
+		data, err := os.ReadFile(filepath.Join(root, "go.mod"))
+		if err != nil {
+			continue
+		}
+		file, err := modfile.ParseLax(filepath.Join(root, "go.mod"), data, nil)
+		if err != nil || file.Go == nil {
+			continue
+		}
+		declared := file.Go.Version
+		if lang := "go" + declared; strings.Contains(declared, ".") && version.Lang(lang) == lang { // a language version ("go1.27"), not a release, a candidate or a beta
+			//perf:ok one append per extension module at registration, a handful of modules, cold path
+			declared += ".0" // "1.27" and "1.27.0" name the same language version; the generated module spells it the second way
+		}
+		if version.Compare("go"+declared, "go"+floor) > 0 {
+			floor = declared
+		}
+	}
+	return floor
 }
 
 func sdkVersionFor(extensions []GoExtension) string {
@@ -718,7 +997,13 @@ func modulePathAt(root string) (string, error) {
 func renderGoRunner(extensions []GoExtension) string {
 	var b strings.Builder
 	b.WriteString("package main\n\nimport (\n")
-	b.WriteString("\t\"bufio\"\n\t\"errors\"\n\t\"fmt\"\n\t\"net\"\n\t\"os\"\n\t\"slices\"\n\t\"strings\"\n\t\"sync\"\n\n")
+	b.WriteString("\t\"bufio\"\n\t\"errors\"\n\t\"fmt\"\n\t\"net\"\n\t\"os\"\n\t\"runtime/debug\"\n\t\"slices\"\n\t\"strings\"\n\t\"sync\"\n\n")
+	// The SDK's ReportLoadFailure closes the connection a failed factory's host helpers dialled. An extension that imports the legacy SDK path runs the legacy copy, whose helper state is its own.
+	legacySDK := requiresLegacyGoSDK(extensions)
+	fmt.Fprintf(&b, "\tsdk %q\n", extsource.GoSDKModulePath)
+	if legacySDK {
+		fmt.Fprintf(&b, "\tlegacysdk %q\n", extsource.LegacyGoSDKModulePath)
+	}
 	for _, ext := range extensions {
 		pkgName := extPackageName(ext.Name)
 		fmt.Fprintf(&b, "\t%s %q\n", pkgName, ext.Package)
@@ -727,10 +1012,15 @@ func renderGoRunner(extensions []GoExtension) string {
 	b.WriteString("func main() {\n")
 	b.WriteString("\ttype item struct { name string; env string; run func(string, func()) error }\n")
 	b.WriteString(goRunnerFactoryScope)
+	b.WriteString("\treportFailure := func(sock string) {\n\t\t_ = sdk.ReportLoadFailure(sock)\n")
+	if legacySDK {
+		b.WriteString("\t\t_ = legacysdk.ReportLoadFailure(sock)\n")
+	}
+	b.WriteString("\t}\n")
 	b.WriteString("\titems := []item{\n")
 	for _, ext := range extensions {
 		pkgName := extPackageName(ext.Name)
-		fmt.Fprintf(&b, "\t\t{name: %q, env: %q, run: func(sock string, built func()) error { extension := build(sock, func() runnable { return %s.%s() }); built(); return extension.RunWithSocket(sock) }},\n", ext.Name, SocketEnvName(ext.Name), pkgName, ext.Factory)
+		fmt.Fprintf(&b, "\t\t{name: %q, env: %q, run: func(sock string, built func()) error { extension := build(sock, func() runnable { if member := %s.%s(); member != nil { return member }; return nil }); built(); if extension == nil { return errNoExtension }; return extension.RunWithSocket(sock) }},\n", ext.Name, SocketEnvName(ext.Name), pkgName, ext.Factory)
 	}
 	b.WriteString("\t}\n")
 	b.WriteString(goRunnerBody)
@@ -742,6 +1032,7 @@ func renderGoRunner(extensions []GoExtension) string {
 // helper the factory calls before Run (the SDK's ParseFrontmatter, ParseDate) dials that socket. The members' factories run one at a time, as Pi loads
 // extensions one at a time.
 const goRunnerFactoryScope = `	type runnable interface{ RunWithSocket(string) error }
+	errNoExtension := errors.New("factory returned nil")
 	var factoryMu sync.Mutex
 	build := func(sock string, factory func() runnable) runnable {
 		factoryMu.Lock()
@@ -764,6 +1055,16 @@ const goRunnerBody = `	var mu sync.Mutex
 	cond := sync.NewCond(&mu)
 	live, parked, inputClosed := 0, false, false
 	var failures []error
+	// A panic in a member's factory or serve loop is that member's failure, reported as an error return is: a factory that throws fails its own load in Pi and in an isolated process, and must not end the process that serves the other members. The stack goes to the log indented, so the failure line stays the last unindented line the host reads as the cause.
+	runMember := func(it item, sock string, built func()) (err error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				fmt.Fprintf(os.Stderr, "panic stack of %s:\n\t%s\n", it.name, strings.ReplaceAll(strings.TrimSpace(string(debug.Stack())), "\n", "\n\t"))
+				err = fmt.Errorf("panic: %v", recovered)
+			}
+		}()
+		return it.run(sock, built)
+	}
 	start := func(it item, sock string) <-chan struct{} {
 		mu.Lock()
 		live++
@@ -773,10 +1074,10 @@ const goRunnerBody = `	var mu sync.Mutex
 		built := func() { once.Do(func() { close(ready) }) }
 		go func() {
 			defer built()
-			err := it.run(sock, built)
+			err := runMember(it, sock, built)
 			if err != nil && !errors.Is(err, net.ErrClosed) {
-				fmt.Fprintf(os.Stderr, "%s: %v\n", it.name, err)
-				if c, dialErr := net.Dial("unix", sock); dialErr == nil { _ = c.Close() }
+				fmt.Fprintf(os.Stderr, "extension \"%s\" load failed: %v\n", it.name, err)
+				reportFailure(sock)
 				mu.Lock()
 				failures = append(failures, fmt.Errorf("%s: %w", it.name, err))
 				mu.Unlock()

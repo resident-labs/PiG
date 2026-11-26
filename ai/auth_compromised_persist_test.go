@@ -5,6 +5,7 @@ package ai
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -33,7 +34,7 @@ func TestRefreshedCredentialSurvivesALockTakenMeanwhile(t *testing.T) {
 			return new(shape.rotate(*current)), nil
 		})
 		if err != nil {
-			_, _ = os.Stderr.WriteString("holder: the refreshed credential was not persisted: " + err.Error() + "\n")
+			fmt.Fprintln(os.Stderr, "holder: the refreshed credential was not persisted:", err)
 			os.Exit(1)
 		}
 		return

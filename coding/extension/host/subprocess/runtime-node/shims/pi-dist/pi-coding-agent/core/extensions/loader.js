@@ -6,11 +6,12 @@ import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { mcpNamespace } from "../../../pi-mcp/index.js";
 import { CONFIG_DIR_NAME, getAgentDir, isBunBinary, isBundledNode } from "../../config.js";
-import { pathsEqual, resolvePath } from "../../utils/paths.js";
+import { canonicalizePath, pathsEqual, resolvePath } from "../../utils/paths.js";
 import { createEventBus } from "../event-bus.js";
 import { execCommand } from "../exec.js";
-import { McpServerRegistry, mcpNamespace, validateMcpServerConfig } from "../mcp-servers.js";
+import { McpServerRegistry, validateMcpServerConfig } from "../mcp-servers.js";
 import { readPiManifest } from "../pi-manifest.js";
 import { createSyntheticSourceInfo, getSyntheticPathSource, isSyntheticPath } from "../source-info.js";
 import { time } from "../timings.js";
@@ -164,6 +165,8 @@ export function createExtensionRuntime() {
             eventBusUnsubscribers.add(trackedUnsubscribe);
             return trackedUnsubscribe;
         },
+        // Nothing can show an error yet. The runner replaces this when it is created.
+        reportError: () => { },
         // Pre-bind: queue registrations so bindCore() can flush them once the
         // model registry is available. bindCore() replaces both with direct calls.
         registerProvider: (name, config, extensionPath = "<unknown>") => {
@@ -190,6 +193,7 @@ export function createExtensionRuntime() {
  * Registration methods write to the extension object.
  * Action methods delegate to the shared runtime.
  */
+const DEFAULT_MARKDOWN_MESSAGE_TYPES = ["user", "assistant", "assistant-thinking"];
 function createExtensionAPI(extension, runtime, cwd, eventBus) {
     const pendingFlagValues = new Map();
     const pendingRuntimeChanges = [];
@@ -281,9 +285,12 @@ function createExtensionAPI(extension, runtime, cwd, eventBus) {
             assertActive();
             extension.messageRenderers.set(customType, renderer);
         },
-        registerMarkdownTransformer(transformer) {
+        registerMarkdownTransformer(transformer, options) {
             assertActive();
-            extension.markdownTransformer = transformer;
+            extension.markdownTransformer = {
+                transformer,
+                messageTypes: new Set(options?.messageTypes ?? DEFAULT_MARKDOWN_MESSAGE_TYPES),
+            };
         },
         registerEntryRenderer(customType, renderer) {
             assertActive();
@@ -425,7 +432,22 @@ function createExtensionAPI(extension, runtime, cwd, eventBus) {
             },
             on(channel, handler) {
                 assertActive();
-                const unsubscribe = runtime.trackEventBusSubscription(eventBus.on(channel, handler));
+                // Report a throwing handler like other extension errors. The event bus would print it with
+                // console.error, which draws over the interactive TUI (#11264).
+                const reportingHandler = async (data) => {
+                    try {
+                        await handler(data);
+                    }
+                    catch (error) {
+                        runtime.reportError({
+                            extensionPath: extension.path,
+                            event: `events:${channel}`,
+                            error: error instanceof Error ? error.message : String(error),
+                            stack: error instanceof Error ? error.stack : undefined,
+                        });
+                    }
+                };
+                const unsubscribe = runtime.trackEventBusSubscription(eventBus.on(channel, reportingHandler));
                 if (state === "loading")
                     loadingUnsubscribers.push(unsubscribe);
                 return unsubscribe;
@@ -482,7 +504,7 @@ async function loadExtensionModule(extensionPath, cacheToken) {
         moduleCache: false,
         ...resolutionOptions,
     });
-    const module = await jiti.import(extensionPath, { default: true });
+    const module = await jiti.import(canonicalizePath(extensionPath), { default: true });
     const factory = module;
     if (typeof factory !== "function") {
         return undefined;

@@ -36,6 +36,8 @@ type inputPreflight struct {
 	// followUp and expand are the caller's delivery and expansion choices.
 	followUp bool
 	expand   bool
+	// queueOnly queues the processed text as a steering message or follow-up whether or not a run is active, as upstream steer() and followUp() do.
+	queueOnly bool
 	// behavior is the streamingBehavior the input event carries. It is sampled
 	// once, at submission, and delivery is decided again when the handlers
 	// return, as upstream does after awaiting them.
@@ -159,8 +161,11 @@ func (m *InteractiveMode) finishPreflight(submission inputPreflight, result inpu
 		// to the old one.
 	case result.err != nil:
 		// Upstream prompt() rejects and the input is not sent; the error is
-		// shown.
-		m.showError(result.err.Error())
+		// shown, or handed to the caller that submitted the prompt.
+		m.rejectPrompt(submission.ctx, result.err)
+	case promptRejected(submission.ctx):
+		// A prompt submitted beside this one under the same rejection handler was rejected: the handler restores the queue this message came from and
+		// clears the Session's queues, so the message is neither queued nor starts a run that the same cause would reject again.
 	case !result.handled:
 		text := result.text
 		if submission.expand {
@@ -173,16 +178,21 @@ func (m *InteractiveMode) finishPreflight(submission inputPreflight, result inpu
 				text = expanded
 			}
 		}
-		// Upstream rechecks streaming after the input await (agent-session.ts
-		// `_queueUserInput`): a run that started while the handlers ran receives
-		// text the user typed while working as a steer or follow-up.
-		if submission.streaming && m.enqueueIfTurnActive(func() {
+		enqueue := func() {
 			if submission.followUp {
 				m.followUpMessageWithImages(text, result.images)
 			} else {
 				m.steerMessageWithImages(text, result.images)
 			}
-		}) {
+		}
+		if submission.queueOnly {
+			enqueue()
+			break
+		}
+		// Upstream rechecks streaming after the input await (agent-session.ts
+		// `_queueUserInput`): a run that started while the handlers ran receives
+		// text the user typed while working as a steer or follow-up.
+		if submission.streaming && m.enqueueIfTurnActive(enqueue) {
 			break
 		}
 		// Text typed while idle never joins another run. Upstream holds it in
@@ -226,7 +236,7 @@ func (m *InteractiveMode) runHeldPrompts() {
 	next := m.heldPrompts[0]
 	m.heldPrompts[0] = heldPrompt{}
 	m.heldPrompts = m.heldPrompts[1:]
-	if next.session == m.opts.SessionHandle {
+	if next.session == m.opts.SessionHandle && !promptRejected(next.ctx) {
 		m.runPromptTurnWithImages(next.ctx, next.text, next.images)
 	}
 	m.runHeldPrompts()

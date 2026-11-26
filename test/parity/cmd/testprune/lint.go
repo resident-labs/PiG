@@ -248,8 +248,8 @@ func piSourceNames(root string) (map[string]bool, error) {
 // (a file piNames holds) whose behavior changed, unless the test file lies in a tooling directory (reviewed.InTooling), or the reviewed ledger holds an entry for the commit and path. An entry
 // is read first: it can record that a commit's own citation names a Pi line that did not change, which history cannot
 // rewrite.
-func checkCoEdits(root string, rangeSpec string, from time.Time, piNames map[string]bool, ledger []reviewed.Entry, tooling []reviewed.Tooling) ([]string, error) {
-	edits, err := scanCoEdits(root, []string{rangeSpec, "--", "*.go"})
+func checkCoEdits(root string, revisions []string, from time.Time, piNames map[string]bool, ledger []reviewed.Entry, tooling []reviewed.Tooling) ([]string, error) {
+	edits, err := scanCoEdits(root, slices.Concat(revisions, []string{"--", "*.go"}))
 	if err != nil {
 		return nil, err
 	}
@@ -296,7 +296,7 @@ func checkCoEdits(root string, rangeSpec string, from time.Time, piNames map[str
 		problems = append(problems, fmt.Sprintf("%s %s: changes %d expected value(s) in %s together with %s; cite the Pi behavior that changed (a `Pi-Behavior-Change: <pi file.ts:line>` trailer, or a `name.ts:line` comment on a changed test line, naming a Pi file of %s), or leave the expectation alone",
 			shortSHA(e.Commit), e.Subject, e.ValueEdits, e.Path, strings.Join(e.Code, ", "), piInventories[0]))
 	}
-	inRange, err := commitsInRange(root, rangeSpec)
+	inRange, err := commitsInRange(root, revisions)
 	if err != nil {
 		return nil, err
 	}
@@ -308,12 +308,12 @@ func checkCoEdits(root string, rangeSpec string, from time.Time, piNames map[str
 	return problems, nil
 }
 
-// commitsInRange returns the full SHA of every commit rangeSpec selects.
-func commitsInRange(root, rangeSpec string) ([]string, error) {
-	//nolint:gosec // G204 (class a): program is literal git; rangeSpec is the operator -base/-head value concatenated as "base..head" and passed to rev-list without `--`.
-	out, err := exec.Command("git", "-C", root, "rev-list", rangeSpec).Output()
+// commitsInRange returns the full SHA of every selected commit.
+func commitsInRange(root string, revisions []string) ([]string, error) {
+	//nolint:gosec // G204 (class a): program is literal git; revisions are the operator's range and any resolved exclusion SHA.
+	out, err := exec.Command("git", append([]string{"-C", root, "rev-list"}, revisions...)...).Output()
 	if err != nil {
-		return nil, fmt.Errorf("git rev-list %s: %w", rangeSpec, err)
+		return nil, fmt.Errorf("git rev-list %v: %w", revisions, err)
 	}
 	return strings.Fields(string(out)), nil
 }
@@ -322,11 +322,11 @@ func entryInRange(r reviewed.Entry, inRange []string) bool {
 	return slices.ContainsFunc(inRange, r.NamesCommit)
 }
 
-// prunableEntries lists the ledger entries whose commit is not in rangeSpec. A squash merge replaces the reviewed
+// prunableEntries lists pinned ledger entries outside the selected history. A squash merge replaces the reviewed
 // commit with a new one, so on main and on every later branch such an entry can never match a finding again; it
 // does not fail the lint, a maintainer deletes it.
-func prunableEntries(root, rangeSpec string, ledger []reviewed.Entry) ([]string, error) {
-	inRange, err := commitsInRange(root, rangeSpec)
+func prunableEntries(root string, revisions []string, ledger []reviewed.Entry) ([]string, error) {
+	inRange, err := commitsInRange(root, revisions)
 	if err != nil {
 		return nil, err
 	}
@@ -359,8 +359,12 @@ func runLint(root string, args []string) error {
 	provOnly := fs.Bool("provenance", false, "check only golden and snapshot provenance")
 	base := fs.String("base", "", "check commits in base..head for expectations edited together with code")
 	head := fs.String("head", "HEAD", "range tip")
+	exclude := fs.String("exclude-ancestors-of", "", "exclude commits reachable from this trusted upstream revision from the history check")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *exclude != "" && (*base == "" || *provOnly) {
+		return fmt.Errorf("-exclude-ancestors-of requires a -base history check")
 	}
 	var problems []string
 	if *base == "" || *provOnly {
@@ -405,17 +409,25 @@ func runLint(root string, args []string) error {
 		if err != nil {
 			return err
 		}
-		rangeSpec := *base + ".." + *head
-		p, err := checkCoEdits(root, rangeSpec, from, piNames, ledger, prov.Tooling)
+		revisions := []string{*base + ".." + *head}
+		if *exclude != "" {
+			//nolint:gosec // G204 (class a): the operator's revision is one operand after --end-of-options.
+			resolved, err := exec.Command("git", "-C", root, "rev-parse", "--verify", "--end-of-options", *exclude+"^{commit}").Output()
+			if err != nil {
+				return fmt.Errorf("resolve excluded upstream revision %q: %w", *exclude, err)
+			}
+			revisions = append(revisions, "^"+strings.TrimSpace(string(resolved)))
+		}
+		p, err := checkCoEdits(root, revisions, from, piNames, ledger, prov.Tooling)
 		if err != nil {
 			return err
 		}
-		prunable, err := prunableEntries(root, rangeSpec, ledger)
+		prunable, err := prunableEntries(root, revisions, ledger)
 		if err != nil {
 			return err
 		}
 		for _, e := range prunable {
-			fmt.Fprintf(os.Stderr, "note: %s: prunable ledger entry %s: its commit is not in %s (squash-merged or rewritten); delete it\n", reviewed.File, e, rangeSpec)
+			fmt.Fprintf(os.Stderr, "note: %s: prunable ledger entry %s: its commit is not selected by %s\n", reviewed.File, e, strings.Join(revisions, " "))
 		}
 		problems = append(problems, p...)
 	}

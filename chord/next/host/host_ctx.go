@@ -9,16 +9,18 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/internal/parking"
 	"github.com/MichaelKinsy/PiG/chord/next/contracts"
 	"github.com/MichaelKinsy/PiG/chord/next/data"
+	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
-// Ports packages/chord/src/next/host/ctx.ts. The `ctx` a method handler gets (§8): its call's context, who called, the
+// Ports packages/chord/src/host/ctx.ts. The `ctx` a method handler gets (§8): its call's context, who called, the
 // calling host's incarnation, and call-scoped references; and the abort signal of a call's context, linked to long-lived
 // sources until it settles.
 //
 // Forced Go differences. `Ctx<P>`'s principal type parameter is type-level (owner class a); Principal is the JSON
 // object of `data.Principal`, nil for Pi's `undefined`. An AbortSignal is a context.Context (`signal.reason` is
-// context.Cause); a listener on a signal is a context.AfterFunc whose stop function removes it. `ctx.get` is an awaited
-// Promise, so Get blocks and returns (reference, error): it is called from a goroutine off the host's loop (a handler's)
+// context.Cause); a listener on a signal is onAbort, which runs inside the cancel as Pi's does, its stop function removing it.
+// `ctx.get` is an awaited Promise, so Get blocks and returns (reference, error): it is called from a goroutine off the host's
+// loop (a handler's)
 // and enters the loop (host.loop().Run) for each synchronous section Pi has between its awaits.
 
 // sectionLoop is what the call helpers ask of the host's loop beyond eventLoop: entering a synchronous section from the
@@ -31,6 +33,9 @@ type sectionLoop interface {
 	Go(fn func())
 	// Lend runs fn as the synchronous part of an async function inside the running section (Loop.Lend).
 	Lend(signal *parking.Signal, fn func(abandoned bool))
+	// counted is the loop whose join counts the tasks started on this one (Loop.counted): the host's loop, also under a
+	// wrapper; nil for a loop with nothing to join (a test's virtual-time loop), which says so.
+	counted() *Loop
 }
 
 // Ctx is a handler's context.
@@ -44,6 +49,11 @@ type Ctx interface {
 	// Get takes a reference as the caller (Principal) sees it, released when the handler settles; afterwards Get returns
 	// `released`. It blocks until the reference is acquired.
 	Get(Type *contracts.Contract, params any, options GetOptions) (*Reference, error)
+	// Trace runs fn in a span named name (the host's `chord.host` and attributes), a child of the handler's, with a child
+	// ctx: the same principal, signal and references, its telemetry the span. A failure of fn marks the span failed
+	// (`trace_failed`; a cancel keeps it ok) and is returned; with nothing recorded fn gets this ctx itself. A panic of fn
+	// is its error.
+	Trace(name string, attributes telemetry.SpanAttributes, fn func(ctx Ctx) (any, error)) (any, error)
 }
 
 // caller is who makes a call: the principal it acts as and its host's incarnation.
@@ -69,18 +79,50 @@ type callContext struct {
 	// signal is the "returned or parked" of the call this is the ctx of (nil for a scope that runs no handler). The ctx
 	// answers Value(parking.Key) with it.
 	signal *parking.Signal
+	// attempt is the attempt a method call runs on; nil for a root scope, a routine or a job run (no chain node).
+	attempt oldWorkSource
 }
 
-var _ Ctx = (*callContext)(nil)
+var (
+	_ Ctx      = (*callContext)(nil)
+	_ callNode = (*callContext)(nil)
+)
 
-func newCallContext(ctx context.Context, from caller, host *chordHost) *callContext {
-	return &callContext{Context: ctx, principal: from.principal, incarnation: from.incarnation, host: host}
+// newCallContext is the ctx of a handler run: a method call's is its own node of the call chain (on: the attempt it runs on,
+// as the chain's `CallNode`), so the chain costs no allocation; a root scope, a routine or a job run has none (on is nil).
+func newCallContext(ctx context.Context, from caller, host *chordHost, on oldWorkSource) *callContext {
+	return &callContext{Context: ctx, principal: from.principal, incarnation: from.incarnation, host: host, attempt: on}
 }
 
-// Value answers the call's parking signal under parking.Key and delegates every other key.
+// Value answers the call's parking signal under parking.Key, itself under the call chain's key when it is a method call's,
+// and delegates every other key.
 func (c *callContext) Value(key any) any {
 	if key == parking.Key && c.signal != nil {
 		return c.signal
+	}
+	if c.attempt != nil && key == callChainKey.Token() {
+		return callNode(c)
+	}
+	return c.Context.Value(key)
+}
+
+// on is the attempt its handler runs on (only read through the call chain, which a method call's ctx answers).
+func (c *callContext) on() oldWorkSource { return c.attempt }
+
+// up is the chain of the call that made this one.
+func (c *callContext) up() callNode { return chainOf(c.Context) }
+
+// chained is c's context with c's own call chain node: what a getter made through Get belongs to (old work during a
+// reload), without the call's other values (its parking signal).
+type chained struct {
+	context.Context
+	node *callContext
+}
+
+// Value answers the chain's key with the call's node; every other key is the call's context's.
+func (c chained) Value(key any) any {
+	if key == callChainKey.Token() && c.node.attempt != nil {
+		return callNode(c.node)
 	}
 	return c.Context.Value(key)
 }
@@ -115,7 +157,8 @@ func (c *callContext) Get(typ *contracts.Contract, params any, options GetOption
 		if c.settling == nil {
 			c.settling, c.settlingCancel = chordctx.WithCancel(chordctx.Background())
 		}
-		scoped = withLinkedAbortSignal(c.settling, c.Context)
+		// Under this ctx's call chain: the getter belongs to the call (old work during a reload).
+		scoped = withLinkedAbortSignal(c.settling, chained{Context: c.Context, node: c})
 	})
 	if err != nil {
 		return nil, err
@@ -180,8 +223,9 @@ type linkedAbort struct {
 }
 
 // aborted is the reason the child aborted for, read from its sources at once: Pi's `AbortSignal.any` aborts its result in the
-// same synchronous step as the input, where the child's own Done follows on a goroutine of its own (context.AfterFunc). Nil
-// while neither source nor the child is aborted.
+// same synchronous step as the input; the child's own Done follows inside the source's cancel for the contexts of this
+// package (onAbortNow), and on a goroutine of its own for a source of another one (context.AfterFunc). Nil while neither
+// source nor the child is aborted.
 func (l linkedAbort) aborted() error {
 	if l.context.Err() != nil {
 		return context.Cause(l.context)
@@ -198,9 +242,9 @@ func (l linkedAbort) aborted() error {
 // release(), which the call runs when it settles. Without a caller's signal (ctx has no Done channel) the child is the
 // signal itself with ctx's values, as in Pi, and release does nothing: the child listens to nothing, so a signal that
 // outlives its calls (an attempt's, a reference's) keeps nothing of them. Pi avoids AbortSignal.any because it keeps
-// cleanup entries per call for as long as its sources live; the Go form of the two listeners is two context.AfterFunc
-// registrations, each removed by its stop function, never context.WithCancel's parent registration (which stays until the
-// parent ends).
+// cleanup entries per call for as long as its sources live; the Go form of the two listeners is two onAbortNow registrations
+// (inside the source's cancel, as Pi's listener runs; context.AfterFunc only for a source of another package), each removed
+// by its stop function, never context.WithCancel's parent registration (which stays until the parent ends).
 func withLinkedAbortSignal(signal context.Context, ctx context.Context) linkedAbort {
 	if ctx.Done() == nil {
 		return linkedAbort{context: chordctx.WithAbortSignal(ctx, signal), release: func() {}}
@@ -208,6 +252,8 @@ func withLinkedAbortSignal(signal context.Context, ctx context.Context) linkedAb
 	linked, abort := chordctx.WithCancel(chordctx.WithoutAbortSignal(ctx))
 	// The sources in Pi's order: the caller's first, so its reason wins a tie.
 	sources := [2]context.Context{ctx, signal}
+	// A listener runs inside the cancel of its source, and inside the registration below when a source aborted since the check
+	// above: so mu is never held while one is registered.
 	var mu sync.Mutex
 	var stops [2]func() bool
 	release := func() {
@@ -227,22 +273,26 @@ func withLinkedAbortSignal(signal context.Context, ctx context.Context) linkedAb
 			return linkedAbort{context: linked, release: release}
 		}
 	}
-	mu.Lock()
+	var registered [2]func() bool
 	for i, source := range sources {
-		stops[i] = context.AfterFunc(source, func() {
+		registered[i] = onAbortNow(source, func() {
 			release()
 			abort(linkedCause(sources))
 		})
 	}
-	// A source aborted while the listeners were added runs its listener on a goroutine of its own, which waits here for
-	// the stops.
+	mu.Lock()
+	stops = registered
 	mu.Unlock()
+	// A listener that ran before the stops were kept released nothing: the other source's registration goes now.
+	if linked.Err() != nil {
+		release()
+	}
 	return linkedAbort{context: linked, release: release, sources: sources}
 }
 
-// linkedCause is the reason of the source that aborted first (`AbortSignal.any`): the listeners of the sources run on
-// goroutines of their own, in any order, so the earliest abort is told by chordctx.AbortOrder; sources it cannot order (a
-// context of another package) rank in the order given, the caller's first.
+// linkedCause is the reason of the source that aborted first (`AbortSignal.any`): two sources can abort at the same time on
+// two goroutines, so the earliest abort is told by chordctx.AbortOrder; sources it cannot order (a context of another
+// package) rank in the order given, the caller's first.
 func linkedCause(sources [2]context.Context) error {
 	var first context.Context
 	var firstOrder uint64

@@ -26,5 +26,14 @@ for (const p of JSON.parse(line.slice('codemode-description-probes:'.length))) {
  } catch (e) {
   row = ['', String(e && e.message)];
  }
+ // P19 (PATCHES.md): expect the fork's exact truncation and store guidance without normalizing any other text.
+ if (!row[1]) {
+  const resultText = 'resolves to a string, or an object';
+  const storeText = 'keep JSON values across codemode calls.';
+  if (!row[0].includes(resultText) || !row[0].includes(storeText)) throw new Error('Pi changed the help text patched by P19');
+  row[0] = row[0]
+   .replace(resultText, 'resolves to a string, the text you would see with any truncation notice, or an object')
+   .replace(storeText, 'keep small JSON values (up to 256 KB, such as IDs or summaries) across codemode calls; large data goes to a file.');
+ }
  process.stdout.write(enc(row) + '\n');
 }

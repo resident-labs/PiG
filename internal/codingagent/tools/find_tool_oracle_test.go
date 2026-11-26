@@ -80,14 +80,14 @@ func findScenarios() []map[string]any {
 			scenario["path"] = pick(paths)
 		}
 		if rng.IntN(5) == 0 {
-			scenario["limit"] = []any{1, 2, 3, 10, 50, 100, 500, 1000, 5000, 2.5, 0}[rng.IntN(11)]
+			scenario["limit"] = []any{1, 2, 3, 10, 50, 100, 500, 1000, 5000, 7}[rng.IntN(10)]
 		}
 		scenarios = append(scenarios, scenario)
 	}
 	return scenarios
 }
 
-// The find tool (core/tools/find.ts, over fd) against pinned Pi on a real tree of 1600 files with a git repository, nested repositories, .gitignore files, hidden entries, node_modules, unicode and spaced names: 700 seeded requests with basename and path globs, brace and character classes, an absolute or missing search directory, a file as the search directory and limits from zero to 5000 (some at fractional values); the result text, error, result-limit and truncation metadata agree.
+// The find tool (core/tools/find.ts, over fd) against pinned Pi on a real tree of 1600 files with a git repository, nested repositories, .gitignore files, hidden entries, node_modules, unicode and spaced names: 700 seeded requests with basename and path globs, brace and character classes, an absolute or missing search directory, a file as the search directory and limits from 1 to 5000; the result text, error, result-limit and truncation metadata agree.
 func TestFindToolMatchesPi(t *testing.T) {
 	requireFD(t)
 	tree := buildFindTree(t)

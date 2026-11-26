@@ -98,16 +98,34 @@ func (m appMode) extensionMode() extension.ExtensionMode {
 }
 
 func normalizeRuntimeExtensionConfigs(configs []subprocess.ExtConfig) []subprocess.ExtConfig {
-	return withFusedExtensionConfigs(fusepack.FusedConfigs(), configs)
+	return withFusedExtensionConfigs(fusepack.FusedConfigs(), configs, fusepack.BakedSource)
 }
 
 // withFusedExtensionConfigs puts the Binary's fused extensions ahead of configs, less the ones an overlay removed (D202).
-func withFusedExtensionConfigs(fused, configs []subprocess.ExtConfig) []subprocess.ExtConfig {
+//
+// pig additive (D31): for a member the Binary baked a source digest for (bakedSource; `build.fusedReload: source`), the first
+// configuration of the member's name that carries a source takes the member's place, so the host has one configuration of that name
+// and can compare the source with the digest. Without a baked digest such a configuration loads beside the fused member, as before.
+func withFusedExtensionConfigs(fused, configs []subprocess.ExtConfig, bakedSource func(name string) bool) []subprocess.ExtConfig {
 	all := make([]subprocess.ExtConfig, 0, len(configs)+len(fused))
 	for _, cfg := range fused {
-		if !droppedBinaryMembers[cfg.Name] {
-			all = append(all, cfg)
+		if droppedBinaryMembers[cfg.Name] {
+			continue
 		}
+		if bakedSource != nil && bakedSource(cfg.Name) {
+			if i := slices.IndexFunc(configs, func(candidate subprocess.ExtConfig) bool {
+				return candidate.Name == cfg.Name && candidate.Source != ""
+			}); i >= 0 {
+				all = append(all, configs[i])
+				// The source configuration and the member's own name-only entries (the active Piglet lists its fused members too) are one extension.
+				source := configs[i].Source
+				configs = slices.DeleteFunc(slices.Clone(configs), func(candidate subprocess.ExtConfig) bool {
+					return candidate.Name == cfg.Name && (candidate.Source == source || candidate.Source == "" && candidate.Path == "")
+				})
+				continue
+			}
+		}
+		all = append(all, cfg)
 	}
 	all = append(all, configs...)
 	return mergeExtConfigs(all)
@@ -115,8 +133,22 @@ func withFusedExtensionConfigs(fused, configs []subprocess.ExtConfig) []subproce
 
 // newSubprocessExtensionHost creates an extension host with no extensions
 // loaded and no config loader.
-func newSubprocessExtensionHost(cwd string, mode extension.ExtensionMode, registry *codingagent.ModelRegistry) (*subprocess.Host, *subprocess.UIBridge) {
+// enableViews turns on what the pig command draws for an extension in every mode and on every command: the view kit's
+// widgets, the editors a view holds and the TuiAltScreens an extension constructs. An embedder that draws none of them
+// leaves the calls out and does not link the widget builders, the terminal editor or the alt-screen renderer. Main calls
+// it before it runs a command, so no path of the command builds a view without it.
+func enableViews() {
+	subprocess.EnableViewWidgets()
+	subprocess.EnableEditorViews()
+	subprocess.EnableTuiAltScreens()
+}
+
+func newSubprocessExtensionHost(cwd string, mode extension.ExtensionMode, registry *codingagent.ModelRegistry, cells *subprocess.CellRegistry) (*subprocess.Host, *subprocess.UIBridge) {
 	host := subprocess.NewHostWithConfigRoot(cwd, codingagent.ConfigRoot())
+	if cells != nil {
+		// pig additive (D232): a --listen server's Hosts share cell processes.
+		host.ShareCells(cells)
+	}
 	// Create UIBridge: starts with NoopUIContext. The real UIContext is wired
 	// in interactive mode after the TUI is created. Widget pushes still work
 	// (cached by PushProxy); UI method calls return noop results until the
@@ -127,14 +159,12 @@ func newSubprocessExtensionHost(cwd string, mode extension.ExtensionMode, regist
 		return subprocess.TerminalCapabilitiesPayload{Images: string(caps.Images), TrueColor: caps.TrueColor, Hyperlinks: caps.Hyperlinks}
 	})
 	bridge.SetThemeFunc(codingagent.ActiveExtensionThemeWire)
-	// The pig command draws the editors an extension's view holds in every mode; an embedder that does not leaves the call out and does not link the terminal editor.
-	subprocess.EnableEditorViews()
-	// Likewise the pig command serves the TuiAltScreens an extension constructs; an embedder that does not leaves the call out and does not link their renderer.
-	subprocess.EnableTuiAltScreens()
+	// Main enabled the views before it ran a command; a caller that creates the host without Main has them from here.
+	enableViews()
 	subprocess.SetThemeLoader(codingagent.LoadExtensionTheme)
 	host.SetUIBridge(bridge)
 	host.SetSessionGraph(coding.NewSessionGraph())
-	codingagent.WireEarlyModelStream(bridge, "")
+	codingagent.WireEarlyModelStream(bridge)
 	installStartupTrace(&trace, host.SetStartupTrace)
 	host.SetMode(string(mode))
 	host.SetHostInfo(extensionHostInfo())
@@ -206,7 +236,7 @@ func ensureReloadableExtensionHost(host *subprocess.Host, bridge *subprocess.UIB
 	if host != nil || noExtensions {
 		return host, bridge
 	}
-	host, bridge = newSubprocessExtensionHost(cwd, extension.ModeTUI, registry)
+	host, bridge = newSubprocessExtensionHost(cwd, extension.ModeTUI, registry, nil)
 	setExtensionConfigLoader(host, nil, reloadConfigs)
 	return host, bridge
 }
@@ -234,11 +264,12 @@ func loadSubprocessExtensionSet(ctx context.Context, cwd string, mode extension.
 
 	var host *subprocess.Host
 	var bridge *subprocess.UIBridge
+	var cells *subprocess.CellRegistry
 	if preloaded != nil {
-		host, bridge = preloaded.host, preloaded.bridge
+		host, bridge, cells = preloaded.host, preloaded.bridge, preloaded.cells
 	}
 	if host == nil {
-		host, bridge = newSubprocessExtensionHost(cwd, mode, registry)
+		host, bridge = newSubprocessExtensionHost(cwd, mode, registry, cells)
 	}
 	setExtensionConfigLoader(host, configs, reloadConfigs)
 
@@ -288,6 +319,8 @@ type startupExtensionSet struct {
 	host    *subprocess.Host
 	bridge  *subprocess.UIBridge
 	configs []subprocess.ExtConfig
+	// cells is the registry the host this set creates shares cell processes through; a --listen server sets it (pig additive (D232)).
+	cells *subprocess.CellRegistry
 }
 
 func (s *startupExtensionSet) close() {

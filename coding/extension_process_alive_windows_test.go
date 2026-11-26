@@ -2,14 +2,44 @@
 
 package coding
 
-import "golang.org/x/sys/windows"
+import (
+	"errors"
+	"math"
+	"testing"
 
-func extensionProcessAlive(pid int) bool {
-	handle, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(pid))
-	if err != nil {
+	"golang.org/x/sys/windows"
+)
+
+func loaderProcessAlive(t *testing.T, pid int) bool {
+	t.Helper()
+	id := int64(pid)
+	if id <= 0 || id > math.MaxUint32 {
+		t.Fatalf("invalid process ID %d", pid)
+	}
+	handle, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(id))
+	if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+		// The positive PID no longer identifies a process.
 		return false
 	}
-	defer windows.CloseHandle(handle) //nolint:errcheck // a handle that cannot close leaves nothing to report.
-	event, _ := windows.WaitForSingleObject(handle, 0)
-	return event == uint32(windows.WAIT_TIMEOUT)
+	if err != nil {
+		t.Fatalf("open process %d: %v", pid, err)
+	}
+	defer func() {
+		if err := windows.CloseHandle(handle); err != nil {
+			t.Errorf("close process %d handle: %v", pid, err)
+		}
+	}()
+	event, err := windows.WaitForSingleObject(handle, 0)
+	if err != nil {
+		t.Fatalf("probe process %d: %v", pid, err)
+	}
+	switch event {
+	case windows.WAIT_OBJECT_0:
+		return false
+	case uint32(windows.WAIT_TIMEOUT):
+		return true
+	default:
+		t.Fatalf("probe process %d: unexpected wait status %#x", pid, event)
+		return false
+	}
 }

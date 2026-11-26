@@ -147,6 +147,7 @@ func newScopedConfigSelector(cwd, agentDir string, global, settings *codingagent
 	selector := tui.NewScopedConfigSelector(tui.BuildResourceGroups(globalItems), tui.BuildResourceGroups(projectItems), 0, writeScope, projectModeAvailable)
 	selector.OnToggle = func(item *tui.ResourceItem, enabled bool) {
 		if err := applyConfigToggle(cwd, agentDir, settings, item, enabled); err != nil {
+			// pig divergence (D633): a toggle whose save failed is reported and shown in its previous state; Pi's selector keeps it (config-selector.ts:552-564, :626-628).
 			item.Enabled = !enabled
 			fmt.Fprintf(os.Stderr, "config toggle: %v\n", err)
 		}
@@ -176,6 +177,8 @@ func runConfigSelectorTUI(selector *tui.ConfigSelectorComponent, settings *codin
 // newConfigSelectorUI themes the process and builds the config selector's terminal UI, as Pi's selectConfig (config-selector.ts:20-30) does before it starts.
 func newConfigSelectorUI(selector *tui.ConfigSelectorComponent, settings *codingagent.SettingsManager, agentDir string) *tui.TuiMainScreen {
 	initTheme(configuredThemeName(settings), true)
+	// Pi's selectConfig() installs KeybindingsManager.create(agentDir) so the selector resolves the user's keybindings.json. Creating the manager installs it as the TUI registry.
+	codingagent.NewKeybindingsManager(agentDir)
 	ui := tui.New()
 	ui.SetLogDirectory(agentDir)
 	ui.SetShowHardwareCursor(settings.GetShowHardwareCursor()) // config-selector.ts:25-30

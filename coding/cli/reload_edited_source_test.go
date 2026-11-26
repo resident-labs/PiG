@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/MichaelKinsy/PiG/internal/testbudget"
+	"github.com/MichaelKinsy/PiG/internal/testenv"
 )
 
 // reloadSourceProbe is one extension whose factory logs the version its helper source file defines and whose /rl command awaits the reload. entry is the path that -e names and version the file the test edits, both relative to the probe directory; build is the longest a cold build of the probe may take.
@@ -77,7 +78,7 @@ func reloadSourceProbes(t *testing.T) []reloadSourceProbe {
 		}}
 }
 
-// Pi's loader imports extensions through jiti with moduleCache: false (core/extensions/loader.ts:569-572), so /reload runs a TypeScript extension's factory from the source as it is now, its local imports included: an -e extension edited after it loaded reloads the edit (probed with Pi 1.0.0 in RPC mode). Pi keeps an edited .mjs extension's old code, which Node's ES module cache holds; PiG evaluates it again (D93). PiG re-invokes the factory in the process that holds the extension, and the Python runner re-imports an extension whose source changed since its import, so a Python extension reloads its edit as a TypeScript one does. A Go or Rust extension's source identifies its build, so an edit rebuilds it.
+// Pi's loader imports extensions through jiti with moduleCache: false (core/extensions/loader.ts:588-593 in Pi 1.5.2), so /reload runs a TypeScript extension's factory from the source as it is now, its local imports included: an -e extension edited after it loaded reloads the edit (probed with Pi 1.0.0 in RPC mode). Pi keeps an edited .mjs extension's old code, which Node's ES module cache holds; PiG evaluates it again (D93). PiG re-invokes the factory in the process that holds the extension, and the Python runner re-imports an extension whose source changed since its import, so a Python extension reloads its edit as a TypeScript one does. A Go or Rust extension's source identifies its build, so an edit rebuilds it.
 func TestReloadRunsTheCurrentSourceOfACommandLineExtension(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds the pig binary and starts Node, Python, Go and Rust extensions")
@@ -98,6 +99,7 @@ func TestReloadRunsTheCurrentSourceOfACommandLineExtension(t *testing.T) {
 				}
 			}
 			home, cwd, sessionDir := t.TempDir(), t.TempDir(), t.TempDir()
+			testenv.DisableGoTelemetryForChild(t, home)
 			agentDir := filepath.Join(home, "pig")
 			if err := os.MkdirAll(agentDir, 0o755); err != nil {
 				t.Fatal(err)

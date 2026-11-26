@@ -13,6 +13,8 @@ use pig_sdk::{
 };
 use pig_sdk::{EditorBase, EditorComponent, JsString};
 use serde_json::{Value, json};
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -143,6 +145,17 @@ impl RemoteComponent for TimerFocused {
     }
 }
 
+/// Dials `addr` ("host:port"), writes "waiting\n" and returns when the peer writes a line.
+fn io_wait(addr: &str) -> std::io::Result<()> {
+    let mut peer = TcpStream::connect(addr)?;
+    peer.write_all(b"waiting\n")?;
+    BufReader::new(peer).read_line(&mut String::new())?;
+    Ok(())
+}
+
+/// The address the session_info_changed handler waits on first; empty when the handler is not armed (io_wait_name).
+static NAME_WAIT_ADDR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
 /// Subscribes `handler` to the event `name`. A before_agent_start handler registers with `on_before_agent_start` and receives the event as Pi's object (`BeforeAgentStartEvent::snapshot`).
 fn subscribe(
     subscriber: &pig_sdk::EventSubscriber,
@@ -159,6 +172,15 @@ fn subscribe(
         });
     }
     subscriber.on_event(name, handler)
+}
+
+// isolation_text is the text of a JSON value the isolation probe reports: a string as is, another value as its JSON, a missing one as "None".
+fn isolation_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+        None => "None".to_string(),
+    }
 }
 
 fn conformance_login_definition() -> LoginDefinition {
@@ -909,6 +931,209 @@ fn kit_event_name(kind: EventKind) -> &'static str {
     }
 }
 
+/// The tag of the last ui.view.intent whose handler saw its request cancelled.
+static VIEW_CANCELLED_TAG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+// D614: the redraw panel and the abilities watcher, the same way in every SDK fixture (conformance
+// TestConformance_UIViewAnswerRedraw and TestConformance_UIViewAbilitiesEvent).
+
+/// The context of the command that mounted the redraw panel: an update made through it is the extension's, not an
+/// intent handler's.
+static VIEW_REDRAW_COMMAND: std::sync::Mutex<Option<pig_sdk::Context>> =
+    std::sync::Mutex::new(None);
+static VIEW_WATCH_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VIEW_WATCH_BLOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VIEW_WATCH_RELEASED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static VIEW_WATCH_EVENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn row_text_view(text: String) -> pig_sdk::kit::View {
+    pig_sdk::kit::View::new(pig_sdk::kit::Text::new(text, 0, 0))
+}
+
+fn row_panel_mount(
+    key: &str,
+    view: pig_sdk::kit::View,
+    intents: Vec<pig_sdk::ViewIntent>,
+) -> pig_sdk::ViewMount {
+    pig_sdk::ViewMount {
+        key: key.into(),
+        slot: "panel".into(),
+        title: String::new(),
+        target: None,
+        view,
+        intents,
+        assets: vec![],
+        fallback: None,
+        alternatives: vec![],
+        drawing: None,
+        a11y: vec![],
+        focus: vec![],
+        bindings: vec![],
+    }
+}
+
+fn redraw_intents() -> Vec<pig_sdk::ViewIntent> {
+    let int = pig_sdk::ViewShape::new("integer");
+    ["fx.redraw", "fx.foreign"]
+        .iter()
+        .map(|name| pig_sdk::ViewIntent {
+            name: (*name).into(),
+            arg: pig_sdk::ViewShape::object(&[("n", int.clone())], &["n"]),
+            answer: Some(pig_sdk::ViewShape::object(
+                &[("rev", int.clone())],
+                &["rev"],
+            )),
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn describe_abilities(abilities: &Option<pig_sdk::ViewAbilities>) -> String {
+    match abilities {
+        Some(a) => format!("slots={},mounts={}", a.slots.join("+"), a.limits.mounts),
+        None => "none".to_string(),
+    }
+}
+
+/// Answers fx.redraw and fx.foreign: both replace the view of the mount the intent came from and answer done with the
+/// new rev. fx.redraw updates through the handler's context; fx.foreign through the context of the command that mounted
+/// the panel.
+fn redraw_intent(inv: &pig_sdk::ViewIntentInvocation) -> pig_sdk::ViewIntentResult {
+    let own = inv.intent == "fx.redraw";
+    let n = inv
+        .arg
+        .get("n")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let limit = inv
+        .context
+        .view_abilities()
+        .map(|a| a.limits.intent_arg_bytes as i64)
+        .unwrap_or(0);
+    let ctx = if own {
+        inv.context.clone()
+    } else {
+        match VIEW_REDRAW_COMMAND.lock().unwrap().clone() {
+            Some(ctx) => ctx,
+            None => return pig_sdk::ViewIntentResult::failed("ui_view_redraw has not run"),
+        }
+    };
+    let name = if own { "redraw" } else { "foreign" };
+    match ctx.update_view(pig_sdk::ViewUpdate {
+        mount: pig_sdk::ViewRef {
+            key: inv.mount.key.clone(),
+            epoch: inv.mount.epoch,
+            rev: inv.rev,
+        },
+        title: String::new(),
+        view: row_text_view(format!("fixture-{name}-{}", n + limit)),
+        intents: redraw_intents(),
+        assets: vec![],
+        fallback: None,
+        alternatives: vec![],
+        drawing: None,
+        a11y: vec![],
+        focus: vec![],
+        bindings: vec![],
+    }) {
+        Ok(st) => pig_sdk::ViewIntentResult::done(serde_json::json!({"rev": st.mount.rev})),
+        Err(e) => pig_sdk::ViewIntentResult::failed(&e.to_string()),
+    }
+}
+
+fn register_view_rows(ext: &mut pig_sdk::Extension) {
+    use std::sync::atomic::Ordering::SeqCst;
+    ext.command(
+        "ui_view_redraw",
+        "Mount the panel whose intents redraw it",
+        |ctx, _args| match ctx.mount_view(row_panel_mount(
+            "redraw",
+            row_text_view("fixture-redraw-0".to_string()),
+            redraw_intents(),
+        )) {
+            Ok(st) => {
+                *VIEW_REDRAW_COMMAND.lock().unwrap() = Some(ctx.clone());
+                ctx.notify(&format!("view-redraw:rev={}", st.mount.rev), "info");
+                CommandResult::Ok
+            }
+            Err(e) => CommandResult::Error(e.to_string()),
+        },
+    );
+    ext.on_view_abilities(|ctx, abilities| {
+        VIEW_WATCH_EVENTS.fetch_add(1, SeqCst);
+        if !VIEW_WATCH_ARMED.load(SeqCst) {
+            return;
+        }
+        if VIEW_WATCH_BLOCK.swap(false, SeqCst) {
+            ctx.notify("view-event-blocked", "info");
+            while !VIEW_WATCH_RELEASED.swap(false, SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            ctx.notify("view-event-released", "info");
+        }
+        let Some(arrived) = abilities.clone() else {
+            ctx.notify("view-event:none", "info");
+            return;
+        };
+        let shown = describe_abilities(&abilities);
+        ctx.notify(
+            &format!(
+                "view-event:{shown},same={}",
+                shown == describe_abilities(&ctx.view_abilities())
+            ),
+            "info",
+        );
+        match ctx.mount_view(row_panel_mount(
+            "arrived",
+            row_text_view(format!("fixture-arrived-{}", arrived.limits.mounts)),
+            vec![],
+        )) {
+            Ok(st) => ctx.notify(&format!("view-arrived:{}", st.state), "info"),
+            Err(e) => ctx.notify(&format!("view-arrived:{}", e.code), "info"),
+        };
+    });
+    ext.command(
+        "ui_view_watch",
+        "Arm the abilities watcher",
+        |ctx, _args| {
+            VIEW_WATCH_ARMED.store(true, SeqCst);
+            ctx.notify("view-watch:armed", "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "ui_view_block",
+        "Block the abilities watcher on its next event",
+        |ctx, _args| {
+            VIEW_WATCH_RELEASED.store(false, SeqCst);
+            VIEW_WATCH_BLOCK.store(true, SeqCst);
+            ctx.notify("view-block:set", "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "ui_view_release",
+        "Release the blocked abilities watcher",
+        |ctx, _args| {
+            VIEW_WATCH_RELEASED.store(true, SeqCst);
+            ctx.notify("view-release:done", "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "ui_view_events",
+        "Report how often the abilities watcher ran",
+        |ctx, _args| {
+            ctx.notify(
+                &format!("view-events:{}", VIEW_WATCH_EVENTS.load(SeqCst)),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+}
+
 fn main() {
     let mut ext = Extension::new("rust-sdk-fixture");
     // factory_agent_dir is get_agent_dir() while the factory runs, where Pi's extensions call it (TestConformance_HostConfigurationAgreesAcrossSDKs).
@@ -1128,6 +1353,52 @@ fn main() {
             "Arguments checked by refinements",
             &root,
             |_, _| ToolResult::text("ok"),
+        );
+        let probe = root.clone();
+        let probed = log.clone();
+        ext.command(
+            "refine_value",
+            "Run Value.check or Value.errors on the refine-probe schema",
+            move |ctx, args| {
+                let case: serde_json::Value = match serde_json::from_str(args) {
+                    Ok(case) => case,
+                    Err(err) => return CommandResult::Error(err.to_string()),
+                };
+                let value = case
+                    .get("value")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let outcome = match case.get("mode").and_then(|mode| mode.as_str()) {
+                    Some("cycle") => Type::unsafe_(json!({"$ref": "#"}).as_object().unwrap())
+                        .and_then(|cyclic| pig_sdk::value::Value::check(cyclic, &json!(1)))
+                        .map(|valid| json!(valid)),
+                    Some("check") => pig_sdk::value::Value::check(probe.clone(), &value)
+                        .map(|valid| json!(valid)),
+                    Some("errors") => {
+                        pig_sdk::value::Value::errors(probe.clone(), &value).map(|list| {
+                            json!(
+                                list.iter()
+                                    .map(|error| json!({
+                                        "keyword": error.keyword,
+                                        "schemaPath": error.schema_path,
+                                        "instancePath": error.instance_path,
+                                        "params": error.params,
+                                        "message": error.message,
+                                    }))
+                                    .collect::<Vec<_>>()
+                            )
+                        })
+                    }
+                    _ => return CommandResult::Error("mode must be check or errors".to_string()),
+                };
+                let calls: Vec<String> = std::mem::take(&mut *probed.lock().unwrap());
+                let report = match outcome {
+                    Ok(result) => json!({"result": result, "calls": calls}),
+                    Err(thrown) => json!({"thrown": thrown, "calls": calls}),
+                };
+                ctx.notify(&format!("refine_value:{report}:end"), "info");
+                CommandResult::Ok
+            },
         );
         let reported = log.clone();
         ext.command(
@@ -2164,6 +2435,154 @@ fn main() {
             CommandResult::Ok
         },
     );
+    // event_session_actions_on keeps the handler's context; event_session_actions_stored calls the actions through it after the handler's request ended.
+    let kept_event_ctx: Arc<Mutex<Option<pig_sdk::Context>>> = Arc::new(Mutex::new(None));
+    let report_session_actions = |ctx: &pig_sdk::Context| {
+        let describe = |name: &str, result: std::io::Result<Option<serde_json::Value>>| match result
+        {
+            Ok(_) => format!("{name}=allowed"),
+            Err(err) if err.to_string().contains("is not a function") => {
+                format!("{name}=rejected")
+            }
+            Err(err) => format!("{name}=error:{err}"),
+        };
+        [
+            describe("wait", ctx.wait_for_idle().map(|()| None)),
+            describe("new", ctx.new_session(serde_json::json!({}))),
+            describe("fork", ctx.fork("entry", serde_json::json!({}))),
+            describe(
+                "navigate",
+                ctx.navigate_tree("entry", serde_json::json!({})),
+            ),
+            describe(
+                "switch",
+                ctx.switch_session("/s.jsonl", serde_json::json!({})),
+            ),
+            describe("reload", ctx.reload().map(|()| None)),
+        ]
+        .join(",")
+    };
+    let event_session_actions_subscriber = ext.event_subscriber();
+    let event_session_actions_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let kept_on_event = kept_event_ctx.clone();
+    ext.command(
+        "event_session_actions_on",
+        "Subscribe to the event named by the argument with a handler that calls the session actions",
+        move |_ctx, args| {
+            let kept = kept_on_event.clone();
+            let subscription = subscribe(
+                &event_session_actions_subscriber,
+                args.trim(),
+                move |ctx, _data| {
+                    *kept.lock().unwrap() = Some(ctx.clone());
+                    ctx.notify(&format!("event_actions:{}", report_session_actions(ctx)), "info");
+                    Ok(None)
+                },
+            );
+            event_session_actions_subscriptions
+                .lock()
+                .unwrap()
+                .push(subscription);
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "event_session_actions_stored",
+        "Call the session actions through the context an event handler kept",
+        move |ctx, _| {
+            let kept = kept_event_ctx
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("no event context was kept");
+            ctx.notify(
+                &format!("stored_actions:{}", report_session_actions(&kept)),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    // tool_call_cancel_on subscribes to tool_call with a handler that waits for the cancel signal and then answers (D650 claim 6).
+    let tool_call_cancel_subscriber = ext.event_subscriber();
+    let tool_call_cancel_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "tool_call_cancel_on",
+        "Subscribe to tool_call with a handler that waits for the cancel signal",
+        move |_ctx, _args| {
+            let subscription = subscribe(
+                &tool_call_cancel_subscriber,
+                "tool_call",
+                move |ctx, _data| {
+                    ctx.notify("cancel_wait", "info");
+                    while !ctx.is_cancelled() {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    ctx.notify("cancel_seen", "info");
+                    Ok(Some(
+                        json!({"block": true, "reason": "answered after the abort"}),
+                    ))
+                },
+            );
+            tool_call_cancel_subscriptions
+                .lock()
+                .unwrap()
+                .push(subscription);
+            CommandResult::Ok
+        },
+    );
+    // session_actions_tool makes the same calls, and the wait, through the context of a tool's execute: Pi's createContext() object, so every one is refused.
+    ext.tool(
+        "session_actions_tool",
+        "Call the session actions through the tool's context",
+        json!({"type": "object", "properties": {}}),
+        move |ctx, _| ToolResult::text(format!("tool_actions:{}", report_session_actions(ctx))),
+    );
+    // wait_idle_command waits for the run from a command context (runner.ts createCommandContext); wait_idle_with_session from a withSession callback's context.
+    ext.command(
+        "wait_idle_command",
+        "Wait for the run from a command",
+        |ctx, _| {
+            let text = match ctx.wait_for_idle() {
+                Ok(()) => "done".to_string(),
+                Err(err) => format!("error:{err}"),
+            };
+            ctx.notify(&format!("wait_idle:{text}"), "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "wait_idle_with_session",
+        "Wait for the run from a withSession callback",
+        |ctx, _| {
+            // The callback runs while this command's switch_session call is in flight, so the notice is sent once the call returned.
+            let text = Arc::new(Mutex::new("never ran".to_string()));
+            let callback_text = text.clone();
+            let _ = ctx.switch_session_with("/s.jsonl", serde_json::json!({}), move |replaced| {
+                *callback_text.lock().unwrap() = match replaced.wait_for_idle() {
+                    Ok(()) => "done".to_string(),
+                    Err(err) => format!("error:{err}"),
+                };
+                Ok(())
+            });
+            let text = text.lock().unwrap().clone();
+            ctx.notify(&format!("with_session_wait:{text}"), "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "host_error_probe",
+        "Report what a host error on navigateTree looks like to the extension",
+        |ctx, _| {
+            let text = match ctx.navigate_tree("entry", serde_json::json!({})) {
+                Ok(_) => "no error".to_string(),
+                Err(err) => err.to_string(),
+            };
+            ctx.notify(&format!("host_error:{text}|-"), "info");
+            CommandResult::Ok
+        },
+    );
     ext.command(
         "session_actions_unbound",
         "Report what unbound session actions answer",
@@ -2209,8 +2628,48 @@ fn main() {
             Err(err) => CommandResult::Error(err.to_string()),
         },
     );
+    // mcp_register_run registers two MCP servers in one synchronous run and reads the active tools after each call (TestConformance_McpServerRegisteredAtRunTimeIsHandledInsideTheCall).
+    ext.command(
+        "mcp_register_run",
+        "Register two MCP servers and report the active tools after each",
+        |ctx, _| {
+            let mut reads = Vec::new();
+            for name in ["conformance-run-a", "conformance-run-b"] {
+                if let Err(err) = ctx.register_mcp_server(
+                    name,
+                    json!({"url": format!("https://{name}.invalid/mcp")}),
+                ) {
+                    return CommandResult::Error(err.to_string());
+                }
+                match ctx.get_active_tools() {
+                    Ok(names) => reads.push(names.join(",")),
+                    Err(err) => return CommandResult::Error(err.to_string()),
+                }
+            }
+            ctx.notify(&format!("mcp_register_run:{}", reads.join("|")), "info");
+            CommandResult::Ok
+        },
+    );
+    // registry-model-probe registers the provider of the active model again with the argument as the model's name, then reads the model (TestARegistryWriteIsVisibleToTheNextModelReadAcrossSDKs).
+    ext.command(
+        "registry-model-probe",
+        "Register the active model's provider with a new name, then read the model",
+        |ctx, name| {
+            let config = json!({"baseUrl":"https://probe.invalid/v1","api":"openai-completions","apiKey":"probe-key","models":[{"id":"m","name":name,"reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1000,"maxTokens":100}]});
+            if let Err(err) = ctx.model_registry().register_provider("replica-reg", config) {
+                return CommandResult::Error(err.to_string());
+            }
+            match ctx.get_model_info() {
+                Ok(info) => {
+                    ctx.notify(&format!("regname={}", info.map(|info| info.name).unwrap_or_default()), "info");
+                    CommandResult::Ok
+                }
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
     ext.command("provider_probe_register", "Register a provider with one model", |ctx, _| {
-        let config: Value = serde_json::from_str(r#"{"baseUrl":"https://probe.invalid/v1","api":"openai-completions","apiKey":"probe-key","models":[{"id":"probe-model","name":"Probe Model","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1000,"maxTokens":100}]}"#).unwrap();
+        let config: Value = serde_json::from_str(r#"{"baseUrl":"https://probe.invalid/v1","api":"openai-completions","apiKey":"probe-key","models":[{"id":"probe-model","name":"Probe Model","reasoning":true,"input":["text","image"],"cost":{"input":3.5,"output":4.5,"cacheRead":0.35,"cacheWrite":0.45},"contextWindow":54321,"maxTokens":4321}]}"#).unwrap();
         match ctx.model_registry().register_provider("conformance-probe", config) {
             Ok(_) => CommandResult::Ok,
             Err(err) => CommandResult::Error(err.to_string()),
@@ -2386,34 +2845,115 @@ fn main() {
     ext.entry_view_renderer("kit-entry", |_ctx, _entry, _options, _width| {
         Ok(kit_probe_view())
     });
-    ext.markdown_transformer(|markdown, context| {
-        // "trace:<dir>:<name>" records the body's entry in <dir>/trace; the body named "first" returns only once <dir>/release exists.
-        if let Some(rest) = markdown.strip_prefix("trace:") {
-            // The name is the last field: a Windows <dir> contains a drive colon.
-            if let Some((dir, name)) = rest.rsplit_once(':') {
-                let append = |line: &str| {
-                    use std::io::Write;
-                    let mut file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(format!("{dir}/trace"))
-                        .unwrap();
-                    writeln!(file, "{line}").unwrap();
-                };
-                append(&format!("entered {name}"));
-                if name == "first" {
-                    while !std::path::Path::new(&format!("{dir}/release")).exists() {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    append("returned first");
-                }
-            }
+    // conformance-click-message / conformance-click-entry: a card whose mouse region counts clicks in the renderer state the SDK keeps per displayed
+    // message. The handler runs for each event the host's view took, before the render.
+    fn click_state(state: &pig_sdk::RenderState, event: &kit::Event) {
+        if event.kind != EventKind::Mouse || event.node != "card" {
+            return;
         }
-        Some(format!(
-            "md:{markdown}:{}:streaming={}:width={}",
-            context.message_type, context.is_streaming, context.available_width
+        let Some(mouse) = &event.mouse else { return };
+        let mut state = state.lock().unwrap();
+        let clicks = state.get("clicks").and_then(Value::as_i64).unwrap_or(0);
+        state.insert("clicks".into(), json!(clicks + 1));
+        state.insert("last".into(), json!(format!("{},{}", mouse.x, mouse.y)));
+    }
+    fn click_view(
+        label: &str,
+        subject: &str,
+        state: &pig_sdk::RenderState,
+        expanded: bool,
+    ) -> kit::View {
+        let state = state.lock().unwrap();
+        let clicks = state.get("clicks").and_then(Value::as_i64).unwrap_or(0);
+        let last = state.get("last").and_then(Value::as_str).unwrap_or("none");
+        kit::View::new(
+            kit::MouseRegion::new(
+                "card",
+                Text::new(
+                    format!("{label}:{subject}:clicks={clicks}:last={last}:expanded={expanded}"),
+                    0,
+                    0,
+                ),
+            )
+            .types(["click"]),
+        )
+    }
+    ext.message_view_renderer(
+        "conformance-click-message",
+        |_ctx, message, options, _width| {
+            let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+            Ok(click_view(
+                "clickcard",
+                content,
+                &options.state,
+                options.expanded,
+            ))
+        },
+    );
+    ext.message_view_event(
+        "conformance-click-message",
+        |_ctx, _message, options, event| {
+            click_state(&options.state, &event);
+            Ok(())
+        },
+    );
+    ext.entry_view_renderer("conformance-click-entry", |_ctx, entry, options, _width| {
+        let data = entry.get("data").and_then(Value::as_str).unwrap_or("");
+        Ok(click_view(
+            "clickentry",
+            data,
+            &options.state,
+            options.expanded,
         ))
     });
+    ext.entry_view_event("conformance-click-entry", |_ctx, _entry, options, event| {
+        click_state(&options.state, &event);
+        Ok(())
+    });
+    ext.markdown_transformer_with_options(
+        |markdown, context| {
+            // "trace:<dir>:<name>" records the body's entry in <dir>/trace; the body named "first" returns only once <dir>/release exists.
+            if let Some(rest) = markdown.strip_prefix("trace:") {
+                // The name is the last field: a Windows <dir> contains a drive colon.
+                if let Some((dir, name)) = rest.rsplit_once(':') {
+                    let append = |line: &str| {
+                        use std::io::Write;
+                        let mut file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(format!("{dir}/trace"))
+                            .unwrap();
+                        writeln!(file, "{line}").unwrap();
+                    };
+                    append(&format!("entered {name}"));
+                    if name == "first" {
+                        while !std::path::Path::new(&format!("{dir}/release")).exists() {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        append("returned first");
+                    }
+                }
+            }
+            Some(format!(
+                "md:{markdown}:{}:streaming={}:width={}",
+                context.message_type, context.is_streaming, context.available_width
+            ))
+        },
+        pig_sdk::MarkdownTransformerOptions {
+            message_types: Some(
+                [
+                    "user",
+                    "assistant",
+                    "assistant-thinking",
+                    "custom",
+                    "summary",
+                    "changelog",
+                ]
+                .map(String::from)
+                .to_vec(),
+            ),
+        },
+    );
     fn resolved_line(prefix: &'static str, tool: &str) -> pig_sdk::ToolRendererSet {
         let tool = tool.to_string();
         pig_sdk::ToolRendererSet::with_call(move |_ctx, args, _render, _width| {
@@ -2431,6 +2971,24 @@ fn main() {
             ));
             set.result_view = Some(Arc::new(|_ctx, _result, _options, _render, _width| {
                 Ok(kit_probe_view())
+            }));
+            Some(set)
+        }
+        "last_view_probe" => {
+            // A view renderer that reads the view form of ToolRenderContext::last_component: the kind of what its previous run returned, and the run's own n.
+            let mut set = pig_sdk::ToolRendererSet::default();
+            set.call_view = Some(Arc::new(|_ctx, args, render, _width| {
+                let kind = match &render.last_component {
+                    None => "none",
+                    Some(pig_sdk::ToolRenderComponent::View(_)) => "view",
+                    Some(_) => "lines",
+                };
+                let n = args.get("n").map(Value::to_string).unwrap_or_default();
+                Ok(kit::View::new(Container::new().child(Text::new(
+                    format!("lastview:{kind}:n={n}"),
+                    0,
+                    0,
+                ))))
             }));
             Some(set)
         }
@@ -2491,8 +3049,9 @@ fn main() {
         render.state.insert("calls".to_string(), json!(calls));
         let topic = args.get("topic").and_then(Value::as_str).unwrap_or("");
         Ok(vec![format!(
-            "toolrender:call:{topic}:partial={}:calls={calls}:width={width}",
-            render.is_partial
+            "toolrender:call:{topic}:partial={}:calls={calls}:width={width}:last={}",
+            render.is_partial,
+            last_render_line(render)
         )])
     });
     ext.render_tool_result("render_probe", |_ctx, result, options, render, width| {
@@ -2501,8 +3060,9 @@ fn main() {
         let calls = render.state.get("calls").cloned().unwrap_or(Value::Null);
         let duration = render.duration_ms.map_or("none".to_string(), |ms| ms.to_string());
         Ok(vec![format!(
-            "toolrender:result:{text}:{key}:expanded={}:calls={calls}:width={width}:duration={duration}",
-            options.expanded
+            "toolrender:result:{text}:{key}:expanded={}:calls={calls}:width={width}:duration={duration}:last={}",
+            options.expanded,
+            last_render_line(render)
         )])
     });
     ext.tool(
@@ -2524,6 +3084,14 @@ fn main() {
         "Return text of the size in the argument",
         json!({"type": "object", "properties": {}}),
         |_ctx, params: Value| ToolResult::Json(json!({"content": [{"type": "text", "text": "a".repeat(params["n"].as_u64().unwrap_or(0) as usize)}]})),
+    );
+    // lone_decl: the other SDKs' fixtures put a lone UTF-16 surrogate into this declaration. A Rust String is UTF-8 and a serde_json::Value holds
+    // Strings, so neither can hold one: this fixture declares the tool with U+FFFD in each place.
+    ext.tool(
+        "lone_decl",
+        "D[\u{FFFD}]",
+        json!({"type": "object", "properties": {"K[\u{FFFD}\u{FFFD}]": {"type": "string", "description": "PD[\u{FFFD}]", "enum": ["E[\u{FFFD}]"], "default": "DF[\u{FFFD}]"}}}),
+        |_ctx, _params: Value| ToolResult::Json(json!({"content": [{"type": "text", "text": "lone"}]})),
     );
     ext.tool(
         "echo_params",
@@ -2593,6 +3161,59 @@ fn main() {
             ToolResult::text("late")
         },
     );
+    // signal_host_probe: the host keeps answering a tool's host calls after the abort, as Pi's in-process calls are.
+    ext.tool(
+        "signal_host_probe",
+        "Await host dialogs across the abort",
+        json!({"type": "object", "properties": {}}),
+        |ctx, _params: Value| {
+            let dialog = |title: &str| match ctx.input(title, "p") {
+                Ok((value, _)) => value.as_str().unwrap_or("").to_string(),
+                Err(error) => format!("failed: {error}"),
+            };
+            let first = dialog("tool_signal:first");
+            let aborted = ctx.is_cancelled();
+            let second = dialog("tool_signal:later");
+            ToolResult::text(format!("tool_signal:{aborted}:{first}:{second}"))
+        },
+    );
+    // aborted_entry_probe: called with its run already aborted, it echoes the nonce, reports whether its signal was aborted on its first line, and makes a host call after that, which the host answers (TestConformance_ToolCalledAbortedEntersWithItsSignalAborted).
+    ext.tool(
+        "aborted_entry_probe",
+        "Report the signal a tool starts with",
+        json!({"type": "object", "properties": {}}),
+        |ctx, params: Value| {
+            let aborted = ctx.is_cancelled();
+            let nonce = params["nonce"].as_str().unwrap_or("").to_string();
+            let answer = match ctx.input(&format!("aborted_entry:{nonce}"), "p") {
+                Ok((value, _)) => value.as_str().unwrap_or("").to_string(),
+                Err(error) => format!("failed: {error}"),
+            };
+            ToolResult::text(format!("aborted_entry:{nonce}:{aborted}:{answer}"))
+        },
+    );
+    // signal_nested_probe: a nested tool call keeps working after the abort, as Pi's in-process calls do.
+    ext.tool(
+        "signal_nested_probe",
+        "Run abort_tool as a nested tool call",
+        json!({"type": "object", "properties": {}}),
+        |ctx, _params: Value| {
+            let text = match ctx.execute_tool(
+                "abort_tool",
+                json!({}),
+                pig_sdk::ExecuteToolOptions::default(),
+            ) {
+                Ok(outcome) => outcome
+                    .result
+                    .content
+                    .iter()
+                    .filter_map(|block| block["text"].as_str())
+                    .collect::<String>(),
+                Err(error) => format!("failed: {error}"),
+            };
+            ToolResult::text(format!("tool_signal_nested:{text}"))
+        },
+    );
     ext.command(
         "abort_probe",
         "Report whether abort_tool saw its abort signal",
@@ -2648,6 +3269,56 @@ fn main() {
         |_ctx, params: Value| {
             let text = params.get("text").and_then(Value::as_str).unwrap_or("");
             ToolResult::text(format!("echo: {text}"))
+        },
+    );
+    // D232 shared-cells rows: instance-local state, the process's event bus, and what this instance heard (the same three tools in every SDK fixture).
+    let shared_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let shared_heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    {
+        let heard = shared_heard.clone();
+        ext.events()
+            .on("shared-cells", move |_ctx, data| {
+                heard.lock().unwrap().push(
+                    data.get("from")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    ext.tool(
+        "counter",
+        "This instance's call count",
+        json!({"type": "object", "properties": {}}),
+        move |_ctx, _params: Value| {
+            ToolResult::text(
+                (shared_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1).to_string(),
+            )
+        },
+    );
+    ext.tool(
+        "ping",
+        "Emit on the shared-cells channel",
+        json!({"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}),
+        |ctx, params: Value| match ctx.events().emit(
+            "shared-cells",
+            json!({"from": params.get("name").and_then(Value::as_str).unwrap_or("")}),
+        ) {
+            Ok(()) => ToolResult::text("pinged"),
+            Err(err) => ToolResult::error(err.to_string()),
+        },
+    );
+    ext.tool(
+        "received",
+        "What this instance heard on shared-cells",
+        json!({"type": "object", "properties": {}}),
+        move |_ctx, _params: Value| {
+            ToolResult::text(format!(
+                "received={}",
+                shared_heard.lock().unwrap().join(",")
+            ))
         },
     );
     ext.tool_with_prepare_arguments(
@@ -2749,6 +3420,27 @@ fn main() {
             let file = params["file"].as_str().unwrap_or_default().to_string();
             let tag = params["tag"].as_str().unwrap_or_default().to_string();
             let result = pig_sdk::with_file_mutation_queue(&file, || {
+                let before = std::fs::read_to_string(&file).unwrap_or_default();
+                std::fs::write(&file, format!("{before}{tag}\n"))
+            });
+            match result {
+                Ok(Ok(())) => ToolResult::text(format!("mutated {tag}")),
+                Ok(Err(err)) | Err(err) => ToolResult::Error(err.to_string()),
+            }
+        },
+    );
+    // mutation_order_ctx_probe makes `calls` getter calls, then takes the queue through its context (TestFileMutationOrderOfTheContextFormAcrossSDKs).
+    ext.tool(
+        "mutation_order_ctx_probe",
+        "Make getter calls, take the queue through the context and append a tag",
+        json!({"type": "object", "properties": {"file": {"type": "string"}, "tag": {"type": "string"}, "calls": {"type": "number"}}}),
+        |ctx, params: Value| {
+            let file = params["file"].as_str().unwrap_or_default().to_string();
+            let tag = params["tag"].as_str().unwrap_or_default().to_string();
+            for _ in 0..params["calls"].as_u64().unwrap_or(0) {
+                let _ = ctx.get_context_usage();
+            }
+            let result = ctx.with_file_mutation_queue(&file, || {
                 let before = std::fs::read_to_string(&file).unwrap_or_default();
                 std::fs::write(&file, format!("{before}{tag}\n"))
             });
@@ -3039,6 +3731,95 @@ fn main() {
         },
     );
     ext.command(
+        "overlay-invalidate-probe",
+        "Count the host's invalidations of a mounted overlay and draw the theme",
+        |ctx, args| {
+            fn row(ctx: &pig_sdk::Context) -> String {
+                let theme = ctx.theme();
+                format!("{}|{}", theme.name, theme.fg("accent", "x"))
+            }
+            fn input(data: &pig_sdk::JsString) -> Result<RemoteComponentResult, String> {
+                if data == "q" {
+                    return Ok(RemoteComponentResult::done(Some(json!("closed"))));
+                }
+                Ok(RemoteComponentResult::pending())
+            }
+            struct InvalidateProbe {
+                ctx: pig_sdk::Context,
+                invalidations: u64,
+                kept: String,
+            }
+            impl RemoteComponent for InvalidateProbe {
+                fn render(&self, _width: u32) -> Vec<String> {
+                    vec![format!(
+                        "inv={} kept={} live={}",
+                        self.invalidations,
+                        self.kept,
+                        self.ctx.theme().name
+                    )]
+                }
+                fn invalidate(&mut self) {
+                    self.invalidations += 1;
+                    self.kept = row(&self.ctx);
+                }
+                fn handle_input(
+                    &mut self,
+                    data: &pig_sdk::JsString,
+                ) -> Result<RemoteComponentResult, String> {
+                    input(data)
+                }
+            }
+            // No invalidate: the host's invalidation renders it again all the same.
+            struct PlainThemeProbe(pig_sdk::Context);
+            impl RemoteComponent for PlainThemeProbe {
+                fn render(&self, _width: u32) -> Vec<String> {
+                    vec![format!("plain live={}", row(&self.0))]
+                }
+                fn handle_input(
+                    &mut self,
+                    data: &pig_sdk::JsString,
+                ) -> Result<RemoteComponentResult, String> {
+                    input(data)
+                }
+            }
+            let on_handle = |_overlay: pig_sdk::OverlayHandle| {};
+            let result = if args.trim() == "plain" {
+                ctx.custom_component_with_handle(
+                    PlainThemeProbe(ctx.clone()),
+                    json!({"overlay": true}),
+                    on_handle,
+                )
+            } else {
+                ctx.custom_component_with_handle(
+                    InvalidateProbe {
+                        ctx: ctx.clone(),
+                        invalidations: 0,
+                        kept: row(ctx),
+                    },
+                    json!({"overlay": true}),
+                    on_handle,
+                )
+            };
+            if let Err(err) = result {
+                return CommandResult::Error(err.to_string());
+            }
+            ctx.notify("overlay-invalidate=ok", "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "theme-read-probe",
+        "Report the theme the extension holds, with no component mounted",
+        |ctx, _args| {
+            let theme = ctx.theme();
+            ctx.notify(
+                &format!("theme-read={}|{}", theme.name, theme.fg("accent", "x")),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    ext.command(
         "overlay-focus-probe",
         "Render the focus the host publishes to a mounted overlay",
         |ctx, _args| {
@@ -3142,6 +3923,67 @@ fn main() {
         |ctx, _args| match ctx.wait_for_idle() {
             Ok(_) => CommandResult::Ok,
             Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    // io_wait and io_wait_settled wait on a plain TCP read: they dial the address they get, announce themselves with a "waiting" line and return when the peer writes a line.
+    ext.command(
+        "io_wait",
+        "Wait on a socket read",
+        |_ctx, args| match io_wait(args) {
+            Ok(()) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    ext.command(
+        "io_wait_name",
+        "Make the session_info_changed handler wait on a socket read",
+        |_ctx, args| {
+            *NAME_WAIT_ADDR.lock().unwrap() = args.to_string();
+            CommandResult::Ok
+        },
+    );
+    // io_wait_input and io_wait_start subscribe an input / before_agent_start handler that waits on a socket read first and then notifies "<event>:<text or prompt>".
+    for (command, event, member) in [
+        ("io_wait_input", "input", "text"),
+        ("io_wait_start", "before_agent_start", "prompt"),
+    ] {
+        let subscriber = ext.event_subscriber();
+        ext.command(
+            command,
+            "Make an input or before_agent_start handler wait on a socket read",
+            move |_ctx, args| {
+                let addr = args.to_string();
+                let subscription = subscribe(&subscriber, event, move |ctx, data| {
+                    io_wait(&addr).map_err(|err| err.to_string())?;
+                    ctx.notify(
+                        &format!(
+                            "{event}:{}",
+                            data.get(member).and_then(Value::as_str).unwrap_or("")
+                        ),
+                        "info",
+                    );
+                    Ok(None)
+                });
+                // The handler stays subscribed for the life of the extension.
+                std::mem::forget(subscription);
+                CommandResult::Ok
+            },
+        );
+    }
+    let io_wait_subscriber = ext.event_subscriber();
+    let io_wait_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "io_wait_settled",
+        "Make agent_settled wait on a socket read",
+        move |_ctx, args| {
+            let addr = args.to_string();
+            let subscription = io_wait_subscriber.on_event("agent_settled", move |_ctx, _data| {
+                io_wait(&addr).map_err(|err| err.to_string())?;
+                Ok(None)
+            });
+            io_wait_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
         },
     );
     ext.command(
@@ -3263,6 +4105,953 @@ fn main() {
             CommandResult::Ok
         },
     );
+    // D614 plugin UI mounts: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewMounts).
+    fn view_text(ctx: &pig_sdk::Context, suffix: &str) -> kit::View {
+        let n = ctx
+            .view_abilities()
+            .map(|a| a.limits.intent_arg_bytes)
+            .unwrap_or(0);
+        kit::View::new(kit::Text::new(format!("fixture-view-{n}{suffix}"), 0, 0))
+    }
+    fn view_mount(
+        key: &str,
+        view: kit::View,
+        intents: Vec<pig_sdk::ViewIntent>,
+    ) -> pig_sdk::ViewMount {
+        pig_sdk::ViewMount {
+            key: key.into(),
+            slot: "panel".into(),
+            title: String::new(),
+            target: None,
+            view,
+            intents,
+            assets: vec![],
+            fallback: None,
+            alternatives: vec![],
+            drawing: None,
+            a11y: vec![],
+            focus: vec![],
+            bindings: vec![],
+        }
+    }
+    ext.command(
+        "ui_view_abilities",
+        "Report the replicated client abilities",
+        |ctx, _args| {
+            match ctx.view_abilities() {
+                None => ctx.notify("view-abilities:none", "info"),
+                Some(ab) => ctx.notify(
+                    &format!(
+                        "view-abilities:mounts={},argbytes={},slots={},nodes={},markdown={}",
+                        ab.limits.mounts,
+                        ab.limits.intent_arg_bytes,
+                        ab.slots.join("+"),
+                        ab.nodes.join("+"),
+                        ab.markdown
+                    ),
+                    "info",
+                ),
+            }
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "ui_view_probe",
+        "Mount, update, hide, show, finish and remove a view",
+        |ctx, _args| {
+            let code = |r: Result<pig_sdk::ViewStatus, pig_sdk::ViewError>| match r {
+                Ok(_) => "none".to_string(),
+                Err(e) => e.code,
+            };
+            let st = match ctx.mount_view(view_mount("probe", view_text(ctx, ""), vec![])) {
+                Ok(st) => st,
+                Err(e) => return CommandResult::Error(e.to_string()),
+            };
+            ctx.notify(
+                &format!(
+                    "view-mounted:epoch={},rev={},state={}",
+                    st.mount.epoch, st.mount.rev, st.state
+                ),
+                "info",
+            );
+            let first = st.mount.clone();
+            let st = match ctx.update_view(pig_sdk::ViewUpdate {
+                mount: first.clone(),
+                title: String::new(),
+                view: view_text(ctx, "-2"),
+                intents: vec![],
+                assets: vec![],
+                fallback: None,
+                alternatives: vec![],
+                drawing: None,
+                a11y: vec![],
+                focus: vec![],
+                bindings: vec![],
+            }) {
+                Ok(st) => st,
+                Err(e) => return CommandResult::Error(e.to_string()),
+            };
+            ctx.notify(&format!("view-updated:rev={}", st.mount.rev), "info");
+            let stale = ctx.update_view(pig_sdk::ViewUpdate {
+                mount: first,
+                title: String::new(),
+                view: view_text(ctx, "-stale"),
+                intents: vec![],
+                assets: vec![],
+                fallback: None,
+                alternatives: vec![],
+                drawing: None,
+                a11y: vec![],
+                focus: vec![],
+                bindings: vec![],
+            });
+            ctx.notify(&format!("view-stale:{}", code(stale)), "info");
+            let cur = st.mount.clone();
+            for (op, label) in [
+                ("hide", "view-hidden"),
+                ("show", "view-shown"),
+                ("finish", "view-finished"),
+            ] {
+                let r = match op {
+                    "hide" => ctx.hide_view(&cur),
+                    "show" => ctx.show_view(&cur),
+                    _ => ctx.finish_view(&cur),
+                };
+                match r {
+                    Ok(st) => ctx.notify(&format!("{label}:{}", st.state), "info"),
+                    Err(e) => return CommandResult::Error(e.to_string()),
+                }
+            }
+            ctx.notify(
+                &format!("view-terminal:{}", code(ctx.remove_view(&cur))),
+                "info",
+            );
+            match ctx.view_state("probe") {
+                Ok(st) => ctx.notify(&format!("view-final:{}", st.state), "info"),
+                Err(e) => return CommandResult::Error(e.to_string()),
+            }
+            let int = pig_sdk::ViewShape::new("integer");
+            let intents = vec![
+                pig_sdk::ViewIntent {
+                    name: "fx.add".into(),
+                    arg: pig_sdk::ViewShape::object(&[("n", int.clone())], &["n"]),
+                    answer: Some(pig_sdk::ViewShape::object(&[("sum", int)], &["sum"])),
+                    ..Default::default()
+                },
+                pig_sdk::ViewIntent {
+                    name: "fx.wait".into(),
+                    arg: pig_sdk::ViewShape::object(
+                        &[("tag", pig_sdk::ViewShape::new("string"))],
+                        &["tag"],
+                    ),
+                    cancellable: true,
+                    timeout_ms: 5000,
+                    ..Default::default()
+                },
+            ];
+            match ctx.mount_view(view_mount("probe2", view_text(ctx, "-live"), intents)) {
+                Ok(st) => ctx.notify(
+                    &format!("view-second:epoch={},rev={}", st.mount.epoch, st.mount.rev),
+                    "info",
+                ),
+                Err(e) => return CommandResult::Error(e.to_string()),
+            }
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "ui_view_cancelled",
+        "Report the intent whose handler was cancelled",
+        |ctx, _args| {
+            let tag = VIEW_CANCELLED_TAG.lock().unwrap().clone();
+            ctx.notify(&format!("intent-cancelled:{tag}"), "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "ui_view_state",
+        "Report the state of the second mount",
+        |ctx, _args| match ctx.view_state("probe2") {
+            Ok(st) => {
+                ctx.notify(&format!("view-state:{}:{}", st.state, st.reason), "info");
+                CommandResult::Ok
+            }
+            Err(e) => CommandResult::Error(e.to_string()),
+        },
+    );
+    // D614 amendment: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewExtras).
+    fn x_claim<'a>(claims: &'a [pig_sdk::ViewClaim], name: &str) -> Option<&'a Value> {
+        claims.iter().find(|c| c.name == name).map(|c| &c.value)
+    }
+    fn x_picked(ab: &pig_sdk::ViewAbilities) -> i64 {
+        ab.slot_claims
+            .iter()
+            .find(|s| s.slot == "panel")
+            .and_then(|s| x_claim(&s.claims, "display.colors"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    }
+    fn x_list(id: &str, label: &str) -> kit::View {
+        kit::View::new(kit::SelectList::new(
+            id,
+            vec![kit::SelectItem::new(id, label)],
+            5,
+        ))
+    }
+    fn x_rects(n: u64) -> Vec<pig_sdk::ViewDrawShape> {
+        (0..n)
+            .map(|_| pig_sdk::ViewDrawShape {
+                kind: "rect".into(),
+                width: 1.0,
+                height: 1.0,
+                ..Default::default()
+            })
+            .collect()
+    }
+    fn x_scene(shapes: Vec<pig_sdk::ViewDrawShape>) -> Option<pig_sdk::ViewDrawing> {
+        Some(pig_sdk::ViewDrawing {
+            profile: "scene".into(),
+            shapes,
+            ..Default::default()
+        })
+    }
+    fn x_code<T>(r: Result<T, pig_sdk::ViewError>) -> String {
+        match r {
+            Ok(_) => "none".into(),
+            Err(e) => e.code,
+        }
+    }
+    fn x_update(mount: &pig_sdk::ViewRef) -> pig_sdk::ViewUpdate {
+        pig_sdk::ViewUpdate {
+            mount: mount.clone(),
+            title: String::new(),
+            view: x_list("base", "fixture-x-base"),
+            intents: vec![],
+            assets: vec![],
+            fallback: None,
+            alternatives: vec![],
+            drawing: None,
+            a11y: vec![],
+            focus: vec![],
+            bindings: vec![],
+        }
+    }
+    fn x_when(claim: &str, op: &str, value: Option<Value>) -> pig_sdk::ViewWhen {
+        pig_sdk::ViewWhen {
+            any: vec![pig_sdk::ViewWhenAll {
+                all: vec![pig_sdk::ViewClause {
+                    claim: claim.into(),
+                    op: op.into(),
+                    value,
+                }],
+            }],
+        }
+    }
+    ext.command(
+        "ui_view_extras",
+        "Mount a view with alternatives, a drawing, a11y and focus, and probe the bounds",
+        |ctx, _args| {
+            let Some(ab) = ctx.view_abilities() else { return CommandResult::Error("no client".into()) };
+            let Some(drawing) = ab.drawing.clone() else { return CommandResult::Error("no drawing abilities".into()) };
+            let picked = x_picked(&ab);
+            let text = |name: &str| x_claim(&ab.claims, name).map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())).unwrap_or_default();
+            let gestures: Vec<String> =
+                x_claim(&ab.claims, "input.gestures").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+            ctx.notify(
+                &format!(
+                    "view-x-claims:colors={},kind={},gestures={},hover={},panel.colors={},profiles={},shapes={},pixels={}",
+                    text("display.colors"),
+                    text("display.kind"),
+                    gestures.join("+"),
+                    text("display.hover"),
+                    picked,
+                    drawing.profiles.join("+"),
+                    drawing.shapes,
+                    drawing.pixels
+                ),
+                "info",
+            );
+            let mut alt_drawing = x_scene(x_rects(drawing.shapes - 1));
+            if let Some(d) = alt_drawing.as_mut() {
+                d.regions = vec![pig_sdk::ViewRegion {
+                    key: "r".into(),
+                    shape: pig_sdk::ViewDrawShape { kind: "rect".into(), width: 4.0, height: 4.0, ..Default::default() },
+                    gestures: vec!["activate".into()],
+                    intent: "fx.tap".into(),
+                    name: "Tap".into(),
+                    ..Default::default()
+                }];
+            }
+            let st = match ctx.mount_view(pig_sdk::ViewMount {
+                key: "extras".into(),
+                slot: "panel".into(),
+                title: String::new(),
+                target: None,
+                view: x_list("base", "fixture-x-base"),
+                intents: vec![pig_sdk::ViewIntent { name: "fx.tap".into(), arg: pig_sdk::ViewShape::new("object"), ..Default::default() }],
+                assets: vec![],
+                fallback: None,
+                alternatives: vec![pig_sdk::ViewAlternative {
+                    when: x_when("display.colors", "equals", Some(json!(picked))),
+                    view: x_list("alt", &format!("fixture-x-alt-{picked}")),
+                    drawing: alt_drawing,
+                }],
+                drawing: None,
+                a11y: vec![
+                    pig_sdk::ViewA11y {
+                        node: "alt".into(),
+                        name: format!("Extras {picked}"),
+                        role: "button".into(),
+                        checked: Some(true),
+                        relations: vec![pig_sdk::ViewRelation { kind: "describedBy".into(), target: "base".into() }],
+                        ..Default::default()
+                    },
+                    pig_sdk::ViewA11y { node: "base".into(), name: "Base".into(), ..Default::default() },
+                ],
+                focus: vec![pig_sdk::ViewFocus { node: "alt".into(), request: "mount".into(), restore: "previous".into() }],
+                bindings: vec![],
+            }) {
+                Ok(st) => st,
+                Err(e) => return CommandResult::Error(e.to_string()),
+            };
+            ctx.notify(&format!("view-x-mounted:{}", st.state), "info");
+            let attempt = |label: &str, update: pig_sdk::ViewUpdate| ctx.notify(&format!("view-x-{label}:{}", x_code(ctx.update_view(update))), "info");
+            let mut update = x_update(&st.mount);
+            update.alternatives = (0..9).map(|_| pig_sdk::ViewAlternative { when: x_when("display.hover", "present", None), view: x_list("base", "fixture-x-base"), drawing: None }).collect();
+            attempt("alts", update);
+            let mut nested = pig_sdk::ViewDrawShape { kind: "rect".into(), width: 1.0, height: 1.0, ..Default::default() };
+            for _ in 0..8 {
+                nested = pig_sdk::ViewDrawShape { kind: "group".into(), children: vec![nested], ..Default::default() };
+            }
+            let mut update = x_update(&st.mount);
+            update.drawing = x_scene(vec![nested]);
+            attempt("nest", update);
+            let mut update = x_update(&st.mount);
+            update.drawing = x_scene(vec![pig_sdk::ViewDrawShape {
+                kind: "polyline".into(),
+                points: (0..1025).map(|i| pig_sdk::ViewPoint { x: f64::from(i), y: f64::from(i) }).collect(),
+                ..Default::default()
+            }]);
+            attempt("points", update);
+            let mut update = x_update(&st.mount);
+            update.drawing = x_scene(x_rects(4097));
+            attempt("shapes", update);
+            let mut update = x_update(&st.mount);
+            update.a11y = (0..257).map(|i| pig_sdk::ViewA11y { node: format!("n{i}"), ..Default::default() }).collect();
+            attempt("a11y", update);
+            let mut update = x_update(&st.mount);
+            update.drawing = x_scene(x_rects(drawing.shapes + 1));
+            attempt("over", update);
+            let mut update = x_update(&st.mount);
+            update.drawing = Some(pig_sdk::ViewDrawing {
+                profile: "pixels".into(),
+                pixels: Some(pig_sdk::ViewPixels { width: 2, height: 2, asset: "img".into(), scaling: "nearest".into() }),
+                ..Default::default()
+            });
+            update.assets = vec![pig_sdk::ViewAsset { id: "img".into(), mime: "image/png".into(), size: 4, sha256: "a".repeat(64), delivery: "inline".into() }];
+            attempt("pixels", update);
+            let mut old = st.mount.clone();
+            old.rev += 50;
+            let mut stale = String::from("none");
+            for _ in 0..3 {
+                stale = x_code(ctx.update_view(x_update(&old)));
+            }
+            ctx.notify(&format!("view-x-stale:{stale}"), "info");
+            let notices = match ctx.view_diagnostics("extras") {
+                Ok(n) => n,
+                Err(e) => return CommandResult::Error(e.to_string()),
+            };
+            let count = |code: &str| notices.iter().filter(|n| n.code == code && n.path == "update").map(|n| n.count).sum::<u64>();
+            ctx.notify(&format!("view-x-diag:invalid={},limit={},unsupported={},stale={}", count("invalid"), count("limit"), count("unsupported"), count("stale")), "info");
+            ctx.notify(&format!("view-x-bigresult:{}", x_code(ctx.finish_view_with(&st.mount, json!("r".repeat(65536))))), "info");
+            CommandResult::Ok
+        },
+    );
+    // D614 bindings: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewBindings).
+    fn b_intents() -> Vec<pig_sdk::ViewIntent> {
+        vec![
+            pig_sdk::ViewIntent {
+                name: "fx.go".into(),
+                arg: pig_sdk::ViewShape::object(
+                    &[("n", pig_sdk::ViewShape::new("integer"))],
+                    &["n"],
+                ),
+                ..Default::default()
+            },
+            pig_sdk::ViewIntent {
+                name: "fx.tap".into(),
+                arg: pig_sdk::ViewShape::new("object"),
+                ..Default::default()
+            },
+        ]
+    }
+    fn b_go(key: &str, n: Value) -> pig_sdk::ViewBinding {
+        pig_sdk::ViewBinding {
+            key: key.into(),
+            intent: "fx.go".into(),
+            arg: Some(json!({ "n": n })),
+            ..Default::default()
+        }
+    }
+    fn b_tap(key: &str) -> pig_sdk::ViewBinding {
+        pig_sdk::ViewBinding {
+            key: key.into(),
+            intent: "fx.tap".into(),
+            ..Default::default()
+        }
+    }
+    ext.command(
+        "ui_view_bindings",
+        "Mount a view with bindings and probe what the host refuses",
+        |ctx, args| {
+            let Some((key, number)) = args.split_once(' ') else {
+                return CommandResult::Error("want a key and a number".into());
+            };
+            let Ok(n) = number.parse::<i64>() else {
+                return CommandResult::Error("want a number".into());
+            };
+            let mut mount = view_mount("bind", view_text(ctx, "-bind"), b_intents());
+            mount.bindings = vec![
+                pig_sdk::ViewBinding {
+                    name: format!("Go {n}"),
+                    ..b_go(key, json!(n))
+                },
+                b_go("w", json!(n + 1)),
+                pig_sdk::ViewBinding {
+                    gesture: "swipe-left".into(),
+                    intent: "fx.tap".into(),
+                    ..Default::default()
+                },
+            ];
+            let st = match ctx.mount_view(mount) {
+                Ok(st) => st,
+                Err(e) => return CommandResult::Error(e.to_string()),
+            };
+            ctx.notify(&format!("view-b-mounted:{}", st.state), "info");
+            let attempt = |label: &str, bindings: Vec<pig_sdk::ViewBinding>| {
+                let mut update = x_update(&st.mount);
+                update.view = view_text(ctx, "-bind");
+                update.intents = b_intents();
+                update.bindings = bindings;
+                ctx.notify(
+                    &format!("view-b-{label}:{}", x_code(ctx.update_view(update))),
+                    "info",
+                );
+            };
+            attempt(
+                "many",
+                "abcdefghijklmnopqrstuvwxyz0123456"
+                    .chars()
+                    .map(|c| b_tap(&c.to_string()))
+                    .collect(),
+            );
+            attempt("reserved", vec![b_tap("shift+tab")]);
+            attempt("order", vec![b_tap("ctrl+shift+p"), b_tap("shift+ctrl+p")]);
+            attempt(
+                "gesture",
+                vec![pig_sdk::ViewBinding {
+                    gesture: "pinch".into(),
+                    intent: "fx.tap".into(),
+                    ..Default::default()
+                }],
+            );
+            attempt("arg", vec![b_go("a", json!("x"))]);
+            attempt(
+                "ok",
+                vec![
+                    b_go("ctrl+shift+p", json!(n)),
+                    b_go("shift+ctrl+q", json!(n + 1)),
+                ],
+            );
+            CommandResult::Ok
+        },
+    );
+    // D614 slot dialog: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewDialog).
+    ext.command(
+        "ui_view_dialog",
+        "Mount a titled view with a bound key in the dialog slot, hide it and show it",
+        |ctx, args| {
+            let Some((key, number)) = args.split_once(' ') else {
+                return CommandResult::Error("want a key and a number".into());
+            };
+            let Ok(n) = number.parse::<i64>() else {
+                return CommandResult::Error("want a number".into());
+            };
+            let int = pig_sdk::ViewShape::new("integer");
+            let mut mount = view_mount(
+                "dlg",
+                view_text(ctx, "-dlg"),
+                vec![pig_sdk::ViewIntent {
+                    name: "fx.add".into(),
+                    arg: pig_sdk::ViewShape::object(&[("n", int.clone())], &["n"]),
+                    answer: Some(pig_sdk::ViewShape::object(&[("sum", int)], &["sum"])),
+                    ..Default::default()
+                }],
+            );
+            mount.slot = "dialog".into();
+            mount.title = format!("Chart {n}");
+            mount.bindings = vec![pig_sdk::ViewBinding {
+                key: key.into(),
+                intent: "fx.add".into(),
+                arg: Some(json!({ "n": n })),
+                ..Default::default()
+            }];
+            let st = match ctx.mount_view(mount) {
+                Ok(st) => st,
+                Err(e) => {
+                    ctx.notify(&format!("view-d-mounted:{}", e.code), "info");
+                    return CommandResult::Ok;
+                }
+            };
+            ctx.notify(&format!("view-d-mounted:{}", st.state), "info");
+            match ctx.hide_view(&st.mount) {
+                Ok(hidden) => ctx.notify(&format!("view-d-hidden:{}", hidden.state), "info"),
+                Err(e) => return CommandResult::Error(e.to_string()),
+            }
+            match ctx.show_view(&st.mount) {
+                Ok(shown) => ctx.notify(&format!("view-d-shown:{}", shown.state), "info"),
+                Err(e) => return CommandResult::Error(e.to_string()),
+            }
+            CommandResult::Ok
+        },
+    );
+    // D614 dismiss: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewDismiss).
+    ext.command(
+        "ui_view_dismiss",
+        "Mount a dialog with a dismiss intent and probe what the host refuses",
+        |ctx, args| {
+            let tap = || pig_sdk::ViewIntent {
+                name: "fx.tap".into(),
+                arg: pig_sdk::ViewShape::new("object"),
+                ..Default::default()
+            };
+            let closing = |name: &str| pig_sdk::ViewIntent {
+                name: name.into(),
+                arg: pig_sdk::ViewShape::new("object"),
+                dismiss: true,
+                ..Default::default()
+            };
+            let mut mount = view_mount(
+                "dismiss",
+                view_text(ctx, "-dismiss"),
+                vec![tap(), closing(args)],
+            );
+            mount.slot = "dialog".into();
+            let st = match ctx.mount_view(mount) {
+                Ok(st) => st,
+                Err(e) => return CommandResult::Error(e.to_string()),
+            };
+            ctx.notify(&format!("view-d-mounted:{}", st.state), "info");
+            let attempt = |label: &str, intents: Vec<pig_sdk::ViewIntent>| {
+                let mut update = x_update(&st.mount);
+                update.view = view_text(ctx, "-dismiss");
+                update.intents = intents;
+                ctx.notify(
+                    &format!("view-d-{label}:{}", x_code(ctx.update_view(update))),
+                    "info",
+                );
+            };
+            attempt(
+                "two",
+                vec![tap(), closing(args), closing(&format!("{args}2"))],
+            );
+            attempt(
+                "node",
+                vec![
+                    tap(),
+                    pig_sdk::ViewIntent {
+                        node_key: "n".into(),
+                        ..closing(args)
+                    },
+                ],
+            );
+            attempt(
+                "arg",
+                vec![
+                    tap(),
+                    pig_sdk::ViewIntent {
+                        arg: pig_sdk::ViewShape::object(
+                            &[("value", pig_sdk::ViewShape::new("string"))],
+                            &["value"],
+                        ),
+                        ..closing(args)
+                    },
+                ],
+            );
+            attempt("ok", vec![closing(args), tap()]);
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "ui_view_extras_end",
+        "Read the notices of the extras mount and finish it with a result",
+        |ctx, _args| {
+            let Some(ab) = ctx.view_abilities() else {
+                return CommandResult::Error("no client".into());
+            };
+            let picked_of = |st: &pig_sdk::ViewStatus| {
+                st.result
+                    .as_ref()
+                    .and_then(|r| r.get("picked"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+            };
+            let run = || -> Result<(), pig_sdk::ViewError> {
+                let st = ctx.view_state("extras")?;
+                let notices = ctx.view_diagnostics("extras")?;
+                ctx.notify(
+                    &format!(
+                        "view-x-diag2:n={},last={}",
+                        notices.len(),
+                        notices.last().map(|n| n.path.as_str()).unwrap_or("")
+                    ),
+                    "info",
+                );
+                let done = ctx.finish_view_with(&st.mount, json!({"picked": x_picked(&ab)}))?;
+                ctx.notify(
+                    &format!("view-x-finished:{},picked={}", done.state, picked_of(&done)),
+                    "info",
+                );
+                let cur = ctx.view_state("extras")?;
+                ctx.notify(
+                    &format!("view-x-state:{},picked={}", cur.state, picked_of(&cur)),
+                    "info",
+                );
+                Ok(())
+            };
+            match run() {
+                Ok(()) => CommandResult::Ok,
+                Err(e) => CommandResult::Error(e.to_string()),
+            }
+        },
+    );
+    register_view_rows(&mut ext);
+    // D614: a view an agent's tool shows. The command registers the tool; the tool mounts a titled panel, hides it,
+    // shows it and updates it with a focus request, the same way in every SDK fixture (conformance
+    // TestConformance_UIViewToolShowsAndFocuses).
+    // D521: bigint_tool registers a tool whose schema declares a bigint parameter and answers the kind of value it receives for it and the value.
+    ext.command(
+        "bigint_tool",
+        "Register the tool that reports what a bigint argument arrives as",
+        |ctx, _args| {
+            let tool = ToolDefinition::new(
+                "bigint_arg",
+                "bigint_arg",
+                "Report the kind and value of n",
+                json!({"type": "object", "required": ["n"], "properties": {"n": {"type": "bigint"}}}),
+                |_ctx, params| {
+                    let value = params.get("n").cloned().unwrap_or(Value::Null);
+                    let kind = if value.is_string() { "string" } else { "other" };
+                    let shown = value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string());
+                    ToolResult::text(format!("{kind}:{shown}"))
+                },
+            );
+            match ctx.register_tool(tool) {
+                Ok(()) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    ext.command(
+        "ui_view_tool",
+        "Register the tool that shows a titled view",
+        |ctx, _args| {
+            let tool = ToolDefinition::new(
+                "view_show",
+                "view_show",
+                "Mount, show and focus a titled view",
+                json!({"type": "object"}),
+                |ctx, params| {
+                    let text = |name: &str| {
+                        params
+                            .get(name)
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    let (title, node) = (text("title"), text("node"));
+                    let run = || -> Result<String, pig_sdk::ViewError> {
+                        if text("op") == "hide" {
+                            let st = ctx.hide_view(&ctx.view_state("shown")?.mount)?;
+                            return Ok(format!("view-tool:{}", st.state));
+                        }
+                        let intents = || {
+                            vec![
+                                pig_sdk::ViewIntent {
+                                    name: "fx.reopen".into(),
+                                    arg: pig_sdk::ViewShape::new("object"),
+                                    when_hidden: true,
+                                    ..Default::default()
+                                },
+                                pig_sdk::ViewIntent {
+                                    name: "fx.tap".into(),
+                                    arg: pig_sdk::ViewShape::new("object"),
+                                    ..Default::default()
+                                },
+                            ]
+                        };
+                        let focus = |request: &str| {
+                            vec![pig_sdk::ViewFocus {
+                                node: node.clone(),
+                                request: request.into(),
+                                ..Default::default()
+                            }]
+                        };
+                        let st = ctx.mount_view(pig_sdk::ViewMount {
+                            key: "shown".into(),
+                            slot: "panel".into(),
+                            title: title.clone(),
+                            target: None,
+                            view: x_list(&node, "fixture-shown"),
+                            intents: intents(),
+                            assets: vec![],
+                            fallback: None,
+                            alternatives: vec![],
+                            drawing: None,
+                            a11y: vec![],
+                            focus: focus(""),
+                            bindings: vec![],
+                        })?;
+                        let st = ctx.hide_view(&st.mount)?;
+                        let st = ctx.show_view(&st.mount)?;
+                        let st = ctx.update_view(pig_sdk::ViewUpdate {
+                            mount: st.mount,
+                            title: format!("{title}/2"),
+                            view: x_list(&node, "fixture-shown"),
+                            intents: intents(),
+                            assets: vec![],
+                            fallback: None,
+                            alternatives: vec![],
+                            drawing: None,
+                            a11y: vec![],
+                            focus: focus("update"),
+                            bindings: vec![],
+                        })?;
+                        Ok(format!("view-tool:{},rev={}", st.state, st.mount.rev))
+                    };
+                    match run() {
+                        Ok(text) => ToolResult::text(text),
+                        Err(e) => ToolResult::Error(e.to_string()),
+                    }
+                },
+            );
+            match ctx.register_tool(tool) {
+                Ok(()) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    // D614 grid node: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewGrid). The
+    // argument is the row's token: the cell values, the selection and one chip text are built from it.
+    fn g_mount(tok: &str, grid: kit::Grid) -> pig_sdk::ViewMount {
+        pig_sdk::ViewMount {
+            fallback: Some(kit::Text::new(format!("grid-fallback {tok}"), 0, 0).into()),
+            ..view_mount(
+                "grid",
+                kit::View::new(
+                    Container::new()
+                        .child(kit::Text::new(format!("Month {tok}"), 0, 0))
+                        .child(grid),
+                ),
+                vec![pig_sdk::ViewIntent {
+                    name: "fx.pick".into(),
+                    node_key: "month".into(),
+                    arg: pig_sdk::ViewShape::object(
+                        &[("value", pig_sdk::ViewShape::new("string"))],
+                        &["value"],
+                    ),
+                    ..Default::default()
+                }],
+            )
+        }
+    }
+    ext.command(
+        "ui_view_grid",
+        "Mount a month as a grid and probe the bounds of the grid",
+        |ctx, args| {
+            let tok = args.trim();
+            let mut cells = vec![
+                kit::GridCell::new().label("30").dim(true),
+                kit::GridCell::new().label("31").dim(true),
+            ];
+            for d in 1..=28 {
+                let cell = kit::GridCell::new().value(format!("{tok}-{d}"));
+                let cell = if d == 28 {
+                    cell
+                } else {
+                    cell.label(d.to_string())
+                };
+                cells.push(match d {
+                    1 => cell
+                        .chip(kit::GridChip::new(format!("{tok} standup")).color("#3366cc"))
+                        .chip(kit::GridChip::new("lunch").color("accent"))
+                        .more(2),
+                    2 => cell.mark("current").color("#ff000080"),
+                    3 => cell.chip(kit::GridChip::new("plain")),
+                    _ => cell,
+                });
+            }
+            let month = kit::Grid::new("month", 7, cells)
+                .head(["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"])
+                .chip_rows(2)
+                .selected(format!("{tok}-2"));
+            let st = match ctx.mount_view(g_mount(tok, month)) {
+                Ok(st) => st,
+                Err(e) => return CommandResult::Error(e.to_string()),
+            };
+            ctx.notify(&format!("view-g-mounted:{}", st.state), "info");
+            let attempt = |label: &str, columns: u32, cells: Vec<kit::GridCell>| {
+                let m = g_mount(tok, kit::Grid::new("month", columns, cells));
+                let update = pig_sdk::ViewUpdate {
+                    mount: st.mount.clone(),
+                    title: String::new(),
+                    view: m.view,
+                    intents: m.intents,
+                    assets: vec![],
+                    fallback: m.fallback,
+                    alternatives: vec![],
+                    drawing: None,
+                    a11y: vec![],
+                    focus: vec![],
+                    bindings: vec![],
+                };
+                ctx.notify(
+                    &format!("view-g-{label}:{}", x_code(ctx.update_view(update))),
+                    "info",
+                );
+            };
+            attempt("cells", 7, vec![kit::GridCell::new().label("x"); 129]);
+            let mut crowded = kit::GridCell::new().value("a");
+            for _ in 0..9 {
+                crowded = crowded.chip(kit::GridChip::new("c"));
+            }
+            attempt("chips", 7, vec![crowded]);
+            attempt("columns", 17, vec![kit::GridCell::new().value("a")]);
+            attempt("mark", 7, vec![kit::GridCell::new().value("a").mark(tok)]);
+            match ctx.view_state("grid") {
+                Ok(cur) => ctx.notify(
+                    &format!("view-g-state:{},rev={}", cur.state, cur.mount.rev),
+                    "info",
+                ),
+                Err(e) => return CommandResult::Error(e.to_string()),
+            }
+            CommandResult::Ok
+        },
+    );
+    // D614 node ids: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewNodeIds). The
+    // argument is the row's token: the ids of the container, the text and the box are built from it.
+    ext.command(
+        "ui_view_node_ids",
+        "Mount a view whose container, text and box carry an id",
+        |ctx, args| {
+            let tok = args.trim();
+            let root = Container::new()
+                .id(format!("{tok}-root"))
+                .child(
+                    kit::Text::new(format!("Label {tok}"), 0, 0)
+                        .id(format!("{tok}-label"))
+                        .bg("selectedBg"),
+                )
+                .child(
+                    kit::Box::new(1, 0)
+                        .id(format!("{tok}-frame"))
+                        .bg("toolPendingBg")
+                        .child(kit::Text::new("inside", 0, 0)),
+                );
+            let mut mount = view_mount("ids", kit::View::new(root), vec![]);
+            mount.a11y = vec![pig_sdk::ViewA11y {
+                node: format!("{tok}-label"),
+                name: format!("Label {tok}"),
+                ..Default::default()
+            }];
+            match ctx.mount_view(mount) {
+                Ok(st) => ctx.notify(&format!("view-i-mounted:{}", st.state), "info"),
+                Err(e) => return CommandResult::Error(e.to_string()),
+            }
+            CommandResult::Ok
+        },
+    );
+    // D614 image id: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewImageID). The argument is the row's token and a Kitty image id only that row uses: the image node carries both, its bytes are the token's.
+    ext.command(
+        "ui_view_image_id",
+        "Mount a view whose image node carries a Kitty image id",
+        |ctx, args| {
+            let Some((tok, number)) = args.trim().split_once(' ') else {
+                return CommandResult::Error("want a token and an image id".into());
+            };
+            let Ok(number) = number.parse::<u32>() else {
+                return CommandResult::Error("the image id is not a number".into());
+            };
+            let image = kit::Image::new(format!("pig-image-{tok}").into_bytes(), "image/png")
+                .id(format!("{tok}-photo"))
+                .image_id(number)
+                .filename(format!("{tok}.png"));
+            match ctx.mount_view(view_mount("image-id", kit::View::new(image), vec![])) {
+                Ok(st) => ctx.notify(&format!("view-m-mounted:{}", st.state), "info"),
+                Err(e) => return CommandResult::Error(e.to_string()),
+            }
+            CommandResult::Ok
+        },
+    );
+    ext.on_view_intent(|inv| match inv.intent.as_str() {
+        // The user dismissed the dialog: the client raised the intent with {}, and its handler removes the mount.
+        name if name.starts_with("fx.close-") => {
+            if inv.arg != json!({}) {
+                return pig_sdk::ViewIntentResult::refused("dismiss takes {}");
+            }
+            let removed = inv.context.remove_view(&pig_sdk::ViewRef {
+                key: inv.mount.key.clone(),
+                epoch: inv.mount.epoch,
+                rev: inv.rev,
+            });
+            match removed {
+                Ok(_) => pig_sdk::ViewIntentResult::done(json!({})),
+                Err(e) => pig_sdk::ViewIntentResult::failed(&e.to_string()),
+            }
+        }
+        "fx.redraw" | "fx.foreign" => redraw_intent(&inv),
+        // The user opened the hidden view: its handler shows it.
+        "fx.reopen" => {
+            let shown = inv.context.show_view(&pig_sdk::ViewRef {
+                key: inv.mount.key.clone(),
+                epoch: inv.mount.epoch,
+                rev: inv.rev,
+            });
+            match shown {
+                Ok(_) => pig_sdk::ViewIntentResult::done(json!({})),
+                Err(e) => pig_sdk::ViewIntentResult::failed(&e.to_string()),
+            }
+        }
+        "fx.pick" => pig_sdk::ViewIntentResult::done(json!({
+            "node": inv.node_key,
+            "picked": inv.arg.get("value").and_then(Value::as_str).unwrap_or(""),
+        })),
+        "fx.add" => {
+            let n = inv.arg.get("n").and_then(Value::as_i64).unwrap_or(0);
+            let extra = inv
+                .context
+                .view_abilities()
+                .map(|a| a.limits.intent_arg_bytes as i64)
+                .unwrap_or(0);
+            pig_sdk::ViewIntentResult::done(json!({"sum": n * 2 + extra}))
+        }
+        "fx.wait" => {
+            let tag = inv
+                .arg
+                .get("tag")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            inv.context.notify(&format!("intent-started:{tag}"), "info");
+            while !inv.context.is_cancelled() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            // A call made after the cancel is cancelled with its request, so the tag is kept for ui_view_cancelled.
+            *VIEW_CANCELLED_TAG.lock().unwrap() = tag;
+            pig_sdk::ViewIntentResult::done(json!({}))
+        }
+        _ => pig_sdk::ViewIntentResult::refused("unknown intent"),
+    });
     ext.command(
         "report_geometry",
         "Report observed terminal geometry",
@@ -3414,6 +5203,91 @@ fn main() {
         }
     });
     ext.command(
+        "send_user_message_delivery",
+        "Send a user message with the delivery named by the argument",
+        |ctx, args| match ctx.send_user_message(
+            format!("delivery-{args}"),
+            if args == "absent" { "" } else { args },
+        ) {
+            Ok(_) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    ext.command(
+        "send_refusal_order",
+        "Send a refused user message and others in one run, as the argument names",
+        |ctx, args| {
+            const FIRST: [(&str, &str); 3] = [
+                ("order-absent", ""),
+                ("order-steer", "steer"),
+                ("order-followUp", "followUp"),
+            ];
+            fn send(ctx: &pig_sdk::Context, items: &[(&str, &str)]) -> CommandResult {
+                for (text, deliver_as) in items {
+                    if let Err(err) = ctx.send_user_message(*text, deliver_as) {
+                        return CommandResult::Error(err.to_string());
+                    }
+                }
+                CommandResult::Ok
+            }
+            fn after_return(
+                ctx: &pig_sdk::Context,
+                items: &'static [(&'static str, &'static str)],
+            ) {
+                let ctx = ctx.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(100));
+                    send(&ctx, items);
+                });
+            }
+            match args {
+                "first" => send(ctx, &FIRST),
+                "between" => send(
+                    ctx,
+                    &[
+                        ("order-absent", ""),
+                        ("order-steer", "steer"),
+                        ("order-absent-2", ""),
+                    ],
+                ),
+                "yielded" => match ctx.yield_now() {
+                    Ok(_) => send(ctx, &FIRST),
+                    Err(err) => CommandResult::Error(err.to_string()),
+                },
+                "throws" => match send(ctx, &FIRST) {
+                    CommandResult::Ok => CommandResult::Error("order-throws".to_string()),
+                    failed => failed,
+                },
+                "blocked" => {
+                    let sent = send(ctx, &FIRST);
+                    thread::sleep(Duration::from_secs(30));
+                    sent
+                }
+                "detached" => {
+                    after_return(ctx, &FIRST);
+                    CommandResult::Ok
+                }
+                "detached_alone" => {
+                    after_return(ctx, &[("order-absent", "")]);
+                    CommandResult::Ok
+                }
+                other => CommandResult::Error(format!("send_refusal_order: unknown case {other}")),
+            }
+        },
+    );
+    ext.command(
+        "send_user_message_expand",
+        "Send a user message with expandPromptTemplates set to the argument",
+        |ctx, args| match ctx.send_user_message_with(
+            "expand-user",
+            "followUp",
+            Some(args == "true"),
+        ) {
+            Ok(_) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    ext.command(
         "settings_probe",
         "Report the effective settings",
         |ctx, _args| match ctx.get_settings() {
@@ -3476,6 +5350,94 @@ fn main() {
                 Ok(None)
             });
             event_field_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    let event_level_subscriber = ext.event_subscriber();
+    let event_level_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    // event_level_edit_probe `<event> <top|deep>`: a handler that edits the event in place and returns nothing. `top` assigns a member of the event itself (probeTop); `deep` edits inside the message the event carries (the first user message of a `messages` list): the text of its first text block, else a string content, else a `probe` member. Every edit writes `other-event-edit`.
+    ext.command(
+        "event_level_edit_probe",
+        "Subscribe to the event named by the argument `<event> <top|deep>` with a handler that edits the event itself or the message inside it in place",
+        move |_ctx, args| {
+            let mut words = args.split_whitespace();
+            let name = words.next().unwrap_or("").to_string();
+            let top = words.next() == Some("top");
+            let subscription = subscribe(&event_level_subscriber, &name, move |_ctx, data| {
+                let edited = Value::from("other-event-edit");
+                if top {
+                    data["probeTop"] = edited;
+                    return Ok(None);
+                }
+                let target: Option<&mut Value> = if data.get("message").is_some() {
+                    data.get_mut("message")
+                } else if let Some(list) = data.get_mut("messages").and_then(|v| v.as_array_mut()) {
+                    let at = list
+                        .iter()
+                        .position(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                        .unwrap_or(0);
+                    list.get_mut(at)
+                } else {
+                    None
+                };
+                let Some(target) = target.filter(|t| t.is_object()) else {
+                    return Ok(None);
+                };
+                let first_is_text = target
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .and_then(|c| c.first())
+                    .is_some_and(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"));
+                if first_is_text {
+                    target["content"][0]["text"] = edited;
+                } else if target.get("content").is_some_and(|c| c.is_string()) {
+                    target["content"] = edited;
+                } else {
+                    target["probe"] = edited;
+                }
+                Ok(None)
+            });
+            event_level_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    let event_member_subscriber = ext.event_subscriber();
+    let event_member_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    // event_member_probe `<event> <set|delete|once> <member> [json]`: a handler that assigns the member the JSON, deletes it, or (once) assigns it in its first call only and reports `member_probe_stale:<event>:<bool>` whether a later call found it already there.
+    ext.command(
+        "event_member_probe",
+        "Subscribe to the event named by the argument `<event> <set|delete|once> <member> [json]` with a handler that assigns, deletes or once assigns a member of the event",
+        move |_ctx, args| {
+            let mut words = args.trim().splitn(4, char::is_whitespace);
+            let name = words.next().unwrap_or("").to_string();
+            let op = words.next().unwrap_or("").to_string();
+            let member = words.next().unwrap_or("").to_string();
+            let value: Value = match words.next().map(str::trim) {
+                Some(raw) if !raw.is_empty() => match serde_json::from_str(raw) {
+                    Ok(value) => value,
+                    Err(err) => return CommandResult::Error(err.to_string()),
+                },
+                _ => Value::Null,
+            };
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let reported = name.clone();
+            let subscription = subscribe(&event_member_subscriber, &name, move |ctx, data| {
+                let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if op == "delete" {
+                    if let Some(object) = data.as_object_mut() {
+                        object.remove(&member);
+                    }
+                } else if op == "once" && call > 1 {
+                    let stale = data.get(member.as_str()) == Some(&value);
+                    ctx.notify(&format!("member_probe_stale:{}:{}", reported, stale), "info");
+                } else {
+                    data[member.as_str()] = value.clone();
+                }
+                Ok(None)
+            });
+            event_member_subscriptions.lock().unwrap().push(subscription);
             CommandResult::Ok
         },
     );
@@ -3782,6 +5744,46 @@ fn main() {
             CommandResult::Ok
         },
     );
+    ext.command(
+        "set_model_object",
+        "Switch to the model object in the arguments",
+        |ctx, args| {
+            let model: serde_json::Value = match serde_json::from_str(args) {
+                Ok(model) => model,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let (ok, error) = ctx.set_model(&model);
+            if error.is_empty() {
+                ctx.notify(&format!("setModelObject={ok}"), "info");
+            } else {
+                ctx.notify(&format!("setModelObject=error:{error}"), "info");
+            }
+            CommandResult::Ok
+        },
+    );
+    let before_agent_model_subscriber = ext.event_subscriber();
+    ext.command(
+        "set_model_object_before_agent_start",
+        "Switch to the model object in the arguments before each agent start",
+        move |_ctx, args| {
+            let model: serde_json::Value = match serde_json::from_str(args) {
+                Ok(model) => model,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let subscription =
+                before_agent_model_subscriber.on_before_agent_start(move |ctx, _event| {
+                    let (ok, error) = ctx.set_model(&model);
+                    if !error.is_empty() {
+                        return Err(error);
+                    }
+                    ctx.notify(&format!("beforeAgentSetModel={ok}"), "info");
+                    Ok(None)
+                });
+            // The handler stays subscribed for the life of the extension.
+            std::mem::forget(subscription);
+            CommandResult::Ok
+        },
+    );
     let event_probe_on_subscriber = ext.event_subscriber();
     let event_probe_on_subscriptions: Arc<Mutex<Vec<(String, pig_sdk::EventSubscription)>>> =
         Arc::new(Mutex::new(Vec::new()));
@@ -3843,10 +5845,19 @@ fn main() {
                     "info",
                 );
                 let mut queued = results.lock().unwrap();
-                Ok(queued
+                let value = queued
                     .get_mut(&reported)
                     .filter(|values| !values.is_empty())
-                    .map(|values| values.remove(0)))
+                    .map(|values| values.remove(0));
+                // Pi ignores what a before_provider_headers handler returns and sends the headers object the handlers edited (runner.ts emitBeforeProviderHeaders), so the queued result becomes the headers by editing event.headers in place, as the Node fixture does.
+                if reported == "before_provider_headers"
+                    && let (Some(Value::Object(replacement)), Some(headers)) =
+                        (value.as_ref(), data["headers"].as_object_mut())
+                {
+                    *headers = replacement.clone();
+                    return Ok(None);
+                }
+                Ok(value)
             });
             event_probe_on_subscriptions
                 .lock()
@@ -3874,6 +5885,98 @@ fn main() {
             CommandResult::Ok
         },
     );
+    // lone_passthrough subscribes to the event named by the argument with a handler that returns the value it received, and lone_send sends the
+    // argument's text back through sendUserMessage, sendMessage or registerProvider (TestConformance_LoneSurrogatePassThroughAcrossSDKs).
+    fn lone_units(text: Option<&str>) -> String {
+        match text {
+            Some(text) => text
+                .chars()
+                .map(|unit| format!("{:x}", unit as u32))
+                .collect::<Vec<_>>()
+                .join("."),
+            None => "none".to_string(),
+        }
+    }
+    let lone_subscriber = ext.event_subscriber();
+    let lone_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "lone_passthrough",
+        "Subscribe to the event named by the argument with a handler that returns the value it received",
+        move |_ctx, args| {
+            let name = args.trim().to_string();
+            let reported = name.clone();
+            let event = if name == "context_edit" {
+                "context"
+            } else {
+                name.as_str()
+            };
+            let subscription = subscribe(&lone_subscriber, event, move |ctx, data| {
+                let (seen, result) = match reported.as_str() {
+                    "input" => (
+                        data["text"].as_str().map(str::to_string),
+                        json!({"action": "transform", "text": data["text"]}),
+                    ),
+                    "before_agent_start" => (
+                        data["systemPrompt"].as_str().map(str::to_string),
+                        json!({"systemPrompt": data["systemPrompt"]}),
+                    ),
+                    "tool_result" => (
+                        data["content"][0]["text"].as_str().map(str::to_string),
+                        json!({"content": data["content"]}),
+                    ),
+                    _ => (
+                        data["messages"][0]["content"]
+                            .as_str()
+                            .or_else(|| data["messages"][0]["content"][0]["text"].as_str())
+                            .map(str::to_string),
+                        if reported == "context_edit" {
+                            json!({"messages": [data["messages"][0], {"role": "user", "content": "edited", "timestamp": 2}]})
+                        } else {
+                            json!({"messages": data["messages"]})
+                        },
+                    ),
+                };
+                ctx.notify(
+                    &format!("lone_seen:{}:{}", reported, lone_units(seen.as_deref())),
+                    "info",
+                );
+                Ok(Some(result))
+            });
+            lone_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "lone_send",
+        "Send the argument's text back through sendUserMessage, sendMessage or registerProvider",
+        |ctx, args| {
+            let (kind, value) = args.trim().split_once(' ').unwrap_or((args.trim(), ""));
+            ctx.notify(
+                &format!("lone_seen:{}:{}", kind, lone_units(Some(value))),
+                "info",
+            );
+            let sent = match kind {
+                "user" => ctx
+                    .send_user_message(serde_json::Value::String(value.to_string()), "followUp")
+                    .map(|_| ())
+                    .map_err(|err| err.to_string()),
+                "custom" => ctx
+                    .send_message("lone", value, true, None, None)
+                    .map(|_| ())
+                    .map_err(|err| err.to_string()),
+                _ => ctx
+                    .model_registry()
+                    .register_provider("lone-compat", json!({"baseUrl":"https://probe.invalid/v1","api":"openai-completions","apiKey":"probe-key","models":[{"id":"m","name":value,"reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1000,"maxTokens":100,"compat":{"openRouterRouting":{"sort":value}}}]}))
+                    .map(|_| ())
+                    .map_err(|err| err.to_string()),
+            };
+            match sent {
+                Ok(()) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err),
+            }
+        },
+    );
     let event_probe_result_subscriber = ext.event_subscriber();
     let event_probe_result_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
         Arc::new(Mutex::new(Vec::new()));
@@ -3895,6 +5998,263 @@ fn main() {
                 .lock()
                 .unwrap()
                 .push(subscription);
+            CommandResult::Ok
+        },
+    );
+    // event_signal_probe subscribes to session_before_compact or session_before_tree with a handler that returns the state of its event signal (the request's cancellation) on its first line and after a dialog it opened was answered, and the dialog's answer: the signal aborts while the dialog is pending (mode "wait") or before the handler runs (mode "first"), and Pi's in-process host call still returns its answer.
+    let event_signal_subscriber = ext.event_subscriber();
+    let event_signal_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "event_signal_probe",
+        "Subscribe to session_before_compact or session_before_tree with a handler that returns the state of its event signal",
+        move |_ctx, args| {
+            let name = args.trim().to_string();
+            let event = name.clone();
+            let subscription = subscribe(&event_signal_subscriber, &name, move |hctx, data| {
+                let source: &serde_json::Value = if event == "session_before_tree" {
+                    data.get("preparation").unwrap_or(&serde_json::Value::Null)
+                } else {
+                    &*data
+                };
+                let mode = source
+                    .get("customInstructions")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let before = hctx.is_cancelled();
+                let answer = match hctx.input(&format!("event_signal:{event}:{mode}:pending"), "p") {
+                    Ok((value, _)) => value.as_str().unwrap_or("").to_string(),
+                    Err(error) => format!("failed: {error}"),
+                };
+                let state = format!("event_signal:{mode}:{before}:{}:{answer}", hctx.is_cancelled());
+                if event == "session_before_compact" {
+                    Ok(Some(serde_json::json!({"compaction": {"summary": state, "firstKeptEntryId": "k", "tokensBefore": 1}})))
+                } else {
+                    Ok(Some(serde_json::json!({"label": state})))
+                }
+            });
+            event_signal_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    // tool_call_abort_probe subscribes to tool_call with a handler that answers from a dialog it opened (TestConformance_ToolCallHandlerIsAwaitedThroughTheAbort).
+    let tool_call_abort_subscriber = ext.event_subscriber();
+    let tool_call_abort_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "tool_call_abort_probe",
+        "Subscribe to tool_call with a handler that answers from a dialog it opened",
+        move |_ctx, _args| {
+            let subscription = subscribe(&tool_call_abort_subscriber, "tool_call", move |hctx, data| {
+                let mode = data
+                    .get("input")
+                    .and_then(|input| input.get("mode"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let answer = match hctx.input(&format!("tool_call_abort:{mode}:pending"), "p") {
+                    Ok((value, _)) => value.as_str().unwrap_or("").to_string(),
+                    Err(error) => format!("failed: {error}"),
+                };
+                Ok(Some(serde_json::json!({"block": true, "reason": format!("tool_call_abort:{mode}:{answer}")})))
+            });
+            tool_call_abort_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    let event_ordered_result_subscriber = ext.event_subscriber();
+    let event_ordered_result_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "event_ordered_result_probe",
+        "Subscribe to an event with a handler that returns the given JSON, members in written order",
+        move |_ctx, args| {
+            let trimmed = args.trim();
+            let (name, raw) = trimmed.split_once(' ').unwrap_or((trimmed, "null"));
+            // serde_json keeps the members in the order they are written (preserve_order).
+            let result: serde_json::Value = match serde_json::from_str(raw) {
+                Ok(value) => value,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let subscription = subscribe(&event_ordered_result_subscriber, name, move |_ctx, _data| {
+                Ok(Some(result.clone()))
+            });
+            event_ordered_result_subscriptions
+                .lock()
+                .unwrap()
+                .push(subscription);
+            CommandResult::Ok
+        },
+    );
+    let event_keys_subscriber = ext.event_subscriber();
+    let event_keys_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "event_keys_probe",
+        "Subscribe to the event named by the argument with a handler that reports the key order of its payload",
+        move |_ctx, args| {
+            let name = args.trim().to_string();
+            let reported = name.clone();
+            let subscription = subscribe(&event_keys_subscriber, &name, move |ctx, data| {
+                let keys = |value: &Value| -> Vec<String> {
+                    value.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default()
+                };
+                let payload = &data["payload"];
+                let wire = serde_json::json!([keys(payload), keys(&payload["zeta"])]);
+                ctx.notify(&format!("event_keys:{reported}:{wire}"), "info");
+                Ok(None)
+            });
+            event_keys_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    let event_echo_subscriber = ext.event_subscriber();
+    let event_echo_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "event_echo_probe",
+        "Subscribe to the event named by the argument with a handler that hands back the objects it was sent",
+        move |_ctx, args| {
+            let name = args.trim().to_string();
+            let echoed = name.clone();
+            let subscription = subscribe(&event_echo_subscriber, &name, move |_ctx, data| {
+                let member = |key: &str| data.get(key).cloned().unwrap_or(Value::Null);
+                match echoed.as_str() {
+                    "turn_end" => Ok(Some(serde_json::json!({ "entries": member("entries") }))),
+                    "context" => {
+                        let messages = member("messages");
+                        let rest: Vec<Value> = messages.as_array().map(|m| m[1..].to_vec()).unwrap_or_default();
+                        Ok(Some(serde_json::json!({ "messages": rest })))
+                    }
+                    "before_provider_request" => Ok(Some(member("payload"))),
+                    "tool_result" => Ok(Some(serde_json::json!({ "content": member("content"), "details": member("details") }))),
+                    "message_end" => Ok(Some(serde_json::json!({ "message": member("message") }))),
+                    other => Err(format!("event_echo_probe has no echo for {other}")),
+                }
+            });
+            event_echo_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    let event_mutate_subscriber = ext.event_subscriber();
+    let event_mutate_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "event_mutate_probe",
+        "Subscribe to the event named by the argument `<event> [mode]` with a handler that works on the event's payload (before_provider_request) or headers (before_provider_headers) as the mode says: no mode edits it in place and returns nothing, fail edits it and fails, replace edits nothing and returns a replacement, both edits it in place under a key of its own and returns the replacement, delete (headers) sets the header the first edit wrote to null",
+        move |_ctx, args| {
+            let (name, mode) = match args.trim().split_once(' ') {
+                Some((name, mode)) => (name.to_string(), mode.trim().to_string()),
+                None => (args.trim().to_string(), String::new()),
+            };
+            let headers = name == "before_provider_headers";
+            let subscription = subscribe(&event_mutate_subscriber, &name, move |_ctx, data| {
+                let key = match mode.as_str() {
+                    "fail" => "inPlaceBeforeError",
+                    "both" => "inPlaceAlongside",
+                    _ => "inPlace",
+                };
+                if headers {
+                    if mode == "delete" {
+                        data["headers"]["x-pig-inPlace"] = Value::Null;
+                    } else if mode != "replace" {
+                        data["headers"][format!("x-pig-{key}")] = Value::from("in-place-edit");
+                    }
+                } else if mode != "replace" {
+                    data["payload"][key] = Value::from("in-place-edit");
+                    if data["payload"]["zeta"].is_object() {
+                        data["payload"]["zeta"][key] = Value::from("in-place-edit");
+                    }
+                }
+                if mode == "fail" {
+                    return Err("failed after the edit".to_string());
+                }
+                if mode == "replace" || mode == "both" {
+                    return Ok(Some(if headers {
+                        serde_json::json!({"x-pig-replaced": "returned"})
+                    } else {
+                        serde_json::json!({"replaced": "returned"})
+                    }));
+                }
+                Ok(None)
+            });
+            event_mutate_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    let event_edit_subscriber = ext.event_subscriber();
+    let event_edit_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    // event_assign_probe: `<event>`, a handler that ASSIGNS a new value to the event's input (tool_call), messages (context) or entries (turn_end) instead of editing the old value in place, and returns nothing.
+    let event_assign_subscriber = ext.event_subscriber();
+    let event_assign_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "event_assign_probe",
+        "Subscribe to the event named by the argument with a handler that assigns a new value to the event's input, messages or entries",
+        move |_ctx, args| {
+            let (name, variant) = args.trim().split_once(' ').map_or((args.trim().to_string(), String::new()), |(n, v)| (n.to_string(), v.to_string()));
+            let which = name.clone();
+            let subscription = subscribe(&event_assign_subscriber, &name, move |_ctx, data| {
+                match which.as_str() {
+                    "tool_call" => data["input"] = serde_json::json!({"command": "other-event-edit"}),
+                    "context" => {
+                        data["messages"] = match variant.as_str() {
+                            "bad" => serde_json::json!("oops"),
+                            "badmsg" => serde_json::json!([42]),
+                            _ => serde_json::json!([{"role": "user", "content": [{"type": "text", "text": "other-event-edit"}], "timestamp": 1}]),
+                        }
+                    }
+                    "turn_end" => {
+                        data["entries"] = serde_json::json!([{"type": "custom", "customType": "other-event-edit"}])
+                    }
+                    other => return Err(format!("event_assign_probe has no event {other}")),
+                }
+                Ok(None)
+            });
+            event_assign_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    // event_edit_probe: `<event> <edit> [fail]`, a handler that makes one edit of the event's content, details, isError, message or messages (tool_result, message_end, context), returns nothing and, with fail, errors after the edit. Every edit writes the value `other-event-edit`, which no other test uses.
+    ext.command(
+        "event_edit_probe",
+        "Subscribe to the event named by the argument with a handler that edits the event in place and returns nothing",
+        move |_ctx, args| {
+            let words: Vec<&str> = args.split_whitespace().collect();
+            let (name, edit, fail) = (
+                words[0].to_string(),
+                words[1].to_string(),
+                words.get(2) == Some(&"fail"),
+            );
+            let which = format!("{name}/{edit}");
+            let subscription = subscribe(&event_edit_subscriber, &name, move |_ctx, data| {
+                let edited = Value::from("other-event-edit");
+                let text = || serde_json::json!([{"type": "text", "text": "other-event-edit"}]);
+                match which.as_str() {
+                    "tool_result/content-assign" => data["content"] = text(),
+                    "tool_result/details-assign" => {
+                        data["details"] = serde_json::json!({"k": "other-event-edit"})
+                    }
+                    "tool_result/iserror-assign" => data["isError"] = Value::from(true),
+                    "tool_result/content-deep" => data["content"][0]["text"] = edited,
+                    "tool_result/details-deep" => data["details"]["k"] = edited,
+                    "message_end/deep" => data["message"]["content"][0]["text"] = edited,
+                    "message_end/content-assign" => data["message"]["content"] = text(),
+                    "message_end/message-assign" => {
+                        data["message"] = serde_json::json!({"role": "user", "content": text(), "timestamp": 1})
+                    }
+                    "context/deep" => data["messages"][0]["content"][0]["text"] = edited,
+                    other => return Err(format!("event_edit_probe has no edit {other}")),
+                }
+                if fail {
+                    Err("failed after the edit".to_string())
+                } else {
+                    Ok(None)
+                }
+            });
+            event_edit_subscriptions.lock().unwrap().push(subscription);
             CommandResult::Ok
         },
     );
@@ -3997,6 +6357,74 @@ fn main() {
             CommandResult::Ok
         },
     );
+    // event_isolation_probe: two handlers; the first reports the marker it received and writes a sentinel into its container, the second reports what it
+    // received (TestConformance_EventHandlersDoNotShareTheirPayload). A handler's data is a &mut Value that cannot outlive the call, so there is no late writer.
+    // A boundary event's marker is the first context entry's sourceEntry id (the container is that source entry); a context or context_with_system event's is
+    // the length of messages (the container is that list).
+    let event_isolation_subscriber = ext.event_subscriber();
+    let event_isolation_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "event_isolation_probe",
+        "Subscribe two handlers that report the nested marker they received and then write sentinels into it",
+        move |_ctx, args| {
+            let name = args.trim().to_string();
+            let conversation = name == "context" || name == "context_with_system";
+            let paths: [&'static str; 3] = if conversation {
+                ["/messages/0/content", "/messages/1/content", "/messages/2/content"]
+            } else {
+                [
+                    "/context/contextMessages/0/content",
+                    "/context/llmMessages/0/content",
+                    "/context/contextEntries/0/messages/0/content",
+                ]
+            };
+            let marker = move |data: &Value| -> String {
+                if conversation {
+                    data.get("messages")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len)
+                        .to_string()
+                } else {
+                    isolation_text(data.pointer("/context/contextEntries/0/sourceEntry/id"))
+                }
+            };
+            let report = move |data: &Value| -> String {
+                paths
+                    .iter()
+                    .map(|path| isolation_text(data.pointer(path)))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            };
+            let first_report = report;
+            let first = subscribe(&event_isolation_subscriber, &name, move |ctx, data| {
+                ctx.notify(&format!("event_isolation:A:{}:end", marker(data)), "info");
+                if conversation {
+                    if let Some(list) = data.get_mut("messages").and_then(Value::as_array_mut) {
+                        list.push(json!({"role": "user", "content": "SENTINEL-HANDLER-A", "timestamp": 0}));
+                    }
+                } else if let Some(id) = data.pointer_mut("/context/contextEntries/0/sourceEntry/id") {
+                    *id = json!("SENTINEL-HANDLER-A");
+                }
+                ctx.notify(&format!("event_isolation_msgs:A:{}", first_report(data)), "info");
+                for path in paths {
+                    if let Some(content) = data.pointer_mut(path) {
+                        *content = json!("SENTINEL-HANDLER-A");
+                    }
+                }
+                Ok(None)
+            });
+            let second = subscribe(&event_isolation_subscriber, &name, move |ctx, data| {
+                ctx.notify(&format!("event_isolation:B:{}:end", marker(data)), "info");
+                ctx.notify(&format!("event_isolation_msgs:B:{}", report(data)), "info");
+                Ok(None)
+            });
+            let mut held = event_isolation_subscriptions.lock().unwrap();
+            held.push(first);
+            held.push(second);
+            CommandResult::Ok
+        },
+    );
     ext.command("set_label", "Set an entry label", |ctx, _args| {
         match ctx.set_label("label-entry", "conformance-label") {
             Ok(_) => CommandResult::Ok,
@@ -4012,6 +6440,80 @@ fn main() {
         |ctx, _args| match ctx.append_entry("conformance-entry", json!("hello-entry")) {
             Ok(_) => CommandResult::Ok,
             Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    // An entry and a message with the optional member left out, then with it written as null: Value::Null is Pi's omitted argument in append_entry, and
+    // the siblings that take an Option write Some(Value::Null) as null.
+    ext.command(
+        "entry_null_members",
+        "Append entries and send messages with an omitted and a null member",
+        |ctx, _args| {
+            let result = ctx
+                .append_entry("conformance-null-omitted", Value::Null)
+                .and_then(|_| ctx.append_entry_opt("conformance-null-explicit", Some(Value::Null)))
+                .and_then(|_| ctx.send_message("conformance-null-omitted", "x", false, None, None))
+                .and_then(|_| {
+                    ctx.send_message_with_details(
+                        "conformance-null-explicit",
+                        "x",
+                        false,
+                        None,
+                        None,
+                        Some(Value::Null),
+                    )
+                });
+            match result {
+                Ok(_) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    // setLabel on the entry in the arguments without a label, with a null one and with an empty one: Pi writes a different entry for each.
+    ext.command(
+        "label_members",
+        "Set a label that is omitted, null and empty",
+        |ctx, args| {
+            let result = ctx
+                .set_label_opt(args, None)
+                .and_then(|_| ctx.set_label_opt(args, Some(Value::Null)))
+                .and_then(|_| ctx.set_label(args, ""));
+            match result {
+                Ok(_) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    // The setup callback's SessionManager: an entry and a message with the optional member left out, then with it written as null. Value::Null is
+    // Pi's omitted argument, and the siblings that take an Option write Some(Value::Null) as null.
+    ext.command(
+        "setup_null_members",
+        "Seed a new session with an omitted and a null member",
+        |ctx, _args| {
+            let result = ctx.new_session_setup(
+                json!({}),
+                |manager: &pig_sdk::SetupSessionManager| {
+                    manager.append_custom_entry("api-custom", Value::Null)?;
+                    manager.append_custom_entry_opt("api-custom", Some(Value::Null))?;
+                    manager.append_custom_message_entry(
+                        "api-message",
+                        json!("x"),
+                        false,
+                        Value::Null,
+                    )?;
+                    manager.append_custom_message_entry_opt(
+                        "api-message",
+                        json!("x"),
+                        true,
+                        Some(Value::Null),
+                    )?;
+                    Ok(())
+                },
+                None,
+            );
+            match result {
+                Ok(_) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
         },
     );
     ext.command(
@@ -4273,6 +6775,86 @@ fn main() {
             CommandResult::Ok
         },
     );
+    // stale-members calls the members that answer a context kept past its Session: each outcome is one line, and the command fails with every
+    // line when one carries the stale message, else it reports them.
+    fn stale_members(ctx: &pig_sdk::Context) -> Result<(), String> {
+        let mut lines: Vec<String> = Vec::new();
+        let mut stale = false;
+        let mut member = |name: &str, call: &dyn Fn() -> Result<String, String>| {
+            let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+                Ok(Ok(value)) => format!("ok:{value}"),
+                Ok(Err(error)) => format!("error:{error}"),
+                Err(payload) => {
+                    let message = payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    format!("panics:{message}")
+                }
+            };
+            stale = stale || outcome.contains("This extension ctx is stale");
+            lines.push(format!("{name}={outcome}"));
+        };
+        member("theme", &|| {
+            let _ = ctx.theme();
+            Ok("Theme".to_string())
+        });
+        member("width", &|| Ok(ctx.width().to_string()));
+        member("height", &|| Ok(ctx.height().to_string()));
+        member("sessionName", &|| Ok(ctx.session_name()));
+        member("setWidgetLines", &|| {
+            ctx.set_widget("stale-members", vec!["x".to_string()])
+                .map(|()| String::new())
+                .map_err(|e| e.to_string())
+        });
+        member("setWidgetView", &|| {
+            ctx.set_widget_view(
+                "stale-members-view",
+                pig_sdk::kit::View::new(pig_sdk::kit::Text::new("x", 0, 0)),
+                None,
+            )
+            .map(|()| String::new())
+            .map_err(|e| e.to_string())
+        });
+        member("setWidgetRenderer", &|| {
+            ctx.set_widget_renderer(
+                "stale-members-renderer",
+                Some(|_width: u32| vec!["x".to_string()]),
+                None,
+            )
+            .map(|()| String::new())
+            .map_err(|e| e.to_string())
+        });
+        member("onUpdate", &|| {
+            ctx.on_update(pig_sdk::ToolResult::text("x"))
+                .map(|()| String::new())
+                .map_err(|e| e.to_string())
+        });
+        member("getSettings", &|| {
+            ctx.get_settings()
+                .map(|_| String::new())
+                .map_err(|e| e.to_string())
+        });
+        member("registerToolRenderer", &|| {
+            ctx.register_tool_renderer(|_tool, _builtin| None)
+                .map(|()| String::new())
+                .map_err(|e| e.to_string())
+        });
+        if stale {
+            return Err(format!("stale-members\n{}", lines.join("\n")));
+        }
+        ctx.notify(&format!("members\n{}", lines.join("\n")), "info");
+        Ok(())
+    }
+    ext.command(
+        "stale-members",
+        "Call the members that fail with the stale message",
+        |ctx, _args| match stale_members(ctx) {
+            Ok(()) => CommandResult::Ok,
+            Err(error) => CommandResult::Error(error),
+        },
+    );
     ext.command("signal-probe", "Report ctx.signal", |ctx, _args| {
         let state = match ctx.signal() {
             None => "none",
@@ -4328,6 +6910,71 @@ fn main() {
         ctx.notify(&serde_json::to_string(&usage).unwrap(), "info");
         CommandResult::Ok
     });
+    // Reports the model, the session id read through the context and through the session manager, and the context usage, as one JSON object (TestReplicatedReadsAreLocalAcrossSDKs). "set-model:<provider>/<id>" switches the model first.
+    ext.command(
+        "replica-probe",
+        "Report the replicated reads",
+        |ctx, args| {
+            if let Some(model) = args.strip_prefix("set-model:") {
+                let (ok, error) = ctx.set_model(model);
+                if !ok {
+                    return CommandResult::Error(format!("set_model failed: {error:?}"));
+                }
+            }
+            let model = ctx.get_model_info().unwrap().map(|m| {
+                json!({
+                    "id": m.id, "name": m.name, "provider": m.provider,
+                    "contextWindow": m.context_window, "maxOutputTokens": m.max_output_tokens,
+                    "reasoning": m.reasoning,
+                    "inputCostPer1M": m.input_cost_per_1m, "outputCostPer1M": m.output_cost_per_1m,
+                    "cacheReadCostPer1M": m.cache_read_cost_per_1m, "cacheWriteCostPer1M": m.cache_write_cost_per_1m,
+                })
+            });
+            let usage = ctx.get_context_usage().unwrap().map(|u| json!({"tokens": u.tokens, "contextWindow": u.context_window, "percent": u.percent}));
+            let report = json!({
+                "model": model,
+                "sessionId": ctx.get_session_id().unwrap(),
+                "managerSessionId": ctx.session_manager().get_session_id().unwrap(),
+                "sessionName": ctx.get_session_name().unwrap(),
+                "sessionFile": ctx.get_session_file().unwrap(),
+                "managerSessionName": ctx.session_manager().get_session_name().unwrap(),
+                "managerSessionFile": ctx.session_manager().get_session_file().unwrap(),
+                "usage": usage,
+            });
+            ctx.notify(&report.to_string(), "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "console-probe",
+        "Write console lines to stdout and stderr",
+        |_ctx, args| {
+            use std::io::Write;
+            for n in 1..=2 {
+                if args != "stderr" {
+                    println!("probe-out-{n}");
+                    let _ = std::io::stdout().flush();
+                }
+                eprintln!("probe-err-{n}");
+            }
+            CommandResult::Ok
+        },
+    );
+    // panic-probe and the on_loaded handler panic after a deliberate stderr line the extension itself writes (TestConformance_SDKDiagnosticsReachOnlyTheExtensionLog).
+    ext.on_loaded(|_ctx| {
+        if std::env::var_os("PIG_FIXTURE_PANIC_PROBE").is_some() {
+            eprintln!("probe-err-loaded");
+            panic!("probe-panic-boom");
+        }
+    });
+    ext.command(
+        "panic-probe",
+        "Panic after an stderr line of the extension's own",
+        |_ctx, _args| {
+            eprintln!("probe-err-command");
+            panic!("probe-panic-boom");
+        },
+    );
     ext.command(
         "context-probe",
         "Report ctx.mode + ctx.getSystemPromptOptions()",
@@ -5290,10 +7937,44 @@ fn main() {
             data["context"]["contextEntries"].as_array().unwrap().len(),
             2
         );
+        // One draft with a null replacement, one without the member, and a compaction that keeps nothing.
         Some(json!({
-            "entries": [{"type": "custom", "customType": "conformance-boundary"}],
+            "entries": [
+                {"type": "custom", "customType": "conformance-boundary"},
+                {"type": "context_edit", "targetId": "conformance-failed-attempt", "replacement": null},
+                {"type": "context_edit", "targetId": "conformance-omitted-member"},
+                {"type": "compaction", "summary": "conformance-summary", "firstKeptEntryId": null, "details": {"format": "conformance-checkpoint"}, "usage": null},
+                {"type": "custom", "customType": "conformance-null-data", "data": null},
+                {"type": "custom_message", "customType": "conformance-null-details", "content": "x", "display": false, "details": null}
+            ],
             "continue": true
         }))
+    });
+    ext.on_event("agent_before_settle", |ctx, data| {
+        let entries = data["entries"].as_array().cloned().unwrap_or_default();
+        assert_eq!(entries.len(), 6, "boundary result reached the next handler");
+        let member = |index: usize, key: &str| match entries[index].get(key) {
+            None => "absent",
+            Some(Value::Null) => "null",
+            Some(_) => "value",
+        };
+        let format = entries[3]["details"]["format"].as_str().unwrap_or("");
+        ctx.notify(
+            &format!(
+                "agent_before_settle_drafts:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                entries.len(),
+                member(1, "replacement"),
+                member(2, "replacement"),
+                member(3, "firstKeptEntryId"),
+                format,
+                member(0, "data"),
+                member(3, "usage"),
+                member(4, "data"),
+                member(5, "details")
+            ),
+            "info",
+        );
+        None
     });
     ext.on_event("session_start", |ctx, data| {
         let reason = data.get("reason").and_then(Value::as_str).unwrap_or("");
@@ -5306,6 +7987,13 @@ fn main() {
             ctx.notify(&format!("previous:{path}"), "info");
         }
         None
+    });
+    // The handler's own context is still active (Pi invalidates after the handlers ran): the stale-members test reads every member from here.
+    ext.on_event_result("session_shutdown", |ctx, data| {
+        if data.get("reason").and_then(Value::as_str) == Some("stale-members-test") {
+            stale_members(ctx)?;
+        }
+        Ok(None)
     });
     ext.on_event("session_shutdown", |ctx, data| {
         let reason = data.get("reason").and_then(Value::as_str).unwrap_or("");
@@ -5320,6 +8008,11 @@ fn main() {
         None
     });
     ext.on_event("session_info_changed", |ctx, data| {
+        // io_wait_name arms the handler to wait on a socket read first, as a handler that awaits does in Pi.
+        let addr = NAME_WAIT_ADDR.lock().unwrap().clone();
+        if !addr.is_empty() {
+            let _ = io_wait(&addr);
+        }
         let name = data.get("name").and_then(Value::as_str).unwrap_or("");
         ctx.notify(&format!("session_info_changed:{name}"), "info");
         None
@@ -5461,7 +8154,7 @@ fn main() {
 const STATE_PUSH_WINDOW: Duration = Duration::from_secs(5);
 
 /// Registers the state-push-probe command (TestHostStateChangeReachesABackgroundReaderAcrossSDKs). The command arms a thread that reads one replicated accessor from outside every request, as an extension's timer does, and returns: the host then changes its own state with no call and no event to this extension, and the thread reports the first value that differs from the one it armed on, or the value it still holds after STATE_PUSH_WINDOW, to a file in the directory the arguments name.
-/// The arguments are {"kind": "model" | "session-name" | "theme" | "settings:<key>" | "mcp", "dir": <directory>}; the report is "<armed>=><read>".
+/// The arguments are {"kind": "model" | "model-name" | "session-id" | "context-usage" | "session-name" | "theme" | "settings:<key>" | "mcp", "dir": <directory>}; the report is "<armed>=><read>".
 fn register_state_push_probe(ext: &mut Extension) {
     ext.command(
         "state-push-probe",
@@ -5507,6 +8200,43 @@ fn state_push_reader(
     }
     if kind == "session-name" {
         return Ok(Box::new(move || ctx.session_name()));
+    }
+    if kind == "model-name" {
+        return Ok(Box::new(move || match ctx.get_model_info() {
+            Ok(info) => info.map(|info| info.name).unwrap_or_default(),
+            Err(err) => format!("error:{err}"),
+        }));
+    }
+    if kind == "context-usage" {
+        return Ok(Box::new(move || match ctx.get_context_usage() {
+            Ok(Some(usage)) => format!(
+                "tokens={}",
+                usage.tokens.map(|n| n.to_string()).unwrap_or_default()
+            ),
+            Ok(None) => "none".to_string(),
+            Err(err) => format!("error:{err}"),
+        }));
+    }
+    if kind == "usage-then-id" {
+        // A host call, then the replicated id: the id must not be older than the host's answer.
+        return Ok(Box::new(move || match ctx.get_context_usage() {
+            Ok(Some(usage)) if usage.tokens == Some(250) => match ctx.get_session_id() {
+                Ok(id) => format!("tokens=250,id={id}"),
+                Err(err) => format!("error:{err}"),
+            },
+            Ok(Some(usage)) => format!(
+                "tokens={}",
+                usage.tokens.map(|n| n.to_string()).unwrap_or_default()
+            ),
+            Ok(None) => "none".to_string(),
+            Err(err) => format!("error:{err}"),
+        }));
+    }
+    if kind == "session-id" {
+        return Ok(Box::new(move || match ctx.get_session_id() {
+            Ok(id) => id,
+            Err(err) => format!("error:{err}"),
+        }));
     }
     if kind == "theme" {
         return Ok(Box::new(move || ctx.theme().name));
@@ -5600,6 +8330,8 @@ fn register_conformance_oauth_object(ext: &mut Extension) {
             })),
             is_subscription: false,
             credential_store: None,
+            modify_models: None,
+            uses_callback_server: false,
         },
     );
 }
@@ -5631,6 +8363,8 @@ fn register_conformance_oauth_large(ext: &mut Extension) {
             })),
             is_subscription: false,
             credential_store: None,
+            modify_models: None,
+            uses_callback_server: false,
         },
     );
 }
@@ -5681,6 +8415,8 @@ fn register_conformance_oauth(ext: &mut Extension) {
                 format!("key:{}", creds.access)
             })),
             credential_store: Some(Box::new(ConformanceStore)),
+            modify_models: None,
+            uses_callback_server: false,
         },
     );
 }
@@ -5695,6 +8431,9 @@ impl EditorComponent for ConformanceEditor {
         &self.base
     }
     fn handle_input(&mut self, data: &JsString) -> Result<(), String> {
+        if data == "!" {
+            panic!("bad key");
+        }
         if data == "q" {
             return Ok(());
         }
@@ -5971,9 +8710,9 @@ fn conformance_bash_operations() -> pig_sdk::BashOperations {
                 (options.on_data)(b"waiting");
                 options.signal.wait();
                 (options.on_data)(b"stopped");
-                Err("aborted".to_string())
+                Err("aborted".into())
             }
-            other => Err(format!("exec failed: {other}")),
+            other => Err(format!("exec failed: {other}").into()),
         }),
     }
 }
@@ -6420,6 +9159,75 @@ fn builtin_options(case: &Value, log: &CallLog) -> ProbeOptions {
             })
         }));
     }
+    if case["ops"].as_str() == Some("localThread") {
+        // The local operations run on another thread and their error comes back unchanged: the shell's exit belongs to the error, not to the thread.
+        let inner = pig_sdk::create_local_bash_operations(None).exec;
+        options.bash.operations = Some(pig_sdk::BashOperations {
+            exec: Arc::new(move |command, cwd, exec_options| {
+                let inner = inner.clone();
+                let (command, cwd) = (command.to_string(), cwd.to_string());
+                std::thread::spawn(move || inner(&command, &cwd, exec_options))
+                    .join()
+                    .unwrap_or_else(|_| Err("the local operations panicked".into()))
+            }),
+        });
+        return options;
+    }
+    if matches!(case["ops"].as_str(), Some("local" | "localWrapped")) {
+        // The bash tool runs on the local operations. "local" returns their error unchanged; "localWrapped" returns a new error with the same message, which is not the
+        // backend's error and keeps nothing of it (Pi matches the backend's class, bash.ts).
+        let wrapped = case["ops"].as_str() == Some("localWrapped");
+        let inner = pig_sdk::create_local_bash_operations(None).exec;
+        options.bash.operations = Some(pig_sdk::BashOperations {
+            exec: Arc::new(move |command, cwd, exec_options| {
+                let result = inner(command, cwd, exec_options);
+                if wrapped {
+                    result.map_err(|error| pig_sdk::BashExecError::from(error.message()))
+                } else {
+                    result
+                }
+            }),
+        });
+        return options;
+    }
+    if case["ops"].as_str() == Some("globlimit") {
+        // Pi main 676af1d77 (#11747): the tool asks glob for one result past its limit.
+        let glob_log = log.clone();
+        options.find.operations = Some(pig_sdk::FindOperations {
+            exists: path_op(log, "exists", |_| Ok(true)),
+            glob: Arc::new(move |pattern, _cwd, glob_options| {
+                log_call(
+                    &glob_log,
+                    format!("glob:{pattern}:limit={}", glob_options.limit as i64),
+                );
+                let all = ["a.txt", "b.txt", "c.txt"];
+                let take = (glob_options.limit as usize).min(all.len());
+                Ok(all[..take].iter().map(|name| name.to_string()).collect())
+            }),
+        });
+    }
+    if case["ops"].as_str() == Some("grepdir") {
+        options.grep.operations = Some(pig_sdk::GrepOperations {
+            is_directory: path_op(log, "isDirectory", |_| Ok(true)),
+            read_file: Some(path_op(log, "readFile", |_| Ok(String::new()))),
+        });
+        return options;
+    }
+    if case["ops"].as_str() == Some("stream") {
+        options.read.operations = Some(pig_sdk::ReadOperations {
+            read_file: path_op(log, "readFile", |path| {
+                Ok(format!("OPS:{path}").into_bytes())
+            }),
+            access: path_op(log, "access", |_| Ok(())),
+            detect_image_mime_type: None,
+            create_read_stream: Some(path_op(log, "createReadStream", |path| {
+                Ok(Box::new(std::io::Cursor::new(
+                    format!("STREAM:{path}\n").into_bytes(),
+                )) as pig_sdk::ReadStream)
+            })),
+        });
+        return options;
+    }
     if !custom {
         return options;
     }
@@ -6429,6 +9237,7 @@ fn builtin_options(case: &Value, log: &CallLog) -> ProbeOptions {
         }),
         access: path_op(log, "access", |_| Ok(())),
         detect_image_mime_type: None,
+        create_read_stream: None,
     });
     options.write.operations = Some(pig_sdk::WriteOperations {
         write_file: write_op(log),
@@ -6716,7 +9525,7 @@ fn builtin_local(case: &Value) -> Value {
         options,
     ) {
         Ok(code) => report["exitCode"] = json!(code),
-        Err(message) => report["error"] = json!(message),
+        Err(error) => report["error"] = json!(error.message()),
     }
     report["output"] = json!(chunks.lock().unwrap().join(""));
     report
@@ -7267,7 +10076,7 @@ impl MutDoc {
         screen.invalidate()?;
         r.push(format!(
             "invalidate={}",
-            self.invalidations.load(Ordering::SeqCst) > 0
+            self.invalidations.load(Ordering::SeqCst)
         ));
         r.push(format!("lines={}", screen.get_screen_lines()?.len()));
         Ok(r.join(","))
@@ -7382,8 +10191,8 @@ fn tui_alt_frame_probe(ctx: &pig_sdk::Context) -> std::io::Result<String> {
     screen.invalidate()?;
     f.push(format!(
         "invalidate={}/{}",
-        doc.invalidations.load(Ordering::SeqCst) > 0,
-        ov.invalidations.load(Ordering::SeqCst) > 0
+        doc.invalidations.load(Ordering::SeqCst),
+        ov.invalidations.load(Ordering::SeqCst)
     ));
     ov2.hide()?;
     let link = Arc::new(std::sync::OnceLock::new());
@@ -7608,4 +10417,15 @@ fn register_tui_alt_reentry_probe(ext: &mut Extension) {
             Err(err) => CommandResult::Error(err.to_string()),
         },
     );
+}
+
+/// The first line the card's renderer of the same phase returned on its previous run, or "none" on the first run: the value
+/// `ToolRenderContext::last_component` carries (the render_probe rows of the conformance suite bind to it).
+fn last_render_line(render: &pig_sdk::ToolRenderContext) -> String {
+    match &render.last_component {
+        Some(pig_sdk::ToolRenderComponent::Lines(lines)) => {
+            lines.first().cloned().unwrap_or_else(|| "none".to_string())
+        }
+        _ => "none".to_string(),
+    }
 }

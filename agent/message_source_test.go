@@ -3,6 +3,8 @@ package agent
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/MichaelKinsy/PiG/ai"
 )
 
 // Pi holds the object JSON.parse returned for a session line or an extension result and writes it with JSON.stringify, so its member order, members PiG does not model and its spellings reach every writer. The expected texts are node's JSON.stringify(JSON.parse(line)).
@@ -74,6 +76,25 @@ func TestDecodedMessageInPiOrderRetainsNoText(t *testing.T) {
 		if got, _ := message.MarshalJSON(); string(got) != line {
 			t.Errorf("MarshalJSON = %s, want %s", got, line)
 		}
+	}
+}
+
+func TestReplaceContentBlocksKeepsRetainedUserMembers(t *testing.T) {
+	const source = `{"timestamp":1,"content":[{"type":"text","text":"before"}],"role":"user","label":"\ud800"}`
+	const want = `{"timestamp":1,"content":[{"type":"text","text":"after"},{"type":"image","data":"AQID","mimeType":"image/png"}],"role":"user","label":"\ud800"}`
+	var message AgentMessage
+	if err := json.Unmarshal([]byte(source), &message); err != nil {
+		t.Fatal(err)
+	}
+	original := message.Clone()
+	if err := message.User.ReplaceContentBlocks(ai.UserContentBlocks{ai.TextContent{Text: "after"}, ai.ImageContent{Data: "AQID", MimeType: "image/png"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := message.MarshalJSON(); err != nil || string(got) != want {
+		t.Errorf("rewritten message = %s, %v; want %s", got, err, want)
+	}
+	if got, err := original.MarshalJSON(); err != nil || string(got) != source {
+		t.Errorf("original message = %s, %v; want %s", got, err, source)
 	}
 }
 

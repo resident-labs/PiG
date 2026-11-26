@@ -8,9 +8,11 @@ import (
 	"io"
 	"strings"
 	"sync"
+
+	"github.com/MichaelKinsy/PiG/internal/jsonwire"
 )
 
-// This file models the promise chain between a Google Generative AI response's headers and the chunks Pi's `for await (const chunk of googleStream)` receives, at the granularity of promise reactions. Pi runs `client.models.generateContentStream(params)` from @google/genai 2.21.0, whose async functions, `.then` chains and tslib generators (google_sdk_generator.go) each add reactions; the order in which they run relative to the consumer of the event stream decides which partial message that consumer observes. Line numbers refer to packages/ai/src/api/google-generative-ai.ts (Pi) and dist/node/index.mjs (SDK).
+// This file models the promise chain between a Google Generative AI response's headers and the chunks Pi's `for await (const chunk of googleStream)` receives, at the granularity of promise reactions. Pi runs `client.models.generateContentStream(params)` from @google/genai 2.32.0, whose async functions, `.then` chains and tslib generators (google_sdk_generator.go) each add reactions; the order in which they run relative to the consumer of the event stream decides which partial message that consumer observes. Line numbers refer to packages/ai/src/api/google-generative-ai.ts (Pi) and dist/node/index.mjs (SDK).
 
 // Node 24.19.0 constants that the Go transport cannot derive. They are measured by testdata/rpc33-observation/providers/google-generative-ai/undici.mjs and asserted against that probe's recorded output.
 const (
@@ -49,7 +51,7 @@ func (response *googleHTTPResponse) json(executor *continuationExecutor, rounds 
 	afterReactions(executor, rounds, func() {
 		var chunk geminiStreamChunk
 		// generateContentResponseFromMldev reads members by path, so a number, string, boolean or array becomes an empty GenerateContentResponse.
-		if top := response.text; top != "" && top[0] != '{' && top[0] != 'n' && json.Valid([]byte(top)) {
+		if top := response.text; top != "" && top[0] != '{' && top[0] != 'n' && jsonwire.Valid(top) {
 			chunk.raw = json.RawMessage(`{}`)
 			promise.resolve(&chunk)
 			return
@@ -118,13 +120,14 @@ func googleGenerateContentStream(executor *continuationExecutor, fetched *tslibP
 		session.outer = googleGenerateContentStreamInternal(executor, value.(*tslibAsyncIterator), jsonRounds)
 		return session.outer, nil
 	}, nil)
-	// F+10: generateContentStreamInternal is async and returns that promise (index.mjs:15768).
+	// F+10: generateContentStreamInternal is async and returns that promise (index.mjs:16665).
 	internal := adopt(generator)
-	// F+11: `return await this.generateContentStreamInternal(transformedParams)` in generateContentStream (index.mjs:15313-15314).
+	// F+11: `return await this.generateContentStreamInternal(transformedParams)` in generateContentStream
+	// (index.mjs:16157; Pi google-generative-ai.ts:397 sets `automaticContinuation: false`, bypassing generateContentStreamWithContinuation).
 	return passthrough(internal)
 }
 
-// googleRetryGoogleRequest is retryGoogleRequest(request, options) for a request that does not fail: two async wrappers, each of which awaits the request and returns (google-shared.ts:499-501 and utils/provider-retry.ts:87). Pi's `await` of the result resumes one reaction after it settles, 14 reactions after fetched settled, which is when Pi pushes start.
+// googleRetryGoogleRequest is retryGoogleRequest(request, options) for a request that does not fail: two async wrappers, each of which awaits the request and returns (google-shared.ts:499-501 and utils/provider-retry.ts:87). Pi's `await` of the result resumes one reaction after it settles, 15 reactions after fetched settled, which is when Pi pushes start.
 func googleRetryGoogleRequest(request *tslibPromise) *tslibPromise {
 	passthrough := func(promise *tslibPromise) *tslibPromise {
 		return promise.then(func(value any) (any, error) { return value, nil }, nil)
@@ -219,18 +222,18 @@ func googleProcessStreamResponse(executor *continuationExecutor, response *googl
 	})
 }
 
-// googleGenerateContentStreamInternal is the async generator in Models.generateContentStreamInternal (index.mjs:15830-15855). It awaits each HttpResponse's json() and yields the parsed GenerateContentResponse; an exception inside the loop closes the inner generator before it is rethrown.
+// googleGenerateContentStreamInternal is the async generator in Models.generateContentStreamInternal (index.mjs:16728-16751). It awaits each HttpResponse's json() and yields the decoded chunk.
 func googleGenerateContentStreamInternal(executor *continuationExecutor, apiResponse *tslibAsyncIterator, jsonRounds int) *tslibAsyncIterator {
 	return newTslibAsyncGenerator(executor, func(y *tslibYield) (any, error) {
-		// for (... apiResponse_2_1 = yield __await(apiResponse_2.next()) ...) { ... } with the compiled try/catch/finally (index.mjs:15833-15853)
+		// for (... apiResponse_2_1 = yield __await(apiResponse_2.next()) ...) { ... } with the compiled try/catch/finally (index.mjs:16731-16750)
 		err := y.ForAwait(tslibAsyncValues(apiResponse), func(value any) (bool, error) {
 			chunk := value.(*googleHTTPResponse)
-			// `generateContentResponseFromMldev((yield __await(chunk.json())), params)` (index.mjs:15838)
+			// `generateContentResponseFromMldev((yield __await(chunk.json())), params)` (index.mjs:16735)
 			parsed, err := y.Await(chunk.json(executor, jsonRounds))
 			if err != nil {
 				return false, err
 			}
-			// `yield yield __await(typedResp)` (index.mjs:15844)
+			// `yield yield __await(typedResp)` (index.mjs:16741)
 			_, err = y.YieldAwaited(parsed)
 			return false, err
 		})

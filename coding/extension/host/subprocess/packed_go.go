@@ -46,6 +46,18 @@ type packedProcessState struct {
 	generation int
 	stopping   atomic.Bool
 	stopOnce   sync.Once
+	// holdMu guards holds and stopDeferred: the lingering members that keep the process (holdForLinger) and whether a stop waits for them.
+	holdMu       sync.Mutex
+	holds        int
+	stopDeferred bool
+	// released closes once stop has run. The watcher of a state whose process another state, or a reference parked for the next Host, still
+	// holds ends then: a reload keeps the process of an unchanged cell and admits a new state to it, and the process's end concerns that state.
+	released chan struct{}
+	// exitMu guards exitHooks and exitRan of the state that spawned the process. exitHooks is what the states released before the process
+	// ended left for its end; the goroutine that reaps the process runs them, once, and exitRan is set from then on.
+	exitMu    sync.Mutex
+	exitHooks []func()
+	exitRan   bool
 	// origin is the state that spawned the OS process this state re-invokes factories in. It is nil for the spawner itself; wait state and the usage lease belong to it.
 	origin          *packedProcessState
 	share           *processShare
@@ -53,11 +65,14 @@ type packedProcessState struct {
 	waitOnce        sync.Once
 	waitDone        chan struct{}
 	waitErr         error
+	reapedAt        time.Time
 	processTree     *processTree
 	lease           *runtimecell.UsageLease
 	releaseLease    sync.Once
 	releaseRecovery sync.Once
 	stderrLog       *processStderrLog
+	// console is the pipe of a Go, Rust or Python runner's output; a Node runner's output is copied by exec.
+	console *consolePipe
 }
 
 // processShare counts the packed-process states that host factories in one OS process. Pi re-invokes an extension's factory inside the process that already holds its module, so a reload or a session replacement admits a new generation to a live process instead of starting another one. The process is killed when its last state stops.
@@ -82,6 +97,8 @@ type processShare struct {
 	admitMu sync.Mutex
 	admit   io.WriteCloser
 	killed  sync.Once
+	// onLast runs when the last reference releases; the cell registry sets it to forget the entry. pig additive (D232).
+	onLast func()
 }
 
 func newProcessShare(key string, origin any, exit <-chan struct{}, admit io.WriteCloser, kill func()) *processShare {
@@ -111,6 +128,9 @@ func (s *processShare) release() bool {
 	s.killed.Do(func() {
 		if s.kill != nil {
 			s.kill()
+		}
+		if s.onLast != nil {
+			s.onLast()
 		}
 		s.admitMu.Lock()
 		if s.admit != nil {
@@ -186,9 +206,58 @@ func (p *packedProcessState) spawner() *packedProcessState {
 	return p
 }
 
+// holdForLinger makes p's process outlive the stop of the cell's other members until releaseHold: a removed member that still owns a provider keeps the cell's
+// process, which is its closure, while the members the reload replaced are stopped. It reports false when the process is already stopping.
+func (p *packedProcessState) holdForLinger() bool {
+	p.holdMu.Lock()
+	defer p.holdMu.Unlock()
+	if p.stopping.Load() {
+		return false
+	}
+	p.holds++
+	return true
+}
+
+// releaseHold gives back a holdForLinger. The stop the hold deferred runs with the last hold.
+func (p *packedProcessState) releaseHold() {
+	p.holdMu.Lock()
+	p.holds--
+	run := p.holds == 0 && p.stopDeferred
+	p.stopDeferred = false
+	p.holdMu.Unlock()
+	if run {
+		p.stop()
+	}
+}
+
+// heldByOthers reports whether a member other than me holds the process for lingering.
+func (p *packedProcessState) heldByOthers(me *managedExt) bool {
+	p.holdMu.Lock()
+	defer p.holdMu.Unlock()
+	return p.holds-btoi(me.lingerHold.Load()) > 0
+}
+
+// deferStop records a stop that a hold postpones and reports whether it did.
+func (p *packedProcessState) deferStop() bool {
+	p.holdMu.Lock()
+	defer p.holdMu.Unlock()
+	if p.holds == 0 {
+		return false
+	}
+	p.stopDeferred = true
+	return true
+}
+
 func (p *packedProcessState) stop() {
+	if p.deferStop() {
+		return
+	}
 	p.stopOnce.Do(func() {
 		p.stopping.Store(true)
+		// After the reference is released, so that the watcher reads whether the process survives this stop.
+		if p.released != nil {
+			defer close(p.released)
+		}
 		if p.share != nil {
 			p.share.release()
 			return
@@ -226,17 +295,29 @@ func (p *packedProcessState) startWait() <-chan struct{} {
 		p.waitDone = make(chan struct{})
 		go func() {
 			p.waitErr = p.cmd.Wait()
+			p.console.finish(p.cmd.WaitDelay)
 			p.stderrLog.closeWriter()
 			_ = p.processTree.Close()
 			// The lease protects the artifact the process runs from, so it ends with the process, however the process ended and whichever states still reference it.
 			p.releaseLease.Do(func() { _ = p.lease.Release() })
+			// The log of a process that outlived a state goes here, once: no released state waits for the process (letGo).
+			p.stderrLog.processExited()
+			p.reapedAt = time.Now()
 			close(p.waitDone)
+			p.exitMu.Lock()
+			hooks := p.exitHooks
+			p.exitHooks, p.exitRan = nil, true
+			p.exitMu.Unlock()
+			for _, hook := range hooks {
+				hook()
+			}
 		}()
 	})
 	return p.waitDone
 }
 
-func (p *packedProcessState) exitErr() error { return p.spawner().waitErr }
+func (p *packedProcessState) exitErr() error          { return p.spawner().waitErr }
+func (p *packedProcessState) exitReapedAt() time.Time { return p.spawner().reapedAt }
 
 // releaseUsageLease releases the usage lease of a state that started no process, and the state's hold on its recovery lifetime. A started process's lease is released when the process is reaped.
 func (p *packedProcessState) releaseUsageLease() {
@@ -247,6 +328,27 @@ func (p *packedProcessState) releaseUsageLease() {
 		if p.recoveryLifetime != nil {
 			p.recoveryLifetime.release()
 		}
+	})
+}
+
+// releaseRecoveryAtExit leaves the state's hold on its recovery lifetime to the end of the process. The process was started under that
+// lifetime's context, which the last release cancels, so a state released while the process runs on must not release it yet. The hook holds
+// the lifetime only, not the state.
+func (p *packedProcessState) releaseRecoveryAtExit() {
+	p.releaseRecovery.Do(func() {
+		lifetime := p.recoveryLifetime
+		if lifetime == nil {
+			return
+		}
+		origin := p.spawner()
+		origin.exitMu.Lock()
+		if !origin.exitRan {
+			origin.exitHooks = append(origin.exitHooks, lifetime.release)
+			origin.exitMu.Unlock()
+			return
+		}
+		origin.exitMu.Unlock()
+		lifetime.release()
 	})
 }
 
@@ -273,6 +375,8 @@ type factoryAdmission struct {
 	Socket     string
 	Cwd        string
 	ReloadPass uint64
+	// Group is the admitting Host's ready.group; a Node runtime scopes its per-process bookkeeping by it before the factory runs. pig additive (D232).
+	Group string
 }
 
 func (a factoryAdmission) line() (string, error) {
@@ -285,6 +389,10 @@ func (a factoryAdmission) line() (string, error) {
 		return "", fmt.Errorf("control field %q contains a tab or line break", op)
 	}
 	fields := []string{op, encodeAdmissionField(a.Name), encodeAdmissionField(a.Socket), encodeAdmissionField(a.Entry), encodeAdmissionField(a.Cwd), strconv.FormatUint(a.ReloadPass, 10)}
+	// pig additive (D232): the group travels as a trailing field only for a Host that shares cells, so every other line is unchanged.
+	if a.Group != "" {
+		fields = append(fields, encodeAdmissionField(a.Group))
+	}
 	return strings.Join(fields, "\t") + "\n", nil
 }
 
@@ -315,11 +423,19 @@ func (h *Host) startGoPackedCell(ctx context.Context, cell *runtimecell.GoPacked
 	// pig additive (D19): a Node cell whose first member failed to start on a slot runtime, before any member's result was
 	// published, starts again, whole, on the next runtime, ending on Node (startGoPackedCellOnce decides under per-member
 	// admission). A later member's failure stays this launch's load error, because a retry would run the earlier factories twice.
+	joinRetried := false
 	for {
-		if _, next := errors.AsType[*errStartOnNextRuntime](err); !next {
-			break
+		if _, next := errors.AsType[*errStartOnNextRuntime](err); next {
+			staged, registered, err = h.startGoPackedCellOnce(ctx, cell)
+			continue
 		}
-		staged, registered, err = h.startGoPackedCellOnce(ctx, cell)
+		// pig additive (D232): a process joined through the cell registry can end between the lookup and the admission, because its runner exits when its last generation ends; the cell starts once more, on a fresh process the registry then offers to the other Hosts.
+		if _, gone := errors.AsType[*errJoinedProcessGone](err); gone && !joinRetried {
+			joinRetried = true
+			staged, registered, err = h.startGoPackedCellOnce(ctx, cell)
+			continue
+		}
+		break
 	}
 	if cell != nil {
 		h.rememberNodeOnly(cell.Key, err)
@@ -333,6 +449,28 @@ type admissionWriteError struct{ err error }
 
 func (e *admissionWriteError) Error() string { return e.err.Error() }
 func (e *admissionWriteError) Unwrap() error { return e.err }
+
+// errJoinedProcessGone is startGoPackedCellOnce's error when the process it joined through the cell registry ended before it served the first admission. pig additive (D232).
+type errJoinedProcessGone struct{ err error }
+
+func (e *errJoinedProcessGone) Error() string { return e.err.Error() }
+func (e *errJoinedProcessGone) Unwrap() error { return e.err }
+
+// joinedProcessGone reports whether err, a failure to admit or accept the first member of a registry-joined cell, comes from a process that has ended.
+func joinedProcessGone(processState *packedProcessState, err error) bool {
+	if errors.Is(err, errNodeCellExitedBeforeAdmission) {
+		return true
+	}
+	if _, write := errors.AsType[*admissionWriteError](err); write {
+		return true
+	}
+	select {
+	case <-processState.startWait():
+		return true
+	default:
+		return false
+	}
+}
 
 // errNodeCellExitedBeforeAdmission is a Node cell member's error when the cell's process exited before the host admitted it.
 var errNodeCellExitedBeforeAdmission = errors.New("Node cell exited before member admission")
@@ -373,6 +511,8 @@ func (h *Host) startGoPackedCellOnce(ctx context.Context, cell *runtimecell.GoPa
 			return nil, nil, newLoadError(cell.Key, "spawn", "runtime_unavailable", err)
 		}
 	}
+	// pig additive (D19): the selection holds the verified executable open; every return releases it, whether or not a process was started.
+	defer releaseVerified(tsSelection)
 	pendingExts := make([]packedPendingExt, 0, len(cell.Extensions))
 	harnessEnv, err := h.harnessEnv()
 	if err != nil {
@@ -416,14 +556,26 @@ func (h *Host) startGoPackedCellOnce(ctx context.Context, cell *runtimecell.GoPa
 		config.selectedPath = h.configuredSelectedPath(desc.Name)
 		recoveryConfigs = append(recoveryConfigs, config)
 		config.Path = cell.BinaryPath
-		me := &managedExt{config: config, nodeEntry: desc.Root, host: h, parentCtx: runtimeParent(ctx), supervisor: NewSupervisor(config.SupervisorConfig), sockPath: sockPath, packedCellKey: cell.Key}
+		me := &managedExt{config: config, nodeEntry: desc.Root, host: h, supervisor: NewSupervisor(config.SupervisorConfig), sockPath: sockPath, packedCellKey: cell.Key}
+		// As for an isolated extension (startExt), an exit after the owner cancelled ctx is teardown, not a crash.
+		me.setStartContext(nil, runtimeParent(ctx))
 		pendingExts = append(pendingExts, packedPendingExt{desc: desc, me: me, ln: ln, address: sockPath})
 		env = append(env, fmt.Sprintf("%s=%s", runtimecell.SocketEnvName(desc.Name), sockPath))
 	}
 	defer closePendingListeners(pendingExts)
 
 	var retained *packedProcessState
-	if share := h.claimRetainedProcess(ctx, cell.BinaryPath, nodeRuntime); share != nil {
+	joined := false
+	share := h.claimRetainedProcess(ctx, cell.BinaryPath, nodeRuntime)
+	if share == nil && h.sharesCells(ctx) {
+		// pig additive (D232): without a parked process of its own, a Host that joined a CellRegistry admits into the live process another Host runs for this cell; it holds the key's start lock until the cell it spawns is registered.
+		if key := h.cellRegistryKey(h.retentionKey(ctx, cell.BinaryPath, nodeRuntime)); key != "" {
+			defer h.cells.startLock(key)()
+			share = h.cells.lookup(key)
+			joined = share != nil
+		}
+	}
+	if share != nil {
 		if share.tier != "" && share.tier != tsSelection.Executable {
 			// pig additive (D19): the compiled host the retained process runs no longer matches the cell's runtime: /reload starts the cell on the runtime its set resolves to now.
 			share.release()
@@ -431,7 +583,7 @@ func (h *Host) startGoPackedCellOnce(ctx context.Context, cell *runtimecell.GoPa
 			retained, _ = share.origin.(*packedProcessState)
 		}
 	}
-	extCtx, cancel := context.WithCancel(runtimeParent(ctx))
+	extCtx, cancel := context.WithCancel(h.processParent(ctx))
 	var lease *runtimecell.UsageLease
 	if retained == nil {
 		var err error
@@ -445,7 +597,7 @@ func (h *Host) startGoPackedCellOnce(ctx context.Context, cell *runtimecell.GoPa
 			installchange.TrackFile(cell.BinaryPath)
 		}
 	}
-	processState := &packedProcessState{key: cell.Key, parent: runtimeParent(ctx), cancel: cancel, lease: lease, generation: cell.Generation, node: nodeRuntime, originalOwner: runtimeParent(ctx), configs: recoveryConfigs}
+	processState := &packedProcessState{key: cell.Key, parent: h.processParent(ctx), cancel: cancel, lease: lease, generation: cell.Generation, node: nodeRuntime, originalOwner: runtimeParent(ctx), configs: recoveryConfigs, released: make(chan struct{})}
 	if retained != nil {
 		// pig additive (D20): the process that already holds this cell's modules re-invokes the factories, as Pi's loader does inside one runtime.
 		processState.adopt(retained)
@@ -470,9 +622,6 @@ func (h *Host) startGoPackedCellOnce(ctx context.Context, cell *runtimecell.GoPa
 	h.mu.Unlock()
 	for i := range pendingExts {
 		pendingExts[i].me.packedProcess = processState
-		// As for an isolated extension (startExt), an exit after the owner
-		// cancelled ctx is teardown, not a crash.
-		pendingExts[i].me.parentCtx = runtimeParent(ctx)
 	}
 	started := false
 	defer func() {
@@ -486,7 +635,7 @@ func (h *Host) startGoPackedCellOnce(ctx context.Context, cell *runtimecell.GoPa
 	}
 	if nodeRuntime {
 		for _, pending := range pendingExts {
-			pending.me.nodeRealm = true
+			pending.me.setNodeRealm()
 		}
 		h.noteNodeRealm(pendingExts[0].me, busRouted)
 	}
@@ -507,7 +656,7 @@ func (h *Host) startGoPackedCellOnce(ctx context.Context, cell *runtimecell.GoPa
 		if processState.cmd != nil {
 			pendingExts[i].me.setProcess(processState.cmd.Process)
 		}
-		pendingExts[i].me.cancel = processState.cancel
+		pendingExts[i].me.setStartContext(processState.cancel, runtimeParent(ctx))
 		if processState.stderrLog != nil {
 			pendingExts[i].me.stderrLogPath = processState.stderrLog.path
 		}
@@ -541,19 +690,25 @@ func (h *Host) startGoPackedCellOnce(ctx context.Context, cell *runtimecell.GoPa
 			}
 			if err == nil {
 				processState.factoryOwner.Store(&me.config.Name)
-				if sendErr := processState.share.send(factoryAdmission{Name: me.config.Name, Entry: me.nodeEntry, Socket: pendingExts[i].address, ReloadPass: reloadPass(ctx), Cwd: h.cwd}); sendErr != nil {
+				if sendErr := processState.share.send(factoryAdmission{Name: me.config.Name, Entry: me.nodeEntry, Socket: pendingExts[i].address, ReloadPass: reloadPass(ctx), Cwd: h.cwd, Group: h.Group()}); sendErr != nil {
 					err = &admissionWriteError{err: sendErr}
 				}
 			}
 		} else if retained != nil {
 			// Pi runs one factory at a time, and a factory may call the host before it returns (a subscription on the event bus). The host serves that call only on the connection it is accepting, so the runner is told of a member once the members before it have registered: its factories run in separate goroutines and the one that takes the runner's factory turn first would otherwise be a later member, while the host waits for an earlier one. The reload pass tells the Python runner when to re-import an edited extension.
-			if sendErr := processState.share.send(factoryAdmission{Name: me.config.Name, Socket: pendingExts[i].address, ReloadPass: reloadPass(ctx)}); sendErr != nil {
-				err = newLoadError(cell.Key, "spawn", "admit_failed", fmt.Errorf("admit %s to the running packed process: %w", me.config.Name, sendErr))
+			if sendErr := processState.share.send(factoryAdmission{Name: me.config.Name, Socket: pendingExts[i].address, ReloadPass: reloadPass(ctx), Group: h.Group()}); sendErr != nil {
 				if i == 0 {
 					// No member's factory has run: the cell fails whole.
+					if joined {
+						// pig additive (D232): the joined process ended; the caller starts the cell again.
+						processState.share.dead.Store(true)
+						processState.stopAndReap()
+						return nil, nil, &errJoinedProcessGone{err: sendErr}
+					}
 					processState.stop()
-					return nil, nil, err
+					return nil, nil, newLoadError(cell.Key, "spawn", "admit_failed", fmt.Errorf("admit %s to the running packed process: %w", me.config.Name, sendErr))
 				}
+				err = newLoadError(cell.Key, "spawn", "admit_failed", fmt.Errorf("admit %s to the running packed process: %w", me.config.Name, sendErr))
 			}
 		}
 		if err == nil {
@@ -563,6 +718,13 @@ func (h *Host) startGoPackedCellOnce(ctx context.Context, cell *runtimecell.GoPa
 			processState.factoryOwner.Store(nil)
 		} else if _, factoryFailure := errors.AsType[*FactoryLoadError](err); factoryFailure {
 			processState.factoryOwner.Store(nil)
+		}
+		if err != nil && i == 0 && joined && joinedProcessGone(processState, err) {
+			// pig additive (D232): no factory ran in a process that was already gone, so the cell starts again, whole, on a fresh process.
+			h.stopFailedPackedMember(me)
+			processState.share.dead.Store(true)
+			processState.stopAndReap()
+			return nil, nil, &errJoinedProcessGone{err: err}
 		}
 		if err != nil && i == 0 && admission != nil && h.retryOnNextRuntime(ctx, cell.Key, err) {
 			h.stopFailedPackedMember(me)
@@ -617,7 +779,9 @@ func (h *Host) startGoPackedCellOnce(ctx context.Context, cell *runtimecell.GoPa
 	processState.watcherDone = make(chan struct{})
 	h.watchedPacked[processState] = struct{}{}
 	h.mu.Unlock()
-	//portlint:allow golifetime the watcher closes processState.watcherDone when the process ends, and Host.Shutdown waits on it for every process in h.watchedPacked
+	processState.stderrLog.hold()
+	h.runningWatchers.Add(1)
+	//portlint:allow golifetime the watcher closes processState.watcherDone when the process ends or, for a state released while its process runs on, when the state is released; Host.Shutdown waits on it for every process in h.watchedPacked whose process it ended
 	go h.watchPackedProcess(processState)
 	if acceptErr != nil {
 		return staged, registered, acceptErr
@@ -633,33 +797,50 @@ func (h *Host) spawnPackedProcess(ctx, extCtx context.Context, cancel context.Ca
 		processState.releaseUsageLease()
 		return err
 	}
-	cmd.Env = env
 	cmd.Dir = h.cwd
 	// pig additive (D20): packed-process diagnostics live only until teardown unless a reported failure retains them.
-	stderrFile, _ := os.CreateTemp("", fmt.Sprintf("pig-packed-%s-*.log", sanitizeLogName(cell.Key)))
+	stderrFile, _ := createExtLog(fmt.Sprintf("pig-packed-%s-*.log", sanitizeLogName(cell.Key)))
+	var stderrLog io.Writer
+	extLogPath := ""
 	if stderrFile != nil {
-		processState.stderrLog = &processStderrLog{path: stderrFile.Name(), writer: stderrFile}
-		// A Go, Rust or Python runner writes a failed member's cause to stderr and then closes the member's socket while the process serves its siblings. The process writes the log file itself, so the cause is in the file when the host reads it on that close; a host-side copy would race the read.
-		cmd.Stderr = stderrFile
+		extLogPath = stderrFile.Name()
+		h.mu.Lock()
+		processState.stderrLog = &processStderrLog{path: extLogPath, writer: stderrFile}
+		h.mu.Unlock()
+		stderrLog = processState.stderrLog
 	}
+	cmd.Env = withExtLog(env, extLogPath)
 	if nodeRuntime {
-		var stderrLog io.Writer
-		if processState.stderrLog != nil {
-			stderrLog = processState.stderrLog
+		cmd.Stdout, cmd.Stderr = h.extensionOutput(stderrLog)
+	} else {
+		// A Go, Rust or Python runner writes a failed member's cause to stderr and then closes the member's socket while the process serves its siblings. The host reads the cause from the log on that close, so the host keeps the pipe's write end and flushes it first (consolePipe).
+		stdout, stderr := h.extensionOutput(stderrLog)
+		console, err := newConsolePipe(stderr)
+		if err != nil {
+			_ = admissionWriter.Close()
+			processState.releaseUsageLease()
+			processState.stderrLog.closeWriter()
+			processState.stderrLog.remove()
+			return newLoadError(cell.Key, "spawn", "spawn_failed", fmt.Errorf("pipe packed runner output: %w", err))
 		}
-		cmd.Stdout, cmd.Stderr = h.nodeExtensionOutput(stderrLog)
+		processState.console = console
+		cmd.Stderr = console.write
+		cmd.Stdout = console.write
+		if stdout != stderr {
+			cmd.Stdout = stdout
+		}
 	}
 	// pig divergence (D56): after the host stops the process, its output pipe gets this long to drain before it is closed; it never bounds extension work.
-	cmd.WaitDelay = 5 * time.Second
+	cmd.WaitDelay = h.processWaitDelay()
 	for _, pending := range pendingExts {
 		h.markExtension(pending.me.config.Name, "spawn-start")
 	}
 	processTree, err := startProcessTree(cmd)
-	if !nodeRuntime || err != nil {
-		// A direct child inherited the log file; Node's host-side copy owns the writer until Cmd.Wait drains it, and no Cmd.Wait runs after a failed start.
-		processState.stderrLog.closeWriter()
-	}
+	releaseVerified(tsSelection)
 	if err != nil {
+		// No Cmd.Wait runs after a failed start, so nothing else ends the host-side copies that own the log's writer.
+		processState.console.finish(0)
+		processState.stderrLog.closeWriter()
 		_ = admissionWriter.Close()
 		processState.releaseUsageLease()
 		cancel()
@@ -671,8 +852,19 @@ func (h *Host) spawnPackedProcess(ctx, extCtx context.Context, cancel context.Ca
 		}
 		return loadErr
 	}
+	// The state is published under h.mu, which killProcesses reads: an exit that began before this point killed nothing of this process, so the process ends here.
+	h.mu.Lock()
 	processState.cmd = cmd
 	processState.processTree = processTree
+	exiting := h.shuttingDown.Load()
+	h.mu.Unlock()
+	if exiting {
+		if processTree != nil {
+			_ = processTree.Kill()
+		} else if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}
 	processState.share = newProcessShare(h.retentionKey(ctx, cell.BinaryPath, nodeRuntime), processState, processState.startWait(), admissionWriter, func() {
 		cancel()
 		if processTree != nil {
@@ -684,6 +876,10 @@ func (h *Host) spawnPackedProcess(ctx, extCtx context.Context, cancel context.Ca
 	processState.share.node = nodeRuntime
 	processState.share.tier = tierOf(tsSelection)
 	h.retention().register(processState.share)
+	// pig additive (D232): a Host that joined a CellRegistry offers this process to the other Hosts of the registry.
+	if h.sharesCells(ctx) {
+		h.cells.register(h.cellRegistryKey(processState.share.key), processState.share)
+	}
 	return nil
 }
 
@@ -791,17 +987,41 @@ func (h *Host) rollbackPartialPackedCell(staged []stagedManagedExt) {
 }
 
 func (h *Host) watchPackedProcess(process *packedProcessState) {
+	// survives is set when the state was released while its process runs on for another state or a parked reference.
+	survives := false
 	defer func() {
-		process.stderrLog.remove()
-		process.releaseUsageLease()
+		// The log goes when the process has ended and no state is left that may name it in a diagnostic.
+		process.stderrLog.letGo()
+		if survives {
+			process.releaseRecoveryAtExit()
+		} else {
+			process.releaseUsageLease()
+		}
 		h.mu.Lock()
 		delete(h.watchedPacked, process)
 		h.mu.Unlock()
+		h.runningWatchers.Add(-1)
 		if process.watcherDone != nil {
 			close(process.watcherDone)
 		}
 	}()
-	err := process.wait()
+	exited := process.startWait()
+	select {
+	case <-exited:
+	case <-process.released:
+		if !process.processReleased() {
+			// The process runs on. Its end concerns the states that still run factories in it, each with its own watcher; this state
+			// has nothing left to report, so its watcher ends here instead of waiting, with the state, for a process that may live as
+			// long as the session.
+			survives = true
+			return
+		}
+		<-exited
+	}
+	if h.deathGate != nil {
+		defer h.deathGate(deathSeenByWatcher, process.key)()
+	}
+	err := process.exitErr()
 	if process.stopping.Load() || h.shuttingDown.Load() || (process.parent != nil && process.parent.Err() != nil) {
 		return
 	}
@@ -811,6 +1031,11 @@ func (h *Host) watchPackedProcess(process *packedProcessState) {
 	}
 	if process.node {
 		h.recoverNodeProcess(process, reason)
+		return
+	}
+	// A trace that names one member of a shared native process blames that member only: the others restart in a shared process, and the culprit runs isolated.
+	if culprit := process.nativeCulprit(err); culprit != "" && len(process.members) > 1 {
+		h.recoverNativeProcess(process, culprit, reason)
 		return
 	}
 	// quarantinePackedCellGeneration checks process.generation against the
@@ -825,7 +1050,7 @@ func (h *Host) watchPackedProcess(process *packedProcessState) {
 func (h *Host) acceptPackedExt(ctx context.Context, me *managedExt, ln net.Listener) (_ *extension.Extension, err error) {
 	defer func() {
 		if loadErr, ok := errors.AsType[*LoadError](err); ok {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || h.shuttingDown.Load() {
 				loadErr.StderrLog = ""
 			} else {
 				loadErr.StderrLog = me.retainStderrLog()
@@ -846,6 +1071,7 @@ func (h *Host) acceptPackedExt(ctx context.Context, me *managedExt, ln net.Liste
 		// Upstream reports the loader's own error; lead with the cause the
 		// process wrote to stderr (matches host.go's isolated-mode
 		// "extension process exited before connecting" case).
+		me.syncStderr()
 		if cause := stderrCause(me.stderrLogPath, me.config.Name); cause != "" {
 			exitErr = fmt.Errorf("%s (%w)", cause, exitErr)
 		}
@@ -860,6 +1086,7 @@ func (h *Host) acceptPackedExt(ctx context.Context, me *managedExt, ln net.Liste
 
 	h.markExtension(me.config.Name, "handshake-start")
 	conn := NewConn(me.config.Name, rawConn)
+	conn.awaitReady()
 	// Every member of a packed process has its own socket, and the process's exit ends them all (peer_exit.go).
 	conn.watchPeerExit(me.packedProcess.startWait())
 	if turns := me.processFileMutations(); turns != nil {
@@ -885,6 +1112,7 @@ func (h *Host) acceptPackedExt(ctx context.Context, me *managedExt, ln net.Liste
 		// A packed Go, Rust or Python member that fails to load sends no
 		// error over the wire (a Node member's cell.mjs reports it above),
 		// so lead with the cause the process wrote to its stderr log.
+		me.syncStderr()
 		if cause := stderrCause(me.stderrLogPath, me.config.Name); cause != "" {
 			regErr = fmt.Errorf("%s (%w)", cause, regErr)
 		}
@@ -899,28 +1127,26 @@ func (h *Host) acceptPackedExt(ctx context.Context, me *managedExt, ln net.Liste
 		loadErr.StderrLog = me.stderrLogPath
 		return nil, loadErr
 	}
-	me.flagNames = make([]string, 0, len(reg.Flags))
-	me.wantsSessionLog = reg.WantsSessionLog
-	me.wantsModelRegistry = reg.WantsModelRegistry
-	for _, f := range reg.Flags {
-		me.flagNames = append(me.flagNames, f.Name)
-	}
 	if err := validateRegisterPayload(me.config.Name, reg); err != nil {
 		_ = conn.Close("invalid registration")
 		loadErr := newLoadError(me.config.Name, "register", "invalid_registration", err)
 		loadErr.StderrLog = me.stderrLogPath
 		return nil, loadErr
 	}
-	me.flagDefaults = reg.flagDefaults
+	registered := newRegisteredState(reg)
+	me.setRegistration(registered)
 	h.joinRoutedBus(ctx, me)
 	// sendReady, or activateNode for a deferred Node payload, fills the geometry.
-	readyPayload := &ReadyPayload{Cwd: h.cwd, Mode: h.mode, SourceInfo: h.readySourceInfo(me)}
+	readyPayload := &ReadyPayload{Group: h.Group(), Cwd: h.cwd, Mode: h.mode, SourceInfo: h.readySourceInfo(me)}
+	var stateEpoch uint64
 	if h.uiBridge != nil {
+		stateEpoch = h.readyStateEpoch(conn)
 		// Same contract as the isolated path: a registering extension gets the
 		// whole log once, then only what is new.
 		me.entryCursorMu.Lock()
 		me.entryCursor = 0
-		readyPayload.State = h.uiBridge.Snapshot(me.flagNames, 0, h.subscribedToSessionLog(me.config.Name))
+		me.entryPairCursor = 0
+		readyPayload.State = h.uiBridge.Snapshot(registered.flagNames, 0, h.subscribedToSessionLog(me.config.Name))
 		if readyPayload.State.Session != nil {
 			me.entryCursor = readyPayload.State.Session.EntryCount
 		}
@@ -928,7 +1154,7 @@ func (h *Host) acceptPackedExt(ctx context.Context, me *managedExt, ln net.Liste
 	}
 	if me.packedProcess.node {
 		me.pendingReady = &Envelope{Type: MsgReady, Ready: readyPayload}
-	} else if err := h.sendReady(me, conn, &Envelope{Type: MsgReady, Ready: readyPayload}); err != nil {
+	} else if err := h.sendReady(me, conn, &Envelope{Type: MsgReady, Ready: readyPayload}, stateEpoch); err != nil {
 		loadErr := newLoadError(me.config.Name, "ready", "send_ready_failed", fmt.Errorf("send ready: %w", err))
 		loadErr.StderrLog = me.stderrLogPath
 		return nil, loadErr
@@ -1007,4 +1233,11 @@ func fileNameComponent(value string) string {
 		}
 		return r
 	}, value)
+}
+
+// syncStderr returns once the stderr log holds what the member's packed process wrote so far, so a failure diagnostic reads the cause the runner wrote before it closed the member's socket. Another runtime's output is copied by exec, whose copy ends with the process.
+func (me *managedExt) syncStderr() {
+	if me.packedProcess != nil {
+		me.packedProcess.spawner().console.flush()
+	}
 }

@@ -1,6 +1,6 @@
 package http
 
-// pi: packages/chord/src/next-node/http/response.ts
+// pi: packages/chord/src/node/http/response.ts
 
 import (
 	"bytes"
@@ -20,12 +20,12 @@ import (
 // Tests of responses (slice 10 §2, D5, R6; security baseline (4), (6)): every kind written by a running server, the
 // response's headers over the default ones (an invalid one reported, 500), ranges (206, 416, multi-range), `HEAD`,
 // attachments and inline bodies, safe download names, bodies without `size`, a short or throwing read, a disconnect
-// stopping the reads. Ports packages/chord/test/next-node/http/response.test.ts.
+// stopping the reads. Ports packages/chord/test/node/http/response.test.ts.
 
 // answering is a server answering `GET /r` with response.
 func answering(t *testing.T, response HttpResponse) *testServer {
 	return serving(t, []plugin{{"@app/r", contributing(HttpContribution{Routes: []HttpRouteEntry{
-		RouteFunc("GET /r", func(HttpRequest, host.Ctx) (HttpResponse, error) { return response, nil }),
+		publicRoute("GET /r", func(HttpRequest, host.Ctx) (HttpResponse, error) { return response, nil }),
 	}})}}, servedOptions{})
 }
 
@@ -111,11 +111,11 @@ func TestDescriptionsWriteJSONHTMLRedirectAndErrorTheDefaultHeadersFirstTheRespo
 //go:fix inline
 func TestDescriptionsAnswer500ForAHeaderWithACROrLFAndAValueThatIsNoJSONReportedResponseFailed(t *testing.T) {
 	server := serving(t, []plugin{{"@app/r", contributing(HttpContribution{Routes: []HttpRouteEntry{
-		RouteFunc("GET /header", func(HttpRequest, host.Ctx) (HttpResponse, error) {
+		publicRoute("GET /header", func(HttpRequest, host.Ctx) (HttpResponse, error) {
 			return HttpResponse{Kind: KindJSON, Value: float64(1), Headers: []ResponseHeader{HeaderOf("X-Split", "a\r\nSet-Cookie: x=1")}}, nil
 		}),
 		// A value with no JSON form (Pi's BigInt).
-		RouteFunc("GET /bigint", func(HttpRequest, host.Ctx) (HttpResponse, error) {
+		publicRoute("GET /bigint", func(HttpRequest, host.Ctx) (HttpResponse, error) {
 			return HttpResponse{Kind: KindJSON, Value: map[string]any{"n": make(chan int)}}, nil
 		}),
 	}})}}, servedOptions{})
@@ -291,12 +291,12 @@ func TestBytesWithoutASizeAreSentChunked(t *testing.T) {
 
 func TestBytesDestroyTheConnectionOnAShortOrAThrowingReadReportedResponseFailed(t *testing.T) {
 	server := serving(t, []plugin{{"@app/r", contributing(HttpContribution{Routes: []HttpRouteEntry{
-		RouteFunc("GET /short", func(HttpRequest, host.Ctx) (HttpResponse, error) {
+		publicRoute("GET /short", func(HttpRequest, host.Ctx) (HttpResponse, error) {
 			size := int64(10)
 			return HttpResponse{Kind: KindBytes, Mime: "text/plain", Size: &size, Read: func(int64, int, host.Ctx) ([]byte, error) { return []byte("abc"), nil }}, nil
 		}),
 		// Astra's build review: a throwing read hung the response, unreported.
-		RouteFunc("GET /throws", func(HttpRequest, host.Ctx) (HttpResponse, error) {
+		publicRoute("GET /throws", func(HttpRequest, host.Ctx) (HttpResponse, error) {
 			size := int64(10)
 			return HttpResponse{Kind: KindBytes, Mime: "text/plain", Size: &size, Read: func(int64, int, host.Ctx) ([]byte, error) { return nil, errors.New("read failed") }}, nil
 		}),

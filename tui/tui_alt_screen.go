@@ -76,22 +76,14 @@ type TuiAltScreen struct {
 	layoutRoot         Component
 	currentLayout      *LayoutFrame
 
-	// One worker coalesces pending geometry so slow callbacks cannot reorder resizes.
-	pendingWidth      int
-	pendingHeight     int
-	notifyingGeometry bool
-
 	implicitDocument   Component
 	implicitScrollView *ScrollView
 	flashes            *AltScreenFlashContainer
 
 	altScreenActive bool
 	imageProtocol   ImageProtocol
-	// wezTerm is isWezTermSession as Start read it. Upstream reads process.env each frame, a property read; a Windows
-	// environment read allocates its UTF-16 key and value, so the alt screen reads it once per start, with the capabilities.
-	wezTerm bool
 	// scrollRows is whether a frame scrolls the rows that only moved (findMovedRows): PIG_TUI_SCROLL_ROWS=0 or a terminal not trusted with scroll regions (scrollRegionsUsable) turns it off.
-	// Start reads it, as it reads wezTerm.
+	// Start reads it with the capabilities.
 	scrollRows bool
 
 	// savedCapabilities holds the pre-enter terminal capabilities when the
@@ -230,14 +222,12 @@ func (d *altScreenDocument) Invalidate() {
 func newTuiAltScreen(out io.Writer, showHardwareCursor bool, options TuiAltScreenOptions) *TuiAltScreen {
 	copyOnSelect := options.CopyOnSelect == nil || *options.CopyOnSelect
 	t := &TuiAltScreen{
-		tuiBase: tuiBase{
-			out:                out,
-			terminalBackground: &terminalBackgroundQueries{},
-			showHardwareCursor: showHardwareCursor,
-			now:                time.Now,
-			afterFunc: func(d time.Duration, fn func()) stoppableTimer {
-				return time.AfterFunc(d, fn)
-			},
+		out:                stdoutWriter(out),
+		terminalBackground: &terminalBackgroundQueries{},
+		showHardwareCursor: showHardwareCursor,
+		now:                time.Now,
+		afterFunc: func(d time.Duration, fn func()) stoppableTimer {
+			return time.AfterFunc(d, fn)
 		},
 		uploadedKittyImages: map[int]cachedKittyImage{},
 		wheelScroll:         NewWheelScrollAccelerator(options.WheelScrollLines),
@@ -262,7 +252,7 @@ func newTuiAltScreen(out io.Writer, showHardwareCursor bool, options TuiAltScree
 	if t.searchNavigationButtonStyle == nil {
 		t.searchNavigationButtonStyle = func(text string, _ bool) string { return text }
 	}
-	t.render = t.doRender
+	t.render = t.drawFrame
 	t.resetRenderState = t.resetRenderStateLocked
 	t.flash = t.Flash
 	t.mountedRoots = t.getMountedRoots
@@ -404,30 +394,57 @@ func (t *TuiAltScreen) getPrimaryScrollView() *ScrollView {
 	return t.implicitScrollView
 }
 
-// Start enters the alternate screen and paints at once, as a live switch into
-// fullscreen needs. Mirrors upstream beforeTerminalStart + the enter write.
+// Start paints at once, as a live switch into fullscreen needs: the steps of Pi's TUI.start() after the terminal's own start. The caller starts
+// the terminal between BeforeTerminalStart and Start; a renderer that is not on the alternate screen yet enters it first (the start of a terminal
+// that writes nothing at its start). Like the main-screen renderer's Start it hides the cursor again, as tui.ts start() does once
+// terminal.start() returns.
 func (t *TuiAltScreen) Start() {
-	t.enterAltScreen()
+	t.continues.beginFor(t.terminal)
+	t.beforeTerminalStartIfNeeded()
+	t.HideCursor()
+	t.afterTerminalStart()
 	t.Render()
 }
 
-// StartRequestingRender enters the alternate screen as Start does but requests
-// the first frame instead of painting it, as Pi's TUI.start does
-// (tui.ts start(): requestRender()). The first frame has no earlier frame to
-// throttle against, so the request goes to the render dispatcher's loop at once,
-// which runs it on its next turn.
+// StartRequestingRender is Start with the first frame requested instead of painted, as Pi's TUI.start does (tui.ts start(): requestRender()), and
+// without the cursor hide: the caller hides it right after its terminal start. The first frame has no earlier frame to throttle against, so the
+// request goes to the render dispatcher's loop at once, which runs it on its next turn.
 func (t *TuiAltScreen) StartRequestingRender() {
-	t.enterAltScreen()
+	t.continues.beginFor(t.terminal)
+	t.beforeTerminalStartIfNeeded()
+	t.afterTerminalStart()
 	t.RequestImmediateRender()
 }
 
-// enterAltScreen is the part of start before the first frame.
-func (t *TuiAltScreen) enterAltScreen() {
+// beforeTerminalStartIfNeeded enters the alternate screen unless BeforeTerminalStart did already.
+func (t *TuiAltScreen) beforeTerminalStartIfNeeded() {
+	t.mu.Lock()
+	entered := t.altScreenActive
+	t.mu.Unlock()
+	if !entered {
+		t.BeforeTerminalStart()
+	}
+}
+
+// afterTerminalStart is tui.ts start() after terminal.start() and hideCursor(): the colour-scheme reports, then the cell-size query.
+func (t *TuiAltScreen) afterTerminalStart() {
+	if t.colorSchemeNotificationsEnabled() {
+		t.writeColorSchemeNotificationsOwned(true)
+	}
+	t.QueryCellSize()
+}
+
+// BeforeTerminalStart is Pi's TuiAltScreen.beforeTerminalStart (tui-alt-screen.ts:347): it resets the renderer's state and enters the alternate
+// screen, which tui.ts start() (:956) does before terminal.start(). The terminal's start follows it: it pushes the Kitty keyboard flags, and the
+// main and alternate screens keep independent stacks, so the push lands on the alternate screen's stack and stays there until terminal.stop()
+// pops it (before the screen is left). Start or StartRequestingRender follows the terminal's start.
+func (t *TuiAltScreen) BeforeTerminalStart() {
+	t.continues.beginFor(t.terminal)
 	t.mu.Lock()
 	// Upstream start() sets stopped=false first, then beforeTerminalStart resets
 	// the selection/scrollbar input state so a start->stop->start cycle resumes
 	// with a clean slate and rendering (doRender gates on stopped).
-	t.stopped = false
+	t.stopped.Store(false)
 	t.stopScrollbarHover()
 	t.stopScrollbarDrag()
 	t.clearTextSelectionLocked()
@@ -436,7 +453,6 @@ func (t *TuiAltScreen) enterAltScreen() {
 	t.altScreenActive = true
 	caps := GetCapabilities()
 	t.imageProtocol = caps.Images
-	t.wezTerm = t.imageProtocol == "kitty" && isWezTermSession()
 	t.scrollRows = scrollRegionsUsable()
 	clear(t.uploadedKittyImages)
 	t.uploadedKittyImagesOrder = nil
@@ -454,6 +470,8 @@ func (t *TuiAltScreen) enterAltScreen() {
 	if t.mouseEnabled {
 		mouse = altMouseEnableSequence()
 	}
+	// The enter sequence is written under mu, so a frame (which needs mu) comes after it, as in Pi, where start() writes it before the first frame.
+	t.writeOwned(t.out, altEnterAltScreen+altDisableAutowrap+mouse+"\x1b[2J\x1b[H\x1b[?25l")
 	t.unlockAndApplyHover()
 	t.clearComponentMouseGesture()
 	t.lastComponentClick = nil
@@ -461,27 +479,9 @@ func (t *TuiAltScreen) enterAltScreen() {
 		suppressed := caps
 		suppressed.Images = ""
 		SetCapabilities(suppressed)
-		t.invalidateMountedRoots()
+		t.Invalidate() // tui-alt-screen.ts:360: the mounted roots and the overlays' components
 	}
-	// The main and alternate screens keep independent Kitty keyboard-protocol
-	// stacks. Pi enters the alternate screen before Terminal.start pushes, so its
-	// single push lives on the active screen (tui.ts start, terminal.ts
-	// queryAndEnableKittyProtocol). The driver pushes on the main screen before
-	// this renderer starts, so when that push is outstanding, move it: pop the
-	// main stack, enter the alternate screen, push there. The pop and push write
-	// no query because the driver's negotiation already ran and its replies are
-	// screen independent. Without this, fullscreen terminals report legacy keys
-	// (ctrl+digit and shift+enter lose their modifiers).
-	enter := altEnterAltScreen + altDisableAutowrap + mouse + "\x1b[2J\x1b[H\x1b[?25l"
-	if keyboardProtocolPushed.Load() {
-		enter = keyboardProtocolPop + altEnterAltScreen + kittyKeyboardProtocolPush + altDisableAutowrap + mouse + "\x1b[2J\x1b[H\x1b[?25l"
-	}
-	WriteToTerminal(t.out, enter)
 	registerExitRestoreAltScreen(t)
-	if t.colorSchemeNotificationsEnabled() {
-		writeColorSchemeNotifications(t.out, true)
-	}
-	t.QueryCellSize()
 }
 
 // getMountedRoots returns the layout root when set, else the base children.
@@ -496,25 +496,16 @@ func (t *TuiAltScreen) getMountedRoots() []Component {
 	return t.childSnapshot()
 }
 
-// invalidateMountedRoots invalidates the rendered document tree so cached lines
-// are recomputed after a capability change. Mirrors upstream invalidate() over
-// getMountedRoots (layoutRoot when set, else the base children).
-func (t *TuiAltScreen) invalidateMountedRoots() {
-	t.mu.Lock()
-	root := t.layoutRoot
-	t.mu.Unlock()
-	if root != nil {
-		root.Invalidate()
-		return
-	}
-	t.implicitDocument.Invalidate()
-}
-
 // StopOptions controls alt-screen teardown. Mirrors upstream TuiStopOptions.
 type StopOptions struct {
 	// PreserveScreen leaves the alternate screen contents visible on exit
 	// instead of re-emitting the final frame into the main screen scrollback.
 	PreserveScreen bool
+	// ExitTerminal makes the stop also write what Pi's terminal.stop() writes between the cursor show and the screen exit (tui.ts:1012
+	// stop(): beforeTerminalStop, showCursor, terminal.stop(), afterTerminalStop): bracketed paste off and the Kitty keyboard pop, on the screen the
+	// flags were pushed on. Every stop of a renderer that draws on the process terminal sets it: the process exit, a renderer swap, a suspend and an
+	// external editor, each of which Pi's stop() covers; a renderer that does not own the terminal's modes leaves it false.
+	ExitTerminal bool
 }
 
 // Stop tears down the alternate screen and reflows the transcript into the
@@ -523,12 +514,13 @@ type StopOptions struct {
 func (t *TuiAltScreen) Stop() { t.StopWithOptions(StopOptions{}) }
 
 func (t *TuiAltScreen) StopWithOptions(options StopOptions) {
+	defer t.continues.end()
 	// Pi's stop() removes the exit handler first (tui.ts stop).
 	unregisterExitRestoreAltScreen(t)
 	t.closeSearch()
 	t.clearComponentMouseGesture()
 	t.mu.Lock()
-	t.stopped = true
+	t.stopped.Store(true)
 	t.pendingWidth = 0
 	t.pendingHeight = 0
 	if t.renderTimer != nil {
@@ -536,7 +528,7 @@ func (t *TuiAltScreen) StopWithOptions(options StopOptions) {
 		t.renderTimer = nil
 	}
 	if t.colorSchemeNotificationsEnabled() {
-		writeColorSchemeNotifications(t.out, false)
+		t.writeColorSchemeNotificationsOwned(false)
 	}
 	t.stopSelectionAutoScrollLocked()
 	// Mirror upstream beforeTerminalStop: clear active press, hover, and drag so
@@ -548,13 +540,16 @@ func (t *TuiAltScreen) StopWithOptions(options StopOptions) {
 	t.implicitScrollView.Dispose()
 	if !t.altScreenActive {
 		t.unlockAndApplyHover()
+		t.writeExitTerminalStop(options)
 		return
 	}
 	mouse := ""
 	if t.mouseEnabled {
 		mouse = altDisableMouse
 	}
-	WriteToTerminal(t.out, altBeginSynchronizedOutput+t.deleteKittyImages()+mouse+altEnableAutowrap+altEndSynchronizedOutput)
+	t.writeOwned(t.out, altBeginSynchronizedOutput+t.deleteKittyImages()+mouse+altEnableAutowrap+altEndSynchronizedOutput)
+	// Pi's stop(): showCursor() and terminal.stop() come between beforeTerminalStop and afterTerminalStop, so before the screen is left.
+	t.writeExitTerminalStop(options)
 	clear(t.uploadedKittyImages)
 	t.uploadedKittyImagesOrder = nil
 	t.altScreenActive = false
@@ -565,17 +560,9 @@ func (t *TuiAltScreen) StopWithOptions(options StopOptions) {
 	}
 	columns, _ := t.size()
 	width := max(1, columns)
-	// Pi pops in terminal.stop() before afterTerminalStop leaves the alternate
-	// screen. An outstanding push belongs to the alternate screen; return it to
-	// the main screen so the driver's DrainInput or restore pops the active
-	// stack. When DrainInput already popped, nothing is outstanding and the
-	// exit writes neither.
-	exit := altExitAltScreen
-	if keyboardProtocolPushed.Load() {
-		exit = keyboardProtocolPop + altExitAltScreen + kittyKeyboardProtocolPush
-	}
+	// Pi pops the Kitty flags in terminal.stop() (ExitTerminal), before afterTerminalStop leaves the alternate screen: the flags were pushed on its stack.
 	if options.PreserveScreen {
-		WriteToTerminal(t.out, altBeginSynchronizedOutput+exit+"\x1b[?25h"+altEndSynchronizedOutput)
+		t.writeOwned(t.out, altBeginSynchronizedOutput+altExitAltScreen+"\x1b[?25h"+altEndSynchronizedOutput)
 		t.unlockAndApplyHover()
 		if restore != nil {
 			SetCapabilities(*restore)
@@ -588,7 +575,7 @@ func (t *TuiAltScreen) StopWithOptions(options StopOptions) {
 	document := t.renderDocument(width)
 	t.leaveFrame()
 	var buf strings.Builder
-	buf.WriteString(altBeginSynchronizedOutput + exit + altDisableAutowrap)
+	buf.WriteString(altBeginSynchronizedOutput + altExitAltScreen + altDisableAutowrap)
 	for row := range document {
 		if row > 0 {
 			buf.WriteString("\r\n")
@@ -598,7 +585,7 @@ func (t *TuiAltScreen) StopWithOptions(options StopOptions) {
 	buf.WriteString("\x1b[0m" + altEnableAutowrap + "\r\n\x1b[?25h" + altEndSynchronizedOutput)
 	t.lastDocument = document
 	t.unlockAndApplyHover()
-	WriteToTerminal(t.out, buf.String())
+	t.writeOwned(t.out, buf.String())
 	// Restore suppressed iTerm2 capabilities after the exit document is written
 	// (the dump renders with images suppressed, matching upstream afterTerminalStop).
 	if restore != nil {
@@ -679,19 +666,19 @@ func (t *TuiAltScreen) rootComponent() Component {
 // ScrollBy scrolls the primary scroll view by the given number of lines.
 func (t *TuiAltScreen) ScrollBy(lines int) {
 	t.getPrimaryScrollViewLocked().ScrollBy(lines)
-	t.RequestRender()
+	t.requestViewRender()
 }
 
 // ScrollToTop scrolls the primary scroll view to its start.
 func (t *TuiAltScreen) ScrollToTop() {
 	t.getPrimaryScrollViewLocked().ScrollToStart()
-	t.RequestRender()
+	t.requestViewRender()
 }
 
 // ScrollToBottom scrolls the primary scroll view to its end.
 func (t *TuiAltScreen) ScrollToBottom() {
 	t.getPrimaryScrollViewLocked().ScrollToEnd()
-	t.RequestRender()
+	t.requestViewRender()
 }
 
 // Flash shows a transient message in the alternate-screen flash stack.
@@ -704,7 +691,7 @@ func (t *TuiAltScreen) Flash(message string, durationMs int) {
 // Mirrors TUI.ForceFullRender (the main-screen sets forceRedraw, consumed by its
 // differential renderer).
 func (t *TuiAltScreen) ForceFullRender() {
-	if t.stopped {
+	if t.stopped.Load() {
 		return
 	}
 	t.mu.Lock()
@@ -870,26 +857,39 @@ func (t *TuiAltScreen) removeUploadedKittyOrder(imageID int) {
 	}
 }
 
-// requestRenderFromLayout is the render callback handed to scroll views. A request made during the frame (a search reveal scrolling the transcript) is issued when the frame releases t.mu (RequestRender).
-func (t *TuiAltScreen) requestRenderFromLayout() { t.RequestRender() }
+// requestRenderFromLayout is the render callback handed to scroll views, as tui-alt-screen.ts passes requestViewRender to renderLayoutFrame: a scroll view
+// asks for a frame because its scroll position moved, which leaves component output unchanged. A request made during the frame (a search reveal scrolling
+// the transcript) is issued when the frame releases t.mu.
+func (t *TuiAltScreen) requestRenderFromLayout() { t.requestViewRender() }
 
 //perf:hot
-func (t *TuiAltScreen) doRender() {
+func (t *TuiAltScreen) doRender() { t.drawFrame(frameGate{}) }
+
+// drawFrame is the alternate screen's frame: gate says which frame started it (frameGate). It reports whether the frame began.
+//
+//perf:hot
+func (t *TuiAltScreen) drawFrame(gate frameGate) (began bool) {
 	t.lockFrame()
 	defer t.unlockFrame()
-	if t.stopped || !t.altScreenActive {
-		return
+	if t.stopped.Load() || !t.altScreenActive || t.frameSupersededLocked(gate) {
+		return false
 	}
-	t.lastRenderAt = t.now()
+	t.frameBeganLocked()
+	began = true
 	t.updateSize()
 	columns, screenRows := t.size()
 	width := max(1, columns)
 	height := max(1, screenRows)
 
 	root := t.rootComponent()
-	nextLayout := RenderLayoutFrame(root, width, height, t.requestRenderFromLayout)
+	// Only requestViewRender leaves contentChanged false, so a frame that follows nothing else reuses the output of the previous frame (tui-alt-screen.ts).
+	var reusableOutput LayoutRenderCache
+	if !t.contentChanged.Swap(false) && t.currentLayout != nil {
+		reusableOutput = t.currentLayout.RenderCache
+	}
+	nextLayout := RenderLayoutFrame(root, width, height, t.requestRenderFromLayout, reusableOutput)
 	if t.refreshSearch(&nextLayout) {
-		nextLayout = RenderLayoutFrame(root, width, height, t.requestRenderFromLayout)
+		nextLayout = RenderLayoutFrame(root, width, height, t.requestRenderFromLayout, nextLayout.RenderCache)
 	}
 	screen := make([]string, len(nextLayout.Lines))
 	for i, line := range nextLayout.Lines {
@@ -924,12 +924,11 @@ func (t *TuiAltScreen) doRender() {
 			imageAnchorsNeedRedraw = true
 		}
 	}
-	// WezTerm erases the Kitty image cells a row write touches, so a changed row an image covers redraws the images
-	// (upstream tui-alt-screen.ts imageCellsNeedRedraw).
-	// Only a Kitty frame can use the answer; Start read it (t.wezTerm), so a frame reads no environment.
-	isWezTerm := t.wezTerm
+	// terminals that store Kitty images in the cells they cover (WezTerm, xterm.js's image addon in
+	// Orca) erase the image cells a row write touches, so a changed row an image covers redraws the images on every Kitty
+	// terminal, not only WezTerm (upstream tui-alt-screen.ts imageCellsNeedRedraw, Pi main 4622edb79).
 	imageCellsNeedRedraw := false
-	if !imageAnchorsNeedRedraw && isWezTerm && t.imageProtocol == "kitty" && anyChanged {
+	if !imageAnchorsNeedRedraw && t.imageProtocol == "kitty" && anyChanged {
 	rows:
 		for row, line := range screen {
 			placementRows, ok := GetKittyImagePlacementRows(line)
@@ -961,11 +960,13 @@ func (t *TuiAltScreen) doRender() {
 	switch {
 	case fullRedraw:
 		t.fullRedrawCount.Add(1) // tui-alt-screen.ts:1725
-		clearImages := t.deleteKittyImages()
 		if t.imageProtocol == "kitty" && hadUploadedKittyImages {
-			clearImages = DeleteAllKittyPlacements()
+			// Kitty frees image data without placements on ED 2, which would break placement-only reuse.
+			// Every row is cleared with EL 2 below, so keep the uploads and skip the screen clear.
+			buf.WriteString(DeleteAllKittyPlacements())
+		} else {
+			buf.WriteString(t.deleteKittyImages() + "\x1b[2J")
 		}
-		buf.WriteString(clearImages + "\x1b[2J")
 	case imagesNeedRedraw:
 		switch t.imageProtocol {
 		case "iterm2":
@@ -976,12 +977,12 @@ func (t *TuiAltScreen) doRender() {
 	}
 	buf.WriteString(evictedImageDeletion)
 
-	// WezTerm erases intersecting Kitty image cells when a later row write
-	// touches a covered row. Draw image placements after every clear and text
-	// write so nothing later intersects them; text-only frames and other
-	// terminals keep the interleaved output. Mirrors upstream drawKittyImagesLast.
+	// some terminals store Kitty images in the cells they cover (WezTerm, xterm.js's image addon in
+	// Orca), so clearing or writing a covered row erases that part of the image, and every Kitty terminal draws images last. Draw image placements after every clear and text write so
+	// nothing later intersects them. Terminals that keep images on a separate layer (Kitty, Ghostty) render the same
+	// result; text-only frames keep the interleaved output. Mirrors upstream drawKittyImagesLast.
 	drawKittyImagesLast := redrawImages && t.imageProtocol == "kitty" &&
-		slices.ContainsFunc(screen, widthx.IsImageLine) && isWezTerm
+		slices.ContainsFunc(screen, widthx.IsImageLine)
 	repaintAll := fullRedraw || imagesNeedRedraw
 	repaint := func(row int) bool {
 		return repaintAll || altScreenRow(screen, row) != altScreenRow(t.previousScreen, row)
@@ -1037,45 +1038,25 @@ func (t *TuiAltScreen) doRender() {
 	}
 	buf.WriteString(altEndSynchronizedOutput)
 	t.previousFrameBytes = buf.Len()
+	// The frame is one write; it takes the terminal writer for it, so a cursor or raw write from another goroutine is before the frame or after it.
+	t.outMu.Lock()
 	WriteToTerminal(t.out, buf.String())
+	t.outMu.Unlock()
 
-	if t.previousScreenWidth > 0 && t.previousScreenWidth != width && t.onWidthChange != nil {
-		t.pendingWidth = width
+	changedWidth, changedHeight := 0, 0
+	if t.previousScreenWidth > 0 && t.previousScreenWidth != width {
+		changedWidth = width
 	}
-	if t.previousScreenHeight > 0 && t.previousScreenHeight != height && t.onHeightChange != nil {
-		t.pendingHeight = height
+	if t.previousScreenHeight > 0 && t.previousScreenHeight != height {
+		changedHeight = height
 	}
-	if !t.notifyingGeometry && (t.pendingWidth != 0 || t.pendingHeight != 0) {
-		t.notifyingGeometry = true
-		go t.notifyGeometryChanges()
-	}
+	t.queueGeometryLocked(changedWidth, changedHeight)
 	t.previousScreen = screen
 	t.previousRows = rows
 	t.previousScreenWidth = width
 	t.previousScreenHeight = height
 	t.currentLayout = &nextLayout
-}
-
-func (t *TuiAltScreen) notifyGeometryChanges() {
-	for {
-		t.mu.Lock()
-		if t.stopped || (t.pendingWidth == 0 && t.pendingHeight == 0) {
-			t.notifyingGeometry = false
-			t.mu.Unlock()
-			return
-		}
-		callback, size := t.onWidthChange, t.pendingWidth
-		if size != 0 {
-			t.pendingWidth = 0
-		} else {
-			callback, size = t.onHeightChange, t.pendingHeight
-			t.pendingHeight = 0
-		}
-		t.mu.Unlock()
-		if callback != nil {
-			callback(size)
-		}
-	}
+	return true
 }
 
 // altScreenRow returns screen[row], or "" past the end (upstream's
@@ -1095,12 +1076,6 @@ func writeCursorTo(buf *strings.Builder, row, col int) {
 	buf.WriteByte(';')
 	buf.Write(strconv.AppendInt(digits[:0], int64(col), 10))
 	buf.WriteByte('H')
-}
-
-// isWezTermSession reports whether the process runs inside WezTerm, from WEZTERM_PANE and TERM_PROGRAM as upstream reads
-// process.env; the alt screen reads it at Start.
-func isWezTermSession() bool {
-	return os.Getenv("WEZTERM_PANE") != "" || strings.ToLower(os.Getenv("TERM_PROGRAM")) == "wezterm"
 }
 
 // compositeOverlays uses the same state snapshot, geometry, and terminal-cell

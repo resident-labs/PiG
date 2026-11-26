@@ -8,11 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"slices"
 	"strings"
-	"syscall"
 
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension/host/cellpack"
@@ -22,6 +20,7 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/packagecontent"
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
 	"github.com/MichaelKinsy/PiG/internal/packagemanager"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 	"github.com/MichaelKinsy/PiG/tui"
 )
 
@@ -58,11 +57,13 @@ type authContributionRegistry struct {
 // pig additive (D40): pre-session OAuth inventory uses registration-only extension startup.
 // discoverAuthContributions inspects runtime registration only. It starts no
 // session runner and dispatches no lifecycle or capability handler.
-func discoverAuthContributions() (*authContributionRegistry, error) {
-	return discoverAuthContributionsFor("")
+func discoverAuthContributions(ctx context.Context) (*authContributionRegistry, error) {
+	return discoverAuthContributionsFor(ctx, "")
 }
 
-func discoverAuthContributionsFor(targetID string) (*authContributionRegistry, error) {
+// discoverAuthContributionsFor inspects under parent, the command's one cancellation source: the registry keeps a child of it for the extension processes it
+// launches, and close ends them. The registry installs no signal handler of its own.
+func discoverAuthContributionsFor(parent context.Context, targetID string) (*authContributionRegistry, error) {
 	cwd, agentDir, settings, err := packageContext()
 	if err != nil {
 		return nil, err
@@ -77,9 +78,9 @@ func discoverAuthContributionsFor(targetID string) (*authContributionRegistry, e
 	// ./src/index.ts is "src") need distinct keys, or a login launches the
 	// last extension of that name instead of the one that declared the provider.
 	configs = subprocess.DisambiguateIdentities(normalizeRuntimeExtensionConfigs(configs))
-	slices.SortStableFunc(configs, func(a, b subprocess.ExtConfig) int { return strings.Compare(a.Name, b.Name) })
+	sortx.Stable(configs, func(a, b subprocess.ExtConfig) int { return strings.Compare(a.Name, b.Name) })
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(parent)
 	if len(configs) > 0 {
 		// Inspection builds source extensions, so it needs the staged SDKs a
 		// clean host has only after this first stage.
@@ -291,7 +292,7 @@ func (r *authContributionRegistry) storeProjection(config subprocess.ExtConfig) 
 			providers = append(providers, provider)
 		}
 	}
-	slices.SortFunc(providers, func(a, b authContribution) int { return strings.Compare(a.ID, b.ID) })
+	sortx.Func(providers, func(a, b authContribution) int { return strings.Compare(a.ID, b.ID) })
 	data, err := json.Marshal(authRegistrationProjection{ConfigDigest: configDigest, ArtifactDigest: artifactDigest, Providers: providers})
 	if err != nil {
 		return err
@@ -314,7 +315,7 @@ func (r *authContributionRegistry) storeProjection(config subprocess.ExtConfig) 
 
 func (r *authContributionRegistry) inspectConfigs(configs []subprocess.ExtConfig) error {
 	configs = slices.Clone(configs)
-	slices.SortFunc(configs, func(a, b subprocess.ExtConfig) int { return strings.Compare(a.Name, b.Name) })
+	sortx.Func(configs, func(a, b subprocess.ExtConfig) int { return strings.Compare(a.Name, b.Name) })
 	for _, config := range configs {
 		host := subprocess.NewHostWithConfigRoot(r.cwd, codingagent.ConfigRoot())
 		host.SetMode("print")
@@ -533,7 +534,7 @@ func registeredAuthTargetItems(registry *authContributionRegistry) []authTargetI
 		}
 		contributed = append(contributed, authTargetItem{ID: target.ID, Name: target.Name, CallbackServer: target.CallbackServer})
 	}
-	slices.SortFunc(contributed, func(a, b authTargetItem) int {
+	sortx.Func(contributed, func(a, b authTargetItem) int {
 		if value := strings.Compare(a.Name, b.Name); value != 0 {
 			return value
 		}
@@ -542,12 +543,12 @@ func registeredAuthTargetItems(registry *authContributionRegistry) []authTargetI
 	return append(items, contributed...)
 }
 
-func authProviderFromContribution(id string, registry **authContributionRegistry) (ai.OAuthProviderInterface, error) {
+func authProviderFromContribution(ctx context.Context, id string, registry **authContributionRegistry) (ai.OAuthProviderInterface, error) {
 	if provider, ok := ai.GetOAuthProvider(id); ok {
 		return provider, nil
 	}
 	if *registry == nil {
-		discovered, err := discoverAuthContributionsFor(id)
+		discovered, err := discoverAuthContributionsFor(ctx, id)
 		if err != nil {
 			return nil, err
 		}
@@ -556,12 +557,12 @@ func authProviderFromContribution(id string, registry **authContributionRegistry
 	return (*registry).load(id)
 }
 
-func loadDeclaredAuthProvider(id string, registry **authContributionRegistry) error {
+func loadDeclaredAuthProvider(ctx context.Context, id string, registry **authContributionRegistry) error {
 	if _, ok := ai.GetOAuthProvider(id); ok {
 		return nil
 	}
 	if *registry == nil {
-		discovered, err := discoverAuthContributionsFor(id)
+		discovered, err := discoverAuthContributionsFor(ctx, id)
 		if err != nil {
 			return err
 		}

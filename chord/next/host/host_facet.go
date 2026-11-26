@@ -10,7 +10,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/state"
 )
 
-// Ports packages/chord/src/next/host/facet.ts. Facets (§16): a plugin's setup for one host, typed by the app's principal
+// Ports packages/chord/src/host/facet.ts. Facets (§16): a plugin's setup for one host, typed by the app's principal
 // type. A setup only declares: the types and registries it serves, its contributions to registries (slice 8) and the
 // host's presence lists; it has no documents, routines or natives, so a facet cannot fail after `load`.
 //
@@ -39,6 +39,11 @@ type FacetHost interface {
 
 // ServeOptions is what `host.serve` takes besides the type and the factory.
 type ServeOptions struct {
+	// Admit is the type's admission (slice 14 §2.1; remote types whose contract declares an `admission`, and only those:
+	// either without the other, or on a `local` type, is a declaration error): run first in every attempt, it reads data
+	// about the caller and returns a watchable of `Allow(value)` or `Deny(reason)`; the factory (an AdmittedFactory) is handed
+	// the value.
+	Admit Admit
 	// Accepts are the older versions of the type this provider still binds, with the mappings their edits need (Q10,
 	// `checkAccepts`): an older consumer's state members mapped per binding, its calls' arguments and results mapped. Checked
 	// at declaration: a declaration error fails the load or the reload of its plugin.
@@ -46,6 +51,9 @@ type ServeOptions struct {
 	// Linger is how long a live object with params stays live after its last reference is released (0 by default, nil):
 	// a reference within that time reuses it, with its documents and dependencies.
 	Linger *time.Duration
+	// Untraced makes the calls of the served type record no span (`serve`'s `untraced`): a span per call of the telemetry
+	// ingest would be telemetry about telemetry, written back with the next batch. Its metrics are still counted.
+	Untraced bool
 }
 
 // FacetSelf is what a facet's setup declares with besides the host: its contributions to registries (R21).
@@ -106,6 +114,16 @@ type facetDefinition struct {
 // DefineFacet defines a facet; base code binds the principal type once, next to its principal type (type-level in Pi).
 func DefineFacet(setup func(host FacetHost, self FacetSelf) error) Facet {
 	return Facet{definition: &facetDefinition{setup: setup}}
+}
+
+// Renew is a new facet of the same setup: the Go form of evaluating a plugin's module again (the code is compiled in, so the
+// setup is the same function). It is not the same facet as f (`Host.Reload` counts it changed), and not shared with it. The zero
+// Facet (the error-path value of facet constructors) has no setup to evaluate again: its renewal is the zero Facet.
+func (f Facet) Renew() Facet {
+	if f.definition == nil {
+		return Facet{}
+	}
+	return DefineFacet(f.definition.setup)
 }
 
 // same is Pi's `facet === other`: both are one DefineFacet's.

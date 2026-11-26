@@ -1,3 +1,8 @@
+//go:build !pig_strip_bedrock_converse_stream && !pig_strip_changelog && !pig_strip_codemode && !pig_strip_docs && !pig_strip_export_html && !pig_strip_extension_sdk_go && !pig_strip_extension_sdk_lisp && !pig_strip_extension_sdk_python && !pig_strip_extension_sdk_rust && !pig_strip_google_vertex && !pig_strip_llama_cpp && !pig_strip_mcp && !pig_strip_mermaid && !pig_strip_mistral_conversations && !pig_strip_node_extensions && !pig_strip_pig_login && !pig_strip_piglet_builder && !pig_strip_self_update && !pig_strip_syntax_highlight && !pig_strip_tool_search && !pig_strip_word_dictionaries
+
+// Pi has no strip: the help of a build with strip tags drops the entries of what they strip (TestStripLeakGate covers that), so the
+// comparison with Pi's help runs in a build without tags.
+
 package cli
 
 import (
@@ -9,8 +14,7 @@ import (
 )
 
 // cli/args.ts printHelp against pinned Pi: every line of Pi's help appears in Pig's, in order, after the program name (`pi` is `pig`), the
-// configuration directory and the environment variable prefix are renamed. PiG's own sections are skipped, and the lines Pi 1.1.0 adds for
-// `--tools +name/-name` belong to the tool-selection port (K1) and are listed as known gaps rather than hidden.
+// configuration directory and the environment variable prefix are renamed. PiG's own sections are skipped.
 func TestHelpMatchesPi(t *testing.T) {
 	cmd := exec.CommandContext(t.Context(), "node", "testdata/help.mjs")
 	var stderr bytes.Buffer
@@ -20,7 +24,8 @@ func TestHelpMatchesPi(t *testing.T) {
 		t.Fatalf("Pi oracle: %v\n%s", err, &stderr)
 	}
 	word := regexp.MustCompile(`\bpi\b`)
-	rename := strings.NewReplacer("PI_CODING_AGENT", "PIG_CODING_AGENT", "PI_PACKAGE_DIR", "PIG_PACKAGE_DIR", "~/.pi/", "~/.pig/", "https://pi.dev/", "https://pig.dev/")
+	// D2 ("Product name in messages"): the help lists PiG's names of PI_OFFLINE, PI_SELF_UPDATE_COMMAND and PI_TELEMETRY; Pi's names are still read.
+	rename := strings.NewReplacer("PI_CODING_AGENT", "PIG_CODING_AGENT", "PI_PACKAGE_DIR", "PIG_PACKAGE_DIR", "PI_OFFLINE", "PIG_OFFLINE", "PI_SELF_UPDATE_COMMAND", "PIG_SELF_UPDATE_COMMAND", "PI_TELEMETRY", "PIG_TELEMETRY", "~/.pi/", "~/.pig/", "https://pi.dev/", "https://pig.dev/")
 	spaces := regexp.MustCompile(` {2,}`)
 	// Renaming an environment variable shifts its description column; Pig re-pads the line, so those lines compare by their words.
 	squash := func(line string) string {
@@ -41,19 +46,12 @@ func TestHelpMatchesPi(t *testing.T) {
 	}
 
 	knownGaps := map[string]string{
-		"                                 Only +name/-name entries add to or remove from the defaults":          "K1: --tools +name/-name",
-		"  # Add codemode to the default tools":                                                                 "K1: --tools +name/-name",
-		"  pig --tools +codemode":                                                                               "K1: --tools +name/-name",
 		"  PIG_SHARE_VIEWER_URL              - Base URL for /share command (default: https://pig.dev/session/)": "PiG's /share has no viewer URL variable",
 		"  PI_SHARE_VIEWER_URL              - Base URL for /share command (default: https://pig.dev/session/)":  "PiG's /share has no viewer URL variable",
 	}
-	// A known-gap example block ends with the blank line that separates examples; it is skipped with the block.
 	var expected []string
 	for i := 0; i < len(want); i++ {
 		if _, known := knownGaps[want[i]]; known {
-			if want[i] == "  pig --tools +codemode" && i+1 < len(want) && want[i+1] == "" {
-				i++
-			}
 			continue
 		}
 		expected = append(expected, want[i])

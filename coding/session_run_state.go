@@ -2,7 +2,6 @@ package coding
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -14,6 +13,7 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/coding/extension/host/invocation"
 	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
 // errAgentAlreadyProcessing is upstream prompt()'s error for a message sent
@@ -38,6 +38,8 @@ type sessionRunState struct {
 	abortRequested atomic.Bool
 	// userRunsPending counts the runs an extension's sendUserMessage prepared or is preparing whose agent_start has not been emitted.
 	userRunsPending atomic.Int32
+	// promptPreflight counts the prompts in their input hooks and auth checks, which tree navigation must not interleave with (#9154).
+	promptPreflight atomic.Int32
 
 	mu              sync.Mutex
 	generation      uint64
@@ -232,7 +234,7 @@ type RunStart struct {
 }
 
 // BeginRunStart marks the Session busy for a user prompt's run (_startRun: `_isAgentRunActive = true; _agentRunAbortRequested = false`).
-// A Session that is already busy rejects the prompt, as prompt() does when it is streaming (agent-session.ts:2098-2103).
+// A Session that is already busy rejects the prompt, as prompt() does when it is streaming (agent-session.ts:2227-2232).
 func (s *Session) BeginRunStart() (*RunStart, error) {
 	s.pendingBashMu.Lock()
 	defer s.pendingBashMu.Unlock()
@@ -241,6 +243,8 @@ func (s *Session) BeginRunStart() (*RunStart, error) {
 		return nil, errors.New("coding: session is closed")
 	default:
 	}
+	// pig divergence (D629): Pi's _startRun marks the run active without this check (agent-session.ts:1943-1945), so the second of two RPC
+	// prompts whose preflights overlapped is answered "started" and never run; PiG rejects it.
 	if s.IsStreaming() {
 		return nil, errAgentAlreadyProcessing
 	}
@@ -465,6 +469,18 @@ func (s *Session) reportRuntimeError(event string, err error) {
 	}
 }
 
+// reportRuntimeErrorAfter is reportRuntimeError for a send whose caller asked to make the report when the sending code's run ends (extension.SendUserMessageOptions.AfterRun).
+func (s *Session) reportRuntimeErrorAfter(after func(report func()), event string, err error) {
+	if err == nil {
+		return
+	}
+	if after == nil {
+		s.reportRuntimeError(event, err)
+		return
+	}
+	after(func() { s.reportRuntimeError(event, err) })
+}
+
 func ignoreCancellation(err error) error {
 	if errors.Is(err, context.Canceled) {
 		return nil
@@ -487,7 +503,8 @@ func extensionUserMessageContent(raw any) (string, []ai.ImageContent, error) {
 	case []ai.UserContentBlock:
 		blocks = value
 	default:
-		encoded, err := json.Marshal(raw)
+		// A text block holds the extension's JavaScript string: a lone UTF-16 unit it carries is kept, as the session line JSON.stringify writes it.
+		encoded, err := jsstring.MarshalKeepingSurrogates(raw)
 		if err != nil {
 			return "", nil, fmt.Errorf("user content must be a string or array: %w", err)
 		}
@@ -497,7 +514,7 @@ func extensionUserMessageContent(raw any) (string, []ai.ImageContent, error) {
 			Data     string `json:"data"`
 			MimeType string `json:"mimeType"`
 		}
-		if err := json.Unmarshal(encoded, &wire); err != nil {
+		if err := jsstring.UnmarshalKeepingSurrogates(encoded, &wire); err != nil {
 			return "", nil, fmt.Errorf("user content must be a string or array")
 		}
 		for i, block := range wire {

@@ -4,9 +4,12 @@ package extension
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/MichaelKinsy/PiG/internal/mcpshared"
 )
 
 // Not upstream tests: guards for packages/coding-agent/src/core/mcp-servers.ts.
@@ -123,8 +126,8 @@ func TestIsLoopbackRedirectURI(t *testing.T) {
 		"http://127.1:8080/cb": true, "http://0x7F.0.0.1/cb": true, "http://127.0.0.1./cb": true,
 		"http://[0:0::1]:8080/cb": true, "http://localhost./cb": false,
 	} {
-		if got := IsLoopbackRedirectURI(uri); got != want {
-			t.Errorf("IsLoopbackRedirectURI(%q) = %v, want %v", uri, got, want)
+		if got := isLoopbackRedirectURI(uri); got != want {
+			t.Errorf("isLoopbackRedirectURI(%q) = %v, want %v", uri, got, want)
 		}
 	}
 }
@@ -226,12 +229,40 @@ func TestValidateMcpServerConfigParsesTheURLAsTheWHATWGParserDoes(t *testing.T) 
 		"http://%6cocalhost:8080/cb": true, "http://%6cocalhost/cb?x=1": false, "http:localhost/cb": true,
 		"https://%6cocalhost/cb": false, "http://exa%20mple.com/": false,
 	} {
-		if got := IsLoopbackRedirectURI(uri); got != want {
-			t.Errorf("IsLoopbackRedirectURI(%q) = %v, want %v", uri, got, want)
+		if got := isLoopbackRedirectURI(uri); got != want {
+			t.Errorf("isLoopbackRedirectURI(%q) = %v, want %v", uri, got, want)
 		}
 	}
 	config := json.RawMessage(`{"url":"https://x.example","oauth":{"callbackUrl":"http://%6cocalhost:9000/cb","callbackPort":9001}}`)
 	if _, message := ValidateMcpServerConfig("s", config); message != `server "s": oauth.callbackUrl and oauth.callbackPort name different ports` {
 		t.Errorf("callbackUrl port message = %q", message)
+	}
+}
+
+// isLoopbackRedirectURI is Pi's isLoopbackRedirectUri of packages/mcp/src/config.ts (not exported since 76c040a2a), observed through the
+// `oauth.callbackUrl` check of the validation: whether a redirect URI can be served by the loopback callback server.
+func isLoopbackRedirectURI(uri string) bool {
+	quoted, _ := json.Marshal(uri)
+	result := mcpshared.ValidateMcpServerConfig("s", json.RawMessage(`{"url":"https://x.example","oauth":{"callbackUrl":`+string(quoted)+`}}`), mcpshared.McpServerConfigOptions{})
+	return !strings.Contains(result.Error, "oauth.callbackUrl must be an http URI")
+}
+
+// Pi's `headers` and `env` are objects whose keys keep their insertion order (packages/mcp/src/config.ts McpHttpServerConfig.headers,
+// McpStdioServerConfig.env); McpServerConfig keeps the order through validation, and `type` is the entry's own.
+func TestValidateMcpServerConfigKeepsTheOrderOfHeadersAndEnvAndTheType(t *testing.T) {
+	http, message := ValidateMcpServerConfig("h", json.RawMessage(`{"type":"streamable-http","url":"https://a.example/","headers":{"b":"1","a":"2","c":"3"}}`))
+	if message != "" || http.Type != "streamable-http" || !slices.Equal(http.Headers.Keys(), []string{"b", "a", "c"}) {
+		t.Fatalf("http = %+v, %q", http, message)
+	}
+	var entries []string
+	for key, value := range http.Headers.All() {
+		entries = append(entries, key+"="+value)
+	}
+	if !slices.Equal(entries, []string{"b=1", "a=2", "c=3"}) {
+		t.Fatalf("entries = %q", entries)
+	}
+	stdio, message := ValidateMcpServerConfig("s", json.RawMessage(`{"type":"stdio","command":"x","env":{"Z":"1","A":"2"}}`))
+	if message != "" || stdio.Type != "stdio" || !slices.Equal(stdio.Env.Keys(), []string{"Z", "A"}) {
+		t.Fatalf("stdio = %+v, %q", stdio, message)
 	}
 }

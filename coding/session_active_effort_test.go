@@ -58,7 +58,6 @@ func TestCreateAgentSessionFromServicesPassesActiveEffortAtTopLevel(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer result.Session.Close()
 	drainSessionEvents(t, result.Session)
 	if _, err := result.Session.Send(context.Background(), "go"); err != nil {
 		t.Fatal(err)

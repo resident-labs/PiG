@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,16 +19,18 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/contracts"
 	"github.com/MichaelKinsy/PiG/chord/next/data"
 	"github.com/MichaelKinsy/PiG/chord/next/host"
+	"github.com/MichaelKinsy/PiG/chord/next/store"
 	"github.com/MichaelKinsy/PiG/chord/nextnode/plugins"
+	"github.com/MichaelKinsy/PiG/chord/nextnode/plugins/build"
+	"github.com/MichaelKinsy/PiG/chord/nextnode/plugins/model"
 )
 
-// Ports packages/chord/test/next-node/workers/support.ts: a server routing `Session` to forked fixture workers, the
+// Ports packages/chord/test/node/workers/support.ts: a server routing `Session` to forked fixture workers, the
 // fixture plugins copied into a temporary root, each address's start data (its behaviour) chosen by the test.
 
 var background = chordctx.Background()
 
-// fixtureServer is the server's own kind: `hostKind("server")`.
-var fixtureServer = mustFixture(contracts.NewHostKind("server"))
+// (fixtureServer, the server's own kind, is in workers_fixture_worker_test.go: control.ts `Server`.)
 
 // fleetOptions are the options of fleet; the zero value is the defaults of support.ts.
 type fleetOptions struct {
@@ -37,10 +40,48 @@ type fleetOptions struct {
 	start     func(address contracts.Address, ctx context.Context) (delta.JsonValue, error)
 	principal func() (data.Principal, error)
 	authorize func() (bool, error)
+	// admit is the route's admission, passed through CreateWorkers (slice 14 §2.3).
+	admit host.RouteAdmit
 	// onAuthorize runs for every hold the route authorizes, inside the server's section (the route's `authorize` runs there).
 	onAuthorize func(address contracts.Address)
 	// env is added to the workers' environment.
 	env map[string]string
+	// entry is the workers' program: the fixture's by default.
+	entry string
+	// baseDir is the directory the worker base's copy is written into (WorkersOptions.BaseDir).
+	baseDir string
+	// execArgv is the workers' arguments (WorkersOptions.ExecArgv).
+	execArgv []string
+	// compileCache is WorkersOptions.CompileCache.
+	compileCache string
+	// facets are the server's facets (none by default).
+	facets []host.HostFacet
+	// store is the server's store, given to its host and to the workers component.
+	store store.Store
+	// onError is called with each error of the component as it is reported (also collected in `errors`).
+	onError func(err WorkersError)
+	// onOutput, when set, is told each chunk of a worker's output before the fleet collects it, on the goroutine that reads the
+	// stream; the fleet collects the chunk only when it returns true.
+	onOutput func(stream string, chunk []byte) (collect bool)
+	// resolved, when set, is told what the workers' `resolve` returned for an address before the route handles it, and what it returns is
+	// what the route handles: a test's hold between the workers' answer and the route's.
+	resolved func(address contracts.Address, link host.ResolvedLink, err error, ctx context.Context) (host.ResolvedLink, error)
+}
+
+// resolvedSeam is a host whose routes hand what their `resolve` returned to resolved before they handle it.
+type resolvedSeam struct {
+	host.Host
+	resolved func(address contracts.Address, link host.ResolvedLink, err error, ctx context.Context) (host.ResolvedLink, error)
+}
+
+// Route implements host.Host.
+func (s *resolvedSeam) Route(kind *contracts.HostKind, options host.RouteOptions, ctx context.Context) (host.RouteHandle, error) {
+	resolve := options.Resolve
+	options.Resolve = func(address contracts.Address, routing context.Context) (host.ResolvedLink, error) {
+		link, err := resolve(address, routing)
+		return s.resolved(address, link, err, routing)
+	}
+	return s.Host.Route(kind, options, ctx)
 }
 
 // collector collects values from callbacks on other goroutines.
@@ -75,6 +116,8 @@ type fleet struct {
 	starts *collector[string]
 	// output is the workers' stdout lines, each with its address key.
 	output *collector[string]
+	// forgotten is the address keys WorkersOptions.Forgotten ran for, in order.
+	forgotten *collector[string]
 	// behaviours is each address's behaviour (its start data); none: a plain worker.
 	behaviours *behaviours
 	clock      *switchClock
@@ -91,6 +134,12 @@ func (b *behaviours) set(id string, behaviour workerBehaviour) {
 	b.byID[id] = behaviour
 }
 
+func (b *behaviours) delete(id string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.byID, id)
+}
+
 func (b *behaviours) get(id string) workerBehaviour {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -103,13 +152,16 @@ func newFleet(t testing.TB, options fleetOptions) *fleet {
 	root := t.TempDir()
 	f := &fleet{
 		t: t, root: root, errors: &collector[WorkersError]{}, hostErrors: &collector[host.HostError]{}, starts: &collector[string]{},
-		output: &collector[string]{}, behaviours: &behaviours{byID: map[string]workerBehaviour{}}, clock: newSwitchClock(),
+		output: &collector[string]{}, forgotten: &collector[string]{}, behaviours: &behaviours{byID: map[string]workerBehaviour{}}, clock: newSwitchClock(),
 	}
 	f.plugins = newPlugins(t, root)
 	serverAddress := fixtureServer.Address(nil)
 	serverOptions := host.HostOptions{Address: &serverAddress, Principal: delta.JsonObjectOf("kind", "server"), OnError: f.hostErrors.add}
 	if options.heartbeat != nil {
 		serverOptions.Heartbeat = options.heartbeat
+	}
+	if options.store != nil {
+		serverOptions.Store = options.store
 	}
 	server, err := host.CreateHost(serverOptions)
 	if err != nil {
@@ -120,10 +172,21 @@ func newFleet(t testing.TB, options fleetOptions) *fleet {
 	if options.idleMs != 0 {
 		idle = options.idleMs
 	}
-	workers, err := CreateWorkers(server, fixtureSession, WorkersOptions{
-		Kind:  "worker",
-		Entry: fixtureEntry(t),
-		Env:   withEnv(fixtureEnvironment("worker"), options.env),
+	entry := options.entry
+	if entry == "" {
+		entry = fixtureEntry(t)
+	}
+	routing := server
+	if options.resolved != nil {
+		routing = &resolvedSeam{Host: server, resolved: options.resolved}
+	}
+	workers, err := CreateWorkers(routing, fixtureSession, WorkersOptions{
+		Kind:         "worker",
+		Entry:        entry,
+		BaseDir:      options.baseDir,
+		ExecArgv:     options.execArgv,
+		CompileCache: options.compileCache,
+		Env:          withEnv(fixtureEnvironment("worker"), options.env),
 		Authorize: func(_ data.Principal, address contracts.Address) (bool, error) {
 			if options.onAuthorize != nil {
 				options.onAuthorize(address)
@@ -133,6 +196,7 @@ func newFleet(t testing.TB, options fleetOptions) *fleet {
 			}
 			return true, nil
 		},
+		Admit: options.admit,
 		Principal: func(address contracts.Address) (data.Principal, error) {
 			if options.principal != nil {
 				return options.principal()
@@ -152,18 +216,30 @@ func newFleet(t testing.TB, options fleetOptions) *fleet {
 		IdleMs:  func() time.Duration { return time.Duration(idle) * time.Millisecond },
 		Plugins: f.plugins,
 		OnOutput: func(address contracts.Address, stream string, chunk []byte) {
+			if options.onOutput != nil && !options.onOutput(stream, chunk) {
+				return
+			}
 			if stream == "stdout" {
 				f.output.add(address.Key + " " + string(trimSpace(chunk)))
 			}
 		},
-		OnError: f.errors.add,
-		clock:   f.clock,
+		OnError: func(err WorkersError) {
+			f.errors.add(err)
+			if options.onError != nil {
+				options.onError(err)
+			}
+		},
+		Forgotten: func(address contracts.Address) { f.forgotten.add(address.Key) },
+		Store:     options.store,
+		clock:     f.clock,
 	}, background)
 	if err != nil {
 		t.Fatal(err)
 	}
 	f.workers = workers
-	loadHost(t, server)
+	if _, err := server.Load(options.facets, background); err != nil {
+		t.Fatal(err)
+	}
 	// The worker kind's set made now (discovery, builds): the watcher marks edits from then on.
 	if _, err := f.plugins.Scripts("worker", background); err != nil {
 		t.Fatal(err)
@@ -209,21 +285,24 @@ func session(id string) contracts.Address {
 	return fixtureSession.Address(delta.JsonObjectOf("id", id))
 }
 
+// entryOf is the raw state entry of id: nil when none.
+func (f *fleet) entryOf(id string) *delta.JsonObject {
+	object, _ := f.workers.State().Value().(*delta.JsonObject)
+	entry, _ := object.Value("session|" + id).(*delta.JsonObject)
+	return entry
+}
+
 // stateOf is the state entry of id: nil when none.
 func (f *fleet) stateOf(id string) *WorkerState {
-	value, err := f.workers.State().Value()
-	if err != nil {
-		f.t.Fatal(err)
-	}
-	object, _ := value.(*delta.JsonObject)
-	entry, ok := object.Value("session|" + id).(*delta.JsonObject)
-	if !ok {
+	entry := f.entryOf(id)
+	if entry == nil {
 		return nil
 	}
 	state := &WorkerState{Status: WorkerStatus(entry.Value("status").(string))}
 	if pid, ok := entry.Value("pid").(float64); ok {
 		state.Pid = int(pid)
 	}
+	state.Incarnation, _ = entry.Value("incarnation").(string)
 	if failure, ok := entry.Value("error").(*delta.JsonObject); ok {
 		state.Error.Message, _ = failure.Value("message").(string)
 		state.Error.Code, _ = failure.Value("code").(string)
@@ -233,8 +312,7 @@ func (f *fleet) stateOf(id string) *WorkerState {
 
 // stateText is JSON.stringify(workers.state.value).
 func (f *fleet) stateText() string {
-	value, _ := f.workers.State().Value()
-	text, _ := delta.JsonObjectOf("v", value).MarshalJSON()
+	text, _ := delta.JsonObjectOf("v", f.workers.State().Value()).MarshalJSON()
 	return string(text)
 }
 
@@ -255,9 +333,30 @@ func errorKind(err WorkersError) string {
 		return "authorize_failed"
 	case WorkerExitedError:
 		return "worker_exited"
+	case WorkerLinkLostError:
+		return "worker_link_lost"
 	default:
 		return fmt.Sprintf("%T", err)
 	}
+}
+
+// reportedErrors is every error the workers reported so far, with the private cause and the stderr tail of a failed worker,
+// for a test whose wait timed out to say why.
+func (f *fleet) reportedErrors() string {
+	var text strings.Builder
+	for _, each := range f.errors.all() {
+		switch failed := each.(type) {
+		case WorkerFailedError:
+			tail := failed.StderrTail
+			if len(tail) > 600 {
+				tail = tail[len(tail)-600:]
+			}
+			fmt.Fprintf(&text, "[worker_failed %s: %v; stderr %q] ", failed.Address, failed.Error, tail)
+		default:
+			fmt.Fprintf(&text, "[%T %+v] ", each, each)
+		}
+	}
+	return text.String()
 }
 
 // firstFailure is the first `worker_failed` the workers reported.
@@ -315,6 +414,13 @@ func (c *fakeClock) afterFunc(d time.Duration, job func()) host.Timer {
 	timer := &fakeTimer{clock: c, due: c.now + d, job: job}
 	c.timers = append(c.timers, timer)
 	return timer
+}
+
+// armed is how many timers the component ever armed on the clock, pending, fired or stopped.
+func (c *fakeClock) armed() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.timers)
 }
 
 func (t *fakeTimer) Stop() bool {
@@ -398,8 +504,8 @@ func newPlugins(t testing.TB, root string) *plugins.Plugins {
 		t.Fatal(err)
 	}
 	component := plugins.CreatePlugins(plugins.PluginsOptions{
-		Roots:   []string{root},
-		Kinds:   []plugins.KindDefinition{{Name: "worker", Platform: plugins.PlatformNode, HostPackages: []string{"@earendil-works/chord/next"}}},
+		Build: build.BuildFacet, Roots: []model.PluginRoot{{Path: root}},
+		Kinds:   []plugins.KindEntry{{Name: "worker", Definition: plugins.KindDefinition{Platform: model.PlatformNode, HostPackages: []string{"@earendil-works/chord"}}}},
 		OnError: func(plugins.PluginsError) {},
 	}, background)
 	t.Cleanup(component.Close)

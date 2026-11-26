@@ -54,7 +54,7 @@ func randomThinkingProbes(bindings []map[string][]string) []thinkingProbe {
 		}
 		probe.Keys = make([]string, 1+rng.Intn(14))
 		for i := range probe.Keys {
-			probe.Keys[i] = keys[rng.Intn(len(keys))]
+			probe.Keys[i] = dictionaryFree(keys[rng.Intn(len(keys))])
 		}
 		probes = append(probes, probe)
 	}
@@ -65,6 +65,7 @@ func randomThinkingProbes(bindings []map[string][]string) []thinkingProbe {
 // highlighted level, up/down/confirm/cancel drive the list (wrapping), and every other key edits the search whose Input submit
 // (LF or tui.input.submit) selects, then the list is rebuilt around the previously highlighted level.
 func TestThinkingSelectorInputMatchesPi(t *testing.T) {
+	restoreStartupTheme(t)
 	levels := []string{"off", "minimal", "low", "medium", "high", "xhigh"}
 	scripts := [][]string{
 		{"\x1b[A"},
@@ -82,6 +83,8 @@ func TestThinkingSelectorInputMatchesPi(t *testing.T) {
 		{"\x13"},
 		{"\x1b[B", "\x13", "\x1b[B", "\x13"},
 		{"m", "\x1b[D", "x", "\x17", "\r"},
+		// Pi 5bcf370a5 (#12334): a key that leaves the query unchanged does not rebuild the list.
+		{"m", "\x1b[B", "\x1b[D", "\x1b[H", "\x1b[F", "\r"},
 	}
 	bindings := []map[string][]string{
 		nil,
@@ -127,11 +130,7 @@ func TestThinkingSelectorInputMatchesPi(t *testing.T) {
 	if err := json.Unmarshal(output, &expected); err != nil {
 		t.Fatal(err)
 	}
-	previousTheme, previousCaps := tui.ActiveTheme(), tui.GetCapabilities()
-	t.Cleanup(func() {
-		tui.SetCapabilities(previousCaps)
-		tui.SetTheme(previousTheme.Name)
-	})
+	restoreStartupTheme(t)
 	failures := 0
 	for i, probe := range probes {
 		tui.SetCapabilities(tui.TerminalCapabilities{TrueColor: true})

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MichaelKinsy/PiG/internal/screenwriter"
+	"github.com/MichaelKinsy/PiG/internal/screenwriter/gridterm"
 	"github.com/MichaelKinsy/PiG/tui/widthx"
 )
 
@@ -60,11 +62,18 @@ type termSession struct {
 	rec *termRecorder
 	out *strings.Builder
 	ui  *TuiAltScreen
+	// draw, when set, stands in for frame: the scenario is a stream whose frames the renderer's scheduler draws (frame_pacing_replay_test.go). quiet then runs before the screen's size or viewport is changed, which a scenario does to the screen as it was last drawn: the stream waits there for the frame that draws its newest state.
+	draw  func(resize []int)
+	quiet func()
 }
 
 // frame draws a frame (after the screen changed size to resize, when set) and records its bytes as one step.
 func (s *termSession) frame(resize ...int) {
 	s.t.Helper()
+	if s.draw != nil {
+		s.draw(resize)
+		return
+	}
 	s.ui.Render()
 	s.rec.add(resize, s.out.String())
 	s.out.Reset()
@@ -72,6 +81,9 @@ func (s *termSession) frame(resize ...int) {
 
 func (s *termSession) resize(cols, rows int) {
 	s.t.Helper()
+	if s.quiet != nil {
+		s.quiet()
+	}
 	s.ui.SetFixedSize(cols, rows)
 	s.frame(cols, rows)
 }
@@ -79,6 +91,9 @@ func (s *termSession) resize(cols, rows int) {
 // scrollBack scrolls the viewport by lines and records the frame, requiring that the viewport moved.
 func (s *termSession) scrollBack(lines int) {
 	s.t.Helper()
+	if s.quiet != nil {
+		s.quiet()
+	}
 	before := s.ui.ViewportTop()
 	s.ui.ScrollBy(lines)
 	if s.ui.ViewportTop() == before {
@@ -90,6 +105,9 @@ func (s *termSession) scrollBack(lines int) {
 // input sends data to the viewport as the driver does and records the frame, requiring that the viewport handled it and moved.
 func (s *termSession) input(data string) {
 	s.t.Helper()
+	if s.quiet != nil {
+		s.quiet()
+	}
 	before := s.ui.ViewportTop()
 	if !s.ui.HandleViewportInput(data) {
 		s.t.Fatalf("the viewport did not handle %q", data)
@@ -340,7 +358,7 @@ var termKnownScenarios = []termScenario{
 // termLeakingOracleScenarios are the fixture scenarios (indexes in testdata/alt-screen-oracle.json.gz) left out of the A == B equality: a
 // component renders a line wider than the screen in each, the clipped line leaks its SGR, and some engine shows other screens for A and B
 // as a result. TestAltScreenTermEngineCorpus records how each is shown to differ only by the leak.
-var termLeakingOracleScenarios = []int{173, 485}
+var termLeakingOracleScenarios = []int{173}
 
 // termRandomMix is a seeded mix of the edits TestAltScreenScrolledFramesShowEveryRow makes: lines added, extended, deleted, inserted and
 // changed (with wide text), the viewport scrolled, and the rows below the transcript changed.
@@ -448,8 +466,8 @@ func TestAltScreenTermEngineCorpus(t *testing.T) {
 	// do not give a terminal that size.
 	//
 	// Scenarios whose components render a line wider than the screen leak SGR (known-clipped-sgr-leak), and most of them still show the same
-	// screen in A and B and stay in the equality as they are. The two that show other screens in some engine (termLeakingOracleScenarios) are
-	// left out of it, and each is shown to differ only by the leak:
+	// screen in A and B and stay in the equality as they are. The one that shows other screens in some engine (termLeakingOracleScenarios) is
+	// left out of it, and it is shown to differ only by the leak:
 	//   - oracle-NNN-closed: the same scenario with every rendered line wider than the screen clipped to it and closed with a reset,
 	//     identically in A and B (a test-only transform of the lines the components render). It is in the equality: A and B are equal in all
 	//     five engines once the leak is closed, and a difference left over would be a finding.
@@ -562,6 +580,21 @@ func TestAltScreenTermEngineCorpus(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// The two recorded steps of the benchmark (PiG's own bytes for the long answer and the 50-file write), in both variants.
+	for name, writes := range screenWriterStreams(t) {
+		recorded := add(name, 160, 48)
+		for _, variant := range []string{"A", "B"} {
+			v := recorded.Variants[variant]
+			for _, write := range writes {
+				(&termRecorder{v}).add(nil, write)
+			}
+		}
+	}
+	// C and D are what the screen writer (D624) makes of A and B: its bytes must leave every engine showing the screen the bytes it
+	// was given do, after every step. Every seventh step ends with the settle write.
+	for _, sc := range manifest.Scenarios {
+		sc.Variants["C"], sc.Variants["D"] = termWriterVariant(sc, sc.Variants["A"], sc.Name+".C.bin"), termWriterVariant(sc, sc.Variants["B"], sc.Name+".D.bin")
+	}
 	for _, sc := range manifest.Scenarios {
 		for _, v := range sc.Variants {
 			if err := os.WriteFile(filepath.Join(dir, v.File), v.data, 0o644); err != nil {
@@ -572,7 +605,7 @@ func TestAltScreenTermEngineCorpus(t *testing.T) {
 	var plan strings.Builder
 	for _, sc := range manifest.Scenarios {
 		fmt.Fprintf(&plan, "scenario\t%s\t%d\t%d\n", sc.Name, sc.Cols, sc.Rows)
-		for _, name := range []string{"A", "B"} {
+		for _, name := range []string{"A", "B", "C", "D"} {
 			v := sc.Variants[name]
 			fmt.Fprintf(&plan, "variant\t%s\t%s\n", name, v.File)
 			for _, step := range v.Steps {
@@ -587,4 +620,26 @@ func TestAltScreenTermEngineCorpus(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "plan.txt"), []byte(plan.String()), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// termWriterVariant is the bytes a terminal of the scenario's size, resized as v says, is sent for the steps of v when a screen writer is under it.
+func termWriterVariant(sc *termCorpusScenario, v *termCorpusVariant, file string) *termCorpusVariant {
+	size := [2]int{sc.Cols, sc.Rows}
+	writer := screenwriter.New(screenwriter.Options{Size: func() (int, int) { return size[0], size[1] }, Settle: -1})
+	out := &termCorpusVariant{File: file}
+	start := 0
+	for i, step := range v.Steps {
+		if step.Resize != nil {
+			size = [2]int{step.Resize[0], step.Resize[1]}
+		}
+		for _, write := range gridterm.SplitWrites(string(v.data[start:step.End])) {
+			out.data = append(out.data, writer.Translate(write)...)
+		}
+		if i%7 == 6 {
+			out.data = append(out.data, writer.Settled()...)
+		}
+		start = step.End
+		out.Steps = append(out.Steps, termCorpusStep{Resize: step.Resize, End: len(out.data)})
+	}
+	return out
 }

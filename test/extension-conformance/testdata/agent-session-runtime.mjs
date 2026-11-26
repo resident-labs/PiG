@@ -30,7 +30,9 @@ export async function agentSessionRuntimeScript({ cwd, agentDir, root, runtimePr
       cwd: options.cwd, agentDir: options.agentDir, settingsManager: settings, modelRuntime: rt, resourceLoaderOptions: { ...quiet, additionalExtensionPaths: [runtimeProbe] },
     });
     const { session, modelFallbackMessage } = await createAgentSessionFromServices({ services, sessionManager: options.sessionManager, sessionStartEvent: options.sessionStartEvent });
-    return { session, services, diagnostics: services.diagnostics, modelFallbackMessage };
+    const diagnostics = [...services.diagnostics, { type: "warning", message: "runtime diagnostics: startup" }];
+    if (calls.length > 1) diagnostics.push({ type: "error", message: "runtime diagnostics: replaced" });
+    return { session, services, diagnostics, modelFallbackMessage };
   };
   const manager = SessionManager.create(cwd, sessionDir);
   const firstFile = () => runtimeFile;
@@ -67,6 +69,9 @@ export async function agentSessionRuntimeScript({ cwd, agentDir, root, runtimePr
     cwd: runtime.cwd, diagnostics: runtime.diagnostics, fallback: orNull(runtime.modelFallbackMessage), sameLog: runtime.session.sessionManager.getSessionId() === manager.getSessionId(),
     servicesCwd: runtime.services.cwd, servicesAgentDir: runtime.services.agentDir === agentDir, calls: calls.length,
   };
+  // takeUnreportedDiagnostics (Pi's c47ad0432bb8): the startup diagnostics once, the next replacement's own once, an unchanged one never again after a later replacement.
+  r.takenAtStartup = runtime.takeUnreportedDiagnostics();
+  r.takenAtStartupAgain = runtime.takeUnreportedDiagnostics();
   await runtime.session.prompt("one");
   r.prompted = { kinds: kinds(), persisted: existsSync(firstFile()) };
 
@@ -83,6 +88,8 @@ export async function agentSessionRuntimeScript({ cwd, agentDir, root, runtimePr
     result: created, fresh: isNew(), parentIsFirst: runtime.session.sessionManager.getHeader()?.parentSession === firstFile(), kinds: kinds(), roles: runtime.session.messages.map((message) => message.role),
     calls: calls.slice(1), rebinds, invalidations,
   };
+  r.takenAfterNew = runtime.takeUnreportedDiagnostics();
+  r.takenAfterNewAgain = runtime.takeUnreportedDiagnostics();
   await runtime.session.prompt("two");
   const secondFile = runtime.session.sessionManager.getSessionFile();
 
@@ -94,6 +101,7 @@ export async function agentSessionRuntimeScript({ cwd, agentDir, root, runtimePr
     result: forked, fresh: isNew(), parentIsNotSecond: runtime.session.sessionManager.getSessionFile() !== secondFile, roles: runtime.session.messages.map((message) => message.role),
     kinds: kinds(), calls: calls.length - 2,
   };
+  r.takenAfterFork = runtime.takeUnreportedDiagnostics();
   await runtime.session.prompt("three");
   const assistant = runtime.session.sessionManager.getEntries().find((entry) => entry.type === "message" && entry.message.role === "assistant");
   const forkedAt = await runtime.fork(assistant.id, { position: "at" });
@@ -125,7 +133,22 @@ export async function agentSessionRuntimeScript({ cwd, agentDir, root, runtimePr
     sourceKept: existsSync(importPath), missing: await error(() => runtime.importFromJsonl(join(importDir, "missing.jsonl"))),
   };
 
+  // reload after bindExtensions({}) (Pi e03dca7a3843): the host bound the session without a UI context, command actions, a shutdown handler or an error listener, and the reload still stops the old extensions and starts the new ones.
+  const loggedBeforeReload = readFileSync(logFile, "utf8").trimEnd().split("\n").length;
+  await runtime.session.reload();
+  r.reload = { events: readFileSync(logFile, "utf8").trimEnd().split("\n").slice(loggedBeforeReload) };
+
+  // dispose settles a run in flight before it emits session_shutdown (Pi's dispose awaits session.abort()): the model never ends this run, so only the abort can end it and the log shows its agent_end before the shutdown.
+  const observeFile = join(cwd, "observe-run");
+  writeFileSync(observeFile, "");
+  const running = runtime.session.prompt("hang-forever");
+  for (let waited = 0; !readFileSync(logFile, "utf8").includes("agent_start"); waited += 10) {
+    if (waited > 30000) throw new Error("the run never started");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
   await runtime.dispose();
+  await running;
+  rmSync(observeFile);
   r.counts = { rebinds, invalidations, factoryCalls: calls.length, reasons: calls.map((call) => call.reason + (call.previous ? "+previous" : "")) };
   r.events = readFileSync(logFile, "utf8").trimEnd().split("\n");
   return r;

@@ -23,7 +23,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -35,8 +34,10 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/nodeerrno"
 	"github.com/MichaelKinsy/PiG/internal/nodefs"
 	"github.com/MichaelKinsy/PiG/internal/nodepath"
+	"github.com/MichaelKinsy/PiG/internal/noderealpath"
 	"github.com/MichaelKinsy/PiG/internal/procpolicy"
 	"github.com/MichaelKinsy/PiG/internal/resolvepath"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 )
 
 // SessionInfo is the picker-display summary of a session JSONL.
@@ -797,10 +798,9 @@ func (sm *SessionManager) findMostRecent(filterCwd bool) string {
 		}
 		mod := stat.ModTime()
 		// libuv: st_mtim.tv_sec * 1000 + st_mtim.tv_nsec / 1e6, in doubles.
-		//portlint:allow fusedmuladd tv_sec*1000 is exact, so fusing it into the sum cannot change mtimeMs
-		candidates = append(candidates, candidate{path, float64(mod.Unix())*1000 + float64(mod.Nanosecond())/1e6})
+		candidates = append(candidates, candidate{path, float64(float64(mod.Unix())*1000) + float64(mod.Nanosecond())/1e6})
 	}
-	slices.SortStableFunc(candidates, func(a, b candidate) int { return cmp.Compare(b.mtimeMs, a.mtimeMs) })
+	sortx.Stable(candidates, func(a, b candidate) int { return cmp.Compare(b.mtimeMs, a.mtimeMs) })
 	for _, c := range candidates {
 		header := readSessionHeaderForDiscovery(c.path)
 		if header != nil && (!filterCwd || sessionCwdMatches(header.CWD, sm.cwd)) {
@@ -856,7 +856,7 @@ func canonicalDir(p string) string {
 	if err != nil {
 		abs = p
 	}
-	if resolved, err := evalCanonicalPath(abs); err == nil {
+	if resolved, err := noderealpath.Eval(abs); err == nil {
 		return resolved
 	}
 	return filepath.Clean(abs)

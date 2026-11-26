@@ -16,7 +16,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/link"
 )
 
-// Ports packages/chord/src/next-node/http/upgrades.ts. Upgraded connections (slice 10 §2, D6, Q6): the links endpoint
+// Ports packages/chord/src/node/http/upgrades.ts. Upgraded connections (slice 10 §2, D6, Q6): the links endpoint
 // (`host.accept` over a WebSocket with a per-socket output cap) and plugin sockets (a WebSocket handed to the contribution's
 // handler for its own protocol, in a scope lasting until it closes, kept alive by a heartbeat). Each connection is kept with
 // what admitted it: when that leaves (its allowed host, its relay, its socket handler) it is terminated at once and its
@@ -39,7 +39,7 @@ import (
 //     attaching it, so a close on another goroutine cannot reach it first.
 
 // UpgradeAdmission is what admitted an upgrade: the allowed host or the relay it came through (local: neither), and its
-// principal.
+// principal (nil for a public socket).
 type UpgradeAdmission struct {
 	// Allowed is the allowed host, "" for none.
 	Allowed   string
@@ -181,18 +181,46 @@ func NewUpgrades() *Upgrades {
 }
 
 // Link upgrades request to the links endpoint: `host.accept` over the socket (its output capped) as the admitted principal,
-// with options' limits; ctx is the parent of the work on the link. checked is the router the check read.
-func (u *Upgrades) Link(w nethttp.ResponseWriter, request *nethttp.Request, admission UpgradeAdmission, options LinkOptions, h host.Host, ctx context.Context, checked *Router) {
+// with options' limits; ctx is the parent of the work on the link. checked is the router the check read. opened is `links.opened`: it
+// runs once the link is accepted, with what terminates that link at once (as a revocation does: no close handshake a peer could
+// ignore; any goroutine, more than once), and what it returns runs when the socket closes, once.
+func (u *Upgrades) Link(w nethttp.ResponseWriter, request *nethttp.Request, admission UpgradeAdmission, options LinkOptions, h host.Host, ctx context.Context, checked *Router, opened func(closeLink func()) func()) {
 	maxPayload := options.MaxPayload
 	if maxPayload == 0 {
 		maxPayload = defaultLinkPayload
 	}
 	upgrade(w, request, maxPayload, func(socket *WebSocket) {
-		end := link.WebSocketLink(limitedSocket(socket))
-		connection := &upgraded{socket: socket, allowed: admission.Allowed, relay: admission.Relay, seal: end.Close, checked: checked.order}
+		linkEnd := link.WebSocketLink(limitedSocket(socket))
+		connection := &upgraded{socket: socket, allowed: admission.Allowed, relay: admission.Relay, seal: linkEnd.Close, checked: checked.order}
 		u.keep(connection)
-		if err := h.Accept(end, host.LinkOptions{Principal: admission.Principal, Limits: options.Limits}, ctx); err != nil {
+		if err := h.Accept(linkEnd, host.LinkOptions{Principal: admission.Principal, Limits: options.Limits}, ctx); err != nil {
 			socket.Terminate()
+		}
+		// Node emits a terminated socket's `close` on a later turn, so what the hook returned is always registered in time; here the
+		// event comes from another goroutine and can come before the hook returned. The listener is attached first and takes what the
+		// hook returned when it is there; when the close came first, that function runs once the hook returned.
+		var mu sync.Mutex
+		var hooked func()
+		ended := false
+		socket.OnceClose(func(CloseEvent) {
+			mu.Lock()
+			ended = true
+			closed := hooked
+			mu.Unlock()
+			if closed != nil {
+				closed()
+			}
+		})
+		closed := opened(func() { end(connection) })
+		mu.Lock()
+		if ended {
+			mu.Unlock()
+			if closed != nil {
+				closed()
+			}
+		} else {
+			hooked = closed
+			mu.Unlock()
 		}
 		socket.Start()
 		u.recheck(connection)
@@ -226,7 +254,9 @@ func (u *Upgrades) Socket(w nethttp.ResponseWriter, r *nethttp.Request, admissio
 			return nil, nil
 		}
 		// The scope sealed (its socket closed, the host closing) is no failure of the handler.
-		go func() { _, _ = h.Root(run, scope, host.RootOptions{Principal: admission.Principal}) }()
+		go func() {
+			_, _ = h.Root(run, scope, host.RootOptions{Principal: admission.Principal, Anonymous: admission.Principal == nil})
+		}()
 		u.recheck(connection)
 	})
 }
@@ -254,7 +284,7 @@ func (connection *upgraded) gone(router *Router) bool {
 	if connection.relay != nil {
 		relayLeft = !slices.Contains(router.Relays, connection.relay)
 	}
-	gone := (connection.allowed != "" && !router.Hosts.Has(connection.allowed)) || relayLeft
+	gone := (connection.allowed != "" && !slices.Contains(router.Hosts, connection.allowed)) || relayLeft
 	if connection.handler != nil {
 		if _, ok := router.SocketHandlers[connection.handler]; !ok {
 			gone = true
@@ -347,10 +377,15 @@ func (u *Upgrades) snapshot() []*upgraded {
 	return open
 }
 
-// keep keeps connection until its socket closes; an error (an oversized frame) terminates only that socket.
+// keep keeps connection until its socket closes, letting a protocol error finish its close handshake.
 func (u *Upgrades) keep(connection *upgraded) {
 	socket := connection.socket
-	socket.OnError(func(error) { socket.Terminate() })
+	socket.OnError(func(error) {
+		// The socket already sent the protocol close code (such as 1009); terminating now can discard that frame.
+		if socket.ReadyState() != WebSocketClosing {
+			socket.Terminate()
+		}
+	})
 	u.mu.Lock()
 	u.open[connection] = struct{}{}
 	u.mu.Unlock()
@@ -364,6 +399,10 @@ func (u *Upgrades) keep(connection *upgraded) {
 // upgrade completes the upgrade with a gorilla upgrader of its own (no compression), dropped with the upgrade: nothing is
 // kept per frame size. It starts reading once then returned.
 func upgrade(w nethttp.ResponseWriter, request *nethttp.Request, maxPayload int, then func(socket *WebSocket)) {
+	if !websocket.IsWebSocketUpgrade(request) {
+		refuse(w, nethttp.StatusBadRequest)
+		return
+	}
 	upgrader := websocket.Upgrader{CheckOrigin: func(*nethttp.Request) bool { return true }}
 	conn, err := upgrader.Upgrade(w, request, nil)
 	if err != nil {

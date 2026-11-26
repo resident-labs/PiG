@@ -715,6 +715,7 @@ let cachedHighlightThemeFor;
 let cachedCliHighlightTheme;
 function buildCliHighlightTheme(t) {
     return {
+        default: (s) => t.fg("text", s),
         keyword: (s) => t.fg("syntaxKeyword", s),
         built_in: (s) => t.fg("syntaxType", s),
         literal: (s) => t.fg("syntaxNumber", s),
@@ -820,6 +821,10 @@ export function getLanguageFromPath(filePath) {
         java: "java",
         kt: "kotlin",
         swift: "swift",
+        dart: "dart",
+        groovy: "groovy",
+        gradle: "groovy",
+        nix: "nix",
         c: "c",
         h: "c",
         cpp: "cpp",

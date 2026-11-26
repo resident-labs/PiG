@@ -21,7 +21,7 @@ import (
 // registryTool builds a tool. Upstream's AppTool adds an application field (snippet); a Go registration carries such data in its own fields, so the snippet rides in PromptGuidelines here.
 func registryTool(name string, edit ...func(*durable.ToolRegistration)) *durable.ToolRegistration {
 	tool := &durable.ToolRegistration{
-		ToolSchema: ai.ToolSchema{Name: name, Description: name + " tool", Parameters: map[string]any{"type": "object", "properties": map[string]any{}}},
+		Name: name, Description: name + " tool", Parameters: map[string]any{"type": "object", "properties": map[string]any{}},
 		Execute: func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			return durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}}, nil
 		},
@@ -425,7 +425,7 @@ func TestAgentResolution(t *testing.T) {
 		local := CreateRegistry()
 		first := &ToolHooks{BeforeTool: func(context.Context, ToolHookCall, HookApi) (*BeforeToolResult, error) { return nil, nil }}
 		second := &ToolHooks{BeforeTool: func(context.Context, ToolHookCall, HookApi) (*BeforeToolResult, error) { return nil, nil }}
-		onYield := &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (*YieldContinue, error) { return nil, nil }}
+		onYield := &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (YieldResult, error) { return nil, nil }}
 		mustInstall(t, local,
 			new(durable.Extension{Name: "a", Hooks: []durable.HookRegistration{Hook(ToolTask, first), Hook(GenerationTask, onYield)}}),
 			new(durable.Extension{Name: "b", Hooks: []durable.HookRegistration{Hook(ToolTask, second)}}),

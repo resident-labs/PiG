@@ -13,6 +13,7 @@ impl Drop for Lease {
                 method: "provider.release".into(),
                 args: Some(json!({"handle":self.handle,"token":self.token})),
                 parent_request_id: None,
+                command_context: false,
                 timer: false,
             }),
             ..Default::default()
@@ -66,6 +67,7 @@ impl Proxy {
                 method: "cancelModelStream".into(),
                 args: Some(json!({"streamId":id})),
                 parent_request_id: None,
+                command_context: false,
                 timer: false,
             }),
             ..Default::default()
@@ -175,11 +177,10 @@ impl Proxy {
         if let Err(err) = std::thread::Builder::new()
             .name("pig-provider-stream".into())
             .spawn(move || {
-                let error =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation.wait()))
-                        .unwrap_or_else(|_| Err("Provider stream worker panicked".into()))
-                        .err()
-                        .unwrap_or_else(|| "Provider stream ended without a terminal event".into());
+                let error = crate::diagnostic::recover(|| operation.wait())
+                    .unwrap_or_else(|_| Err("Provider stream worker panicked".into()))
+                    .err()
+                    .unwrap_or_else(|| "Provider stream ended without a terminal event".into());
                 running.mark_started(Some(error.clone()));
                 running.push(crate::context::model_stream_error_event(&error, &model));
                 state.streams.lock().unwrap().remove(&id);
@@ -400,6 +401,7 @@ impl ProviderObjects {
             name: decl["name"].as_str().ok_or("missing Provider name")?.into(),
             base_url: decl["baseUrl"].as_str().map(str::to_owned),
             headers: optional(&decl["headers"]),
+            refresh_models_auth: decl["refreshModelsAuth"].as_str().map(str::to_owned),
             auth: ProviderAuth { api_key, oauth },
             get_models: {
                 let proxy = proxy.clone();

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"testing"
 
 	"github.com/MichaelKinsy/PiG/extensions/sdk/kit"
@@ -33,6 +34,7 @@ func representativeView(image []byte) kit.View {
 	img := kit.NewImage(image, "image/png")
 	img.MaxWidthCells = new(20)
 	img.MaxHeightCells = new(10)
+	img.ImageID = new(4242)
 	img.Filename = "cover.png"
 	img.FallbackColor = "muted"
 	loader := kit.NewLoader("Working")
@@ -92,7 +94,7 @@ func TestEncodeMatchesTheHostViewPayload(t *testing.T) {
 		`{"kind":"spacer","lines":2},` +
 		`{"kind":"select-list","id":"tracks","items":[{"value":"k0","label":"Track 0","description":"Artist 0"},{"value":"k1","label":"Track 1"}],"maxVisible":3,"layout":{"minPrimaryColumnWidth":10,"maxPrimaryColumnWidth":20},"selectedIndex":1,"filter":"tr"},` +
 		`{"kind":"settings-list","id":"settings","items":[{"id":"theme","label":"Theme","description":"Color theme","currentValue":"dark","values":["dark","light"]},{"id":"model","label":"Model","currentValue":"a","submenu":{"kind":"text","text":"pick","paddingX":0,"paddingY":0}}],"maxVisible":5,"selectedIndex":0,"filter":"th","enableSearch":true},` +
-		`{"kind":"image","ref":"` + ref + `","mimeType":"image/png","maxWidthCells":20,"maxHeightCells":10,"filename":"cover.png","fallbackColor":"muted"},` +
+		`{"kind":"image","ref":"` + ref + `","mimeType":"image/png","maxWidthCells":20,"maxHeightCells":10,"imageId":4242,"filename":"cover.png","fallbackColor":"muted"},` +
 		`{"kind":"loader","message":"Working","spinnerColor":"accent","messageColor":"muted","indicator":{"frames":["a","b"],"intervalMs":120},"frame":1},` +
 		`{"kind":"loader","message":"Hidden","indicator":{"frames":[]}},` +
 		`{"kind":"hstack","children":[` +
@@ -223,5 +225,104 @@ func TestEncodeConversationKinds(t *testing.T) {
 	}
 	if len(encoded.Images) != 1 || encoded.Images[0].Ref != ref {
 		t.Fatalf("images = %+v, want the result image once", encoded.Images)
+	}
+}
+
+// The grid node (D614): the encoded node holds exactly the wire members the author set. Columns is always sent, and an
+// optional member left unset is absent, not null, zero or empty.
+func TestEncodeGridHoldsExactlyTheMembersSet(t *testing.T) {
+	grid := kit.NewGrid("month", 7, []kit.GridCell{
+		{Label: "30", Dim: true},
+		{Value: "d1", Label: "1", Chips: []kit.GridChip{{Text: "standup", Color: "#3366cc"}, {Text: "lunch"}}, More: 2},
+		{Value: "d2", Label: "2", Mark: "current", Color: "accent"},
+		{Value: "d3"},
+		{},
+	})
+	grid.Head = []string{"Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"}
+	grid.ChipRows = new(2)
+	grid.Selected = "d2"
+	encoded, err := Encode(kit.View{Root: kit.NewContainer(grid, kit.NewGrid("bare", 1, nil))}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"root":{"kind":"container","children":[` +
+		`{"kind":"grid","id":"month","columns":7,"chipRows":2,"head":["Mo","Tu","We","Th","Fr","Sa","Su"],"cells":[` +
+		`{"label":"30","dim":true},` +
+		`{"value":"d1","label":"1","chips":[{"text":"standup","color":"#3366cc"},{"text":"lunch"}],"more":2},` +
+		`{"value":"d2","label":"2","mark":"current","color":"accent"},` +
+		`{"value":"d3"},` +
+		`{}],"selected":"d2"},` +
+		`{"kind":"grid","id":"bare","columns":1}]}}`
+	if string(encoded.View) != want {
+		t.Fatalf("view JSON\n got %s\nwant %s", encoded.View, want)
+	}
+}
+
+// Every node kind can carry an id: an a11y, focus or drawing record of a mounted view (D614) names a node by it. The
+// structural kinds send the id that was set, and no member when none was.
+func TestEncodeStructuralNodeIDs(t *testing.T) {
+	build := func(id func(kind string) string) kit.View {
+		box := kit.NewBox(1, 1, &kit.Text{ID: id("text"), Text: "t"})
+		box.ID = id("box")
+		image := kit.NewImage([]byte("png"), "image/png")
+		image.ID = id("image")
+		root := kit.NewContainer(
+			box,
+			&kit.TruncatedText{ID: id("truncated-text"), Text: "t"},
+			&kit.Markdown{ID: id("markdown"), Text: "m"},
+			&kit.Spacer{ID: id("spacer"), Lines: 1},
+			&kit.DynamicBorder{ID: id("dynamic-border")},
+			image,
+			&kit.Loader{ID: id("loader"), Message: "l"},
+			&kit.HStack{ID: id("hstack")},
+			&kit.VStack{ID: id("vstack")},
+			&kit.Lines{ID: id("lines"), Lines: []string{"row"}},
+			&kit.UserMessage{ID: id("user-message"), Text: "u", OutputPad: 1},
+			&kit.Diff{ID: id("diff"), Diff: "d"},
+		)
+		root.ID = id("container")
+		return kit.View{Root: root}
+	}
+	type node struct {
+		Kind     string  `json:"kind"`
+		ID       *string `json:"id"`
+		Children []node  `json:"children"`
+	}
+	nodes := func(view kit.View) []node {
+		t.Helper()
+		encoded, err := Encode(view, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var payload struct {
+			Root node `json:"root"`
+		}
+		if err := json.Unmarshal(encoded.View, &payload); err != nil {
+			t.Fatal(err)
+		}
+		var all []node
+		var walk func(n node)
+		walk = func(n node) {
+			all = append(all, n)
+			for _, child := range n.Children {
+				walk(child)
+			}
+		}
+		walk(payload.Root)
+		return all
+	}
+	named := nodes(build(func(kind string) string { return "id-" + kind }))
+	if len(named) != 14 {
+		t.Fatalf("the view encodes %d nodes, want the 14 structural kinds", len(named))
+	}
+	for _, n := range named {
+		if n.ID == nil || *n.ID != "id-"+n.Kind {
+			t.Errorf("the %s node carries the id %v, want %q", n.Kind, n.ID, "id-"+n.Kind)
+		}
+	}
+	for _, n := range nodes(build(func(string) string { return "" })) {
+		if n.ID != nil {
+			t.Errorf("the %s node without an id carries the member id %q", n.Kind, *n.ID)
+		}
 	}
 }

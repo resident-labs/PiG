@@ -109,7 +109,7 @@ func TestPostLoginSelectionLosesToOwnerLoopCommands(t *testing.T) {
 				started, release := make(chan struct{}), make(chan struct{})
 				build := m.opts.ModelBuilder
 				m.opts.ModelBuilder = func(spec string) (*ai.Model, error) {
-					if spec == "openai/gpt-6.1-sol" {
+					if spec == "openai/"+providerDefault("openai") {
 						close(started)
 						<-release
 					}
@@ -143,7 +143,7 @@ func TestPostLoginSelectionLosesToOwnerLoopCommands(t *testing.T) {
 				if m.opts.SettingsManager.GetDefaultModel() != "" {
 					t.Fatal("stale login persisted the default")
 				}
-				if strings.Contains(plainRender(m.chatContainer), "Selected gpt-6.1-sol") {
+				if strings.Contains(plainRender(m.chatContainer), "Selected "+providerDefault("openai")) {
 					t.Fatal("stale login announced selection")
 				}
 			})
@@ -165,7 +165,7 @@ func (h *blockedPostLoginHandle) SetModelOnMain(_ context.Context, model *ai.Mod
 	return h.setModel(model, []ModelMutationOptions{options}, dispatch)
 }
 func (h *blockedPostLoginHandle) setModel(model *ai.Model, options []ModelMutationOptions, dispatch func(func() error) error) error {
-	login := model.ID == "gpt-6.1-sol"
+	login := model.ID == providerDefault("openai")
 	if login && !h.afterMutation {
 		close(h.started)
 		<-h.release
@@ -193,7 +193,7 @@ func TestPostLoginSelectionRechecksSessionMutationAndCompletion(t *testing.T) {
 		t.Run(map[bool]string{false: "before state mutation", true: "after state mutation"}[after], func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				m := newPostLoginTestMode(t)
-				h := &blockedPostLoginHandle{recordingCompactHandle: recordingCompactHandle{agent: m.agent, inner: NewSession("login-race", m.opts.AgentDir)}, started: make(chan struct{}), release: make(chan struct{}), afterMutation: after}
+				h := &blockedPostLoginHandle{agent: m.agent, inner: NewSession("login-race", m.opts.AgentDir), started: make(chan struct{}), release: make(chan struct{}), afterMutation: after}
 				m.opts.SessionHandle = h
 				if err := setPostLoginAPIKey(m, "openai", "test-key"); err != nil {
 					t.Fatal(err)

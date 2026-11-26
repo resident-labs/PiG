@@ -35,45 +35,78 @@ func SliceWithWidth(line string, startCol, length int, strict bool) SliceResult 
 		return SliceResult{}
 	}
 	endCol := startCol + length
-	var result strings.Builder
+	var result, pendingAnsi strings.Builder
 	resultWidth := 0
 	currentCol := 0
-	pendingAnsi := ""
 
 	for i := 0; i < len(line); {
 		if n := ExtractAnsi(line, i); n > 0 {
 			code := line[i : i+n]
 			if currentCol >= startCol && currentCol < endCol {
 				// Codes from before the range precede codes at the boundary, keeping the line's order (#10169).
-				result.WriteString(pendingAnsi)
+				if pendingAnsi.Len() > 0 {
+					result.WriteString(pendingAnsi.String())
+					pendingAnsi.Reset()
+				}
 				result.WriteString(code)
-				pendingAnsi = ""
-			} else if currentCol < startCol {
-				pendingAnsi += code
+			} else if currentCol < startCol && !strings.HasPrefix(code, "\x1b_") {
+				// APC sequences (cursor markers) are positional one-shot commands, not persistent style
+				// state, so codes before the range carry over only when they are not APC (Pi main 25490ea49).
+				pendingAnsi.WriteString(code)
 			}
 			i += n
 			continue
 		}
-		// Non-ANSI run until next ANSI or end.
+		// Non-ANSI run until next ANSI or end: an escape byte that is no complete code stays in the run.
 		end := i
 		for end < len(line) {
+			e := strings.IndexByte(line[end:], 0x1b)
+			if e < 0 {
+				end = len(line)
+				break
+			}
+			end += e
 			if ExtractAnsi(line, end) > 0 {
 				break
 			}
 			end++
 		}
 		run := line[i:end]
-		gs := newGraphemeIter(run)
 		broken := false
-		for gs.Next() {
+		// Printable ASCII always forms one cell of one column per character, so a stretch of it is placed by arithmetic. The last
+		// ASCII character before a non-ASCII byte is left to the grapheme iterator, because a mark, a joiner or a variation selector
+		// after it joins its cluster. (Pi's sliceWithWidth takes the shortcut only for a text that is printable ASCII throughout.)
+		if n := printableASCIIPrefix(run); n > 0 {
+			if n < len(run) {
+				n--
+			}
+			if n > 0 {
+				take := n
+				if currentCol+n >= endCol {
+					take, broken = max(1, endCol-currentCol), true
+				}
+				if first, last := max(0, startCol-currentCol), min(take, endCol-currentCol); first < last {
+					if pendingAnsi.Len() > 0 {
+						result.WriteString(pendingAnsi.String())
+						pendingAnsi.Reset()
+					}
+					result.WriteString(run[first:last])
+					resultWidth += last - first
+				}
+				currentCol += take
+				run = run[n:]
+			}
+		}
+		gs := newGraphemeIter(run)
+		for !broken && gs.Next() {
 			seg := gs.Str()
 			w := graphemeWidthFast(seg)
 			inRange := currentCol >= startCol && currentCol < endCol
 			fits := !strict || currentCol+w <= endCol
 			if inRange && fits {
-				if pendingAnsi != "" {
-					result.WriteString(pendingAnsi)
-					pendingAnsi = ""
+				if pendingAnsi.Len() > 0 {
+					result.WriteString(pendingAnsi.String())
+					pendingAnsi.Reset()
 				}
 				result.WriteString(seg)
 				resultWidth += w
@@ -202,3 +235,13 @@ func ExtractSegments(line string, beforeEnd, afterStart, afterLen int, strictAft
 
 // graphemeWidthFast returns upstream graphemeWidth(seg) for one cluster.
 func graphemeWidthFast(seg string) int { return GraphemeWidth(seg) }
+
+// printableASCIIPrefix is how many bytes at the start of s are printable ASCII (0x20 to 0x7e).
+func printableASCIIPrefix(s string) int {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c > 0x7e {
+			return i
+		}
+	}
+	return len(s)
+}

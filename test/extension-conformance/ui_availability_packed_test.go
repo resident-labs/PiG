@@ -11,7 +11,7 @@ import (
 
 	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
 	"github.com/MichaelKinsy/PiG/coding/extension/host/subprocess"
-	"github.com/MichaelKinsy/PiG/internal/coding/pigversion"
+	"github.com/MichaelKinsy/PiG/internal/testenv"
 )
 
 var packedUIConfigs = map[string]func() ([]subprocess.ExtConfig, error){
@@ -20,10 +20,11 @@ var packedUIConfigs = map[string]func() ([]subprocess.ExtConfig, error){
 	"rust":   sync.OnceValues(func() ([]subprocess.ExtConfig, error) { return createPackedUIConfigs("rust") }),
 }
 
-// Sources live as long as their cached runners, including Python's imported modules.
+// Sources live as long as their cached runners, including Python's imported modules, in the directory every process of the package shares (sharedSources), so the
+// cell of one process is the cell of the next.
 func createPackedUIConfigs(language string) ([]subprocess.ExtConfig, error) {
 	root := fixtureSourceRoot
-	dir := filepath.Join(fixtureRoot, "packed-ui-"+language)
+	dir := filepath.Join(sharedSources, "packed-ui-"+language)
 	files := make(map[string]string)
 	write := func(path, text string) { files[path] = text }
 	name := map[string]string{"go": "sdk-fixture", "python": "python-sdk-fixture", "rust": "rust-sdk-fixture"}[language]
@@ -31,6 +32,10 @@ func createPackedUIConfigs(language string) ([]subprocess.ExtConfig, error) {
 	peer := filepath.Join(dir, "ui-peer")
 	switch language {
 	case "go":
+		goDirective, err := rootGoDirective(root)
+		if err != nil {
+			return nil, err
+		}
 		for _, item := range []struct{ path, body string }{
 			{source, `package fixture
 import "github.com/MichaelKinsy/PiG/test/extension-conformance/testfixture"
@@ -43,7 +48,11 @@ func Extension() *sdk.Extension { return sdk.New("ui-peer") }
 `},
 		} {
 			write(filepath.Join(item.path, "extension.go"), item.body)
-			write(filepath.Join(item.path, "go.mod"), fmt.Sprintf("module example.com/%s\n\ngo 1.26.0\nrequire (\n github.com/MichaelKinsy/PiG v%s\n github.com/MichaelKinsy/PiG/extensions/sdk v%s\n)\nreplace github.com/MichaelKinsy/PiG => %s\nreplace github.com/MichaelKinsy/PiG/extensions/sdk => %s\n", filepath.Base(item.path), pigversion.PigVersion, pigversion.PigVersion, filepath.ToSlash(root), filepath.ToSlash(filepath.Join(root, "extensions", "sdk"))))
+			sdkVersion, err := testenv.RootSDKRequirement(root)
+			if err != nil {
+				return nil, err
+			}
+			write(filepath.Join(item.path, "go.mod"), fmt.Sprintf("module example.com/%s\n\ngo %s\nrequire (\n github.com/MichaelKinsy/PiG %s\n github.com/MichaelKinsy/PiG/extensions/sdk %s\n)\nreplace github.com/MichaelKinsy/PiG => %s\nreplace github.com/MichaelKinsy/PiG/extensions/sdk => %s\n", filepath.Base(item.path), goDirective, sdkVersion, sdkVersion, filepath.ToSlash(root), filepath.ToSlash(filepath.Join(root, "extensions", "sdk"))))
 		}
 	case "python":
 		data, err := os.ReadFile(filepath.Join(root, "test", "extension-conformance", "testdata", name, "main.py"))
@@ -72,10 +81,7 @@ func Extension() *sdk.Extension { return sdk.New("ui-peer") }
 		}
 	}
 	for path, text := range files {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return nil, err
-		}
-		if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+		if err := writeSharedSource(path, text); err != nil {
 			return nil, err
 		}
 	}
@@ -106,17 +112,24 @@ func makePackedUIHarness(t *testing.T, language string) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return makePackedUIHarnessOf(t, language, configs)
+}
+
+// makePackedUIHarnessOf loads configs (the extension and its peer, from packedUIConfigs or changed from them) into one shared cell.
+func makePackedUIHarnessOf(t *testing.T, language string, configs []subprocess.ExtConfig) *harness {
+	t.Helper()
 	configs = slices.Clone(configs)
 	notify, status, actions := &[]string{}, &[]string{}, &[]string{}
 	ui := newRecordingUI(notify, status)
 	bridge := subprocess.NewUIBridge(func() {})
 	bridge.SetUIContext(ui)
 	bridge.SetActions(conformanceActions(actions))
-	host := subprocess.NewHost(t.TempDir())
+	host := subprocess.NewHost(harnessHostCwd(t))
 	if rpcRowMode != "" {
 		host.SetMode(rpcRowMode)
 	}
 	host.SetHostInfo(conformanceHostInfo)
+	host.ShareCells(conformanceCellRegistry)
 	host.SetUIBridge(bridge)
 	wire := observeWire(t, host)
 	host.SetConfigLoader(func() ([]subprocess.ExtConfig, error) { return configs, nil })

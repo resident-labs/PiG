@@ -102,7 +102,7 @@ func holdTool(t *testing.T, setup *chatState, gate *deferredGate, result ...dura
 		returned = result[0]
 	}
 	addTool(t, setup.Registry, DefineTool(durable.ToolRegistration{
-		ToolSchema: ai.ToolSchema{Name: "hold", Description: "Waits for the test", Parameters: map[string]any{"type": "object", "properties": map[string]any{}}},
+		Name: "hold", Description: "Waits for the test", Parameters: map[string]any{"type": "object", "properties": map[string]any{}},
 		Execute: func(ctx context.Context, _ any, _ durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			if err := gate.wait(ctx); err != nil {
 				return durable.ToolExecutionResult{}, err
@@ -278,7 +278,7 @@ func TestInbox(t *testing.T) {
 		first := gatedReply("first")
 		setup.Faux.SetResponses([]ai.FauxResponseStep{first.step, fauxAnswer("both")})
 		yielded := deferred()
-		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (*YieldContinue, error) {
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (YieldResult, error) {
 			yielded.resolve()
 			return nil, nil
 		}})
@@ -572,7 +572,7 @@ func TestInbox(t *testing.T) {
 		var mu sync.Mutex
 		handoffs := 0
 		addTool(t, setup.Registry, DefineTool(durable.ToolRegistration{
-			ToolSchema: ai.ToolSchema{Name: "hold", Description: "Hands off", Parameters: map[string]any{"type": "object", "properties": map[string]any{}}},
+			Name: "hold", Description: "Hands off", Parameters: map[string]any{"type": "object", "properties": map[string]any{}},
 			Execute: func(context.Context, any, durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 				mu.Lock()
 				defer mu.Unlock()
@@ -805,7 +805,7 @@ func TestInbox(t *testing.T) {
 		setup := chatSetup(t)
 		first := gatedReply("first")
 		setup.Faux.SetResponses([]ai.FauxResponseStep{first.step})
-		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (*YieldContinue, error) {
+		addHooks(t, setup.Registry, GenerationTask.Erased(), &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (YieldResult, error) {
 			return &YieldContinue{Continue: ai.UserText("more")}, nil
 		}})
 		harness, root := openChat(t, storage.NewMemoryStorage(), setup)
@@ -892,7 +892,7 @@ func TestInbox(t *testing.T) {
 		firstGate, secondGate := deferred(), deferred()
 		holdTool(t, setup, firstGate, durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{}, Control: &durable.ToolControl{Handoff: new("one")}})
 		addTool(t, setup.Registry, DefineTool(durable.ToolRegistration{
-			ToolSchema: ai.ToolSchema{Name: "later", Description: "Finishes first", Parameters: map[string]any{"type": "object", "properties": map[string]any{}}},
+			Name: "later", Description: "Finishes first", Parameters: map[string]any{"type": "object", "properties": map[string]any{}},
 			Execute: func(ctx context.Context, _ any, _ durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 				if err := secondGate.wait(ctx); err != nil {
 					return durable.ToolExecutionResult{}, err
@@ -1232,7 +1232,7 @@ func expectSameSettlement(t *testing.T, got, settled durable.SubmissionRecord, i
 func continueOnce(text string) *GenerationHooks {
 	var mu sync.Mutex
 	yields := 0
-	return &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (*YieldContinue, error) {
+	return &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (YieldResult, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		yields++

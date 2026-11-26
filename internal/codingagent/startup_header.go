@@ -141,7 +141,7 @@ func drawBuiltInHeader(in builtInHeaderKey, bindings *tui.TUIKeybindingsManager,
 	// line carries the version and the slot's second line the first line of key hints, so the hints wrap where Pi's wrap. In
 	// Apple Terminal, where Pi draws its wordmark instead of the logo (supportsPiLogo), the text mark takes the wordmark's
 	// place.
-	// pig divergence (D63): the startup version is the composite PiG+Pi release identity.
+	// pig divergence (D2): the version beside the head is the composite PiG+Pi release identity (`pig --version` prints Pi's version).
 	version := themeFg(theme.Dim, "v"+pigversion.Version)
 	drawHead := in.halfBlock && mode == tui.TerminalColorModeTrueColor &&
 		width-2 >= piglogin.HeadCells+1+widthx.VisibleWidth(version)
@@ -280,7 +280,7 @@ func (m *InteractiveMode) handleBuiltInHeaderMouse(event tui.TuiMouseEvent) *tui
 	}
 	left, top := event.ScreenX-event.X+area.column, event.ScreenY-event.Y+area.row
 	m.playPigLogoAnimation(left, top, area.columns, area.rows)
-	return &tui.TuiMouseDispatchResult{TuiMouseEventResult: tui.TuiMouseEventResult{Handled: true}}
+	return &tui.TuiMouseDispatchResult{Handled: true}
 }
 
 // pig additive (D91): builtInHeaderClickArea is the header's logo as a frontend session reports a click on it.

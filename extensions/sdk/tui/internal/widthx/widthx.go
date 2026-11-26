@@ -7,8 +7,6 @@ package widthx
 import (
 	"strings"
 	"unicode/utf8"
-
-	"github.com/MichaelKinsy/PiG/extensions/sdk/tui/internal/jsstring"
 )
 
 // ExtractAnsi returns the byte length of the ANSI escape starting at byte
@@ -119,24 +117,31 @@ func boxDrawingAt(s string, i int) bool {
 	return i+2 < len(s) && s[i] == 0xE2 && (s[i+1] == 0x94 || s[i+1] == 0x95) && s[i+2]&0xC0 == 0x80
 }
 
-// NormalizeTerminalOutput encodes unpaired UTF-16 units like Node's UTF-8 terminal writes, then rewrites Thai/Lao AM vowels to compatibility
+// NormalizeTerminalOutput rewrites Thai/Lao AM vowels to compatibility
 // decompositions that preserve logical content while avoiding stale-cell
-// artifacts in some terminal differential repaints. Visible tabs are expanded
+// artifacts in some terminal differential repaints. An unpaired UTF-16 unit
+// stays in the string, as in upstream, where VisibleWidth measures it as zero
+// cells; Terminal.Write encodes it when the frame is written. Visible tabs are expanded
 // to the fixed layout width (3 spaces, matching VisibleWidth) so terminal tab
 // stops cannot wrap a logical line; tabs inside ANSI sequences stay untouched.
+// Unpaired UTF-16 units stay as they are: upstream measures a row as a UTF-16 string, where one is nonprinting, and only the
+// terminal write encodes it (WriteToTerminal), so encoding here would make a row that fills the terminal one cell too wide.
 func NormalizeTerminalOutput(s string) string {
-	if !utf8.ValidString(s) {
-		s = string(jsstring.ToUTF8(s))
-	}
-	if containsThaiLaoAM(s) {
+	return rewriteTerminalOutput(s, containsThaiLaoAM(s), "")
+}
+
+// rewriteTerminalOutput is NormalizeTerminalOutput(s) + suffix for a caller that has already found whether s contains U+0E33 or U+0EB3
+// (thai), and that wants the suffix in the same allocation as the rewritten string.
+func rewriteTerminalOutput(s string, thai bool, suffix string) string {
+	if thai {
 		s = strings.ReplaceAll(s, "\u0e33", "\u0e4d\u0e32")
 		s = strings.ReplaceAll(s, "\u0eb3", "\u0ecd\u0eb2")
 	}
 	if !strings.ContainsRune(s, '\t') {
-		return s
+		return s + suffix
 	}
 	var b strings.Builder
-	b.Grow(len(s) + 8)
+	b.Grow(len(s) + 8 + len(suffix))
 	for i := 0; i < len(s); {
 		if n := ExtractAnsi(s, i); n > 0 {
 			b.WriteString(s[i : i+n])
@@ -150,6 +155,7 @@ func NormalizeTerminalOutput(s string) string {
 		}
 		i++
 	}
+	b.WriteString(suffix)
 	return b.String()
 }
 
@@ -196,7 +202,15 @@ func containsThaiLaoAM(s string) bool {
 // fromFirstNonASCII returns s from its first non-ASCII byte, or ok=false when s
 // is all ASCII.
 func fromFirstNonASCII(s string) (string, bool) {
-	for i := 0; i < len(s); i++ {
+	i := 0
+	// Eight bytes at a time while all are ASCII: the loads merge into one, and the bytewise loop below finds the byte inside the block that
+	// stopped this one. Rows are mostly ASCII, so this scan is most of the cost of a styled row that needs no rewrite.
+	for ; len(s)-i >= 8; i += 8 {
+		if load64(s[i:])&0x8080808080808080 != 0 {
+			break
+		}
+	}
+	for ; i < len(s); i++ {
 		if s[i] >= utf8.RuneSelf {
 			return s[i:], true
 		}

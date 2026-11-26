@@ -51,11 +51,10 @@ func identityAllowances() []*identityAllowance {
 		allow(`^pi-coding-agent/(config\.js|sdk-bundle/chunk-[A-Z0-9]+\.js)$`, `^earendil-works/pi`, "install-method message text (Download from ...); never requested."),
 		allow(`^pi-(coding-agent|agent-core|ai|tui)/package\.json$`, `^earendil-works/pi`, "the pinned package's repository field."),
 		allow(`^pi-coding-agent/modes/interactive/theme/(dark|light)\.json$`, `^pi\.dev/schemas/theme\.schema\.json$`, "the theme's $schema reference (Pi 1.2.0 moved it to pi.dev/schemas), read by editors; the theme loader validates with its built-in schema and never requests it."),
-		allow(`^pi-coding-agent/core/remote-catalog-provider\.js$`, `^pi\.dev$`, "a doc comment naming the catalog the overlay replaces; the request goes to PiG's hosted origin (D64)."),
+		allow(`^pi-coding-agent/(core/remote-catalog-provider\.js|sdk-bundle/chunk-[A-Z0-9]+\.js)$`, `^pi\.dev\.?$`, "a doc comment naming the catalog the overlay replaces (Pi 1.5.1, also bundled into the SDK chunk); the request goes to PiG's hosted origin (D64)."),
 		allow(`^pi-coding-agent/(config\.js|cli/args\.js|sdk-bundle/chunk-[A-Z0-9]+\.js)$`, `pi\.dev/session/`, "the /share gist viewer address shown as text; PiG's /share uses its own gateway (D64) and never opens this viewer."),
 		allow(`^pi-coding-agent/config\.js$`, `^pi\.dev$`, "a code comment on the npm self-update command (Pi 1.0.1); the Go host owns self-update and requests nothing here."),
 		allow(`^pi-coding-agent/(package-manager-cli\.js|sdk-bundle/index\.js)$`, `^pi\.dev(/install\.(sh|ps1))?$`, "Pi 1.0.1's npm-migration hint after `pi update`, printed as text by the JS package manager the Go host never runs; PiG designs the hint out (test/parity/upstream-sync/v1.0.1.toml)."),
-		allow(`^pi-coding-agent/(extensions/mcp/oauth\.js|sdk-bundle/chunk-[A-Z0-9]+\.js)$`, `^pi\.dev(/oauth)?$`, "Pi's Client ID Metadata Documents for oauth.clientRegistration \"cimd\"; the Go host identifies with the same documents (coding/mcpext/oauth.go clientMetadataBaseURL)."),
 		allow(`^pi-coding-agent/(modes/interactive/interactive-mode\.js|sdk-bundle/index\.js)$`, `pi\.dev/changelog`, "the update notification prints this link; PiG's Go notification drops it (D39) and nothing requests it."),
 		allow(`^pi-coding-agent/(modes/interactive/components/earendil-announcement\.js|sdk-bundle/index\.js)$`, `mariozechner\.at`, "the announcement banner's blog link, shown as text; the Go host shows the same (internal/codingagent/earendil_announcement.go)."),
 	}

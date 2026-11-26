@@ -45,6 +45,8 @@ func (m *InteractiveMode) beginReloadBlocker() func() {
 	)
 	m.editorContainer.SetChildren(box)
 	m.tuiInst.SetFocus(box)
+	// Pi shows the box with `requestRender(true)` (interactive-mode.ts:6648): the one clearing redraw of a reload. The transcript repaint that follows is differential, as in Pi.
+	m.tuiInst.ForceFullRender()
 	m.tuiInst.Render()
 	// Pi's dismissReloadBox focuses the editor (interactive-mode.ts:6425-6430), not a selector the reload displaced.
 	return func() {
@@ -59,6 +61,8 @@ func (m *InteractiveMode) awaitReloadStep(parent context.Context, work func(cont
 	if err := parent.Err(); err != nil {
 		return context.Cause(parent)
 	}
+	// Pi's awaits between the steps read the keys that arrived after a step and drop them, so no step hands a key on to the next.
+	m.reloadTailInput = nil
 	if m.runCtx != nil {
 		m.currentInputTicket.resume()
 		m.currentInputTicket.settle()
@@ -85,14 +89,22 @@ func (m *InteractiveMode) awaitReloadStep(parent context.Context, work func(cont
 		}
 		select {
 		case <-done:
+			// Pi's step is an awaited call in one process, so what the step's handlers asked of the UI (an extension's setEditorComponent from session_start)
+			// has happened when it returns. Here the handler's posts are queued ahead of this wake, and the select above takes either at random.
+			m.runQueuedUITasks()
 			if ctx.Err() != nil {
 				return context.Cause(ctx)
 			}
 			return err
 		case <-cancelled:
 			cancelled = nil
-		case <-input:
-			// The reload box owns input; it has no key actions.
+		case key := <-input:
+			// The reload box owns input; it has no key actions, and a key that arrives while the step is pending is dropped, as in Pi (packages/tui/src/tui.ts:1153-1158). A key taken once the step has completed arrived after the awaited work: Pi reads it after the synchronous tail that follows its last await (interactive-mode.ts:6671-6698) and the editor, which the dismissed box gives the input back to, receives it. The input loop dispatches it, in order, before any key routed later (takeReloadTailInput); a later step drops it as Pi's awaits between steps do.
+			select {
+			case <-done:
+				m.reloadTailInput = append(m.reloadTailInput, key)
+			default:
+			}
 		case task := <-m.uiTaskCh:
 			task()
 		case <-m.renderWakeCh:
@@ -107,4 +119,27 @@ func (m *InteractiveMode) awaitReloadStep(parent context.Context, work func(cont
 			}
 		}
 	}
+}
+
+// runQueuedUITasks runs the UI tasks already queued, in order, and none posted meanwhile that this goroutine would have to wait for. Owner loop only.
+func (m *InteractiveMode) runQueuedUITasks() {
+	for queued := len(m.uiTaskCh); queued > 0; queued-- {
+		select {
+		case task := <-m.uiTaskCh:
+			task()
+		default:
+			return
+		}
+	}
+}
+
+// takeReloadTailInput returns the oldest key awaitReloadStep kept for the editor, or false when none waits. Owner loop only.
+func (m *InteractiveMode) takeReloadTailInput() ([]byte, bool) {
+	if len(m.reloadTailInput) == 0 {
+		return nil, false
+	}
+	key := m.reloadTailInput[0]
+	m.reloadTailInput[0] = nil
+	m.reloadTailInput = m.reloadTailInput[1:]
+	return key, true
 }

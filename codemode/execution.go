@@ -14,6 +14,7 @@ import (
 
 	"github.com/MichaelKinsy/PiG/internal/ecmascript"
 	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
+	"github.com/MichaelKinsy/PiG/internal/jsonwire"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
@@ -308,7 +309,7 @@ func bridgeBroken(reason string) *Error {
 //
 // Ports packages/codemode/src/runtime/execution.ts (parseBridgeJson).
 func parseBridgeJSON(text, what string) (json.RawMessage, error) {
-	if !json.Valid([]byte(text)) {
+	if !jsonwire.Valid(text) {
 		return nil, bridgeError(what + " is not valid JSON")
 	}
 	return json.RawMessage(text), nil
@@ -360,7 +361,7 @@ func parseStoreWrites(writes string) (StoreWrites, error) {
 		if err != nil {
 			return StoreWrites{}, err
 		}
-		// execution.ts assigns `writes.set[key] = value`, which sets the prototype of `set` for `__proto__` and creates no property.
+		// The key `__proto__` is dropped, as execution.ts drops it (`writes.set[key] = value` sets a prototype and creates no property): the keys become members of the JSON objects that extensions and Pi read (the codemode-store session entry, the durable store document), where an own `__proto__` member is what a naive deep merge turns into prototype pollution.
 		if key != "__proto__" {
 			if _, ok := result.Set[key]; !ok {
 				result.setOrder = append(result.setOrder, key)
@@ -512,7 +513,6 @@ func (e *execution) startCall(id int, isTool bool, name, args string, argsDefine
 	ctx, cancel := context.WithCancel(e.callCtx)
 	pending := &pendingCall{record: record, startedAt: time.Now(), cancel: cancel}
 	e.pending[id] = pending
-	e.mu.Unlock()
 
 	initiated := make(chan struct{})
 	var initiate sync.Once
@@ -523,6 +523,8 @@ func (e *execution) startCall(id int, isTool bool, name, args string, argsDefine
 		table := e.tools
 		awaitInitiation = table[name].AwaitsInitiation
 	}
+	// e.calls counts the call before the lock that checked finished is released: finish takes that lock before run's Wait, so Wait
+	// either waits for this call or the call found the execution finished and started nothing.
 	e.calls.Go(func() {
 		defer cancel()
 		defer mark()
@@ -578,6 +580,7 @@ func (e *execution) startCall(id int, isTool bool, name, args string, argsDefine
 		}
 		e.post(reply)
 	})
+	e.mu.Unlock()
 	if awaitInitiation {
 		select {
 		case <-initiated:

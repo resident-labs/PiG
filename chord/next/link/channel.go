@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/MichaelKinsy/PiG/chord/next/data"
+	chordtelemetry "github.com/MichaelKinsy/PiG/chord/next/telemetry"
+	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
-// Ports packages/chord/src/next/link/channel.ts. A host's end of a link (§3, §22, 2b): the handshake, the link's codec,
+// Ports packages/chord/src/link/channel.ts. A host's end of a link (§3, §22, 2b): the handshake, the link's codec,
 // the checks of every message (skipped on a trusted link), the heartbeat, and messages handled in order while one waits
 // for an asynchronous inflate; a protocol error closes the link.
 //
@@ -102,7 +105,7 @@ type ChannelOptions struct {
 	Codec Codec
 	// Incarnation is this host's incarnation, sent in `hello`.
 	Incarnation string
-	// Calls is how many concurrent calls this side accepts, sent in `hello`.
+	// Calls is how many concurrent calls of one origin this side accepts, sent in `hello`; 0: no window (a trusted link).
 	Calls int
 	// Trusted skips the message schema check (framing, the codec's decode and the owners' checks still run).
 	Trusted bool
@@ -110,7 +113,15 @@ type ChannelOptions struct {
 	Report func(err error)
 	// Now is the clock of the heartbeat in milliseconds (`Date.now()`); nil reads the wall clock. Tests set it.
 	Now func() int64
+	// Metrics are the host's instruments (`chord.link.bytes`); nil counts nothing.
+	Metrics *chordtelemetry.Instruments
 }
+
+// sentBytes and receivedBytes are the attributes of `chord.link.bytes`.
+var (
+	sentBytes     = telemetry.SpanAttributes{telemetry.Attr("direction", "sent")}
+	receivedBytes = telemetry.SpanAttributes{telemetry.Attr("direction", "received")}
+)
 
 type channelKind int
 
@@ -137,6 +148,8 @@ type Channel struct {
 	ctx     context.Context
 	now     func() int64
 	hello   []byte
+	// bytes counts the bytes of the encoded messages (`chord.link.bytes`).
+	bytes telemetry.TelemetryCounter
 
 	mu           sync.Mutex
 	state        channelKind
@@ -146,6 +159,11 @@ type Channel struct {
 	lastReceived int64
 	// pinged is whether a `ping` went out since the last received message.
 	pinged bool
+	// pings and pongs count the `ping`s it sent and the `pong`s it received: a fence waits for the `pong` of its own
+	// `ping`.
+	pings, pongs int
+	// fences are the fences waiting for their `pong`, oldest first.
+	fences []*channelFence
 	// held is the messages received while one is handled asynchronously, in order, and the index of the next to handle;
 	// nil while none waits.
 	held *heldMessages
@@ -170,15 +188,20 @@ func NewChannel(link Link, handler ChannelHandler, options ChannelOptions, ctx c
 	if err != nil {
 		return nil, err
 	}
-	return &Channel{
+	channel := &Channel{
 		link: link, codec: options.Codec, handler: handler, report: options.Report, trusted: options.Trusted, ctx: ctx, now: now,
-		hello: hello, lastReceived: now(),
-	}, nil
+		hello: hello, lastReceived: now(), bytes: chordtelemetry.Metrics(nil).Counter("chord.link.bytes"),
+	}
+	if options.Metrics != nil {
+		channel.bytes = options.Metrics.Counter("chord.link.bytes")
+	}
+	return channel, nil
 }
 
 // Start sends `hello` and starts listening: messages that arrived already are handled now, and a link closed already
 // calls `Closed` now; so the handler is complete before it starts.
 func (c *Channel) Start() {
+	c.bytes.Add(float64(len(c.hello)), sentBytes)
 	c.link.Send(c.hello)
 	c.link.OnMessage(c.receive)
 	c.link.OnClose(c.linkClosed)
@@ -194,7 +217,8 @@ func (c *Channel) Peer() string {
 	return ""
 }
 
-// PeerCalls is how many concurrent calls the peer accepts, from its `hello`; 0 before it arrived.
+// PeerCalls is how many concurrent calls of one origin the peer accepts, from its `hello`: 0 when it announced no window
+// (read once the channel is open).
 func (c *Channel) PeerCalls() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -231,6 +255,7 @@ func (c *Channel) Send(message Message) error {
 	if err != nil {
 		return err
 	}
+	c.bytes.Add(float64(len(bytes)), sentBytes)
 	c.mu.Lock()
 	if c.state == channelGreeting {
 		c.queued = append(c.queued, bytes)
@@ -245,10 +270,66 @@ func (c *Channel) Send(message Message) error {
 // Close closes the link.
 func (c *Channel) Close() { c.link.Close() }
 
-// Tick is the heartbeat, at now (milliseconds): a link silent for close ms (the handshake included) closes; an open
-// one silent for ping ms sends one `ping`.
-func (c *Channel) Tick(now, ping, close int64) {
+// channelFence is a fence waiting for the `pong` of its ping (the pings-th it sent).
+type channelFence struct {
+	ping int
+	then func()
+}
+
+// Fence (slice 14 §2.3) sends a `ping` and calls then when its `pong` arrived. A link is ordered and the peer answers a
+// `ping` after everything it handled before it, so whatever the peer sent before it saw the `ping` has arrived here by
+// then. Pings and pongs are counted: a liveness `pong` in transit ends no fence. then runs on the goroutine that reads
+// the `pong` (the link's delivery goroutine), with no channel lock held, so it may call the channel; the fences of one
+// channel run in order. Fence returns what cancels it (idempotent, safe from any goroutine; a fence cancelled before
+// its `pong` never runs). A link that closes first runs none: nothing waits on a timer.
+func (c *Channel) Fence(then func()) (cancel func()) {
 	c.mu.Lock()
+	if c.state == channelClosed {
+		c.mu.Unlock()
+		return func() {}
+	}
+	c.pings++
+	fence := &channelFence{ping: c.pings, then: then}
+	c.fences = append(c.fences, fence)
+	c.mu.Unlock()
+	// The only error is a message the codec cannot write; a `ping` has no fields.
+	_ = c.Send(&PingMessage{})
+	return func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if at := slices.Index(c.fences, fence); at != -1 {
+			c.fences = slices.Delete(c.fences, at, at+1)
+		}
+	}
+}
+
+// ponged is a `pong` arrived: the fences of the pings up to it run, in order.
+func (c *Channel) ponged() {
+	c.mu.Lock()
+	c.pongs++
+	c.mu.Unlock()
+	for {
+		c.mu.Lock()
+		if len(c.fences) == 0 || c.fences[0].ping > c.pongs {
+			c.mu.Unlock()
+			return
+		}
+		fence := c.fences[0]
+		c.fences = c.fences[1:]
+		c.mu.Unlock()
+		fence.then()
+	}
+}
+
+// Tick is the heartbeat, at now (milliseconds): a link silent for close ms (the handshake included) closes; an open
+// one silent for ping ms sends one `ping`. paused ms this process did not run before it are no silence: what the peer sent
+// meanwhile is still unread (timers run before I/O). The silence stays what it was before the pause, at least ping ms, so
+// a dead peer (a dropped TCP connection) is found close - ping ms later.
+func (c *Channel) Tick(now, paused, ping, close int64) {
+	c.mu.Lock()
+	if paused > 0 {
+		c.lastReceived = min(c.lastReceived+paused, now-ping)
+	}
 	silent := now - c.lastReceived
 	sendPing := false
 	if silent >= close {
@@ -258,6 +339,7 @@ func (c *Channel) Tick(now, ping, close int64) {
 	}
 	if silent >= ping && !c.pinged && c.state == channelOpen {
 		c.pinged = true
+		c.pings++
 		sendPing = true
 	}
 	c.mu.Unlock()
@@ -274,6 +356,7 @@ func (c *Channel) receive(bytes []byte) {
 		c.mu.Unlock()
 		return
 	}
+	c.bytes.Add(float64(len(bytes)), receivedBytes)
 	c.lastReceived = c.now()
 	c.pinged = false
 	if c.held != nil {
@@ -314,6 +397,7 @@ func (c *Channel) handleBytes(bytes []byte) error {
 		}
 		c.link.Send(pong)
 	case *PongMessage:
+		c.ponged()
 	default:
 		handling, err := c.handler.Message(message)
 		if err != nil {
@@ -474,6 +558,7 @@ func (c *Channel) linkClosed() {
 	}
 	c.held = nil
 	c.queued = nil
+	c.fences = nil
 	c.mu.Unlock()
 	c.handler.Closed()
 }

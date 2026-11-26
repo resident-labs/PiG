@@ -33,6 +33,7 @@ func TestCrossProviderHandoffUpstream(t *testing.T) {
 		{"xiaomi", "mimo-v2.6-pro", "xiaomi-mimo-v2.6-pro", ""}, {"xiaomi-token-plan-cn", "mimo-v2.6-pro", "xiaomi-token-plan-cn-mimo-v2.6-pro", ""}, {"xiaomi-token-plan-ams", "mimo-v2.6-pro", "xiaomi-token-plan-ams-mimo-v2.6-pro", ""}, {"xiaomi-token-plan-sgp", "mimo-v2.6-pro", "xiaomi-token-plan-sgp-mimo-v2.6-pro", ""},
 		{"qwen-token-plan", "qwen3.7-max", "qwen-token-plan-qwen3.7-max", ""}, {"qwen-token-plan-cn", "qwen3.7-max", "qwen-token-plan-cn-qwen3.7-max", ""}, {"qwen-token-plan-individual", "qwen3.8-max", "qwen-token-plan-individual-qwen3.8-max", ""},
 		{"qwen-token-plan-individual", "deepseek-v4-flash-0731", "qwen-token-plan-individual-deepseek-v4-flash-0731", ""}, {"qwen-token-plan-individual", "glm-5.2", "qwen-token-plan-individual-glm-5.2", ""},
+		{"qwen-token-plan-individual-cn", "qwen3.8-max", "qwen-token-plan-individual-cn-qwen3.8-max", ""}, {"qwen-token-plan-individual-cn", "deepseek-v4-flash-0731", "qwen-token-plan-individual-cn-deepseek-v4-flash-0731", ""}, {"qwen-token-plan-individual-cn", "glm-5.2", "qwen-token-plan-individual-cn-glm-5.2", ""},
 	}
 	tool := ai.ToolSchema{Name: "double_number", Description: "Doubles a number and returns the result", Parameters: map[string]any{"type": "object", "properties": map[string]any{"value": map[string]any{"type": "number", "description": "A number to double"}}, "required": []string{"value"}}}
 	services, err := coding.CreateAgentSessionServices(coding.CreateAgentSessionServicesOptions{CWD: t.TempDir(), AgentDir: t.TempDir()})
@@ -51,6 +52,10 @@ func TestCrossProviderHandoffUpstream(t *testing.T) {
 		model := *found
 		if pair.api != "" {
 			model.API = pair.api
+		}
+		if !ai.BuiltAPI(model.API) {
+			// A build with this API's pig_strip tag has no provider to hand a transcript to or from: the handoffs run among the kept providers.
+			continue
 		}
 		models[index] = model
 		provider := ai.NewFauxProvider(ai.FauxConfig{ProviderID: pair.provider, Model: pair.model})

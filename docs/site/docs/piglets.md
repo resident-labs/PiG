@@ -94,6 +94,8 @@ build:
 | `systemPrompt` | Select one inline or file-based system prompt. |
 | `discovery` | Permit or reject ambient workspace and user Resources. |
 | `contextFiles` | Set `trusted-only` to load no project `AGENTS.md` or `CLAUDE.md` until the project is trusted. |
+| `viewClient` | Set `terminal` to let the TUI draw the views extensions mount (D614). |
+| `viewEndpoint` | Set `socket` to let other programs of the same user attach to an interactive session's views (D614). |
 | `secrets` | Declare logical secret requirements without storing values. |
 | `agentEnv` | Require an image, Dev Container, or typed environment source. |
 | `slots` | Replace a part of PiG with a fused Go member. `frontend` is the only slot (D91); see [Piglet Binaries](piglet-binaries.md#frontend-members). |
@@ -294,6 +296,26 @@ contextFiles: trusted-only
 
 With `trusted-only`, a project that has a context file needs a trust decision. Until the project is trusted, PiG loads only the context file in the agent directory and the one in your home directory. PiG prints a notice that names each file it skipped. `contextFiles: all` is the default. A Piglet that extends a `trusted-only` Piglet and sets `all` widens its base, so it needs `allowWiden`.
 
+## View client
+
+An extension can mount a view (`ui.view`, D614) only when a client that draws views is attached to the session. Stock PiG attaches none in an interactive session, so a mount fails with `unsupported`. A Piglet can attach the terminal:
+
+```yaml
+viewClient: terminal
+```
+
+With `terminal`, the TUI draws mounted views above and below the editor and in a panel directly above it. Until an extension mounts a view, the screen and the keys are unchanged. `none` is the default; a child Piglet that extends a base with `terminal` sets `viewClient: none` to turn it off. See [Terminal UI](tui.md#extension-views).
+
+## View endpoint
+
+A view client outside the process, such as a web page behind a bridge, can attach to a running interactive session when the Piglet says so:
+
+```yaml
+viewEndpoint: socket
+```
+
+With `socket`, an interactive session serves the view carrier on the Unix socket `<agent directory>/view-endpoint/<pid>.sock`. Only your own user can connect, and a client can only draw the mounted views and raise the intents they declare: it cannot prompt the agent or read the session. The terminal and every connected client show the same mounts. A new session and the exit close the connections and remove the socket; a reload keeps them, ends the views of the extensions it reloads and shows the views they mount again. `none` is the default: nothing listens. Print, JSON and RPC mode ignore the key, and on Windows no socket is served. The lines a client speaks are in `docs/ui-view-carrier.md`.
+
 ## Origins
 
 Origins are typed strings. PiG tries them in declaration order and records the first exact successful source.
@@ -362,6 +384,8 @@ pig piglet validate research
 pig --piglet research
 ```
 
+PiG copies the YAML and the relative `systemPrompt.file` it names, and records each copied file with its digest in `<name>.files.json`. `pig piglet remove <name> --source` removes the YAML and the copied files that no other registered Piglet uses and that you have not edited, and reports each file it keeps. To replace a registered source Piglet, run `remove --source` and then `add`. See [Replace or remove a registered source Piglet](/docs/latest/piglet-lifecycle#replace-or-remove-a-registered-source-piglet).
+
 Add a Piglet from npm or Git:
 
 ```bash
@@ -422,7 +446,7 @@ Pulled pig-with-batteries 0.1.0 for linux/amd64, signed by ed25519:fc4fbe0a1ba0f
   receipt: /home/you/.pig/receipts/piglets/pig-with-batteries/0.1.0/linux/amd64.pull
 ```
 
-Run the file on the `binary:` line. It is a complete PiG with the Piglet built in, so it needs no `--piglet` option. It carries the PiG version it was built with, which `--version` prints and which can be older than your `pig`. `pig piglet list` shows it with the scope `binary`. `pig --piglet pig-with-batteries` does not run it, because no source is registered. [Piglet Binaries](/docs/latest/piglet-binaries#pull-a-published-binary) explains the signature checks.
+Run the file on the `binary:` line. It is a complete PiG with the Piglet built in, so it needs no `--piglet` option. It carries the PiG version it was built with, which its `version` command prints and which can be older than your `pig`. `pig piglet list` shows it with the scope `binary`. `pig --piglet pig-with-batteries` does not run it, because no source is registered. [Piglet Binaries](/docs/latest/piglet-binaries#pull-a-published-binary) explains the signature checks.
 
 Pigpen's Packages are on npm as `@pi-in-go/pigpen-<name>`, for example `pig install npm:@pi-in-go/pigpen-dirty-repo-guard` ([Packages](/docs/latest/packages)). A Go extension built for an older extension SDK stops PiG at startup with `Extension "<name>" was written for an older SDK` and names the changed call, for example `Context.ConfigHome`, which returns an error since PiG 0.5.0. Remove such a Package with `pig remove npm:<name>` until its author publishes an update.
 
@@ -508,6 +532,8 @@ build:
 ```
 
 This setting requires every selected extension to be compiled into its Piglet Binary. A non-fusible extension stops the build.
+
+`build.fusedReload: source` is the companion setting for developing a fused member: the Binary then runs a member whose source you edited from that source. See [Editing a fused member's source](piglet-binaries.md#editing-a-fused-members-source). PiG Standard does not set it.
 
 ## Worked example: a read-only reviewer
 

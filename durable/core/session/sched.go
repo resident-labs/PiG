@@ -279,6 +279,9 @@ type Scheduler struct {
 	pins        map[treeNode]int
 	reserveSkip uint8 // the decision of the reservation job's first run, which a later run of the same job keeps (reserve)
 	stateAwaits int   // the `await #loadChain` calls of #loadScopes in the terminal #commitState just staged (runtime.go commitStateTicks)
+	// candidates is the set the running reservation pass took out of runnable while it plans (takeCandidates); nil between passes. spare is
+	// the emptied set the next pass takes into, so a pass allocates none.
+	candidates, spare *orderedSet[ID]
 
 	// observing is set while the commit observer runs (it runs inside the Storage's adopt).
 	observing bool
@@ -471,9 +474,8 @@ func (s *Scheduler) Open(done func(error)) {
 				}
 				state := getObj(rec, "state")
 				if taskStatus(rec) == StatusRunning {
-					cp, _ := state.Get("checkpoint")
 					restarts := restartsOf(rec) + 1
-					pending := with(withState(rec, obj("status", StatusPending, "checkpoint", cp)), "restarts", restarts)
+					pending := with(pendingAgain(rec), "restarts", restarts)
 					if err := tx.stageTask(pending); err != nil {
 						return err
 					}
@@ -977,8 +979,7 @@ func (s *Scheduler) CloseWrites() []*jv.Object {
 		if taskStatus(rec) != StatusRunning {
 			continue
 		}
-		cp, _ := getObj(rec, "state").Get("checkpoint")
-		records = append(records, withState(rec, obj("status", StatusPending, "checkpoint", cp)))
+		records = append(records, pendingAgain(rec))
 	}
 	slices.SortFunc(records, func(a, b *jv.Object) int { return int(mustInt(a, "id") - mustInt(b, "id")) })
 	return records

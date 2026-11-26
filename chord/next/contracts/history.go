@@ -1,6 +1,6 @@
 package contracts
 
-// Ports packages/chord/src/next/contracts/history.ts. Upstream's history is a type-level structure (Variants, Step,
+// Ports packages/chord/src/contracts/history.ts. Upstream's history is a type-level structure (Variants, Step,
 // History, CurrentStep, StepAt, OlderVersions, ChangesAfter, Increment); all of it is designed out. At runtime a
 // contract holds its versions (VersionData: the number, the fingerprint, the variants and the changes that produced
 // it), and accepts reads the older versions' changes directly. What remains of the history types as runtime helpers
@@ -9,12 +9,13 @@ package contracts
 // ChangeSide is the side of a member an edit changed.
 type ChangeSide string
 
-// The sides of an edit; SideKeyed is a local contract's keyed member (slice 7b).
+// The sides of an edit; SideKeyed is a local contract's keyed member (slice 7b), SideEvent an event member.
 const (
 	SideState  ChangeSide = "state"
 	SideArgs   ChangeSide = "args"
 	SideResult ChangeSide = "result"
 	SideKeyed  ChangeSide = "keyed"
+	SideEvent  ChangeSide = "event"
 )
 
 // Change is what one edit changed: one side of one member in one variant. An edit that changed several variants
@@ -25,8 +26,8 @@ type Change struct {
 	Side    ChangeSide
 }
 
-// MemberSide names a part of a variant: its state members, its methods or its keyed members (upstream's
-// `keyof VariantShape`).
+// MemberSide names a part of a variant: its state members, its methods, its keyed members, its event members or its
+// queries members (upstream's `keyof VariantShape`).
 type MemberSide string
 
 // The parts of a variant.
@@ -34,6 +35,9 @@ const (
 	MemberSideState   MemberSide = "state"
 	MemberSideMethods MemberSide = "methods"
 	MemberSideKeyed   MemberSide = "keyed"
+	MemberSideEvents  MemberSide = "events"
+	// MemberSideQueries is a local contract's queries members (slice 14 §3.1: history.ts VariantShape.queries).
+	MemberSideQueries MemberSide = "queries"
 )
 
 // MemberNames lists the names of the members of side in any variant, each once, in order of first appearance.
@@ -49,6 +53,10 @@ func MemberNames(variants *NamedMap[*VariantData], side MemberSide) []string {
 			keys = variant.Methods.Keys()
 		case MemberSideKeyed:
 			keys = variant.Keyed.Keys()
+		case MemberSideEvents:
+			keys = variant.Events.Keys()
+		case MemberSideQueries:
+			keys = variant.Queries.Keys()
 		}
 		for _, name := range keys {
 			if !seen[name] {

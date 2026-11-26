@@ -5,21 +5,51 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 
 	"github.com/MichaelKinsy/PiG/internal/pigstrip"
 )
 
-// strippedAPIs lists the APIs this process runs without. It is empty in Stock PiG.
-func strippedAPIs() []API {
-	ids := pigstrip.IDs(pigstrip.ListAPIs)
-	apis := make([]API, len(ids))
-	for i, id := range ids {
-		apis[i] = API(id)
-	}
-	return apis
+type strippedAPIsSnapshot struct {
+	gen  uint64
+	apis []API
 }
 
-// OfferedModels returns models without the chat models of a stripped API. The generated catalog listing (ListModels) and every Models collection read pass their models through it, so a stripped API's models are offered nowhere: not by --list-models, /model, the --models scope, startup's default model, RPC or the extension model registry. An exact catalog lookup (LookupModel, LookupModelExact) still finds such a model, so that using one reports the strip.
+var currentStrippedAPIs atomic.Pointer[strippedAPIsSnapshot]
+
+// strippedAPIs lists the APIs this process runs without. It is empty in Stock PiG.
+// The snapshot is keyed by pigstrip.Generation so lookups allocate nothing while the strip state is unchanged; callers must not mutate the returned slice.
+func strippedAPIs() []API {
+	gen := pigstrip.Generation()
+	snap := currentStrippedAPIs.Load()
+	for snap == nil || snap.gen < gen {
+		ids := pigstrip.IDs(pigstrip.ListAPIs)
+		var apis []API
+		if len(ids) > 0 {
+			apis = make([]API, len(ids))
+			for i, id := range ids {
+				apis[i] = API(id)
+			}
+		}
+		fresh := &strippedAPIsSnapshot{gen: gen, apis: apis}
+		if currentStrippedAPIs.CompareAndSwap(snap, fresh) {
+			return fresh.apis
+		}
+		snap = currentStrippedAPIs.Load()
+	}
+	return snap.apis
+}
+
+// modelOffered reports whether model is offered under the current stripped API set. Non-chat models and nil models are unaffected by API strips.
+func modelOffered[T AnyModel](model T) bool {
+	chat, ok := any(model).(*Model)
+	if !ok || chat == nil {
+		return true
+	}
+	return !slices.Contains(strippedAPIs(), chat.ProviderMeta.API)
+}
+
+// OfferedModels returns models without the chat models of a stripped API. The generated catalog listing (ListModels) and every Models collection read omit them (via OfferedModels or modelOffered), so a stripped API's models are offered nowhere: not by --list-models, /model, the --models scope, startup's default model, RPC or the extension model registry. An exact catalog lookup (LookupModel, LookupModelExact) still finds such a model, so that using one reports the strip.
 // pig additive (D92): Stock PiG strips no API and returns models unchanged.
 func OfferedModels[T AnyModel](models []T) []T {
 	stripped := strippedAPIs()
@@ -79,6 +109,16 @@ func ProviderStripped(providerID string) bool {
 	registryProviderOnce.Do(initRegistryProvider)
 	models := registryByProvider[strings.ToLower(providerID)]
 	return len(models) > 0 && !slices.ContainsFunc(models, func(model *GeneratedModel) bool { return !pigstrip.Has(pigstrip.ListAPIs, string(model.API)) })
+}
+
+// strippedDirectAPIError is the strip error of api for model, the one the API's provider constructor reports, or nil when api is not stripped. The stream entry points ask it before they look at any credential, so a request for a stripped API ends with the strip whether or not it carries a key.
+// pig additive (D92): strips are PiG's own, so Pi has no order of the strip and the missing-key errors to match; Stock PiG strips no API and keeps Pi's order of errors.
+func strippedDirectAPIError(api API, model *Model, env ProviderEnv) error {
+	if !pigstrip.Has(pigstrip.ListAPIs, string(api)) {
+		return nil
+	}
+	_, err := directAPIProviderFor(api, model, "", env)
+	return err
 }
 
 // strippedAPIError is the error building providerID's provider reports when its API is stripped.

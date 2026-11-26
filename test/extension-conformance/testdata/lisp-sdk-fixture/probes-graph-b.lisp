@@ -21,6 +21,15 @@
             (gethash "exitCode" report) (pig:jget structured "exit_code")))
     report))
 
+;;; a binary input stream over octets, the :create-read-stream of the "stream" case
+(defclass bp-octet-stream (sb-gray:fundamental-binary-input-stream)
+  ((octets :initarg :octets :reader bp-octets) (position :initform 0 :accessor bp-position)))
+(defmethod stream-element-type ((stream bp-octet-stream)) '(unsigned-byte 8))
+(defmethod sb-gray:stream-read-byte ((stream bp-octet-stream))
+  (if (< (bp-position stream) (length (bp-octets stream)))
+      (prog1 (aref (bp-octets stream) (bp-position stream)) (incf (bp-position stream)))
+      :eof))
+
 (defun bp-options (case log)
   "The options of the tool the case names; LOG is a cons whose car collects what the custom operations saw."
   (flet ((note (text) (push text (car log)) nil)
@@ -30,8 +39,14 @@
         ((equal tool "read")
          (pig:make-read-tool-options
           :auto-resize-images (bp-case case "autoResizeImages")
-          :operations (and (custom) (pig:make-read-operations :read-file (lambda (path) (note (format nil "readFile:~A" path)) (sb-ext:string-to-octets (format nil "OPS:~A" path) :external-format :utf-8))
-                                                              :access (lambda (path) (note (format nil "access:~A" path)))))))
+          :operations (or (and (custom) (pig:make-read-operations :read-file (lambda (path) (note (format nil "readFile:~A" path)) (sb-ext:string-to-octets (format nil "OPS:~A" path) :external-format :utf-8))
+                                                              :access (lambda (path) (note (format nil "access:~A" path)))))
+                      (and (equal (bp-case case "ops") "stream")
+                           (pig:make-read-operations :read-file (lambda (path) (note (format nil "readFile:~A" path)) (sb-ext:string-to-octets (format nil "OPS:~A" path) :external-format :utf-8))
+                                                     :access (lambda (path) (note (format nil "access:~A" path)))
+                                                     :create-read-stream (lambda (path)
+                                                                           (note (format nil "createReadStream:~A" path))
+                                                                           (make-instance 'bp-octet-stream :octets (sb-ext:string-to-octets (format nil "STREAM:~A~%" path) :external-format :utf-8))))))))
         ((equal tool "write")
          (pig:make-write-tool-options
           :operations (and (custom) (pig:make-write-operations :write-file (lambda (path content) (note (format nil "writeFile:~A:~A" path content)))
@@ -48,7 +63,17 @@
                                                             :readdir (lambda (path) (note (format nil "readdir:~A" path)) (list "b.txt" "a.txt" "sub"))))))
         ((equal tool "grep")
          (pig:make-grep-tool-options
-          :operations (and (custom) (pig:make-grep-operations :is-directory (lambda (path) (note (format nil "isDirectory:~A" path)) (error "no such path for the probe"))))))
+          :operations (cond ((custom) (pig:make-grep-operations :is-directory (lambda (path) (note (format nil "isDirectory:~A" path)) (error "no such path for the probe"))))
+                            ((equal (bp-case case "ops") "grepdir") (pig:make-grep-operations :is-directory (lambda (path) (note (format nil "isDirectory:~A" path)) t) :read-file (lambda (path) (note (format nil "readFile:~A" path)) ""))))))
+        ((and (equal tool "find") (equal (bp-case case "ops") "globlimit"))
+         ;; Pi main 676af1d77 (#11747): the tool asks glob for one result past its limit.
+         (pig:make-find-tool-options
+          :operations (pig:make-find-operations :exists (lambda (path) (note (format nil "exists:~A" path)) t)
+                                                :glob (lambda (pattern cwd options)
+                                                        (declare (ignore cwd))
+                                                        (let ((limit (pig:jget options "limit")))
+                                                          (note (format nil "glob:~A:limit=~D" pattern (round limit)))
+                                                          (subseq (list "a.txt" "b.txt" "c.txt") 0 (min 3 (round limit))))))))
         ((equal tool "find")
          (pig:make-find-tool-options
           :operations (and (custom) (pig:make-find-operations :exists (lambda (path) (note (format nil "exists:~A" path)) nil)
@@ -66,12 +91,34 @@
                                (maphash (lambda (k v) (setf (gethash k env) v)) (pig:jget spawn "env"))
                                (setf (gethash "HOOK_VAR" env) "hook-env")
                                (pig:obj "command" "printf '%s|%s' \"$HOOK_VAR\" \"$PI_SESSION_ID\"" "cwd" (pig:jget spawn "cwd") "env" env))))
-          :operations (and (custom)
+          :operations (cond
+                        ;; The bash tool runs on the local operations. "local" signals their condition unchanged; "localWrapped" signals a new one with the same message, which is
+                        ;; not the backend's and keeps nothing of it (Pi matches the backend's class, bash.ts).
+                        ;; "localThread" runs them on another thread and signals the very condition they signaled there, unchanged.
+                        ((equal (bp-case case "ops") "localThread")
+                         (let ((local (pig:bash-operations-exec (pig:create-local-bash-operations))))
                            (pig:make-bash-operations
                             (lambda (command cwd options)
-                              (note (format nil "exec:~A|cwd=~A" command cwd))
-                              (funcall (pig:bash-exec-options-on-data options) (sb-ext:string-to-octets (format nil "custom:~A" command) :external-format :utf-8))
-                              (pig:obj "exitCode" 0))))))))))
+                              (let* ((failure nil)
+                                     (worker (sb-thread:make-thread
+                                              (lambda ()
+                                                (handler-case (funcall local command cwd options)
+                                                  (error (e) (setf failure e) nil))))))
+                                (let ((result (sb-thread:join-thread worker)))
+                                  (if failure (error failure) result)))))))
+                        ((member (bp-case case "ops") '("local" "localWrapped") :test #'equal)
+                         (let ((local (pig:bash-operations-exec (pig:create-local-bash-operations)))
+                               (wrapped (equal (bp-case case "ops") "localWrapped")))
+                           (pig:make-bash-operations
+                            (lambda (command cwd options)
+                              (handler-bind ((error (lambda (e) (when wrapped (error "~A" e)))))
+                                (funcall local command cwd options))))))
+                        ((custom)
+                         (pig:make-bash-operations
+                          (lambda (command cwd options)
+                            (note (format nil "exec:~A|cwd=~A" command cwd))
+                            (funcall (pig:bash-exec-options-on-data options) (sb-ext:string-to-octets (format nil "custom:~A" command) :external-format :utf-8))
+                            (pig:obj "exitCode" 0)))))))))))
 
 (defun bp-factories (tool)
   "(definition-factory . tool-factory) of the built-in TOOL."

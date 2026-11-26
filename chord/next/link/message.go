@@ -6,10 +6,12 @@ import (
 
 	chordctx "github.com/MichaelKinsy/PiG/chord/context"
 	"github.com/MichaelKinsy/PiG/chord/delta"
+	chordtelemetry "github.com/MichaelKinsy/PiG/chord/next/telemetry"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
-// Ports packages/chord/src/next/link/message.ts. Messages (§22, R1, R4, 2b): the one Message every link carries, a
+// Ports packages/chord/src/link/message.ts. Messages (§22, R1, R4, 2b): the one Message every link carries, a
 // sealed interface of one struct per kind in place of upstream's schema-checked tagged union, checked after every decode by
 // CheckMessage (the schema's constraints, field by field), and the codecs that turn it into bytes.
 //
@@ -75,7 +77,7 @@ const RETRY_HOPS = 16
 
 // CauseKinds are the kinds of a `failed` message's cause, in their codes' order (the binary codec's byte, the text
 // codec's letter).
-var CauseKinds = [3]string{"transient", "broken", "waiting"}
+var CauseKinds = [4]string{"transient", "broken", "waiting", "denied"}
 
 // NoRetired is the `retired` list of a state entry without retirements, shared (no allocation per message).
 var NoRetired = []int{}
@@ -130,12 +132,20 @@ type StateEntry struct {
 	Retired []int
 }
 
-// HelloMessage opens a link. Calls is how many concurrent calls this side accepts (the call window).
+// HelloMessage opens a link. Calls is how many concurrent calls of one origin this side accepts (the call window); 0:
+// none announced (a link this side was given as trusted: a window is at least 1).
 type HelloMessage struct {
 	Protocol    int
 	Incarnation string
 	Calls       int
 }
+
+// CARRIER bounds a trace carrier: the most keys it has (Keys) and the longest key or value (Length), in UTF-16 units.
+var CARRIER = struct{ Keys, Length int }{Keys: 8, Length: 256}
+
+// NAME_LENGTH is the longest name a message carries (a type's, a host kind's): a relay records them in its spans
+// unparsed, so a peer cannot hand it an unbounded string (slice 9 review M1).
+const NAME_LENGTH = 256
 
 // HoldMessage holds an object. Principal is whom the hold acts for and Incarnation the origin's, read only on a parent
 // link; Chain is the instance ids of the activations waiting for this hold (Q5), read only on a trusted link; Limit
@@ -153,6 +163,13 @@ type HoldMessage struct {
 	Incarnation string
 	Chain       []string
 	Limit       Optional[int]
+	// Trace is the caller's trace carrier (R5, slice 9): an adapter's opaque string record, bounded by CARRIER, printable
+	// ASCII only. nil is no carrier; an empty one is a carrier without keys.
+	Trace map[string]string
+	// TraceOrder is the order of Trace's keys as a decoded message had them (Pi's object keeps its insertion order, a Go map
+	// has none): encoding writes them in it again, so a relayed carrier is the one that arrived. Empty (or not exactly Trace's
+	// keys): the keys sorted.
+	TraceOrder []string
 }
 
 // ReleaseMessage releases a hold.
@@ -162,7 +179,8 @@ type ReleaseMessage struct {
 }
 
 // CallMessage calls a method. Args is absent for a method without arguments; Segments are the byte segments of a
-// payload whose method's schema has a `bytes()` leaf, referenced from its JSON by `{"$bytes": i}`.
+// payload whose method's schema has a `bytes()` leaf, referenced from its JSON by `{"$bytes": i}`. Old is old work of a
+// reload (decision "Reload restarts every affected object"): honoured only from a trusted link.
 type CallMessage struct {
 	Origin   Optional[int]
 	Call     int
@@ -170,6 +188,10 @@ type CallMessage struct {
 	Method   int
 	Args     Part
 	Segments [][]byte
+	Trace    map[string]string
+	// TraceOrder is HoldMessage.TraceOrder.
+	TraceOrder []string
+	Old        bool
 }
 
 // AbortMessage aborts a call.
@@ -199,8 +221,26 @@ type StateMessage struct {
 	Holds  []StateEntry
 }
 
-// AckMessage acknowledges one applied `bound` or `state` message of its origin (the window).
-type AckMessage struct{ Origin Optional[int] }
+// AckMessage acknowledges one applied `bound` or `state` message of its origin (the window); with Events, none of
+// those: the number of `event` messages of the origin consumed since the last such ack (the event window).
+type AckMessage struct {
+	Origin Optional[int]
+	Events Optional[int]
+}
+
+// WireEvent is one entry of an `event` message: the emitting hold, `member` an index into the bound variant's event
+// members, `At` the emitting host's `Date.now()` at the emit, and the value's part.
+type WireEvent struct {
+	Hold, Member, At int
+	Value            Part
+}
+
+// EventMessage carries the events of bound holds: one message per flush per link and origin, possibly without entries
+// (a relay forwards what is left after filtering).
+type EventMessage struct {
+	Origin Optional[int]
+	Events []WireEvent
+}
 
 // ClosedMessage says a relay's downstream link closed: the origin's holds are released and its calls aborted. Its
 // origin is required (0 is what a decode without one gives, which CheckMessage refuses).
@@ -270,6 +310,7 @@ func (*LoadingMessage) Kind() string { return "loading" }
 func (*ResultMessage) Kind() string  { return "result" }
 func (*ErrorMessage) Kind() string   { return "error" }
 func (*GoneMessage) Kind() string    { return "gone" }
+func (*EventMessage) Kind() string   { return "event" }
 
 func (message *HoldMessage) origin() Optional[int]    { return message.Origin }
 func (message *ReleaseMessage) origin() Optional[int] { return message.Origin }
@@ -285,6 +326,7 @@ func (message *LoadingMessage) origin() Optional[int] { return message.Origin }
 func (message *ResultMessage) origin() Optional[int]  { return message.Origin }
 func (message *ErrorMessage) origin() Optional[int]   { return message.Origin }
 func (message *GoneMessage) origin() Optional[int]    { return message.Origin }
+func (message *EventMessage) origin() Optional[int]   { return message.Origin }
 
 func (message *HoldMessage) withOrigin(origin Optional[int]) OriginMessage {
 	copied := *message
@@ -329,7 +371,7 @@ func (message *StateMessage) withOrigin(origin Optional[int]) OriginMessage {
 }
 
 func (message *AckMessage) withOrigin(origin Optional[int]) OriginMessage {
-	return &AckMessage{Origin: origin}
+	return &AckMessage{Origin: origin, Events: message.Events}
 }
 
 func (message *ClosedMessage) withOrigin(origin Optional[int]) OriginMessage {
@@ -360,6 +402,12 @@ func (message *ErrorMessage) withOrigin(origin Optional[int]) OriginMessage {
 	return &copied
 }
 
+func (message *EventMessage) withOrigin(origin Optional[int]) OriginMessage {
+	copied := *message
+	copied.Origin = origin
+	return &copied
+}
+
 func (message *GoneMessage) withOrigin(origin Optional[int]) OriginMessage {
 	copied := *message
 	copied.Origin = origin
@@ -380,6 +428,7 @@ func (*LoadingMessage) consumerMessage() {}
 func (*ResultMessage) consumerMessage()  {}
 func (*ErrorMessage) consumerMessage()   {}
 func (*GoneMessage) consumerMessage()    {}
+func (*EventMessage) consumerMessage()   {}
 
 // Codec is how a link turns messages into bytes and back; both ends of a link use the same one.
 type Codec interface {
@@ -410,16 +459,17 @@ func CheckMessage(message Message, ctx context.Context) (Message, error) {
 func conforms(message Message) bool {
 	switch typed := message.(type) {
 	case *HelloMessage:
-		return typed.Protocol >= 0 && isUUID(typed.Incarnation) && typed.Calls >= 1
+		return typed.Protocol >= 0 && isUUID(typed.Incarnation) && typed.Calls >= 0
 	case *HoldMessage:
 		return validOrigin(typed.Origin) && typed.Hold >= 0 && typed.Version >= 1 && isHex16(typed.Fingerprint) && typed.Params != nil &&
+			jsstring.Length(typed.Type) <= NAME_LENGTH && jsstring.Length(typed.Address.Kind) <= NAME_LENGTH && validCarrier(typed.Trace) &&
 			(typed.Principal == nil || isString(typed.Principal.Value("kind"))) &&
 			(typed.Incarnation == "" || isUUID(typed.Incarnation)) && validIDs(typed.Chain) &&
 			(!typed.Limit.Ok || typed.Limit.Value >= 0)
 	case *ReleaseMessage:
 		return validOrigin(typed.Origin) && typed.Hold >= 0
 	case *CallMessage:
-		return validOrigin(typed.Origin) && typed.Call >= 0 && typed.Hold >= 0 && typed.Method >= 0
+		return validOrigin(typed.Origin) && typed.Call >= 0 && typed.Hold >= 0 && typed.Method >= 0 && validCarrier(typed.Trace)
 	case *AbortMessage:
 		return validOrigin(typed.Origin) && typed.Call >= 0
 	case *RetryMessage:
@@ -460,7 +510,17 @@ func conforms(message Message) bool {
 		}
 		return true
 	case *AckMessage:
-		return validOrigin(typed.Origin)
+		return validOrigin(typed.Origin) && (!typed.Events.Ok || typed.Events.Value >= 1)
+	case *EventMessage:
+		if !validOrigin(typed.Origin) {
+			return false
+		}
+		for _, entry := range typed.Events {
+			if entry.Hold < 0 || entry.Member < 0 || entry.At < 0 || entry.Value == nil {
+				return false
+			}
+		}
+		return true
 	case *ClosedMessage:
 		return typed.Origin >= 1
 	case *RevokeMessage, *PingMessage, *PongMessage:
@@ -481,6 +541,31 @@ func conforms(message Message) bool {
 }
 
 func validOrigin(origin Optional[int]) bool { return !origin.Ok || origin.Value >= 1 }
+
+// validCarrier is the message schema's trace carrier: at most CARRIER.Keys keys, keys and values at most CARRIER.Length
+// long, of printable ASCII only (keys without spaces), as W3C's headers and Chord's adapters are, so no control
+// character becomes a stored trace or span id (review M2).
+func validCarrier(carrier map[string]string) bool {
+	if len(carrier) > CARRIER.Keys {
+		return false
+	}
+	for key, value := range carrier {
+		if key == "" || len(key) > CARRIER.Length || len(value) > CARRIER.Length {
+			return false
+		}
+		for index := 0; index < len(key); index++ {
+			if key[index] < 0x21 || key[index] > 0x7e {
+				return false
+			}
+		}
+		for index := 0; index < len(value); index++ {
+			if value[index] < 0x20 || value[index] > 0x7e {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 func validIDs(ids []string) bool {
 	if len(ids) > CHAIN {
@@ -558,4 +643,14 @@ func isUUID(text string) bool {
 	}
 	//portlint:allow utf16units the length check above admits only ASCII text here, so byte offsets are UTF-16 offsets (incarnation pattern, message.ts:48)
 	return isLowerHex(text[:8]) && isLowerHex(text[9:13]) && isLowerHex(text[14:18]) && isLowerHex(text[19:23]) && isLowerHex(text[24:])
+}
+
+// carrierValue is the carrier as it is written: an object with its keys in order (the insertion order a decoded carrier
+// had, else sorted).
+func carrierValue(carrier map[string]string, order []string) any {
+	object := delta.NewJsonObject(len(carrier))
+	for _, key := range chordtelemetry.CarrierKeys(carrier, order) {
+		object.Set(key, carrier[key])
+	}
+	return object
 }

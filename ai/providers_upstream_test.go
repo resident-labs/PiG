@@ -36,8 +36,8 @@ func TestBuiltinProvidersUpstream(t *testing.T) {
 	// .upstream/v0.99.1/packages/ai/test/providers.test.ts:56
 	t.Run("builtinModels registers every builtin provider with models", func(t *testing.T) {
 		providers := ListProviders()
-		if len(BuiltinProviders()) != len(providers) {
-			t.Fatalf("BuiltinProviders() = %d providers, ListProviders() = %d", len(BuiltinProviders()), len(providers))
+		if built := builtCatalogProviders(); len(BuiltinProviders()) != len(built) {
+			t.Fatalf("BuiltinProviders() = %d providers, the catalog without this build's stripped providers = %d", len(BuiltinProviders()), len(built))
 		}
 		if !slices.Contains(providers, "anthropic") || len(ListModels("")) <= 500 {
 			t.Fatal("incomplete builtin catalog")
@@ -45,7 +45,8 @@ func TestBuiltinProvidersUpstream(t *testing.T) {
 		if providerModelUpstream(t, "anthropic", "claude-haiku-4-5").API != APIAnthropicMessages {
 			t.Fatal("wrong Anthropic API")
 		}
-		for _, provider := range providers {
+		// A build with a pig_strip_<api> tag offers no model of the provider it strips.
+		for _, provider := range builtCatalogProviders() {
 			models := GetAllBuiltinModels(provider)
 			if len(models) == 0 {
 				t.Fatal(provider)
@@ -61,13 +62,27 @@ func TestBuiltinProvidersUpstream(t *testing.T) {
 			t.Fatal(radius)
 		}
 	})
-	// .upstream/v0.87.1/packages/ai/test/providers.test.ts:73
+	// .upstream/v0.87.1/packages/ai/test/providers.test.ts:73 (Pi c815a3dfe: Copilot anthropic-messages models declare supportsStrictTools)
 	t.Run("stores native constrained-sampling capabilities in model metadata", func(t *testing.T) {
 		gpt4 := providerModelUpstream(t, "openai", "gpt-4o")
 		gpt5 := providerModelUpstream(t, "openai", "gpt-5.4")
 		anth := providerModelUpstream(t, "anthropic", "claude-haiku-4-5")
 		if gpt4.Compat == nil || gpt4.Compat.SupportsStrictMode == nil || !*gpt4.Compat.SupportsStrictMode || gpt4.Compat.SupportsOpenAIGrammarTools != nil || gpt5.Compat == nil || gpt5.Compat.SupportsStrictMode == nil || !*gpt5.Compat.SupportsStrictMode || gpt5.Compat.SupportsOpenAIGrammarTools == nil || !*gpt5.Compat.SupportsOpenAIGrammarTools || anth.Compat == nil || anth.Compat.SupportsStrictTools == nil || !*anth.Compat.SupportsStrictTools {
 			t.Fatal("incorrect constrained sampling metadata")
+		}
+		copilotClaude := 0
+		for _, model := range ListModels("github-copilot") {
+			if model.API == APIAnthropicMessages {
+				copilotClaude++
+				if model.Compat == nil || model.Compat.SupportsStrictTools == nil || !*model.Compat.SupportsStrictTools {
+					t.Errorf("github-copilot/%s does not declare supportsStrictTools", model.ID)
+				}
+			} else if model.Compat != nil && model.Compat.SupportsStrictTools != nil && *model.Compat.SupportsStrictTools {
+				t.Errorf("github-copilot/%s (%s) unexpectedly declares supportsStrictTools", model.ID, model.API)
+			}
+		}
+		if copilotClaude == 0 {
+			t.Fatal("no github-copilot anthropic-messages models in catalog")
 		}
 	})
 	// .upstream/v0.87.1/packages/ai/test/providers.test.ts:84
@@ -131,10 +146,10 @@ func TestBuiltinProvidersUpstream(t *testing.T) {
 			t.Fatal(got)
 		}
 	})
-	// .upstream/v0.99.1/packages/ai/test/providers.test.ts:162 (0.99.1 moved the Fireworks unsupported row from kimi-k2p6 to nemotron-3-ultra-nvfp4)
+	// .upstream/v0.99.1/packages/ai/test/providers.test.ts:162 (0.99.1 moved the Fireworks unsupported row from kimi-k2p6 to nemotron-3-ultra-nvfp4; Pi c8d1a826a moved it on to deepseek-v4p1-flash after the model was removed)
 	t.Run("enables mid-conversation system messages only for verified models", func(t *testing.T) {
 		supported := [][2]string{{"moonshotai", "kimi-k2.6"}, {"moonshotai", "kimi-k2.7-code"}, {"moonshotai", "kimi-k2.7-code-highspeed"}, {"moonshotai", "kimi-k3"}, {"moonshotai-cn", "kimi-k2.6"}, {"moonshotai-cn", "kimi-k2.7-code"}, {"moonshotai-cn", "kimi-k2.7-code-highspeed"}, {"moonshotai-cn", "kimi-k3"}, {"fireworks", "accounts/fireworks/models/kimi-k3"}, {"fireworks", "accounts/fireworks/routers/kimi-k3-fast"}, {"openai", "gpt-5.4"}, {"openai", "gpt-5.5"}, {"openai", "gpt-6-astra"}, {"openai-codex", "gpt-5.6-sol"}, {"anthropic", "claude-opus-5"}, {"opencode", "gpt-5.4"}, {"opencode", "gpt-5.6-terra"}, {"opencode-go", "gpt-5.6-luna"}, {"opencode", "claude-opus-4-8"}, {"opencode", "claude-opus-5"}, {"opencode", "kimi-k3"}, {"opencode-go", "kimi-k3"}, {"github-copilot", "gpt-5.6-terra"}, {"github-copilot", "claude-opus-5"}, {"github-copilot", "claude-opus-4.8"}, {"github-copilot", "kimi-k3"}, {"deepseek", "deepseek-v4-pro"}, {"openrouter", "openai/gpt-5.6-terra"}}
-		unsupported := [][2]string{{"fireworks", "accounts/fireworks/models/nemotron-3-ultra-nvfp4"}, {"openai", "gpt-4.1"}, {"openai", "gpt-5.2"}, {"anthropic", "claude-sonnet-4-5"}, {"google", "gemini-2.5-pro"}, {"opencode", "gpt-5.2"}, {"opencode", "claude-sonnet-4-5"}, {"github-copilot", "claude-sonnet-4.6"}, {"deepseek", "deepseek-flash"}, {"openrouter", "anthropic/claude-opus-5"}, {"openrouter", "moonshotai/kimi-k3"}, {"openrouter", "openai/gpt-5.6-terra:batch"}}
+		unsupported := [][2]string{{"fireworks", "accounts/fireworks/models/deepseek-v4p1-flash"}, {"openai", "gpt-4.1"}, {"openai", "gpt-5.2"}, {"anthropic", "claude-sonnet-4-5"}, {"google", "gemini-2.5-pro"}, {"opencode", "gpt-5.2"}, {"opencode", "claude-sonnet-4-5"}, {"github-copilot", "claude-sonnet-4.6"}, {"deepseek", "deepseek-flash"}, {"openrouter", "anthropic/claude-opus-5"}, {"openrouter", "moonshotai/kimi-k3"}, {"openrouter", "openai/gpt-5.6-terra:batch"}}
 		for _, row := range supported {
 			model := providerModelUpstream(t, row[0], row[1])
 			if model.Compat == nil || model.Compat.SupportsMidConvoSystemMessages == nil || !*model.Compat.SupportsMidConvoSystemMessages {
@@ -321,6 +336,8 @@ func TestListProvidersMatchesPinnedBarrelKeys(t *testing.T) {
 	for _, provider := range BuiltinProviders() {
 		built = append(built, provider.ID)
 	}
+	// A build with a pig_strip_<api> tag builds the barrel's providers without the one it strips.
+	want = slices.DeleteFunc(want, func(id string) bool { return slices.Contains(BuiltStrippedProviders(), id) })
 	if !slices.Equal(built, want) {
 		t.Fatalf("BuiltinProviders() ids = %v\nwant %v", built, want)
 	}

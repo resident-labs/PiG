@@ -67,7 +67,11 @@
   (state :active)               ; :active, :completed, :cancelled
   (finished nil)
   (reason nil)
-  (ticket nil))
+  (ticket nil)
+  ;; T for the request of a command handler or a withSession callback, whose context is Pi's command context. The context keeps the kind after the request ended; the host refuses the command-only session actions from any other.
+  (command nil)
+  ;; A function of no arguments that an ordinary cancel, and the end of the runtime, call once: it ends what the request's handler waits on (the stream of a provider_stream_simple request). A signal-only cancel does not call it.
+  (on-end nil))
 
 (defstruct (footer-data)
   (branch nil)
@@ -79,6 +83,7 @@
 (defstruct (extension (:constructor %make-extension (name)))
   (name "" :type string)
   (reg-lock (sb-thread:make-mutex :name "pig registration"))
+  (publish-lock (sb-thread:make-mutex :name "pig tool publication"))
   (tools '()) (tool-handlers (make-hash-table :test 'equal))
   (tool-hooks (make-hash-table :test 'equal)) ; name -> plist of :prepare :loadout :reaches handlers
   (commands '()) (command-handlers (make-hash-table :test 'equal))
@@ -86,6 +91,8 @@
   (flags '()) (flag-defaults (make-hash-table :test 'equal))
   (handlers '()) (event-handlers (make-hash-table)) (next-handler-id 0)
   (loaded-handlers '())
+  ;; D614 plugin UI mounts: what the attached client draws (replicated, NIL while none is attached) and the intent handler
+  (view-lock (sb-thread:make-mutex :name "pig ui view")) (view-abilities nil) (view-abilities-known nil) (view-intent-handler nil)
   (live nil)
   ;; connection and per-connection state
   (conn nil)
@@ -150,19 +157,21 @@
     (host-call ext "registerDeclaration" declarations)))
 
 (defun install-tool (ext decl handler &optional hooks)
-  "Install the tool declaration DECL with HANDLER and HOOKS (a plist of :prepare :loadout :reaches handlers), replacing a tool of the same name."
+  "Install the tool declaration DECL with HANDLER and HOOKS (a plist of :prepare :loadout :reaches handlers), replacing a tool of the same name.
+A running session is refreshed before this returns. The refresh asks every tool's prepare-loadout hook, and a hook reads the tables under reg-lock on another thread, so the host call is made without it; publish-lock keeps the changes and their publications in one order."
   (let ((name (gethash "name" decl)))
-    (sb-thread:with-mutex ((extension-reg-lock ext))
-      (let ((existing (position name (extension-tools ext)
-                                :key (lambda (d) (gethash "name" d)) :test #'string=)))
-        (if existing
-            (setf (nth existing (extension-tools ext)) decl)
-            (setf (extension-tools ext) (append (extension-tools ext) (list decl)))))
-      (setf (gethash name (extension-tool-handlers ext)) handler)
-      (if hooks
-          (setf (gethash name (extension-tool-hooks ext)) hooks)
-          (remhash name (extension-tool-hooks ext)))
-      (when (extension-live ext)
+    (sb-thread:with-mutex ((extension-publish-lock ext))
+      (when (sb-thread:with-mutex ((extension-reg-lock ext))
+              (let ((existing (position name (extension-tools ext)
+                                        :key (lambda (d) (gethash "name" d)) :test #'string=)))
+                (if existing
+                    (setf (nth existing (extension-tools ext)) decl)
+                    (setf (extension-tools ext) (append (extension-tools ext) (list decl)))))
+              (setf (gethash name (extension-tool-handlers ext)) handler)
+              (if hooks
+                  (setf (gethash name (extension-tool-hooks ext)) hooks)
+                  (remhash name (extension-tool-hooks ext)))
+              (extension-live ext))
         (host-call ext "registerTool" decl)))
     name))
 
@@ -254,7 +263,7 @@ Returns an idempotent function that unsubscribes."
                                    nil)))))
             (when connected
               (handler-case (host-call ext "event.unsubscribe" (obj "event" event "handlerId" id))
-                (error (e) (format *error-output* "extension: event.unsubscribe ~S: ~A~%" event e))))))))))
+                (error (e) (diagnose "extension: event.unsubscribe ~S: ~A~%" event e))))))))))
 
 (defun on-loaded (ext handler)
   "Run HANDLER, (lambda (ctx)), once the extension has registered and received its state, before it serves any request."

@@ -11,7 +11,7 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
-// Ports packages/chord/src/next/store/import.ts
+// Ports packages/chord/src/store/import.ts
 //
 // `ImportStore(backend, parts, ctx, options)` (slice 6a §13, rules 12, 24, 25): a store made from an archive, a trust
 // boundary. Every part is checked against the archive schema, its place in the archive's order and its content
@@ -36,6 +36,7 @@ type PartSource interface {
 	// Next blocks for the next value; ok is false at the end of the input.
 	Next(ctx context.Context) (value any, ok bool, err error)
 	// Close ends the input early (Pi's iterator `return()`); called when the import stops before the end.
+	// Close may be called from another goroutine while a Next is in flight: the import does not wait for a stalled input.
 	Close() error
 }
 
@@ -225,6 +226,9 @@ func (archive *archiveImport) start(part ArchivePart, what string) error {
 	if manifest.Schema > StoreSchema {
 		return data.Invalid(data.ReasonArgs, fmt.Sprintf("%s: schema %d is newer than %d", what, manifest.Schema, StoreSchema))
 	}
+	if manifest.Host != nil {
+		return data.Invalid(data.ReasonArgs, fmt.Sprintf("%s: a host's data archive (%s); import it with importHostData", what, *manifest.Host))
+	}
 	archive.manifest = manifest
 	archive.step = NewStep(archive.executor, manifest.LastSeq, NewIdAllocator(manifest.NextID), map[string]*TableRecord{})
 	return nil
@@ -288,7 +292,11 @@ func (archive *archiveImport) checkDocument(part *DocumentCreate, what string) e
 	if record.Key != nil {
 		key = *record.Key
 	}
-	for _, text := range []string{record.Namespace, record.Owner, record.Kind, key} {
+	texts := []string{record.Namespace, record.Owner, record.Kind, key}
+	if record.Host != nil {
+		texts = append(texts, *record.Host)
+	}
+	for _, text := range texts {
 		stored, err := StoredText(text, what)
 		if err != nil {
 			return err

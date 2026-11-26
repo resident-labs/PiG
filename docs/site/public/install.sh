@@ -89,7 +89,9 @@ main() {
   "$staged" --version >/dev/null 2>&1 || fail "the downloaded pig binary does not run on this machine"
   mv -f "$staged" "${install_dir}/pig"
 
-  say "Installed $("${install_dir}/pig" --version 2>/dev/null || printf 'pig %s' "$version") to ${install_dir}/pig"
+  # `pig --version` prints Pi's version, so the release comes from `pig version` (its `pig:` line).
+  installed=$("${install_dir}/pig" version 2>/dev/null | sed -n 's/^pig: //p' | sed -n 1p)
+  say "Installed pig ${installed:-$version} to ${install_dir}/pig"
   write_receipt "$install_dir" "$version" ||
     say "Could not record the install receipt; to update later, run this installer again"
   case ":${PATH:-}:" in
@@ -136,6 +138,13 @@ say() {
   printf 'pig-install: %s\n' "$*"
 }
 
+remote_hint='
+To use PiG from this device, connect to a computer that has PiG installed, then run pig there:
+  ssh you@your-computer
+  pig
+Install PiG on that computer with:
+  curl -fsSL https://pi-in-go.dev/install.sh | sh'
+
 fail() {
   printf 'pig-install: error: %s\n' "$*" >&2
   exit 1
@@ -180,11 +189,25 @@ is_android() {
   [ "$(uname -o 2>/dev/null)" = Android ]
 }
 
+# unsupported_device exits with the remote-use hint on an iPhone, an iPad or iSH. a-Shell reports a device
+# identifier such as iPhone18,3 as uname -m; iSH is Linux on emulated 32-bit x86 and exposes /proc/ish.
+unsupported_device() {
+  case "$(uname -m)" in
+    iPhone* | iPad*)
+      fail "PiG can't run on iPhone or iPad: iOS lets terminal apps run only code built into the app.$remote_hint"
+      ;;
+  esac
+  if [ -e /proc/ish ]; then
+    fail "PiG has no build for iSH, which emulates 32-bit x86 Linux.$remote_hint"
+  fi
+}
+
 # detect_platform prints OS-ARCH as release archives name them. Termux reports
 # uname -s Linux, but it needs the android build: that one is a position
 # independent executable linked to bionic, which Termux's loader runs and which
 # resolves DNS and trusts certificates through Android.
 detect_platform() {
+  unsupported_device
   case "$(uname -s)" in
     Linux)
       if is_android; then os=android; else os=linux; fi

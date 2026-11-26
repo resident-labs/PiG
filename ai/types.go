@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"fmt"
 	"io"
 	"maps"
@@ -14,6 +15,8 @@ import (
 
 	sdkjson "github.com/MichaelKinsy/PiG/extensions/sdk/json"
 	"github.com/MichaelKinsy/PiG/internal/allocsize"
+	"github.com/MichaelKinsy/PiG/internal/jsonopts"
+	"github.com/MichaelKinsy/PiG/internal/jsonwire"
 	"github.com/MichaelKinsy/PiG/internal/jsparity"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/telemetry"
@@ -77,6 +80,20 @@ func (content TextContent) MarshalJSON() ([]byte, error) {
 
 // AppendStringify appends the JSON.stringify text of MarshalJSON's output to dst (sdkjson.StringifyAppender).
 func (content TextContent) AppendStringify(dst []byte) ([]byte, error) {
+	// A large text's encoding is the one the request cache keeps for the request that sends it (and for the tool that made it, QuotedPlainText),
+	// so it is escaped once for all of them. The members follow appendContent's: type, text, and textSignature unless it is empty.
+	//portlint:allow utf16units a size threshold of the request cache's splice, not a Pi comparison: bytes are what the cache stores
+	if len(content.Text) >= requestSpliceMinBytes {
+		if quoted, ok := requestStrings.quoteValidEarly(content.Text); ok {
+			dst = append(dst, `{"type":"text","text":`...)
+			dst = append(dst, quoted...)
+			if content.TextSignature != "" {
+				dst = append(dst, `,"textSignature":`...)
+				dst = sdkjson.AppendStringifyString(dst, content.TextSignature)
+			}
+			return append(dst, '}'), nil
+		}
+	}
 	return appendContent(dst, content.contentType(), content.wire())
 }
 
@@ -290,6 +307,10 @@ func marshalContent(contentType string, content any) ([]byte, error) {
 	} else {
 		encoded = append(encoded, '}')
 	}
+	// JSON.stringify writes a negative zero as 0 and an ill-formed byte as the replacement character, as MarshalJSONTo does.
+	if jsonwire.MayHaveJSForms(encoded) {
+		return sdkjson.AppendJSNormalized(encoded[:0], encoded)
+	}
 	return encoded, nil
 }
 
@@ -398,6 +419,11 @@ func (s OrderedSections) MarshalJSON() ([]byte, error) {
 	jsstring.SortOwnKeys(s, func(section PromptSection) string { return section.Name })
 	var buf bytes.Buffer
 	writeString := func(value string) error {
+		if jsstring.HoldsSurrogate(value) {
+			// JSON.stringify writes a lone surrogate as its escape; the encoder below writes each of its bytes as U+FFFD.
+			buf.Write(jsstring.AppendString(nil, value))
+			return nil
+		}
 		var encoded bytes.Buffer
 		encoder := json.NewEncoder(&encoded)
 		encoder.SetEscapeHTML(false)
@@ -429,28 +455,27 @@ func (s OrderedSections) MarshalJSON() ([]byte, error) {
 }
 
 func (s *OrderedSections) UnmarshalJSON(data []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	token, err := decoder.Token()
+	decoder := jsontext.NewDecoder(bytes.NewReader(data), jsonopts.Parse)
+	token, err := decoder.ReadToken()
 	if err != nil {
 		return err
 	}
-	if token != json.Delim('{') {
+	if token.Kind() != '{' {
 		return fmt.Errorf("system message sections must be an object")
 	}
 	sections := OrderedSections{}
-	for decoder.More() {
-		nameToken, err := decoder.Token()
+	var jsNames []string // the keys as JSON.parse has them, parallel to sections
+	for decoder.PeekKind() != '}' {
+		jsName, err := jsonopts.ReadName(decoder) // the JavaScript key: "\ud800" and "\ud801" stay two keys, as in JSON.parse
 		if err != nil {
 			return err
 		}
-		name, ok := nameToken.(string)
-		if !ok {
-			return fmt.Errorf("system message section name must be a string")
-		}
-		var raw json.RawMessage
-		if err := decoder.Decode(&raw); err != nil {
+		name := jsonopts.ValidName(jsName)
+		rawValue, err := decoder.ReadValue()
+		if err != nil {
 			return err
 		}
+		raw := json.RawMessage(rawValue) // json.Unmarshal below reads it before the decoder moves on
 		var value *string
 		if string(raw) != "null" {
 			var text string
@@ -459,13 +484,14 @@ func (s *OrderedSections) UnmarshalJSON(data []byte) error {
 			}
 			value = &text
 		}
-		if index := slices.IndexFunc(sections, func(section PromptSection) bool { return section.Name == name }); index >= 0 {
+		if index := slices.Index(jsNames, jsName); index >= 0 {
 			sections[index].Value = value
 		} else {
+			jsNames = append(jsNames, jsName)
 			sections = append(sections, PromptSection{Name: name, Value: value})
 		}
 	}
-	if _, err := decoder.Token(); err != nil {
+	if _, err := decoder.ReadToken(); err != nil {
 		return err
 	}
 	// JSON.parse yields an object whose integer-like keys enumerate first.
@@ -489,7 +515,8 @@ const (
 
 // ─── Tool Schema ──────────────────────────────────────────────────────────────
 
-// ToolSchema describes an LLM-callable tool in JSON Schema format. JSON decoding and encoding retain schema declaration order for provider strict-schema derivation; directly authored Go maps use deterministic key order.
+// ToolSchema describes an LLM-callable tool in JSON Schema format. JSON decoding and encoding retain schema declaration order for provider strict-schema derivation and for the request body: Pi sends a tool's schema in the order its author wrote it, and those bytes are part of the prompt and of the provider's prompt-cache key.
+// A schema that reaches pig as JSON text (an extension's declaration, an MCP server's input schema, a built-in's source literal) is sent in that order. A schema a Go caller assigns to Parameters as a map[string]any has no order to keep, since a Go map is unordered: its object members are sent sorted by name, on every provider. A caller that needs an order hands the declaration as JSON text and decodes it into a ToolSchema.
 type ToolSchema struct {
 	parameterOrder   schemaObjectOrder
 	Name             string         `json:"name"`
@@ -651,6 +678,20 @@ const (
 	SessionAffinityOpenAINoSession SessionAffinityFormat = "openai-nosession"
 	// SessionAffinityOpenRouter sends x-session-id.
 	SessionAffinityOpenRouter SessionAffinityFormat = "openrouter"
+)
+
+// PromptCacheKeyMode controls the prompt_cache_key request field on OpenAI-compatible APIs (types.ts PromptCacheKeyMode).
+// Empty string means "auto".
+type PromptCacheKeyMode string
+
+const (
+	// PromptCacheKeyAuto keeps each API's default: Completions sends the key to api.openai.com or with long cache retention
+	// when the provider supports it; Responses sends it whenever caching is active.
+	PromptCacheKeyAuto PromptCacheKeyMode = "auto"
+	// PromptCacheKeyEnabled sends the key whenever caching is active, for compatible proxies.
+	PromptCacheKeyEnabled PromptCacheKeyMode = "enabled"
+	// PromptCacheKeyDisabled never sends the key.
+	PromptCacheKeyDisabled PromptCacheKeyMode = "disabled"
 )
 
 // ThinkingLevel is the reasoning effort a request can ask for (types.ts ThinkingLevel). It has no "off": an omitted level means no reasoning request.
@@ -828,10 +869,14 @@ type StreamOptions struct {
 	Temperature float64
 	// TemperatureSet distinguishes an explicit zero temperature from omission.
 	// Non-zero Temperature values remain present for existing callers.
-	TemperatureSet  bool
-	SamplingParams  map[string]any
-	ThinkingBudgets *ThinkingBudgets
-	Thinking        ThinkingLevel `json:"reasoning,omitempty"`
+	TemperatureSet bool
+	SamplingParams map[string]any
+	// SamplingParamsOrder is the insertion order of SamplingParams' keys: the order in which they follow the request's own members on an
+	// OpenAI-compatible wire. Keys missing from it follow in sorted order, so a caller that sets only the map sends them sorted. Callers that
+	// decode the parameters from JSON fill it.
+	SamplingParamsOrder []string `json:"-"`
+	ThinkingBudgets     *ThinkingBudgets
+	Thinking            ThinkingLevel `json:"reasoning,omitempty"`
 	// GoogleThinking carries Google's raw thinking object; Thinking is the provider-neutral reasoning option.
 	GoogleThinking       *GoogleThinkingOptions `json:"thinking,omitempty"`
 	ThinkingEnabled      *bool                  `json:"thinkingEnabled,omitempty"`
@@ -890,9 +935,13 @@ type StreamOptions struct {
 	CacheRetention CacheRetention
 	// SessionID is passed to the provider for prompt caching (OpenAI prompt_cache_key). When non-empty and the provider supports it, repeated calls with the same session ID can reuse cached prompt processing. Mirrors upstream openai-completions.ts:449.
 	SessionID string
+	// DisableContinuation keeps the request from using or recording server-side continuation state, such as Anthropic message threads. Set it for replays such as cache warming, which must not replace the state of the real conversation. Providers that keep no continuation state ignore it.
+	DisableContinuation bool
 	// ToolChoice selects provider-neutral automatic/no-tool behavior (a ToolChoice or its string) or a
 	// provider-specific choice object. Anthropic and Bedrock also accept "any" and
-	// {"type":"tool","name":...}.
+	// {"type":"tool","name":...}. Pi sends the caller's object with its members in the caller's order; a Go map
+	// is written with its keys sorted, so a caller that has an order passes the object's JSON text
+	// (json.RawMessage), as the extension bridge does, or a struct.
 	ToolChoice any
 	// Debug asks a pi-messages backend for debug metadata such as routing response headers (pi-messages.ts PiMessagesOptions.debug).
 	Debug bool `json:"debug,omitempty"`
@@ -1139,7 +1188,12 @@ type Model struct {
 	SamplingParams   map[string]any
 	// SamplingParamsByThinkingLevel overrides SamplingParams for the effective thinking level on OpenAI-compatible APIs.
 	SamplingParamsByThinkingLevel SamplingParamsByThinkingLevel
-	PromptCache                   ModelPromptCache
+	// SamplingParamsOrder is the insertion order of SamplingParams' keys, and SamplingParamsByThinkingLevelOrder that of each level's: the
+	// order in which the parameters reach an OpenAI-compatible wire. Keys missing from a list follow in sorted order, so a model that sets
+	// only the maps sends them sorted. Callers that decode a model from JSON fill them.
+	SamplingParamsOrder                []string                        `json:"-"`
+	SamplingParamsByThinkingLevelOrder map[ModelThinkingLevel][]string `json:"-"`
+	PromptCache                        ModelPromptCache
 	// InputLimits mirrors upstream Model.inputLimits.
 	InputLimits *ModelInputLimits
 	// catalog is the persisted record this model was decoded from; it keeps the fields the model has no member for.

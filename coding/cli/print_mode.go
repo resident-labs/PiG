@@ -18,6 +18,7 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/coding/extension/host/subprocess"
 	"github.com/MichaelKinsy/PiG/coding/rpcclient"
+	"github.com/MichaelKinsy/PiG/extensions/sdk/clihook"
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
 	"github.com/MichaelKinsy/PiG/internal/handleryield"
@@ -62,6 +63,19 @@ func (e *signalExitError) ExitCode() int {
 // arriving mid-run.
 var receivedTerminationSignal atomic.Int32
 
+// repeatedTerminationSignal is the signal that repeated while print mode was disposing, if any. print-mode.ts gives each signal its own
+// handler, which exits with that signal's code (143 for SIGTERM, 129 for SIGHUP), so the repeat decides the code: it is set before
+// anything the repeat does can end the extension processes and so complete the disposal the first signal waits for.
+var repeatedTerminationSignal atomic.Int32
+
+// terminationExitSignal is the signal whose code ends the process: the repeated one, else the first.
+func terminationExitSignal(first syscall.Signal) syscall.Signal {
+	if repeated := repeatedTerminationSignal.Load(); repeated != 0 {
+		return syscall.Signal(repeated)
+	}
+	return first
+}
+
 // printModeRuntime is what main resolved for the print-mode session: the
 // runtime services and extensions, and the options the session starts with.
 type printModeRuntime struct {
@@ -74,6 +88,10 @@ type printModeRuntime struct {
 	Session     coding.SessionStartOptions
 	ResumePath  string
 	SessionName string
+	// Diagnostics are the build's diagnostics (cliBuild.runtimeDiagnostics), the model fallback message included as a warning: the Runtime holds them for the mode to report once.
+	Diagnostics []codingagent.AgentSessionRuntimeDiagnostic
+	// ModelFallbackMessage is the build model fallback message (cliBuild.ModelFallbackMessage); the Runtime reports it as ModelFallbackMessage().
+	ModelFallbackMessage string
 	// ToolRegistryAllowed and ToolRegistryExcluded bound the tool registry
 	// pi.getAllTools() reports (see toolRegistryFilters).
 	ToolRegistryAllowed  map[string]struct{}
@@ -96,7 +114,7 @@ func (h printModeRuntime) startOptions() coding.SessionStartOptions {
 }
 
 func (h printModeRuntime) inputs() cliSessionInputs {
-	return cliSessionInputs{Services: h.Services, Extensions: h.Extensions, Start: h.Session, Host: h.Host, Bridge: h.Bridge, Runtime: h.Runtime, Invalidate: h.Invalidate, Release: h.Release}
+	return cliSessionInputs{Services: h.Services, Extensions: h.Extensions, Start: h.Session, Host: h.Host, Bridge: h.Bridge, Runtime: h.Runtime, Diagnostics: h.Diagnostics, ModelFallbackMessage: h.ModelFallbackMessage, Invalidate: h.Invalidate, Release: h.Release}
 }
 
 // printModeOptions mirrors upstream PrintModeOptions (print-mode.ts).
@@ -113,6 +131,8 @@ type printModeOptions struct {
 	// stdout and stderr default to the process's raw stdout and stderr.
 	stdout io.Writer
 	stderr io.Writer
+	// ownOutput is a fused member's clihook.Result.OwnPrintOutput: the member writes the run's stdout and the words of a failed run's stderr line.
+	ownOutput bool
 	// convertEvent defaults to rpcAgentEvent, upstream's toJsonEvent.
 	convertEvent func(agent.AgentEvent) ([]any, error)
 	// toolRegistryAllowed and toolRegistryExcluded bound the tool registry pi.getAllTools() reports (see toolRegistryFilters); startPrintMode takes them from the command line.
@@ -150,6 +170,8 @@ func startPrintMode(ctx context.Context, host printModeRuntime, opts printModeOp
 	if err != nil {
 		return 1, fmt.Errorf("construct session: %w", err)
 	}
+	// main.ts takes the startup diagnostics from the runtime and writes them to stderr before the mode runs (c47ad0432bb8).
+	codingagent.WriteDiagnosticsToStderr(rt.TakeUnreportedDiagnostics())
 	opts.toolRegistryAllowed, opts.toolRegistryExcluded = host.ToolRegistryAllowed, host.ToolRegistryExcluded
 	return runPrintMode(ctx, rt, opts)
 }
@@ -182,6 +204,11 @@ func runPrintModeIn(ctx context.Context, rt *coding.Runtime, opts printModeOptio
 			}
 		}
 		opts.stdout = codingagent.RawStdoutWriter()
+		if opts.ownOutput {
+			// pig additive (D653): a fused member that owns the print output gets the raw stdout; PiG writes none.
+			clihook.SetStdout(opts.stdout)
+			opts.stdout = io.Discard
+		}
 	}
 	if opts.stderr == nil {
 		opts.stderr = os.Stderr
@@ -199,7 +226,18 @@ func runPrintModeIn(ctx context.Context, rt *coding.Runtime, opts printModeOptio
 	var convertErr error
 	var detachOutput []func()
 	var outputDetached bool
-	intCh := make(chan os.Signal, 1)
+	// detachWriter ends the JSON writer's subscriptions and its entry_appended line (print-mode.ts:44-52 disposeRuntime unsubscribes first); lines already queued still drain.
+	detachWriter := func() {
+		convertMu.Lock()
+		detaches := detachOutput
+		detachOutput = nil
+		outputDetached = true
+		convertMu.Unlock()
+		for _, detach := range detaches {
+			detach()
+		}
+	}
+	intCh := make(chan os.Signal, 2)
 	termSignals := []os.Signal{syscall.SIGTERM}
 	if runtime.GOOS != "windows" {
 		termSignals = append(termSignals, syscall.SIGHUP)
@@ -216,7 +254,23 @@ func runPrintModeIn(ctx context.Context, rt *coding.Runtime, opts printModeOptio
 	// disposal therefore waits for that result (resultMu) before it disposes the Session.
 	var disposeOnce sync.Once
 	var disposed atomic.Bool
+	// finalDisposing is set while the final disposal (the teardown's rt.Close) runs, and finalDisposed closes when it ends; a signal during it waits for that disposal, as Pi's disposeRuntime() returns the shared in-flight disposal (print-mode.ts), instead of starting a second one or cutting it off.
+	var finalDisposing atomic.Bool
+	finalDisposed := make(chan struct{})
+	// teardownDone closes when the teardown has ended. The signal handlers live until then, not until the run's ctx ends: a stdout or conversion error cancels ctx before the final disposal, and a signal during it must still be handled, a repeated one by exiting at once.
+	teardownDone := make(chan struct{})
+	defer close(teardownDone)
 	var resultMu sync.Mutex
+	// Pi's disposal and the prompt it interrupts interleave on one event loop (print-mode.ts, agent-session-runtime.ts dispose): once the aborted
+	// run settles, runtimeHost.dispose() goes on into the session_shutdown handlers up to their first await, and only then does the prompt's own
+	// continuation print the run's result. disposalStarted marks a disposal in progress, handlersDone closes when the handlers have yielded or
+	// ended, and resultStageDone closes when the main flow has printed (or skipped) the result of a prompt that was in flight at the signal.
+	var disposalStarted atomic.Bool
+	var promptsInFlight atomic.Int32
+	handlersDone, resultStageDone := make(chan struct{}), make(chan struct{})
+	var handlersDoneOnce, resultStageOnce sync.Once
+	endHandlerPhase := func() { handlersDoneOnce.Do(func() { close(handlersDone) }) }
+	passResultStage := func() { resultStageOnce.Do(func() { close(resultStageDone) }) }
 	var releaseHoldMu sync.Mutex
 	releaseHold := func() {}
 	setTerminationPrelude(func() {
@@ -233,44 +287,76 @@ func runPrintModeIn(ctx context.Context, rt *coding.Runtime, opts printModeOptio
 		fn()
 	}
 	disposeFromSignal := func() {
+		if finalDisposing.Load() {
+			// The termination prelude held the Session's agent events for this signal; a run a session_shutdown handler starts during the final disposal would block on that hold and stall the disposal this signal waits for.
+			release()
+			<-finalDisposed
+			return
+		}
 		disposeOnce.Do(func() {
-			convertMu.Lock()
-			detaches := detachOutput
-			detachOutput = nil
-			outputDetached = true
-			convertMu.Unlock()
-			for _, detach := range detaches {
-				detach()
-			}
+			detachWriter()
+			// runtimeHost.dispose() awaits session.abort() before session_shutdown (agent-session-runtime.ts dispose, Pi main 7a53c310a, #9126):
+			// the abort flag is set while the signal's hold is still in place, so the killed tool's turn ends as aborted and starts no next request,
+			// and the interrupted run settles (its tool result and aborted assistant message are persisted) before any handler runs.
+			disposalStarted.Store(true)
+			resultPending := promptsInFlight.Load() > 0
+			session := rt.Session()
+			session.RequestAbort()
+			release()
 			//portlint:allow ctxbackground Pi's SIGTERM/SIGHUP handler awaits runtimeHost.dispose() with no signal (print-mode.ts:57-60); this signal hook has no caller context
-			rt.EmitQuitShutdownContext(handleryield.With(context.Background(), release))
+			_ = session.WaitForIdle(context.Background())
+			//portlint:allow ctxbackground Pi's SIGTERM/SIGHUP handler awaits runtimeHost.dispose() with no signal (print-mode.ts:57-60); this signal hook has no caller context
+			rt.EmitQuitShutdownContext(handleryield.With(context.Background(), func() { release(); endHandlerPhase() }))
+			endHandlerPhase()
+			if resultPending {
+				<-resultStageDone
+			}
 			// Pi exits a microtask after dispose; the aborted run's later extension errors (a turn_end boundary without a persisted entry) are never printed.
 			resultMu.Lock()
 			disposed.Store(true)
 			resultMu.Unlock()
 			rt.Session().Dispose()
 			release()
+			// Pi's runtimeHost.dispose() waits for credential writes in progress, so a started OAuth refresh is saved before the signal's exit.
+			//portlint:allow ctxbackground Pi's SIGTERM/SIGHUP handler awaits runtimeHost.dispose() with no signal (print-mode.ts:57-60); this signal hook has no caller context
+			_ = rt.SettleCredentialWrites(context.Background())
 		})
 	}
 	setTerminationShutdownHook(disposeFromSignal)
 	defer setTerminationShutdownHook(nil)
 	signal.Notify(intCh, termSignals...)
 	defer signal.Stop(intCh)
+	// exitOnSignal is the handler's end: process.exit(128+signum) once the disposal is done. Extension processes end with the process, as the RPC signal exit ends them.
+	exitOnSignal := func(sysSig syscall.Signal) {
+		if extensionHost, _ := rpcExtensionHost(rt.Session()); extensionHost != nil {
+			extensionHost.TerminateProcesses()
+		}
+		exitProcess(128 + int(terminationExitSignal(sysSig)))
+	}
 	go func() {
 		select {
 		case sig := <-intCh:
+			// a repeated signal exits at once, without waiting for the disposal the first one started (print-mode.ts signalCount > 1), including a wait for a credential write. The watcher starts before anything that can wait on that disposal.
+			go func() {
+				select {
+				case again := <-intCh:
+					if againSig, againOK := again.(syscall.Signal); againOK {
+						repeatedTerminationSignal.Store(int32(againSig))
+						tools.KillTrackedDetachedChildren()
+						exitOnSignal(againSig)
+					}
+				case <-teardownDone:
+				}
+			}()
 			sysSig, ok := noteTerminationSignal(sig)
 			tools.KillTrackedDetachedChildren()
 			disposeFromSignal()
-			// Then process.exit(128+signum): the aborted run's remaining work (tool hooks, turn boundaries, extension errors) never runs. Extension processes end with the process, as the RPC signal exit ends them.
+			// Then process.exit(128+signum): the aborted run's remaining work (tool hooks, turn boundaries, extension errors) never runs.
 			if ok {
-				if extensionHost, _ := rpcExtensionHost(rt.Session()); extensionHost != nil {
-					extensionHost.TerminateProcesses()
-				}
-				exitProcess(128 + int(sysSig))
+				exitOnSignal(sysSig)
 			}
 			cancel()
-		case <-ctx.Done():
+		case <-teardownDone:
 		}
 	}()
 	defer func() {
@@ -278,7 +364,7 @@ func runPrintModeIn(ctx context.Context, rt *coding.Runtime, opts printModeOptio
 		// surfaced, so the caller reports the signal's exit code instead of a
 		// generic failure.
 		if sig := receivedTerminationSignal.Load(); sig != 0 {
-			err = &signalExitError{signal: syscall.Signal(sig)}
+			err = &signalExitError{signal: terminationExitSignal(syscall.Signal(sig))}
 		}
 	}()
 
@@ -359,7 +445,7 @@ func runPrintModeIn(ctx context.Context, rt *coding.Runtime, opts printModeOptio
 	var currentCommands atomic.Pointer[headlessCommandCatalog]
 	var detachModelRegistry, stopRunSignal, stopHostState func()
 	var publishedCommands atomic.Pointer[headlessCommandCatalog]
-	// bind wires the Session to this mode as upstream rebindSession does: extension bindings, command actions, then the event subscription. It emits session_start for the Session's own reason, which is startup for the first Session.
+	// bind wires the Session to this mode as upstream rebindSession does: the event subscription, then extension bindings and command actions. It emits session_start for the Session's own reason, which is startup for the first Session.
 	// A reload binds the same Session to a replacement runner: the Session has reloaded its resources and rebuilt its system prompt, and the event subscription stays (agent-session.ts:3575-3625).
 	bind := func(ctx context.Context, session *coding.Session, event extension.SessionStartEvent, reloading bool) error {
 		services := session.Services()
@@ -377,13 +463,17 @@ func runPrintModeIn(ctx context.Context, rt *coding.Runtime, opts printModeOptio
 		stopRunSignal = coding.WatchSessionRunSignal(bridge, session)
 		stopHostState = coding.WatchHostState(bridge, session)
 		coding.BindSessionReadActions(bridge, current, session.CWD(), session.Inner().GetSessionDir())
-		// writing is set once session_start is dispatched; a reload binds the same Session, whose writer stays subscribed.
-		var writing atomic.Bool
-		writing.Store(reloading)
+		// print-mode.ts:84-98 subscribes the writer before `await session.bindExtensions()`, so what a session_start handler emits (events, entry_appended) is written. A reload binds the same Session, whose writer stays subscribed.
+		if !reloading {
+			subscribe(session)
+		}
 		var emitEntryAppended func(RPCEntryAppendedEvent)
 		if opts.Mode == "json" {
+			// The entry_appended line is the writer's too (agent-session.ts appendEntry emits it to the Session's listeners): once the writer is detached, at the start of the final disposal, it has no listener (print-mode.ts disposeRuntime unsubscribes before runtimeHost.dispose).
 			emitEntryAppended = func(event RPCEntryAppendedEvent) {
-				if writing.Load() {
+				convertMu.Lock()
+				defer convertMu.Unlock()
+				if !outputDetached {
 					writeJSONLine(jsonOut, event)
 				}
 			}
@@ -439,11 +529,6 @@ func runPrintModeIn(ctx context.Context, rt *coding.Runtime, opts printModeOptio
 		if err := session.EmitSessionStartTransition(event.Reason, event.PreviousSessionFile); err != nil {
 			return err
 		}
-		// print-mode.ts:76-108 subscribes the writer after `await session.bindExtensions()`, so what a session_start handler emitted (events, entry_appended) is not written. A reload keeps the writer subscribed.
-		if !reloading {
-			subscribe(session)
-		}
-		writing.Store(true)
 		commands.promptTemplates = session.PromptTemplates()
 		commands.skills = session.ResourceLoader().GetSkills().Skills
 		publishedCommands.Store(new(commands))
@@ -451,14 +536,20 @@ func runPrintModeIn(ctx context.Context, rt *coding.Runtime, opts printModeOptio
 		return nil
 	}
 	rt.SetRebindSession(func(ctx context.Context, session *coding.Session) error {
-		return bind(ctx, session, session.StartEvent(), false)
+		if err := bind(ctx, session, session.StartEvent(), false); err != nil {
+			return err
+		}
+		// print-mode.ts setRebindSession: the replacement's diagnostics follow the rebind, on stderr (c47ad0432bb8).
+		codingagent.WriteDiagnosticsToStderr(rt.TakeUnreportedDiagnostics())
+		return nil
 	})
 	// print-mode.ts:97-99: ctx.reload() runs session.reload() and then rebinds the Session's extensions.
 	rt.SetReload(func(ctx context.Context, session *coding.Session) error {
 		previous := session.ExtensionRunner()
 		if err := session.Reload(ctx); err != nil {
-			// The old runner went stale after session_shutdown; its extension processes reject later calls with its message too.
-			if extensionHost := session.ExtensionHost(); extensionHost != nil && previous != nil && session.ExtensionRunner() == previous {
+			// A reload that failed after session_shutdown left the old runner stale; its extension processes reject later calls with its message too.
+			// a reload refused while the session runs or compacts (Pi c3b938e3e) touched nothing, so the running tool's context stays live.
+			if extensionHost := session.ExtensionHost(); extensionHost != nil && previous != nil && previous.IsStale() && session.ExtensionRunner() == previous {
 				extensionHost.Invalidate(previous.StaleMessage())
 			}
 			return err
@@ -490,16 +581,17 @@ func runPrintModeIn(ctx context.Context, rt *coding.Runtime, opts printModeOptio
 			disposeFromSignal()
 		}
 		// Ordered teardown: shutdown hooks run while the Session is still open,
-		// then closing it ends the Session's event executor.
+		// then closing it ends the Session's event executor. The signal handlers stay until it is done.
+		finalDisposing.Store(true)
+		// print-mode.ts:44-52 disposeRuntime unsubscribes the writer BEFORE runtimeHost.dispose() emits session_shutdown: what a shutdown handler emits (entry_appended, session_info_changed, a custom message) is persisted but never written. Lines already queued still drain below.
+		detachWriter()
 		_ = rt.Close()
+		close(finalDisposed)
 		// Upstream's signal handler disposes the runtime and calls process.exit
 		// without flushRawStdout. The process owns any blocked stdout write on
 		// this path; waiting for it would make a full client pipe prevent exit.
 		// Ordinary cancellation still drains output.
 		convertMu.Lock()
-		for _, detach := range detachOutput {
-			detach()
-		}
 		if convertErr != nil {
 			runErr = convertErr
 		}
@@ -526,9 +618,11 @@ func runPrintModeIn(ctx context.Context, rt *coding.Runtime, opts printModeOptio
 	// A termination signal ends the run where it is: upstream's handler
 	// disposes the runtime and exits, so no later prompt starts.
 	send := func(message string, images []ai.ImageContent) {
-		if runErr != nil || ctx.Err() != nil {
+		if runErr != nil || ctx.Err() != nil || disposalStarted.Load() {
 			return
 		}
+		promptsInFlight.Add(1)
+		defer promptsInFlight.Add(-1)
 		_, runErr = sendPrintPrompt(ctx, current(), *currentCommands.Load(), message, images)
 	}
 	if opts.InitialMessage != "" {
@@ -539,6 +633,10 @@ func runPrintModeIn(ctx context.Context, rt *coding.Runtime, opts printModeOptio
 	}
 	// A run that a signal's disposal cut short never resolves Pi's prompt; one that ended first prints its result before
 	// the disposal goes on.
+	defer passResultStage()
+	if disposalStarted.Load() {
+		<-handlersDone
+	}
 	resultMu.Lock()
 	defer resultMu.Unlock()
 	if disposed.Load() {
@@ -558,7 +656,12 @@ func runPrintModeIn(ctx context.Context, rt *coding.Runtime, opts printModeOptio
 	if opts.Mode != "text" {
 		return nil
 	}
-	return writePrintModeResult(current().Messages(), opts.stdout, opts.stderr)
+	resultStderr := opts.stderr
+	if opts.ownOutput {
+		// pig additive (D653): a fused member that owns the print output words a failed run's error itself.
+		resultStderr = io.Discard
+	}
+	return writePrintModeResult(current().Messages(), opts.stdout, resultStderr)
 }
 
 // sendPrintPrompt mirrors AgentSession.prompt for print and JSON mode's input
@@ -579,11 +682,7 @@ func sendPrintPrompt(ctx context.Context, sess *coding.Session, commands headles
 	}
 	// Skill commands and prompt templates expand before the model and auth checks (agent-session.ts:2095-2100, then 2118-2136), so an unreadable /skill: reports its skill_expansion error ahead of a missing-auth error.
 	text = commands.expandPrompt(text)
-	// An absent startup selection becomes Pi's Agent DEFAULT_MODEL. Its unknown provider fails credential preflight, not the lower-level run-start model guard; commands and handled input above do not need credentials.
-	if model := sess.Model(); model == nil || model.Provider == nil && model.ProviderMeta.ProviderID == "unknown" {
-		return false, errors.New(codingagent.FormatNoAPIKeyFoundMessage("unknown"))
-	}
-	// AgentSession.prompt (agent-session.ts:2118-2136) rejects a prompt whose provider has no usable auth before it reaches the provider.
+	// AgentSession.prompt (agent-session.ts:2242-2259) rejects a prompt whose provider has no usable auth before it reaches the provider. An absent startup selection is Pi's Agent DEFAULT_MODEL: its unknown provider fails this check, not the lower-level run-start model guard; commands and handled input above do not need credentials.
 	if err := sess.ValidatePromptModelAuth(ctx); err != nil {
 		return false, err
 	}

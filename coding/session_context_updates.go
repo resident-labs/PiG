@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
@@ -16,6 +18,7 @@ import (
 	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/prompts"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 )
 
 // contextUpdateType is the custom type of a context update message.
@@ -94,24 +97,72 @@ func heldSections(messages []agent.AgentMessage, system ai.SystemMessage) map[st
 	return held
 }
 
-// contextUpdateSections reads the sections a context update records. Its details are a map when the Session made it and raw
-// JSON when it was read from a session file. A session file may hold another extension's message of the type, so one whose
-// details are not sections of text is not an update.
+// contextUpdateSections reads the sections a context update records. The Session and Go extensions can supply native maps; restored messages and subprocess extensions supply raw JSON. A message whose details are not sections of text is not an update.
 func contextUpdateSections(message agent.AgentMessage) (map[string]string, bool) {
 	if message.Custom == nil || message.Custom["customType"] != contextUpdateType {
 		return nil, false
 	}
-	encoded, err := json.Marshal(message.Custom["details"])
+	details := message.Custom["details"]
+	if raw, ok := details.(json.RawMessage); ok {
+		return decodeContextUpdateDetails(raw)
+	}
+	if object, ok := details.(map[string]any); ok && len(object) == 1 {
+		switch value := object["sections"].(type) {
+		case map[string]string:
+			if value == nil {
+				return nil, false
+			}
+			sections := make(map[string]string, len(value))
+			for name, section := range value {
+				if !utf8.ValidString(name) || !utf8.ValidString(section) {
+					break
+				}
+				sections[name] = section
+			}
+			if len(sections) == len(value) {
+				return sections, true
+			}
+		case json.RawMessage:
+			var sections map[string]string
+			if json.Unmarshal(value, &sections) != nil {
+				return nil, false
+			}
+			return sections, sections != nil
+		case map[string]any:
+			if value == nil {
+				return nil, false
+			}
+			// The Session creates this shape. JSON null members become empty strings.
+			sections := make(map[string]string, len(value))
+			for name, member := range value {
+				section, ok := member.(string)
+				if (!ok && member != nil) || !utf8.ValidString(name) || !utf8.ValidString(section) {
+					break
+				}
+				sections[name] = section
+			}
+			if len(sections) == len(value) {
+				return sections, true
+			}
+		}
+	}
+	// Use the wire codec for arbitrary Go Details and non-UTF-8 text. It honors tags and custom marshalers, preserves lone UTF-16 units, and normalizes invalid bytes in encoding order.
+	raw, err := json.Marshal(details)
 	if err != nil {
 		return nil, false
 	}
-	var details struct {
+	//perf:ok Only arbitrary Go detail values and non-UTF-8 text need to pass through the wire codec; ordinary maps and restored records do not.
+	return decodeContextUpdateDetails(raw)
+}
+
+func decodeContextUpdateDetails(raw json.RawMessage) (map[string]string, bool) {
+	var decoded struct {
 		Sections map[string]string `json:"sections"`
 	}
-	if json.Unmarshal(encoded, &details) != nil || details.Sections == nil {
+	if json.Unmarshal(raw, &decoded) != nil || decoded.Sections == nil {
 		return nil, false
 	}
-	return details.Sections, true
+	return decoded.Sections, true
 }
 
 // refreshPromptResources rereads the context files and skills of the Session's own loader. When they changed, the base
@@ -160,6 +211,7 @@ func (s *Session) promptToolOrder(names []string) []string {
 const deferredToolsSection = "deferred_tools"
 
 // maxDeferredNames is how many tools a namespace lists, and actions a tool; the rest are counted.
+// pig divergence (D10007): Dyna's deferred-tools prompt section bounds both lists.
 const maxDeferredNames = 80
 
 // deferredTool is a tool the deferred_tools section names: its name, its namespace's, and the action enum of its schema.
@@ -187,7 +239,7 @@ func renderDeferredTools(tools []deferredTool, toolSearch, codemode bool) (strin
 		if len(names) <= maxDeferredNames {
 			return names
 		}
-		return append(slices.Clone(names[:maxDeferredNames]), fmt.Sprintf("+%d more; tool_search finds them", len(names)-maxDeferredNames))
+		return append(slices.Clone(names[:maxDeferredNames]), "+"+strconv.Itoa(len(names)-maxDeferredNames)+" more; tool_search finds them")
 	}
 	groups := map[string][]deferredTool{}
 	for _, tool := range tools {
@@ -200,7 +252,7 @@ func renderDeferredTools(tools []deferredTool, toolSearch, codemode bool) (strin
 	lines := []string{"Tools not declared to you yet, by name prefix, with a tool's actions after it. " + how}
 	for _, prefix := range slices.Sorted(maps.Keys(groups)) {
 		sorted := groups[prefix]
-		slices.SortFunc(sorted, func(a, b deferredTool) int { return strings.Compare(a.name, b.name) })
+		sortx.Func(sorted, func(a, b deferredTool) int { return strings.Compare(a.name, b.name) })
 		kept := sorted[:min(len(sorted), maxDeferredNames)]
 		var plain []string
 		for _, tool := range kept {
@@ -209,7 +261,7 @@ func renderDeferredTools(tools []deferredTool, toolSearch, codemode bool) (strin
 			}
 		}
 		if len(sorted) > maxDeferredNames {
-			plain = append(plain, fmt.Sprintf("+%d more; tool_search finds them", len(sorted)-maxDeferredNames))
+			plain = append(plain, "+"+strconv.Itoa(len(sorted)-maxDeferredNames)+" more; tool_search finds them")
 		}
 		switch {
 		case prefix != "" && len(plain) > 0:
@@ -298,10 +350,10 @@ func (s *Session) compactionHead() (ai.OrderedSections, []ai.ToolSchema, error) 
 }
 
 // appendCompaction records a compaction in manager with the head compactionHead gives.
-func (s *Session) appendCompaction(manager *icodingagent.Session, summary, firstKeptEntryID string, tokensBefore int, details any, fromHook bool, usage *ai.Usage) (string, error) {
+func (s *Session) appendCompaction(manager *icodingagent.Session, entry icodingagent.CompactionEntry) (string, error) {
 	head, tools, err := s.compactionHead()
 	if err != nil {
 		return "", err
 	}
-	return manager.AppendCompactionWithSections(summary, firstKeptEntryID, tokensBefore, details, fromHook, usage, head, tools)
+	return manager.AppendCompactionWithSections(entry, head, tools)
 }

@@ -39,6 +39,10 @@ func TestCredentialWritesGoInPlaceThroughAHardLink(t *testing.T) {
 		return info.Sys().(*syscall.Stat_t).Ino
 	}
 	before := inode(path)
+	oauth := &OAuthAuth{Name: "probe", Refresh: func(_ context.Context, c Credential) (Credential, error) {
+		c.Access, c.Refresh, c.Expires = "access-refreshed", "refresh-refreshed", 4102444800000
+		return c, nil
+	}}
 	for _, target := range []string{path, control} {
 		store, err := NewAuthStorage(target)
 		if err != nil {
@@ -50,11 +54,7 @@ func TestCredentialWritesGoInPlaceThroughAHardLink(t *testing.T) {
 		if err := store.Set(fixtureAPIKeys[0], Credential{Type: CredentialAPIKey, Key: "key-login"}); err != nil {
 			t.Fatalf("API key login through %s: %v", target, err)
 		}
-		if _, err := store.Modify(context.Background(), fixtureLiveOAuth[0], func(cur *Credential) (*Credential, error) {
-			next := *cur
-			next.Access, next.Refresh, next.Expires = "access-refreshed", "refresh-refreshed", 4102444800000
-			return &next, nil
-		}); err != nil {
+		if _, err := RefreshStoredOAuth(context.Background(), store, fixtureExpiredOAuth, oauth, func(Credential) bool { return true }); err != nil {
 			t.Fatalf("refresh through %s: %v", target, err)
 		}
 	}
@@ -72,5 +72,11 @@ func TestCredentialWritesGoInPlaceThroughAHardLink(t *testing.T) {
 	}
 	if got := credentialFixtureEntries(t, path); len(got) != len(credentialFixtureProviders) {
 		t.Errorf("providers after the writes = %v, want %v", got, credentialFixtureProviders)
+	}
+	entries, _ := os.ReadDir(filepath.Dir(path))
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) != "" && entry.Name() != "auth.json.second-name" && entry.Name() != "auth.json" {
+			t.Errorf("an extra file is left in the credential directory: %s", entry.Name())
+		}
 	}
 }

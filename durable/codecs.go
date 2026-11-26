@@ -3,9 +3,11 @@ package durable
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/chord/delta"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
 
 // JSON codecs for records whose members hold the pi-ai Message union, the "self" entry head, or a present JSON-null
@@ -22,13 +24,25 @@ type entryRecordWire struct {
 	ByTaskId       *TaskId         `json:"byTaskId,omitempty"`
 }
 
-// MarshalJSON encodes Model and Edits when they are not nil, even when empty: upstream keeps a present empty list.
+// MarshalJSON encodes Model and Edits when they are not nil, even when empty: upstream keeps a present empty list. The text is what
+// JSON.stringify writes for the record: a lone UTF-16 surrogate (a Go string holds it as WTF-8) is the escape \udXXX and a high
+// unit followed by a low one is the character they make. appendMembers writes it; a record with a Data it does not know (a
+// struct, a Go slice type) goes through encoding/json, which keeps the lone surrogates of its strings as well.
 func (entry EntryRecord) MarshalJSON() ([]byte, error) {
+	if text, ok := entry.appendMembers(nil); ok {
+		return text, nil
+	}
+	return entry.marshalGeneral()
+}
+
+// marshalGeneral is the encoding/json encoding of the record: it carries a Data of any type and reports a message or an edit that
+// does not encode.
+func (entry EntryRecord) marshalGeneral() ([]byte, error) {
 	model, err := marshalModel(entry.Model)
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(entryRecordWire{
+	return jsstring.MarshalKeepingSurrogates(entryRecordWire{
 		Id: entry.Id, ConversationId: entry.ConversationId, Kind: entry.Kind, Model: model, Data: entry.Data,
 		Head: entry.Head, Edits: presentEdits(entry.Edits), ByTaskId: entry.ByTaskId,
 	})
@@ -64,7 +78,7 @@ func (entry *EntryRecord) unmarshalGeneral(data []byte) error {
 		entryRecordWire
 		Data orderedValue `json:"data"`
 	}
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := jsstring.UnmarshalKeepingSurrogates(data, &decoded); err != nil {
 		return err
 	}
 	wire := decoded.entryRecordWire
@@ -98,12 +112,12 @@ func (draft EntryDraft) MarshalJSON() ([]byte, error) {
 	case draft.HeadSelf:
 		wire.Head = json.RawMessage(`"self"`)
 	case draft.Head != nil:
-		wire.Head, err = json.Marshal(*draft.Head)
+		wire.Head, err = jsstring.MarshalKeepingSurrogates(*draft.Head)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return json.Marshal(wire)
+	return jsstring.MarshalKeepingSurrogates(wire)
 }
 
 // UnmarshalJSON decodes head "self" as HeadSelf.
@@ -112,7 +126,7 @@ func (draft *EntryDraft) UnmarshalJSON(data []byte) error {
 		entryDraftWire
 		Data orderedValue `json:"data"`
 	}
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := jsstring.UnmarshalKeepingSurrogates(data, &decoded); err != nil {
 		return err
 	}
 	wire := decoded.entryDraftWire
@@ -148,13 +162,13 @@ func (edit ContextEdit) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(contextEditWire{Target: edit.Target, Action: edit.Action, Messages: messages})
+	return jsstring.MarshalKeepingSurrogates(contextEditWire{Target: edit.Target, Action: edit.Action, Messages: messages})
 }
 
 // UnmarshalJSON decodes Messages by message role.
 func (edit *ContextEdit) UnmarshalJSON(data []byte) error {
 	var wire contextEditWire
-	if err := json.Unmarshal(data, &wire); err != nil {
+	if err := jsstring.UnmarshalKeepingSurrogates(data, &wire); err != nil {
 		return err
 	}
 	messages, err := unmarshalModel(wire.Messages)
@@ -169,7 +183,7 @@ func marshalModel(messages []ai.Message) (json.RawMessage, error) {
 	if messages == nil {
 		return nil, nil
 	}
-	return json.Marshal(messages)
+	return jsstring.MarshalKeepingSurrogates(messages)
 }
 
 func unmarshalModel(raw json.RawMessage) ([]ai.Message, error) {
@@ -198,7 +212,7 @@ func (outcome TaskOutcome[R]) MarshalJSON() ([]byte, error) {
 	wire := taskOutcomeWire{Status: outcome.Status, Error: outcome.Error, Reason: outcome.Reason}
 	switch {
 	case outcome.Result != nil:
-		result, err := json.Marshal(*outcome.Result)
+		result, err := jsstring.MarshalKeepingSurrogates(*outcome.Result)
 		if err != nil {
 			return nil, err
 		}
@@ -206,7 +220,7 @@ func (outcome TaskOutcome[R]) MarshalJSON() ([]byte, error) {
 	case outcome.Status == OutcomeCompleted:
 		wire.Result = json.RawMessage("null")
 	}
-	return json.Marshal(wire)
+	return jsstring.MarshalKeepingSurrogates(wire)
 }
 
 // UnmarshalJSON keeps a present JSON-null result as a non-nil Result.
@@ -252,7 +266,7 @@ func (content DocumentContent) MarshalJSON() ([]byte, error) {
 		}
 		wire.Ops = &ops
 	}
-	return json.Marshal(wire)
+	return jsstring.MarshalKeepingSurrogates(wire)
 }
 
 // UnmarshalJSON decodes Ops as a delta.Ops batch, so an object an operation carries keeps its JSON key order, as Pi's storage JSON.parse does (storage/sqlite/storage.ts:63, storage/jsonl/storage.ts:118). Value is a JsonObject, which decodes in order itself.
@@ -263,25 +277,79 @@ func (content *DocumentContent) UnmarshalJSON(data []byte) error {
 		Value   JsonObject          `json:"value"`
 		Ops     delta.Ops           `json:"ops"`
 	}
-	if err := json.Unmarshal(data, &wire); err != nil {
+	if err := jsstring.UnmarshalKeepingSurrogates(data, &wire); err != nil {
 		return err
+	}
+	if jsstring.HasSurrogateEscape(data) {
+		// Value and Ops decode themselves with Chord's decoder, which reads the escape of a lone surrogate as U+FFFD; their text is
+		// read again as JSON.parse reads it.
+		var raw struct {
+			Value json.RawMessage `json:"value"`
+			Ops   json.RawMessage `json:"ops"`
+		}
+		if err := jsstring.UnmarshalKeepingSurrogates(data, &raw); err != nil {
+			return err
+		}
+		var err error
+		if wire.Value, wire.Ops, err = decodeContentMembers(raw.Value, raw.Ops); err != nil {
+			return err
+		}
 	}
 	*content = DocumentContent{Version: wire.Version, Kind: wire.Kind, Value: wire.Value, Ops: wire.Ops}
 	return nil
 }
 
+// decodeContentMembers reads a document content's value and operations with the unit of each lone surrogate escape kept and the
+// key order of their text.
+func decodeContentMembers(value, ops json.RawMessage) (JsonObject, delta.Ops, error) {
+	var object JsonObject
+	if len(value) > 0 && string(value) != "null" {
+		decoded, err := decodeJsonText(value)
+		if err != nil {
+			return nil, nil, err
+		}
+		var ok bool
+		if object, ok = decoded.(JsonObject); !ok {
+			return nil, nil, &json.UnmarshalTypeError{Value: "non-object", Type: reflect.TypeFor[JsonObject]()}
+		}
+	}
+	var batch delta.Ops
+	if len(ops) > 0 && string(ops) != "null" {
+		decoded, err := decodeJsonText(ops)
+		if err != nil {
+			return nil, nil, err
+		}
+		items, ok := decoded.([]any)
+		if !ok {
+			return nil, nil, &json.UnmarshalTypeError{Value: "non-array", Type: reflect.TypeFor[delta.Ops]()}
+		}
+		batch = make(delta.Ops, len(items))
+		for index, item := range items {
+			op, isOp := item.([]any)
+			if !isOp {
+				return nil, nil, &json.UnmarshalTypeError{Value: "non-array", Type: reflect.TypeFor[Op]()}
+			}
+			batch[index] = op
+		}
+	}
+	return object, batch, nil
+}
+
 type taskStateWire[S, R any] struct {
 	Status     TaskStatus      `json:"status"`
 	Checkpoint *S              `json:"checkpoint,omitempty"`
+	Wake       *WakeReason     `json:"wake,omitempty"`
 	On         *[]TaskId       `json:"on,omitempty"`
 	Policy     JoinPolicy      `json:"policy,omitempty"`
 	Until      *float64        `json:"until,omitempty"`
+	Signals    *[]SignalKey    `json:"signals,omitempty"`
 	Outcome    *TaskOutcome[R] `json:"outcome,omitempty"`
 }
 
-// MarshalJSON encodes On for a waiting state even when it is empty: the waiting member requires it.
+// MarshalJSON encodes On for a waiting state even when it is empty: the waiting member requires it. A non-nil Signals
+// is encoded as well, also when empty: a sleep lists them as given.
 func (state TaskState[S, R]) MarshalJSON() ([]byte, error) {
-	wire := taskStateWire[S, R]{Status: state.Status, Checkpoint: state.Checkpoint, Policy: state.Policy, Until: state.Until, Outcome: state.Outcome}
+	wire := taskStateWire[S, R]{Status: state.Status, Checkpoint: state.Checkpoint, Wake: state.Wake, Policy: state.Policy, Until: state.Until, Outcome: state.Outcome}
 	if state.On != nil || state.Status == TaskWaiting {
 		on := state.On
 		if on == nil {
@@ -289,7 +357,54 @@ func (state TaskState[S, R]) MarshalJSON() ([]byte, error) {
 		}
 		wire.On = &on
 	}
-	return json.Marshal(wire)
+	if state.Signals != nil {
+		signals := state.Signals
+		wire.Signals = &signals
+	}
+	return jsstring.MarshalKeepingSurrogates(wire)
+}
+
+type wakeReasonWire struct {
+	Reason WakeReasonKind `json:"reason"`
+	Signal *string        `json:"signal,omitempty"`
+	Key    *string        `json:"key,omitempty"`
+	Ended  *[]TaskId      `json:"ended,omitempty"`
+}
+
+// MarshalJSON writes the member of the union the reason names: signal carries the key's signal and key, tasks the ended
+// list, also when empty.
+func (wake WakeReason) MarshalJSON() ([]byte, error) {
+	wire := wakeReasonWire{Reason: wake.Reason}
+	switch wake.Reason {
+	case WakeSignal:
+		wire.Signal, wire.Key = &wake.Signal, &wake.Key
+	case WakeTasks:
+		ended := wake.Ended
+		if ended == nil {
+			ended = []TaskId{}
+		}
+		wire.Ended = &ended
+	}
+	return jsstring.MarshalKeepingSurrogates(wire)
+}
+
+// UnmarshalJSON reads the member of the union the reason names.
+func (wake *WakeReason) UnmarshalJSON(data []byte) error {
+	var wire wakeReasonWire
+	if err := jsstring.UnmarshalKeepingSurrogates(data, &wire); err != nil {
+		return err
+	}
+	*wake = WakeReason{Reason: wire.Reason}
+	if wire.Signal != nil {
+		wake.Signal = *wire.Signal
+	}
+	if wire.Key != nil {
+		wake.Key = *wire.Key
+	}
+	if wire.Ended != nil {
+		wake.Ended = *wire.Ended
+	}
+	return nil
 }
 
 // orderedValue decodes a JsonValue member with insertion-ordered objects, as JSON.parse gives Pi.
@@ -312,9 +427,9 @@ type documentRecordWire struct {
 	RetiredAt *Seq                `json:"retiredAt,omitempty"`
 }
 
-// MarshalJSON writes the members in the order Pi's storages build a record, not the declaration order: the create's own members, then the createdAt and retiredAt that storage stamps (memory.ts and sqlite/storage.ts spread the create first and add retiredAt last).
+// MarshalJSON writes the members in the order Pi's storages build a record, not the declaration order: the create's own members, then the createdAt and retiredAt that storage stamps (memory.ts and sqlite/storage.ts spread the create first and add retiredAt last). A lone UTF-16 surrogate in kind or key (a Go string holds it as WTF-8) is the escape \udXXX, as JSON.stringify writes it, not U+FFFD.
 func (record DocumentRecord) MarshalJSON() ([]byte, error) {
-	return json.Marshal(documentRecordWire{
+	return jsstring.MarshalKeepingSurrogates(documentRecordWire{
 		Id: record.Id, Kind: record.Kind, Key: record.Key, Scope: record.Scope, History: record.History, Fork: record.Fork,
 		CreatedAt: record.CreatedAt, RetiredAt: record.RetiredAt,
 	})

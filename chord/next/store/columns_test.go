@@ -9,14 +9,14 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/contracts"
 )
 
-// Ports packages/chord/test/next/store/columns.test.ts: table columns (decisions "Flat columns", "Nullable columns
+// Ports packages/chord/test/store/columns.test.ts: table columns (decisions "Flat columns", "Nullable columns
 // and the `set` form"): descriptors.
 //
 // Designed out: "row types" (the `RowOf` / `PutRowOf` type-level Equal checks): Go has no type-level machinery over
 // column declarations; a row is `Row`. TestEvidenceStoreAColumnsOptionalRowType (evidence_storeA_test.go) asserts the
 // declarations that replace them.
 //
-// pi: packages/chord/src/next/store/columns.ts
+// pi: packages/chord/src/store/columns.ts
 
 func describeFails(t *testing.T, columns []ColumnProp, want string) {
 	t.Helper()
@@ -113,4 +113,17 @@ func TestColumnRecordFromJSONKeepsAnIntDefaultThatIsNoSafeInteger(t *testing.T) 
 	if fractional.Default != 1.5 {
 		t.Fatalf("default of 1.5 = %#v, want float64(1.5)", fractional.Default)
 	}
+}
+
+func TestHostColumnsDescribed(t *testing.T) {
+	session := hostColKind(t, "session")
+
+	t.Run("are recorded as str columns with their kind, refused inside opt(...)", func(t *testing.T) {
+		columns, err := DescribeColumns([]ColumnProp{Col("session", Host(session))}, "t")
+		must(t, err)
+		record := ColumnRecordOf(columns[0])
+		qEqual(t, record, ColumnRecord{Type: ColStr, Host: new("session")})
+		qEqual(t, qJSON(t, record), `{"type":"str","host":"session"}`)
+		describeFails(t, []ColumnProp{Col("session", Opt(Host(session)))}, "not opt(...)")
+	})
 }

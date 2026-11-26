@@ -49,11 +49,11 @@ func TestOpenAIResponsesCompatHeadersUpstream(t *testing.T) {
 		headers                               map[string]string
 	}{
 		// .upstream/v0.87.1/packages/ai/test/openai-responses-compat.test.ts:292
-		{name: "sets cache-affinity headers for official OpenAI Responses requests with a sessionId", session: "session-123", key: new("session-123"), headers: map[string]string{"session_id": "session-123", "x-client-request-id": "session-123"}},
+		{name: "sets cache-affinity headers for official OpenAI Responses requests with a sessionId", session: "session-123", key: new("session-123"), headers: map[string]string{"session-id": "session-123", "x-client-request-id": "session-123"}},
 		// .upstream/v0.87.1/packages/ai/test/openai-responses-compat.test.ts:299
-		{name: "clamps prompt_cache_key to OpenAI's 64-character limit", session: strings.Repeat("x", 67), key: new(strings.Repeat("x", 64)), headers: map[string]string{"session_id": strings.Repeat("x", 67), "x-client-request-id": strings.Repeat("x", 67)}},
+		{name: "clamps prompt_cache_key to OpenAI's 64-character limit", session: strings.Repeat("x", 67), key: new(strings.Repeat("x", 64)), headers: map[string]string{"session-id": strings.Repeat("x", 67), "x-client-request-id": strings.Repeat("x", 67)}},
 		// .upstream/v0.87.1/packages/ai/test/openai-responses-compat.test.ts:331
-		{name: "sets cache-affinity headers for proxy OpenAI Responses requests with a sessionId", provider: "opencode", url: "https://proxy.example.com/v1", session: "session-123", key: new("session-123"), headers: map[string]string{"session_id": "session-123", "x-client-request-id": "session-123"}},
+		{name: "sets cache-affinity headers for proxy OpenAI Responses requests with a sessionId", provider: "opencode", url: "https://proxy.example.com/v1", session: "session-123", key: new("session-123"), headers: map[string]string{"session-id": "session-123", "x-client-request-id": "session-123"}},
 		// .upstream/v0.87.1/packages/ai/test/openai-responses-compat.test.ts:343
 		{name: "uses OpenRouter session-affinity header when configured", provider: "proxy", url: "https://proxy.example.com/v1", format: SessionAffinityOpenRouter, session: "session-proxy", key: new("session-proxy"), headers: map[string]string{"x-session-id": "session-proxy"}},
 		// .upstream/v0.87.1/packages/ai/test/openai-responses-compat.test.ts:368
@@ -65,7 +65,7 @@ func TestOpenAIResponsesCompatHeadersUpstream(t *testing.T) {
 		// .upstream/v0.87.1/packages/ai/test/openai-responses-compat.test.ts:437
 		{name: "can omit OpenAI session_id header while preserving other affinity data", provider: "opencode", url: "https://proxy.example.com/v1", format: SessionAffinityOpenAINoSession, session: "session-123", key: new("session-123"), headers: map[string]string{"x-client-request-id": "session-123"}},
 		// .upstream/v0.87.1/packages/ai/test/openai-responses-compat.test.ts:460
-		{name: "lets explicit headers override the default OpenAI cache-affinity headers", session: "session-123", key: new("session-123"), override: ProviderHeadersFromStrings(map[string]string{"session_id": "override-session", "x-client-request-id": "override-request"}), headers: map[string]string{"session_id": "override-session", "x-client-request-id": "override-request"}},
+		{name: "lets explicit headers override the default OpenAI cache-affinity headers", session: "session-123", key: new("session-123"), override: ProviderHeadersFromStrings(map[string]string{"session-id": "override-session", "x-client-request-id": "override-request"}), headers: map[string]string{"session-id": "override-session", "x-client-request-id": "override-request"}},
 		// .upstream/v0.87.1/packages/ai/test/openai-responses-compat.test.ts:473
 		{name: "omits OpenAI cache-affinity headers when cacheRetention is none", session: "session-123", retention: CacheRetentionNone},
 	} {
@@ -99,7 +99,7 @@ func TestOpenAIResponsesCompatHeadersUpstream(t *testing.T) {
 				data, _ := json.Marshal(*tc.key)
 				assertShapeJSON(t, payload["prompt_cache_key"], string(data))
 			}
-			for _, name := range []string{"session_id", "x-client-request-id", "x-session-id"} {
+			for _, name := range []string{"session-id", "session_id", "x-client-request-id", "x-session-id"} {
 				if got := headers.Get(name); got != tc.headers[name] {
 					t.Errorf("header %s=%q want=%q", name, got, tc.headers[name])
 				}
@@ -184,27 +184,76 @@ func TestOpenAIResponsesCompatDefaultsUpstream(t *testing.T) {
 			}
 		})
 	}
-	// .upstream/v0.87.1/packages/ai/test/openai-responses-compat.test.ts:157
-	t.Run("sets strict mode explicitly for Cloudflare OpenAI Responses tools", func(t *testing.T) {
-		cfg := responsesCompatConfig(t, "cloudflare-ai-gateway", "gpt-5.6-sol")
-		if cfg.Compat == nil || cfg.Compat.SupportsStrictMode == nil || !*cfg.Compat.SupportsStrictMode {
-			t.Fatal("catalog strict mode is not true")
+	// .upstream/v0.87.1/packages/ai/test/openai-responses-compat.test.ts:157 (Pi e5c01ca6c, #12286: Copilot treats a tool without `strict` as strict and fills omitted optional arguments, so the Copilot Responses models send it too)
+	for _, tc := range []struct{ provider, id string }{
+		{"cloudflare-ai-gateway", "gpt-5.6-sol"},
+		{"github-copilot", "gpt-5.3-codex"},
+		// Stands for Pi's mai-code-2: that id is not in the catalog at this pin, and this model takes the same Copilot Responses compat path.
+		{"github-copilot", "mai-code-1.1-flash"},
+		{"github-copilot", "grok-4.7"},
+	} {
+		t.Run("sets strict mode explicitly for "+tc.provider+"/"+tc.id+" Responses tools", func(t *testing.T) {
+			cfg := responsesCompatConfig(t, tc.provider, tc.id)
+			if cfg.Compat == nil || cfg.Compat.SupportsStrictMode == nil || !*cfg.Compat.SupportsStrictMode {
+				t.Fatal("catalog strict mode is not true")
+			}
+			cfg.BaseURL = "https://example.invalid/v1"
+			ctx := Context{Messages: []Message{UserMessage{Content: UserText("Use a tool.")}}, Tools: []ToolSchema{
+				{Name: "ordinary", Description: "An ordinary tool", Parameters: JsonObject{"type": "object", "properties": JsonObject{"path": JsonObject{"type": "string"}, "offset": JsonObject{"type": "number"}}, "required": []string{"path"}}},
+				{Name: "constrained", Description: "A constrained tool", Parameters: JsonObject{"type": "object", "properties": JsonObject{"value": JsonObject{"type": "string"}}, "required": []string{"value"}}, ConstrainedSampling: &ConstrainedSamplingConfig{Type: "json_schema", Strict: "prefer"}},
+			}}
+			payload, _, _ := captureResponsesCompat(t, cfg, ctx, StreamOptions{}, "data: [DONE]\n\n")
+			var tools []struct {
+				Name   string `json:"name"`
+				Strict *bool  `json:"strict"`
+			}
+			if err := json.Unmarshal(payload["tools"], &tools); err != nil {
+				t.Fatal(err)
+			}
+			if len(tools) != 2 || tools[0].Name != "ordinary" || tools[0].Strict == nil || *tools[0].Strict || tools[1].Name != "constrained" || tools[1].Strict == nil || !*tools[1].Strict {
+				t.Fatalf("tools=%s", payload["tools"])
+			}
+		})
+	}
+	// Every GitHub Copilot Responses model of the catalog declares strict mode (Pi e5c01ca6c); a model of another api keeps its own flag.
+	t.Run("every GitHub Copilot Responses model of the catalog sends strict tools", func(t *testing.T) {
+		n := 0
+		for _, m := range ListModels("github-copilot") {
+			if m.Provider != "github-copilot" || m.API != "openai-responses" {
+				continue
+			}
+			n++
+			if m.Compat == nil || m.Compat.SupportsStrictMode == nil || !*m.Compat.SupportsStrictMode {
+				t.Errorf("%s does not declare supportsStrictMode", m.ID)
+			}
 		}
-		cfg.BaseURL = "https://example.invalid/v1"
+		if n == 0 {
+			t.Fatal("no GitHub Copilot Responses model in the catalog")
+		}
+	})
+	// The matrix of the shared path: an API-key OpenAI Responses model keeps strict on, a custom OpenAI-compatible base URL without the flag sends no strict key.
+	t.Run("OpenAI keeps strict tools and a custom base URL without the flag sends none", func(t *testing.T) {
 		ctx := Context{Messages: []Message{UserMessage{Content: UserText("Use a tool.")}}, Tools: []ToolSchema{
-			{Name: "ordinary", Description: "An ordinary tool", Parameters: JsonObject{"type": "object", "properties": JsonObject{"path": JsonObject{"type": "string"}, "offset": JsonObject{"type": "number"}}, "required": []string{"path"}}},
-			{Name: "constrained", Description: "A constrained tool", Parameters: JsonObject{"type": "object", "properties": JsonObject{"value": JsonObject{"type": "string"}}, "required": []string{"value"}}, ConstrainedSampling: &ConstrainedSamplingConfig{Type: "json_schema", Strict: "prefer"}},
+			{Name: "ordinary", Description: "An ordinary tool", Parameters: JsonObject{"type": "object", "properties": JsonObject{"path": JsonObject{"type": "string"}}, "required": []string{"path"}}},
 		}}
-		payload, _, _ := captureResponsesCompat(t, cfg, ctx, StreamOptions{}, "data: [DONE]\n\n")
-		var tools []struct {
-			Name   string `json:"name"`
-			Strict *bool  `json:"strict"`
+		strictOf := func(cfg OpenAIResponsesConfig) string {
+			payload, _, _ := captureResponsesCompat(t, cfg, ctx, StreamOptions{}, "data: [DONE]\n\n")
+			var tools []map[string]json.RawMessage
+			if err := json.Unmarshal(payload["tools"], &tools); err != nil || len(tools) != 1 {
+				t.Fatalf("tools=%s err=%v", payload["tools"], err)
+			}
+			if v, ok := tools[0]["strict"]; ok {
+				return string(v)
+			}
+			return "absent"
 		}
-		if err := json.Unmarshal(payload["tools"], &tools); err != nil {
-			t.Fatal(err)
+		if got := strictOf(responsesCompatConfig(t, "openai", "gpt-5.4")); got != "false" {
+			t.Fatalf("openai strict=%s, want false (strict mode on, the tool schema is not constrained)", got)
 		}
-		if len(tools) != 2 || tools[0].Name != "ordinary" || tools[0].Strict == nil || *tools[0].Strict || tools[1].Name != "constrained" || tools[1].Strict == nil || !*tools[1].Strict {
-			t.Fatalf("tools=%s", payload["tools"])
+		custom := responsesCompatConfig(t, "openai", "gpt-5.4")
+		custom.ProviderID, custom.BaseURL, custom.Compat = "custom-proxy", "https://example.invalid/v1", nil
+		if got := strictOf(custom); got != "absent" {
+			t.Fatalf("custom base URL strict=%s, want absent", got)
 		}
 	})
 	// .upstream/v0.87.1/packages/ai/test/openai-responses-compat.test.ts:208

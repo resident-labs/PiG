@@ -59,7 +59,7 @@ func NewSandbox(options SandboxOptions) (*Sandbox, error) {
 //
 // Ports packages/codemode/src/runtime/execution.ts (CodemodeSandboxBase).
 func newSandbox(options SandboxOptions, launcher func(*Sandbox) vmLauncher) (*Sandbox, error) {
-	s := &Sandbox{options: options, running: map[*execution]struct{}{}, toolSet: make(map[string]struct{}, len(options.Tools)), prelude: PreludeSource, engines: &engineSource{wasm: options.Wasm, cacheDir: options.CacheDir}}
+	s := &Sandbox{options: options, running: map[*execution]struct{}{}, toolSet: make(map[string]struct{}, len(options.Tools)), prelude: PreludeSource, engines: &engineSource{wasm: options.Wasm, cacheDir: options.CacheDir, interpreter: options.Interpreter}}
 	s.launcher = launcher(s)
 	if s.options.TimeoutMs == 0 {
 		s.options.TimeoutMs = defaultTimeoutMs
@@ -201,9 +201,11 @@ func (s *Sandbox) Close() error {
 	return nil
 }
 
-// engineKey identifies a shared engine: the compilation cache location and the heap limit its runtime is sized for.
+// engineKey identifies a shared engine: the compilation cache location (empty on the interpreter), whether it runs on the interpreter, and the heap
+// limit its runtime is sized for.
 type engineKey struct {
 	cacheDir    string
+	interpreter bool
 	memoryLimit uint32
 }
 
@@ -214,8 +216,9 @@ var (
 
 // engineSource loads the compiled QuickJS module, the embedded one or a custom one.
 type engineSource struct {
-	wasm     func() ([]byte, error)
-	cacheDir string
+	wasm        func() ([]byte, error)
+	cacheDir    string
+	interpreter bool
 
 	mu sync.Mutex
 	// loaded is the shared engine of a custom module per heap limit, kept after the first successful load. The process
@@ -223,9 +226,10 @@ type engineSource struct {
 	loaded map[uint32]*engine
 }
 
-// wasmEngineLoader loads the module wasm returns (nil: the embedded module) with its on-disk compilation cache in cacheDir.
-func wasmEngineLoader(wasm func() ([]byte, error), cacheDir string) engineLoader {
-	return (&engineSource{wasm: wasm, cacheDir: cacheDir}).load
+// wasmEngineLoader loads the module wasm returns (nil: the embedded module) with its on-disk compilation cache in cacheDir,
+// or on the interpreter when interpreter is set.
+func wasmEngineLoader(wasm func() ([]byte, error), cacheDir string, interpreter bool) engineLoader {
+	return (&engineSource{wasm: wasm, cacheDir: cacheDir, interpreter: interpreter}).load
 }
 
 // engineFor returns the compiled module for VMs with the given heap limit.
@@ -239,11 +243,12 @@ func (s *engineSource) load(ctx context.Context, memoryLimit uint32) (*engine, e
 	if s.wasm == nil {
 		defaultEnginesMu.Lock()
 		defer defaultEnginesMu.Unlock()
-		key := engineKey{s.cacheDir, memoryLimit}
+		cacheDir := s.compilationCache()
+		key := engineKey{cacheDir, s.interpreter, memoryLimit}
 		if e := defaultEngines[key]; e != nil {
 			return e, nil
 		}
-		e, err := newEngine(context.WithoutCancel(ctx), QuickJSWasm(), s.cacheDir, memoryLimit)
+		e, err := newEngine(context.WithoutCancel(ctx), QuickJSWasm(), cacheDir, memoryLimit, s.interpreter)
 		if err != nil {
 			return nil, err
 		}
@@ -259,7 +264,7 @@ func (s *engineSource) load(ctx context.Context, memoryLimit uint32) (*engine, e
 	if err != nil {
 		return nil, err
 	}
-	e, err := customEngine(context.WithoutCancel(ctx), wasm, s.cacheDir, memoryLimit)
+	e, err := customEngine(context.WithoutCancel(ctx), wasm, s.compilationCache(), memoryLimit, s.interpreter)
 	if err != nil {
 		return nil, err
 	}
@@ -270,6 +275,15 @@ func (s *engineSource) load(ctx context.Context, memoryLimit uint32) (*engine, e
 	return e, nil
 }
 
+// compilationCache is the compilation cache directory the engine is built with: none on the interpreter, which keeps no
+// compiled code, so interpreter sandboxes that differ only in CacheDir share one engine.
+func (s *engineSource) compilationCache() string {
+	if s.interpreter {
+		return ""
+	}
+	return s.cacheDir
+}
+
 // release forgets the custom engines the source holds; the process-wide set keeps them for other sandboxes.
 func (s *engineSource) release() {
 	s.mu.Lock()
@@ -277,10 +291,12 @@ func (s *engineSource) release() {
 	s.mu.Unlock()
 }
 
-// customEngineKey identifies a compiled custom module: its content, the compilation cache location and the heap limit.
+// customEngineKey identifies a compiled custom module: its content, the compilation cache location, whether it runs on
+// the interpreter, and the heap limit.
 type customEngineKey struct {
 	digest      [sha256.Size]byte
 	cacheDir    string
+	interpreter bool
 	memoryLimit uint32
 }
 
@@ -291,14 +307,14 @@ var (
 
 // customEngine compiles a custom module once per process and shares it between the sandboxes that load the same bytes, as Pi's loadQuickJSWasm compiles a module once per process (wasm.ts:14-35) and every
 // sandbox given that module uses the one compilation. A failed compile is not kept, so the next call retries it.
-func customEngine(ctx context.Context, wasm []byte, cacheDir string, memoryLimit uint32) (*engine, error) {
-	key := customEngineKey{sha256.Sum256(wasm), cacheDir, memoryLimit}
+func customEngine(ctx context.Context, wasm []byte, cacheDir string, memoryLimit uint32, interpreter bool) (*engine, error) {
+	key := customEngineKey{sha256.Sum256(wasm), cacheDir, interpreter, memoryLimit}
 	customEnginesMu.Lock()
 	defer customEnginesMu.Unlock()
 	if e := customEngines[key]; e != nil {
 		return e, nil
 	}
-	e, err := newEngine(ctx, wasm, cacheDir, memoryLimit)
+	e, err := newEngine(ctx, wasm, cacheDir, memoryLimit, interpreter)
 	if err != nil {
 		return nil, err
 	}

@@ -8,21 +8,24 @@
 //
 //	-out dir        write gaps.tsv, not-a-gap.tsv and summary.md (default build/interface-gaps)
 //	-check          compare the gap list with the committed baseline and fail when it grows (make interface-gaps)
-//	-update         rewrite the baseline
+//	-update         rewrite the baseline: it removes the gaps that are closed and fails, writing nothing, when the tree has a gap the baseline does not list
+//	-allow-new r    with -update, list the gaps the baseline lacks too, each marked "allowed: r" in a fifth column that later updates keep
 //	-closed-check   trust check 1: run the rules on the rows closed by hand and list every disagreement
 //	-blind          ignore documented renames (with -closed-check: measure how many closed rows need one)
 //	-seed-renames   write renames.json from the hand-closed rows whose Go name the name rules cannot find
 //	-write-reach f  write the reach graph the ledger uses to f and exit (input of audit.py and reproduce.py)
 //
-// A run that writes committed files (-update, -seed-renames, -mutate) first checks that .upstream/current is the mirror of the
-// pinned Pi build (internal/upstreammirror) and exits non-zero, having written nothing, when it is not.
+// Every run that reads Pi's source (all modes except -write-reach) first checks that .upstream/current is the mirror of the
+// pinned Pi build (internal/upstreammirror) and exits non-zero before doing any work when it is not.
 package main
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"maps"
 	"os"
 	"os/exec"
@@ -37,13 +40,13 @@ import (
 )
 
 const (
-	renamesFile         = "test/parity/interface-closure/autobind/renames.json"
+	renamesFile         = "test/parity/interface-closure/autobind/reviewed/renames.json"
 	reviewedRenamesFile = "test/parity/interface-closure/autobind/renames-reviewed.json"
 	placementsFile      = "test/parity/interface-closure/autobind/placements-reviewed.json"
 	representationsFile = "test/parity/interface-closure/autobind/representations.json"
 	structuralFile      = "test/parity/interface-closure/autobind/structural-reviewed.json"
 	holdsFile           = "test/parity/interface-closure/autobind/holds.json"
-	reviewedTypesFile   = "test/parity/interface-closure/autobind/reviewed-types.json"
+	reviewedTypesFile   = "test/parity/interface-closure/autobind/reviewed/reviewed-types.json"
 	reviewedGapsFile    = "test/parity/interface-closure/autobind/reviewed-gaps.json"
 	baselineFile        = "test/parity/interface-closure/gaps/interface-gaps-v%s.tsv"
 )
@@ -51,6 +54,7 @@ const (
 type options struct {
 	root, version, reach, out                  string
 	cache, frontier, writeReach                string
+	allowNew                                   string
 	importDecisions                            bool
 	check, update, closed, blind, seed, mutate bool
 }
@@ -65,7 +69,8 @@ func main() {
 	flag.StringVar(&o.cache, "cache", "", `derivation cache directory, or "auto" for $PIG_LEDGER_CACHE (else build/ledger-cache); empty derives from scratch`)
 	flag.StringVar(&o.frontier, "frontier", "", "write the ranked list of root gaps to this TSV file")
 	flag.BoolVar(&o.check, "check", false, "fail when the gap list grows past the committed baseline")
-	flag.BoolVar(&o.update, "update", false, "rewrite the committed baseline")
+	flag.BoolVar(&o.update, "update", false, "rewrite the committed baseline: remove the closed gaps; fail when the tree has a gap the baseline lacks")
+	flag.StringVar(&o.allowNew, "allow-new", "", "with -update, the reason for listing the gaps the baseline lacks (written into each new entry)")
 	flag.BoolVar(&o.importDecisions, "import-decisions", false, "with -update, add the mapping's designed-out and divergence rows that reviewed-decisions.json lacks")
 	flag.BoolVar(&o.closed, "closed-check", false, "run the rules on the rows closed by hand and list the disagreements")
 	flag.BoolVar(&o.blind, "blind", false, "ignore documented renames")
@@ -87,16 +92,21 @@ func run(o options) error {
 	if pin := os.Getenv("PIG_UPSTREAM_VERSION"); pin != "" && pin != o.version {
 		return fmt.Errorf("ledger version %s is not the exported pin %s (a PI_UPSTREAM_REF run must build with the pigversion overlay); refusing to read or write a ledger", o.version, pin)
 	}
+	if o.allowNew != "" && !o.update {
+		return errors.New("-allow-new needs -update")
+	}
 	root, err := filepath.Abs(o.root)
 	if err != nil {
 		return err
 	}
-	// The rules read Pi's source under .upstream/current. Without it, rows a rule closes from that source fall back to hand decisions
-	// the run cannot find; with another Pi's mirror, rows reopen and the run succeeds. A run that writes stops first, before it writes
-	// anything.
-	if o.writes() {
+	// The rules read Pi's source under .upstream/current. Without it, or with another Pi's mirror, a detector would report false
+	// gaps and stale reviewed entries (and a writing run would reopen rows and exit 0). Stop before doing any work.
+	if o.writeReach == "" {
 		if err := upstreammirror.Check(root, o.version); err != nil {
-			return fmt.Errorf("refusing to rewrite the ledger: %w", err)
+			if o.writes() {
+				return fmt.Errorf("refusing to rewrite the ledger: %w", err)
+			}
+			return err
 		}
 	}
 	// Parts of the engine find the repository from the working directory (the PORT_MAP placement rule), so the working directory is the root.
@@ -133,6 +143,19 @@ func run(o options) error {
 	if err != nil {
 		return err
 	}
+	decisions := dv.Decisions
+	stale, gaps, err := applyReviewInputs(root, decisions, o.blind, o.seed)
+	if err != nil {
+		return err
+	}
+	// An update refuses to list a gap the baseline lacks before it writes any file, so a refused update leaves the tree as it was.
+	baseline := filepath.Join(root, fmt.Sprintf(baselineFile, o.version))
+	var baselineText string
+	if o.update {
+		if baselineText, err = updatedBaseline(baseline, decisions, o.allowNew); err != nil {
+			return err
+		}
+	}
 	// A stale reviewed exception fails the run, after the reports are written: they describe the derivation either way.
 	var reviewedFail error
 	if !o.blind {
@@ -148,11 +171,6 @@ func run(o options) error {
 			}
 		}
 		reviewedFail = reviewedErr(reviewed, dv.usedSet())
-	}
-	decisions := dv.Decisions
-	stale, gaps, err := applyReviewInputs(root, decisions, o.blind, o.seed)
-	if err != nil {
-		return err
 	}
 	if reviewedFail != nil {
 		if !o.mutate && !o.seed && !o.closed {
@@ -192,7 +210,6 @@ func run(o options) error {
 			return err
 		}
 	}
-	baseline := filepath.Join(root, fmt.Sprintf(baselineFile, o.version))
 	mappingPath := filepath.Join(root, "test/parity/interfaces", "mapping-v"+o.version+".json")
 	decisionsPath := filepath.Join(root, reviewedDecisionsFile)
 	derived, st, decided, err := derivedMapping(l, mappingPath, decisionsPath, decisions, o.importDecisions && o.update)
@@ -204,7 +221,7 @@ func run(o options) error {
 		if err := os.MkdirAll(filepath.Dir(baseline), 0o755); err != nil {
 			return err
 		}
-		if err := os.WriteFile(baseline, []byte(gapTSV(decisions, false)), 0o644); err != nil {
+		if err := os.WriteFile(baseline, []byte(baselineText), 0o644); err != nil {
 			return err
 		}
 		// The file keeps one compact line per ID so lanes merge it without conflicts; an update writes it in that form whenever it differs
@@ -373,6 +390,7 @@ var libraryEntries = map[string][]string{
 	"durable:./tool-search":               {"./durable/toolsearch"},
 	"durable:./tools":                     {"./durable/tools"},
 	"durable:./images":                    {"./durable/images"},
+	"durable:./images/fit":                {"./durable/images/fit"},
 	"durable:./images/node":               {"./durable/images/node"},
 	"durable:./images/cloudflare":         {"./durable/images/cloudflare"},
 	"durable:./storage/memory":            {"./durable/storage"},
@@ -382,16 +400,32 @@ var libraryEntries = map[string][]string{
 	"durable:./storage/sqlite/node":       {"./durable/storage/sqlite/node"},
 	"durable:./storage/sqlite/cloudflare": {"./durable/storage/sqlite/cloudflare"},
 	"durable:./storage/store":             {"./durable/storage/store"},
-	"chord:.":                             {"./chord", "./chord/context", "./chord/delta", "./chord/host", "./chord/next/documents", "./chord/next/host", "./durable", "./durable/core/internal/delta"},
-	"chord:./next":                        {"./chord", "./chord/next/contracts", "./chord/next/data", "./chord/next/documents", "./chord/next/host", "./chord/next/link", "./chord/next/registries", "./chord/next/state", "./chord/next/store"},
+	"chord:.":                             {"./chord", "./chord/context", "./chord/delta", "./chord/next/contracts", "./chord/next/data", "./chord/next/documents", "./chord/next/host", "./chord/next/link", "./chord/next/registries", "./chord/next/state", "./chord/next/store", "./chord/next/surfaces", "./chord/next/telemetry", "./chord/nextnode", "./durable", "./durable/core/internal/delta"},
+	"chord:./app":                         {"./chord/nextnode", "./chord/nextnode/app", "./chord/nextnode/plugins"},
+	"chord:./compression":                 {"./chord/nextnode"},
+	"chord:./app/files":                   {"./chord/nextnode/app"},
 	"chord:./context":                     {"./chord/context", "./chord/next/host"},
 	"chord:./delta":                       {"./chord", "./chord/delta", "./durable", "./durable/core/internal/delta"},
-	"chord:./node":                        {"./chord/host"},
+	"chord:./http":                        {"./chord/nextnode/http"},
+	"chord:./json":                        {"./chord", "./chord/delta", "./durable"},
 	"chord:./output":                      {"./chord/output"},
+	"chord:./plugins":                     {"./chord/nextnode/plugins", "./chord/nextnode/plugins/build", "./chord/nextnode/plugins/model"},
+	"chord:./plugins/runtime":             {"./chord/nextnode/plugins"},
+	"chord:./react":                       {"./chord/nextnode/surfaces/client", "./chord/next/surfaces"},
 	"chord:./sqlite":                      {"./chord/sqlite"},
-	"chord:./sqlite/node":                 {"./chord/sqlite/node"},
 	"chord:./sqlite/cloudflare":           {"./chord/sqlite/cloudflare"},
-	"chord:./telemetry-sqlite":            {"./chord/telemetrysqlite"},
+	"chord:./sqlite/node":                 {"./chord/sqlite/node"},
+	"chord:./surfaces":                    {"./chord/nextnode/surfaces"},
+	"chord:./sync":                        {"./chord/sync"},
+	"chord:./telemetry-ingest":            {"./chord/next/telemetryingest"},
+	"chord:./telemetry-sqlite":            {"./chord/next/telemetryingest", "./chord/telemetrysqlite"},
+	"chord:./telemetry-sqlite/node":       {"./chord/telemetrysqlite"},
+	"chord:./tui":                         {"./chord/nextnode/surfaces/client", "./chord/next/surfaces", "./chord/next/tui", "./chord/nextnode/tui"},
+	"chord:./tui/launcher":                {"./chord/nextnode/tui"},
+	"chord:./watch":                       {"./chord", "./chord/next/documents"},
+	"chord:./web":                         {"./chord/nextnode/surfaces/client", "./chord/next/surfaces"},
+	"chord:./workers":                     {"./chord/nextnode/workers"},
+	"chord:./workers/child":               {"./chord/nextnode/workers"},
 }
 
 // libraryPackages is the sorted, distinct Go packages of libraryEntries.
@@ -682,6 +716,65 @@ func baselineIDs(data string) map[string]bool {
 		known[id] = true
 	}
 	return known
+}
+
+// baselineNoteColumn is the index of the column that records why a gap was listed on purpose (-allow-new); the first four are the
+// ID, the package, the reason and the candidate Go symbol.
+const baselineNoteColumn = 4
+
+// updatedBaseline is the baseline text an update writes: the tree's gaps in the baseline's form. The baseline is the list of known
+// gaps and only shrinks: an update drops the entries whose gap is closed and keeps the note of the entries that stay. A gap the
+// baseline does not list fails the update with the gaps named, unless allowNew gives the reason for listing them; each such entry then
+// carries "allowed: <reason>". A pin's first baseline (no file yet) is written whole. Nothing is written here.
+func updatedBaseline(path string, ds []*decision, allowNew string) (string, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return gapTSV(ds, false), nil
+	}
+	if err != nil {
+		return "", err
+	}
+	known := map[string]bool{}
+	notes := map[string]string{}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		known[fields[0]] = true
+		if len(fields) > baselineNoteColumn {
+			notes[fields[0]] = fields[baselineNoteColumn]
+		}
+	}
+	reason := strings.Join(strings.Fields(allowNew), " ")
+	var out strings.Builder
+	var added []string
+	for _, d := range ds {
+		if !d.Gap {
+			continue
+		}
+		line := strings.TrimSuffix(gapTSV([]*decision{d}, false), "\n")
+		switch {
+		case known[d.ID]:
+			if note := notes[d.ID]; note != "" {
+				line += "\t" + note
+			}
+		case reason != "":
+			line += "\tallowed: " + reason
+			added = append(added, d.ID)
+		default:
+			added = append(added, fmt.Sprintf("%s\t%s\t%s", d.ID, d.Reason, d.Detail))
+			continue
+		}
+		out.WriteString(line + "\n")
+	}
+	if len(added) > 0 && reason == "" {
+		return "", fmt.Errorf("refusing to add %d gap(s) to %s: the baseline lists known gaps and only shrinks. Close them; to list them on purpose, run the update with a reason (make interface-gaps-update ALLOW_NEW=\"<reason>\"):\n%s", len(added), path, strings.Join(firstN(added, 50), "\n"))
+	}
+	if len(added) > 0 {
+		fmt.Printf("baseline: %d gap(s) listed on purpose (allowed: %s)\n", len(added), reason)
+	}
+	return out.String(), nil
 }
 
 // checkBaseline fails when a gap exists that the committed baseline does not list.

@@ -117,6 +117,8 @@ pub fn extension_runner_script(ctx: &Context, args: &Value) -> io::Result<Value>
     )?;
     loader.reload(None)?;
     let loaded = loader.get_extensions()?;
+    // The loader's last use: from here only the loaded extensions name it (the runner below puts their loader's handle on the wire).
+    drop(loader);
     let paths: Vec<Value> = loaded
         .extensions
         .iter()
@@ -422,6 +424,7 @@ pub fn extension_runner_script(ctx: &Context, args: &Value) -> io::Result<Value>
         "beforeAgentStart".into(),
         json!({"messages": started["messages"], "forced": {"startsWithBase": forced.starts_with("base"), "endsWithA": forced.ends_with("[A]")}, "customPrompt": started["systemPromptOptions"]["customPrompt"]}),
     );
+    runner.emit(json!({"type": "message_start", "message": {"role": "user", "content": "hi", "timestamp": 1}}))?;
     set(&mut emits, "messageEnd", runner.emit_message_end(json!({"type": "message_end", "message": {"role": "user", "content": "hi", "timestamp": 1}}))?);
     emits.insert(
         "providerRequest".into(),

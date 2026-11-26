@@ -1,34 +1,41 @@
 package http
 
-// pi: packages/chord/src/next-node/http/node.ts
+// pi: packages/chord/src/node/http/node.ts
 
 import (
+	"bufio"
+	"context"
+	"encoding/json"
 	"io"
 	"net"
 	nethttp "net/http"
 	"net/http/httptest"
+	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/MichaelKinsy/PiG/chord/next/data"
 	"github.com/MichaelKinsy/PiG/chord/next/host"
 )
 
 // Tests of Chord's own listener (the listener's native): request targets (origin-form only; a malformed or double-slash path
 // never crashes or reroutes), raw `Host` headers, the request's scope lasting until its response is flushed (and `close`
-// waiting for it), and a client's disconnect aborting the scope. Ports packages/chord/test/next-node/http/node.test.ts.
+// waiting for it), and a client's disconnect aborting the scope. Ports packages/chord/test/node/http/node.test.ts.
 //
-// Not ported: "makes a Web Request only when something reads the headers or the body" counts `new Request` calls
-// (designed out: Go's *net/http.Request exists when the server hands it over, there is no lazily made Web object).
+// "makes a Web Request only when something reads the headers or the body" counts `new Request` calls, which Go has no form of
+// (the *net/http.Request exists when the server hands it over); TestWebRequestsAreServedFromTheListenerWhetherTheRouteReadsTheHeadersTheBodyOrNeither
+// ports what the case observes: three public routes, no authenticator naming a principal, and their three answers.
 //
 // Forced difference (node.go): net/http refuses two `Host` headers itself, 400, where Node's parser keeps them and the
 // component answers 403; the component's 403 for them is covered through Fetch (TestFetchRefusesTwoHostHeaders).
 
 // echo is a plugin answering its path and params, under `GET /who` and `GET /n/:name`.
 var echoPlugin = plugin{"@app/echo", contributing(HttpContribution{Routes: []HttpRouteEntry{
-	RouteFunc("GET /who", func(request HttpRequest, _ host.Ctx) (HttpResponse, error) { return jsonOf(request.Path()), nil }),
-	RouteFunc("GET /n/:name", func(request HttpRequest, _ host.Ctx) (HttpResponse, error) {
+	publicRoute("GET /who", func(request HttpRequest, _ host.Ctx) (HttpResponse, error) { return jsonOf(request.Path()), nil }),
+	publicRoute("GET /n/:name", func(request HttpRequest, _ host.Ctx) (HttpResponse, error) {
 		params := map[string]any{}
 		for name, value := range request.Params() {
 			params[name] = value
@@ -112,8 +119,8 @@ func TestMountingConvertsWithTheListenersChecksNeverPanickingBadTargetsUserinfoT
 	server := serving(t, []plugin{echoPlugin}, servedOptions{noListen: true})
 	own := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
 		converted := NodeRequestOf(r)
-		if converted.Refused != nil {
-			w.WriteHeader(converted.Refused.Status)
+		if converted.Kind == NodeRequestRefused {
+			w.WriteHeader(int(converted.Status))
 			return
 		}
 		response := server.http.Fetch(converted.Request, converted.Connection)
@@ -160,7 +167,7 @@ func TestTheRequestsScopeLastsUntilTheResponseIsFlushedCloseWaitsForIt(t *testin
 	scope := make(chan host.Ctx, 1)
 	body := strings.Repeat("x", size)
 	server := serving(t, []plugin{{"@app/large", contributing(HttpContribution{Routes: []HttpRouteEntry{
-		RouteFunc("GET /large", func(_ HttpRequest, ctx host.Ctx) (HttpResponse, error) {
+		publicRoute("GET /large", func(_ HttpRequest, ctx host.Ctx) (HttpResponse, error) {
 			scope <- ctx
 			return htmlOf(body), nil
 		}),
@@ -193,7 +200,7 @@ func TestTheRequestsScopeLastsUntilTheResponseIsFlushedCloseWaitsForIt(t *testin
 func TestTheRequestsScopeIsAbortedWhenTheClientDisconnects(t *testing.T) {
 	entered := make(chan host.Ctx, 1)
 	server := serving(t, []plugin{{"@app/slow", contributing(HttpContribution{Routes: []HttpRouteEntry{
-		RouteFunc("GET /slow", func(_ HttpRequest, ctx host.Ctx) (HttpResponse, error) {
+		publicRoute("GET /slow", func(_ HttpRequest, ctx host.Ctx) (HttpResponse, error) {
 			entered <- ctx
 			<-ctx.Done()
 			return HttpResponse{Kind: KindError, Status: 503}, nil
@@ -233,12 +240,169 @@ func TestNodeRequestRefusesWhatTheListenerRefuses(t *testing.T) {
 		{"TRACK", request("TRACK", "/who", "127.0.0.1:1"), 501},
 	} {
 		converted := NodeRequestOf(each.request)
-		if converted.Refused == nil || converted.Refused.Status != each.status {
+		if converted.Kind != NodeRequestRefused || int(converted.Status) != each.status {
 			t.Fatalf("%s: %+v, want refused %d", each.name, converted, each.status)
 		}
 	}
 	converted := NodeRequestOf(request("GET", "/a/../who?x=1", "127.0.0.1:8788"))
-	if converted.Refused != nil || converted.Request.URL.Path != "/who" || converted.Request.URL.RawQuery != "x=1" || converted.Request.Header.Get("Host") != "127.0.0.1:8788" {
+	if converted.Kind != NodeRequestRequest || converted.Request.URL.Path != "/who" || converted.Request.URL.RawQuery != "x=1" || converted.Request.Header.Get("Host") != "127.0.0.1:8788" {
 		t.Fatalf("converted = %+v", converted)
+	}
+}
+
+func TestWebRequestsAreServedFromTheListenerWhetherTheRouteReadsTheHeadersTheBodyOrNeither(t *testing.T) {
+	server := serving(t, []plugin{{"@app/r", contributing(HttpContribution{Routes: []HttpRouteEntry{
+		publicRoute("GET /plain", func(request HttpRequest, _ host.Ctx) (HttpResponse, error) {
+			return jsonOf(request.Path()), nil
+		}),
+		publicRoute("GET /headers", func(request HttpRequest, _ host.Ctx) (HttpResponse, error) {
+			return jsonOf(request.Headers().Get("x-thing")), nil
+		}),
+		publicRoute("POST /body", func(request HttpRequest, _ host.Ctx) (HttpResponse, error) {
+			value, err := request.JSON()
+			if err != nil {
+				return HttpResponse{}, err
+			}
+			return jsonOf(value), nil
+		}),
+	}})}}, servedOptions{
+		authenticate: func(context.Context, HttpRequest) (data.Principal, error) { return nil, nil },
+	})
+	hostLine := "Host: 127.0.0.1:" + strconv.Itoa(server.port) + "\r\nConnection: close"
+	_, plain := rawExchange(t, server.port, "GET /plain HTTP/1.1\r\n"+hostLine+"\r\n\r\n")
+	_, read := rawExchange(t, server.port, "GET /headers HTTP/1.1\r\n"+hostLine+"\r\nX-Thing: t\r\n\r\n")
+	_, posted := rawExchange(t, server.port, "POST /body HTTP/1.1\r\n"+hostLine+"\r\nContent-Length: 3\r\n\r\n\"a\"")
+	if plain != `"/plain"` || read != `"t"` || posted != `"a"` {
+		t.Fatalf("answers = %q, %q, %q, want \"/plain\", \"t\", \"a\"", plain, read, posted)
+	}
+	server.close()
+}
+
+// Pi's NodeIncoming.cancelled (node.ts:119-140, node.test.ts:84): a request an app mounts on its own server aborts when the client
+// goes, and not before. NodeRequestOf takes the one request: its context ends with the client, which is Pi's `res`-finished check
+// without a second argument.
+func TestMountedRequestContextEndsWhenTheClientGoesAndNotBefore(t *testing.T) {
+	alive := make(chan bool, 1)
+	ended := make(chan bool, 1)
+	own := httptest.NewServer(nethttp.HandlerFunc(func(_ nethttp.ResponseWriter, r *nethttp.Request) {
+		converted := NodeRequestOf(r)
+		if converted.Kind != NodeRequestRequest {
+			t.Errorf("converted = %+v", converted)
+			alive <- false
+			ended <- false
+			return
+		}
+		ctx := converted.Request.Context()
+		alive <- ctx.Err() == nil
+		select {
+		case <-ctx.Done():
+			ended <- true
+		case <-time.After(within):
+			ended <- false
+		}
+	}))
+	defer own.Close()
+	clientCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request, err := nethttp.NewRequestWithContext(clientCtx, "GET", own.URL+"/who", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		if response, err := nethttp.DefaultClient.Do(request); err == nil {
+			_ = response.Body.Close()
+		}
+	}()
+	if !<-alive {
+		t.Fatal("the request's context was done before the client went")
+	}
+	select {
+	case <-ended:
+		t.Fatal("the request's context ended while the client was still there")
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	if !<-ended {
+		t.Fatal("the request's context did not end when the client went")
+	}
+}
+
+// malformedEscape is a `%` not followed by two hexadecimal digits.
+var malformedEscape = regexp.MustCompile(`%($|[^0-9A-Fa-f]|[0-9A-Fa-f]($|[^0-9A-Fa-f]))`)
+
+// rawHead is rawExchange's status line and the whole head.
+func rawHead(t testing.TB, port int, text string) (status, head string) {
+	t.Helper()
+	conn, err := net.Dial("tcp", "127.0.0.1:"+strconv.Itoa(port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.Write([]byte(text)); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(within))
+	out, _ := io.ReadAll(conn)
+	head, _, _ = strings.Cut(string(out), "\r\n\r\n")
+	status, _, _ = strings.Cut(head, "\r\n")
+	return status, head
+}
+
+// testdata/target_corpus.jsonl is what testdata/target_probe.cjs recorded from the pinned Node: for each request target (Latin-1
+// characters, one byte each), whether Node's parser let the request reach its handler (false: it answered 400 itself). Node
+// takes the printable ASCII bytes only; the corpus has every byte in the path, the query and the fragment.
+func TestTargetsReachTheComponentOnlyWhereNodesParserTakesThem(t *testing.T) {
+	file, err := os.Open("testdata/target_corpus.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := file.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	server := serving(t, []plugin{echoPlugin}, servedOptions{})
+	host := "Host: 127.0.0.1:" + strconv.Itoa(server.port)
+	scanner := bufio.NewScanner(file)
+	rows := 0
+	for scanner.Scan() {
+		var row [2]any
+		if err := json.Unmarshal(scanner.Bytes(), &row); err != nil {
+			t.Fatal(err)
+		}
+		target, nodeReached := latin1Bytes(row[0].(string)), row[1].(bool)
+		status, head := rawHead(t, server.port, "GET "+target+" HTTP/1.1\r\n"+host+"\r\nConnection: close\r\n\r\n")
+		rows++
+		// A request the parser refuses is answered without the component's default headers; the component's own answers
+		// (a 400 for a malformed percent-escape in a path, 403, 404) carry them.
+		reached := strings.Contains(head, "X-Content-Type-Options: nosniff")
+		if nodeReached && !reached && status == "HTTP/1.1 400 Bad Request" && malformedEscape.MatchString(target) {
+			// Forced difference (D218, node.go): net/http refuses a malformed percent-escape in the target itself, 400, where the
+			// component answers it 400 with its default headers.
+			continue
+		}
+		if reached != nodeReached {
+			t.Errorf("GET %q: %q, node's parser let it through: %v", row[0], status, nodeReached)
+		}
+	}
+	if rows < 1000 {
+		t.Fatalf("only %d corpus rows", rows)
+	}
+}
+
+// Forced difference (D218, node.go): Node's parser reads `GET /  HTTP/1.1` (two spaces) as `GET /` and hands it to the component; net/http
+// refuses the request line itself, 400, before any handler, so none of the component's default headers are on the answer.
+func TestARequestLineWithTwoSpacesIsRefusedByNetHTTPBeforeTheComponent(t *testing.T) {
+	server := serving(t, []plugin{echoPlugin}, servedOptions{})
+	status, head := rawHead(t, server.port, "GET /  HTTP/1.1\r\nHost: 127.0.0.1:"+strconv.Itoa(server.port)+"\r\nConnection: close\r\n\r\n")
+	if status != "HTTP/1.1 400 Bad Request" {
+		t.Fatalf("status %q, want net/http's 400", status)
+	}
+	if strings.Contains(head, "X-Content-Type-Options: nosniff") {
+		t.Fatalf("the component answered a request line net/http refuses:\n%s", head)
+	}
+	status, head = rawHead(t, server.port, "GET / HTTP/1.1\r\nHost: 127.0.0.1:"+strconv.Itoa(server.port)+"\r\nConnection: close\r\n\r\n")
+	if !strings.Contains(head, "X-Content-Type-Options: nosniff") {
+		t.Fatalf("the one-space request line did not reach the component: %q\n%s", status, head)
 	}
 }

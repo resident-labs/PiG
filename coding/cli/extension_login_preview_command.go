@@ -110,13 +110,15 @@ func runExtensionLoginPreview(args []string) int {
 
 	ctx, cancel := context.WithTimeout(context.Background(), extensionLoginPreviewTimeout)
 	defer cancel()
+	// Main enabled the views before it ran the command; a caller that runs the preview without Main has them from here.
+	enableViews()
 	host := subprocess.NewHostWithConfigRoot(filepath.Dir(abs), codingagent.ConfigRoot())
 	defer host.Shutdown("login preview complete")
 	ui := newLoginPreviewUI()
 	bridge := subprocess.NewUIBridge(func() {})
 	bridge.SetUIContext(ui)
 	host.SetUIBridge(bridge)
-	codingagent.WireEarlyModelStream(bridge, "")
+	codingagent.WireEarlyModelStream(bridge)
 	width := extensionLoginPreviewWidth()
 	trueColor := tui.SupportsTrueColor()
 	glyphFree := loginPreviewGlyphFreeEnabled()

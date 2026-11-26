@@ -3,9 +3,11 @@ package coding
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,8 +16,8 @@ import (
 
 // Review regressions for the typed ModelRuntime surface (Pi 0.99.1).
 
-// lazy.ts lazyStream reports every setup rejection, including assertChatModel, with reason "error"; a cancelled signal does not turn it into "aborted".
-func TestModelRuntimeNonChatRejectionIsAnErrorUnderCancellation(t *testing.T) {
+// lazy.ts:83 (Pi f3a64af07, #8635): lazyStream reports a setup rejection, including assertChatModel's, with reason "aborted" under an aborted signal (model-runtime.ts passes options?.signal).
+func TestModelRuntimeNonChatRejectionIsAbortedUnderCancellation(t *testing.T) {
 	for _, provider := range []string{"openrouter", "anthropic"} {
 		t.Run(provider, func(t *testing.T) {
 			services, _ := nativeCompatServices(t, "", nil)
@@ -28,7 +30,7 @@ func TestModelRuntimeNonChatRejectionIsAnErrorUnderCancellation(t *testing.T) {
 				"Stream":       runtime.Stream(ctx, chat, request, ai.StreamOptions{}).Result(),
 				"StreamSimple": runtime.StreamSimple(ctx, chat, request, ai.StreamOptions{}).Result(),
 			} {
-				if result.StopReason != ai.StopReasonError || !strings.Contains(result.ErrorMessage, "is not a chat model") {
+				if result.StopReason != ai.StopReasonAborted || !strings.Contains(result.ErrorMessage, "is not a chat model") {
 					t.Errorf("%s: stopReason=%s error=%q", name, result.StopReason, result.ErrorMessage)
 				}
 			}
@@ -118,11 +120,11 @@ func TestModelRuntimeModifyModelsProjectionReachesTypedLists(t *testing.T) {
 	image := imagesTestImageModel("extension-oauth", "flux")
 	if err := runtime.RegisterProvider("extension-oauth", ProviderConfigInput{BaseURL: model.ProviderMeta.BaseURL, API: model.ProviderMeta.API, Models: []ai.AnyModel{image, model}, Images: ai.ProviderImageAPIMap{"test-images": {GenerateImages: func(_ context.Context, model *ai.ImageModel, _ ai.ImagesContext, _ ai.ImagesOptions) (ai.AssistantImages, error) {
 		return imagesTestOKResult(model), nil
-	}}}, OAuth: &ExtensionOAuthConfig{Name: "Extension OAuth", RefreshToken: func(_ context.Context, credential ai.Credential) (ai.Credential, error) { return credential, nil }, GetAPIKey: func(credential ai.Credential) string { return credential.Access }, ModifyModels: func(models []*ai.Model, credential ai.Credential) []*ai.Model {
+	}}}, OAuth: &ExtensionOAuthConfig{Name: "Extension OAuth", RefreshToken: func(_ context.Context, credential ai.Credential) (ai.Credential, error) { return credential, nil }, GetAPIKey: func(credential ai.Credential) string { return credential.Access }, ModifyModels: func(models []*ai.Model, credential ai.Credential) ([]*ai.Model, error) {
 		if credential.Access == "access" {
-			return append(models, nativeCompatModel("credential-model", "extension-oauth", "https://example.test/v1"))
+			return append(models, nativeCompatModel("credential-model", "extension-oauth", "https://example.test/v1")), nil
 		}
-		return models
+		return models, nil
 	}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -134,6 +136,35 @@ func TestModelRuntimeModifyModelsProjectionReachesTypedLists(t *testing.T) {
 	}
 	if runtime.GetModelOfType(ai.ModelTypeChat, "extension-oauth", "credential-model") == nil {
 		t.Fatal("GetModelOfType misses the modifyModels projection")
+	}
+}
+
+// provider-composer.ts:566-575: modifyModels is synchronous and the composer does not catch it, so an exception of the hook reaches the caller of the model listing. Here the hook's error is the listing's error, from getModels and getAllModels alike, and the listing recovers once the hook stops failing.
+func TestModelRuntimeModifyModelsErrorIsTheListingsError(t *testing.T) {
+	services, _ := nativeCompatServices(t, "", map[string]ai.Credential{"extension-oauth": {Type: ai.CredentialOAuth, Access: "access", Refresh: "refresh", Expires: time.Now().Add(time.Minute).UnixMilli()}})
+	runtime := services.ModelRuntime()
+	model := nativeCompatModel("base", "extension-oauth", "https://example.test/v1")
+	var failing atomic.Bool
+	failing.Store(true)
+	if err := runtime.RegisterProvider("extension-oauth", ProviderConfigInput{BaseURL: model.ProviderMeta.BaseURL, API: model.ProviderMeta.API, Models: []ai.AnyModel{model}, OAuth: &ExtensionOAuthConfig{Name: "Extension OAuth", RefreshToken: func(_ context.Context, credential ai.Credential) (ai.Credential, error) { return credential, nil }, GetAPIKey: func(credential ai.Credential) string { return credential.Access }, ModifyModels: func(models []*ai.Model, _ ai.Credential) ([]*ai.Model, error) {
+		if failing.Load() {
+			return nil, errors.New("modify exploded")
+		}
+		return models, nil
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.Refresh(t.Context(), ai.ModelsRefreshOptions{AllowNetwork: new(false)})
+	provider := runtime.GetProvider("extension-oauth")
+	if _, err := provider.GetModels(); err == nil || err.Error() != "modify exploded" {
+		t.Fatalf("GetModels error = %v, want the hook's error", err)
+	}
+	if _, err := provider.GetAllModels(); err == nil || err.Error() != "modify exploded" {
+		t.Fatalf("GetAllModels error = %v, want the hook's error", err)
+	}
+	failing.Store(false)
+	if models, err := provider.GetModels(); err != nil || len(models) != 1 || models[0].ID != "base" {
+		t.Fatalf("GetModels after the hook recovered = %v, %v", models, err)
 	}
 }
 

@@ -3,7 +3,7 @@
 ;;;; (to-json schema) is what JSON.stringify of Pi's value writes. TypeBox's hidden members (~kind, ~optional, ~readonly, ~immutable, ~unsafe,
 ;;;; ~refine) live in a weak side table keyed by the schema: JSON never sees them, the constructors and guards read them. A schema is never
 ;;;; changed after it is built; every constructor returns a new one. A JSON array can be a schema too (Type.unsafe, Type.optional of one).
-;;;; The Codec family of Type is not served (divergence D198).
+;;;; pig divergence (D198): the Codec family of Type (Codec, Decode, Encode, DecodeBuilder, EncodeBuilder, IsCodec) is not served; no such function exists in this SDK.
 
 (in-package #:pig)
 
@@ -133,9 +133,14 @@ JSON fails, with Pi's message. A Lisp integer is a JavaScript number."
 ;;; ---------------------------------------------------------------- JSON
 
 (defun ts-holds-big-int (value)
-  (cond ((big-int-p value) t)
-        ((hash-table-p value) (loop for member being the hash-values of value thereis (ts-holds-big-int member)))
-        ((ts-array-p value) (some #'ts-holds-big-int value))))
+  "Whether VALUE holds a bigint anywhere. The members are walked with a stack of the function's own: a value nested thousands of levels deep does not depend on the thread's control stack."
+  (let ((stack (list value)))
+    (loop while stack
+          do (let ((item (pop stack)))
+               (cond ((big-int-p item) (return-from ts-holds-big-int t))
+                     ((hash-table-p item) (maphash (lambda (k member) (declare (ignore k)) (push member stack)) item))
+                     ((ts-array-p item) (loop for member across item do (push member stack))))))
+    nil))
 
 (defun type-to-json (value)
   "JSON.stringify of a schema (any value of hash-tables, vectors, strings, numbers and the JSON constants). A schema that holds a bigint
@@ -213,13 +218,13 @@ out when there are none. Keys that are array indexes come first and ascending, a
 
 (defstruct (type-refinement (:constructor make-type-refinement (check message)))
   "One entry of a schema's hidden ~refine list: (funcall CHECK value) decides whether a value passes and (funcall MESSAGE value) words the
-failure (NIL is TypeBox's \"Refine Error\"). TypeBox's own validation runs them, but a tool's arguments are validated as plain JSON Schema (Pi 1.4.0+b556cfe5 validates with pi-schema: ai/CHANGELOG.md:25, coding-agent/docs/extensions.md:176), so nothing consults the list: arguments a refinement would reject are accepted and the constraint belongs in the tool's handler."
+failure (NIL is TypeBox's \"Refine Error\"). VALUE-CHECK and VALUE-ERRORS run them (Value.Check, Value.Errors). A tool's arguments are validated as plain JSON Schema (Pi 1.4.0+b556cfe5 validates with pi-schema: ai/CHANGELOG.md:25, coding-agent/docs/extensions.md:176), so they are not refined: arguments a refinement would reject are accepted, as in Pi, and the handler calls VALUE-CHECK."
   check message)
 
-;; pig divergence (D226): the stored check is never run by any API; remove when every SDK serves TypeBox Value.Check.
+;; pig divergence (D226): tool arguments are not refined (as in Pi); Value.Check and Value.Errors, served through the host by value-check and value-errors, run the refinements.
 (defun type-refine (&rest arguments)
   "Type.Refine (schema check) or (schema check error): a copy of the schema whose hidden ~refine list has the refinement appended; the schema's
-JSON does not change. The refinements are not run: a tool's arguments are validated as plain JSON Schema, so check such constraints in the handler. TypeBox matches the arguments by count, so
+JSON does not change. VALUE-CHECK and VALUE-ERRORS run the refinements; a tool's arguments are validated as plain JSON Schema, so check such constraints in the handler. TypeBox matches the arguments by count, so
 any other count signals TYPE-SCHEMA-ERROR \"Invalid Arguments\", as Pi's does."
   (unless (<= 2 (length arguments) 3) (ts-fail "Invalid Arguments"))
   (destructuring-bind (schema check &optional message) arguments

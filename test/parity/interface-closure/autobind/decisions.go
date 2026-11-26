@@ -14,7 +14,7 @@ import (
 // from it, so a merge or a regeneration of the mapping cannot reset a reviewed decision: the file is an input, never a field the
 // regeneration rewrites. A decision carries the row's upstreamShapeHash and applies only while the upstream shape is unchanged; a changed
 // shape makes the row pending again and its decision awaits re-review.
-const reviewedDecisionsFile = "test/parity/interface-closure/autobind/reviewed-decisions.json"
+const reviewedDecisionsFile = "test/parity/interface-closure/autobind/reviewed/reviewed-decisions.json"
 
 // reviewedDecisions maps an interface ID to its mapping row without the id key.
 type reviewedDecisions map[string]orderedRow
@@ -22,6 +22,28 @@ type reviewedDecisions map[string]orderedRow
 // decisionStats reports what applyReviewedDecisions did.
 type decisionStats struct {
 	Applied, Restored, Stale, Imported, Reset int
+}
+
+// intentionKeys are the intention-check fields (AGENTS.md, Upstream test parity) a designed-out or divergence row about a test helper must carry.
+var intentionKeys = []string{"protects", "pigTest", "whyNot"}
+
+// isTestHelperID reports whether an interface ID names a testing package (`pkg:<path>/testing#...`): a row that designs out a test surface, not a product one.
+func isTestHelperID(id string) bool {
+	pkg, _, _ := strings.Cut(strings.TrimPrefix(id, "pkg:"), "#")
+	return pkg == "testing" || strings.HasSuffix(pkg, "/testing")
+}
+
+// missingIntention returns the first intention key a test-helper row lacks or leaves blank, or "".
+func missingIntention(id string, row orderedRow) string {
+	if !isTestHelperID(id) {
+		return ""
+	}
+	for _, key := range intentionKeys {
+		if strings.TrimSpace(row.get(key)) == "" {
+			return key
+		}
+	}
+	return ""
 }
 
 func isReviewedDisposition(disposition string) bool {
@@ -133,6 +155,9 @@ func readReviewedDecisions(path string) (reviewedDecisions, error) {
 	for id, row := range reviewed {
 		if !isReviewedDisposition(row.get("disposition")) || row.get("upstreamShapeHash") == "" {
 			return nil, fmt.Errorf("%s: %s must be a designed-out or divergence row with an upstreamShapeHash", path, id)
+		}
+		if key := missingIntention(id, row); key != "" {
+			return nil, fmt.Errorf("%s: %s designs out a test helper and needs a non-empty %s (property protected, PiG-shaped test considered, why impossible or worthless)", path, id, key)
 		}
 	}
 	return reviewed, nil

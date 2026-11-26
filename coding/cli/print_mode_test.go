@@ -20,6 +20,7 @@ import (
 	"github.com/MichaelKinsy/PiG/coding"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/compaction"
 	"github.com/MichaelKinsy/PiG/internal/testbudget"
 )
 
@@ -270,11 +271,13 @@ func TestPrintModePrintsOnlyTheFinalMessage(t *testing.T) {
 func TestPrintModePrintsAnswerAfterOverflowRecovery(t *testing.T) {
 	provider := ai.NewFauxProvider(ai.FauxConfig{})
 	var workTurns, summaries int
-	overflowed := false
+	var overflowed, summarizedOverflow bool
 	respond := func(request ai.TranscriptContext) ai.FauxResponse {
 		messages := request.Messages()
-		if last, _ := json.Marshal(messages[len(messages)-1]); strings.Contains(string(last), "checkpoint") {
+		// The same model is still active, so P16 extends its live request with this prompt.
+		if last, ok := messages[len(messages)-1].(ai.UserMessage); ok && userMessageText(last) == compaction.LIVE_SUMMARIZATION_PROMPT {
 			summaries++
+			summarizedOverflow = overflowed
 			return fauxTextResponse("## Goal\nsummary of the earlier work")
 		}
 		switch {
@@ -303,8 +306,8 @@ func TestPrintModePrintsAnswerAfterOverflowRecovery(t *testing.T) {
 	if result.err != nil {
 		t.Fatalf("err = %v, stderr %q", result.err, result.stderr)
 	}
-	if !overflowed || summaries == 0 {
-		t.Fatalf("overflowed=%v summaries=%d: the run did not compact after the overflow", overflowed, summaries)
+	if !overflowed || !summarizedOverflow || summaries != 1 {
+		t.Fatalf("overflowed=%v live summaries=%d summarized after overflow=%v, want one live summary after overflow", overflowed, summaries, summarizedOverflow)
 	}
 	if result.stdout != "recovered answer\n" {
 		t.Fatalf("stdout = %q, want the answer after overflow recovery %q", result.stdout, "recovered answer\n")

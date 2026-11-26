@@ -17,9 +17,7 @@ func TestSettingsSelectorReportsEveryCyclingRowThroughItsCallback(t *testing.T) 
 	initSettingsSelectorTheme(t)
 	// The image rows exist only on a terminal with image support (settings-selector.ts supportsImages), so the test fixes the capabilities
 	// instead of reading the ones of the terminal it runs in.
-	previousCapabilities := tui.GetCapabilities()
 	tui.SetCapabilities(tui.TerminalCapabilities{Images: tui.ImageProtocolKitty, TrueColor: true, Hyperlinks: true})
-	t.Cleanup(func() { tui.SetCapabilities(previousCapabilities) })
 	fired := map[string]string{}
 	record := func(name string) func(value any) {
 		return func(value any) { fired[name] = fmt.Sprint(value) }
@@ -73,6 +71,11 @@ func TestSettingsSelectorReportsEveryCyclingRowThroughItsCallback(t *testing.T) 
 		"HideThinkingBlock": "true", "HttpIdleTimeoutMs": "120000", "ImageWidthCells": "80", "ShowCacheMissNotices": "false",
 		"ShowHardwareCursor": "true", "ShowImages": "false", "ShowTerminalProgress": "true", "SteeringMode": "all",
 		"Transport": "websocket", "TreeFilterMode": "no-tools", "TuiMode": "fullscreen",
+	}
+	for name, row := range map[string]string{"CollapseChangelog": "collapse-changelog", "EnableInstallTelemetry": "install-telemetry"} {
+		if settingStripped(row) { // a build that strips the changelog does not offer these rows
+			delete(want, name)
+		}
 	}
 	for name, value := range want {
 		if got, ok := fired[name]; !ok || got != value {

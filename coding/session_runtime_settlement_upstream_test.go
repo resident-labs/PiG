@@ -27,9 +27,9 @@ func (tool runtimeAbortTool) Execute(ctx context.Context, _ string, _ json.RawMe
 	return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "tool aborted"}}, Details: map[string]any{}}, nil
 }
 
-// packages/coding-agent/test/suite/agent-session-runtime.test.ts:166.
+// packages/coding-agent/test/suite/agent-session-runtime.test.ts:167.
 func TestRuntimeOriginalSettlesActiveResponse(t *testing.T) {
-	recordRuntimeOriginal(t, 166)
+	recordRuntimeOriginal(t, 167)
 	started := make(chan struct{})
 	var h *runtimeTestHarness
 	switching, settledBeforeShutdown := false, false
@@ -92,7 +92,7 @@ func TestRuntimeOriginalSettlesActiveResponse(t *testing.T) {
 		t.Fatal("switch did not install destination Session")
 	}
 	// Replacement must have joined the outgoing tool and persisted its terminal response before returning.
-	loaded, err := newSessionManagerForDir(h.runtime.Services(), outgoing.inner.GetSessionDir()).Load(outgoing.Path())
+	loaded, err := newSessionManagerForDir(h.runtime.Services(), outgoing.inner.Load().GetSessionDir()).Load(outgoing.Path())
 	if err != nil {
 		t.Fatal(err)
 	}

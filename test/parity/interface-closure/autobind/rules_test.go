@@ -465,6 +465,31 @@ func TestValueRuleDecodesTypeScriptEscapes(t *testing.T) {
 	}
 }
 
+// V1 compares a number literal by value: the Go constant 0.15 is the rational 3/20, which is not the text "0.15", and a different
+// value, a string constant or a sign flip must still differ.
+func TestValueRuleComparesNumberLiteralsByValue(t *testing.T) {
+	for _, tc := range []struct {
+		literal string
+		value   constant.Value
+		want    bool
+	}{
+		{"0.15", constant.MakeFromLiteral("0.15", token.FLOAT, 0), true},
+		{"0.15", constant.MakeFromLiteral("0.16", token.FLOAT, 0), false},
+		{"0.05", constant.MakeFromLiteral("0.05", token.FLOAT, 0), true},
+		{"0.05", constant.MakeFromLiteral("0.5", token.FLOAT, 0), false},
+		{"60000", constant.MakeInt64(60000), true},
+		{"60000", constant.MakeInt64(60001), false},
+		{"-3", constant.MakeInt64(-3), true},
+		{"-3", constant.MakeInt64(3), false},
+		{"1", constant.MakeString("1"), false},
+	} {
+		c := types.NewConst(token.NoPos, nil, "C", types.Typ[types.UntypedFloat], tc.value)
+		if got := valueVerdict(nil, tc.literal, c).ok == yes; got != tc.want {
+			t.Errorf("valueVerdict(%s, %s) = %v, want %v", tc.literal, tc.value.ExactString(), got, tc.want)
+		}
+	}
+}
+
 // TestObjectLiteralMembers: T12 ignores comments and readonly, finds a member promoted from an embedded struct that encoding/json
 // flattens, a method member as a Go method (T12m), and a string-literal member as the JSON discriminator the type marshals (T12d).
 func TestObjectLiteralMembers(t *testing.T) {
@@ -1987,6 +2012,22 @@ func TestSourceProps(t *testing.T) {
 	}
 	if got := d.propShapes("p", "L2"); len(got) != 3 {
 		t.Errorf("L2 read on its own = %+v, want f0..f2", got)
+	}
+}
+
+// TestSourcePropsPreferTheRowsOwnTypeAlias: a type alias the row's package declares (chord's Theme) is not read as a same-named
+// class of another package, whose members its indexed accesses (Theme["mode"]) would then be judged against.
+func TestSourcePropsPreferTheRowsOwnTypeAlias(t *testing.T) {
+	own := "{ mode: \"dark\" | \"light\" }"
+	class := &upstreamEntry{ID: "pkg:coding-agent/.#Theme", Name: "Theme", Kind: "class"}
+	member := &upstreamEntry{ID: "pkg:coding-agent/.#Theme::property:foreign", Name: "foreign", Role: "property", ParentID: class.ID, Shape: shape{Name: "foreign", Type: "string"}}
+	d := &detector{l: &ledger{entries: []*upstreamEntry{class, member}, children: map[string][]*upstreamEntry{class.ID: {member}}},
+		aliases: aliasTable{"p": {"Theme": &own}}}
+	if got := d.propShapes("q", "Theme"); len(got) != 1 || got[0].Name != "foreign" {
+		t.Fatalf("a package without the alias reads the class, got %+v", got)
+	}
+	if got := d.propShapes("p", "Theme"); len(got) != 0 {
+		t.Errorf("p's own alias Theme has the members of the other package's class: %+v", got)
 	}
 }
 

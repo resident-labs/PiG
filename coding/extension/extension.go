@@ -4,6 +4,7 @@ import (
 	"context"
 	"maps"
 	"sync"
+	"sync/atomic"
 )
 
 // ExtensionFactory is an extension written as Go code the binary was built with: it receives the extension API and registers tools, commands,
@@ -106,10 +107,11 @@ type Extension struct {
 	// upstream: types.ts Extension.toolRenderers
 	ToolRenderers []ToolRendererResolver
 
-	// MarkdownTransformer is the extension's display-only Markdown transform,
-	// if it registered one; a later registration replaces an earlier one.
+	// MarkdownTransformer is the extension's display-only Markdown transform and the surfaces it runs on,
+	// if it registered one; a later registration replaces an earlier one. Nil when it registered none. A shared Extension is read through
+	// MarkdownTransformerRegistration: a restart of its process replaces it (ReplaceDeclarations).
 	// upstream: types.ts Extension.markdownTransformer
-	MarkdownTransformer MarkdownTransformer
+	MarkdownTransformer *MarkdownTransformerRegistration
 
 	// Commands is keyed by the command name (without leading slash).
 	Commands map[string]RegisteredCommand
@@ -166,11 +168,32 @@ type registeredEventHandler struct {
 	handler HandlerFn
 	// jsonOnly reports that the handler reads its event only through the event's JSON encoding.
 	jsonOnly bool
+	// returnsWithoutAwait reports that the handler never awaits before it returns, so its dispatch cannot pend.
+	returnsWithoutAwait bool
+}
+
+// HasEventHandlersThatMayAwait reports whether e has a handler for event that was not registered as one that returns without awaiting (AddEventHandlerReturningWithoutAwait):
+// a legacy Handlers entry, a JSON handler of a subprocess extension and a handler added with AddEventHandler can pend.
+func (e *Extension) HasEventHandlersThatMayAwait(event string) bool {
+	state := e.handlerState
+	if state == nil {
+		return len(e.Handlers[event]) > 0
+	}
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, handler := range state.handlers[event] {
+		if !handler.returnsWithoutAwait {
+			return true
+		}
+	}
+	return false
 }
 
 type eventHandlerState struct {
 	mu       sync.RWMutex
 	handlers map[string][]registeredEventHandler
+	// present is the set of events that have a handler, built on demand under mu and dropped (nil) by every change to handlers, so a reader that finds it set answers without a lock. A change publishes nil while it holds mu exclusively, and a reader publishes a set only while it holds mu shared, so a set never outlives the change that made it stale.
+	present atomic.Pointer[map[string]struct{}]
 }
 
 // InitializeEventHandlers imports legacy Handlers once. Call before sharing an
@@ -198,12 +221,21 @@ func (e *Extension) AddJSONEventHandler(event string, id int, handler HandlerFn)
 	e.addEventHandler(event, registeredEventHandler{id: id, handler: handler, jsonOnly: true})
 }
 
+// AddEventHandlerReturningWithoutAwait is AddEventHandler for a handler that returns without awaiting anything: in Pi, a handler whose function is not async or never
+// awaits, so that the runner's `await handler(event, ctx)` settles in microtasks and the event loop takes no turn (core/extensions/runner.ts:1103-1110). A host that runs the handlers of
+// an event asks HasEventHandlersThatMayAwait whether any of them can pend. A Go handler that blocks on the user, the terminal or another goroutine must not be
+// registered with it.
+func (e *Extension) AddEventHandlerReturningWithoutAwait(event string, id int, handler HandlerFn) {
+	e.addEventHandler(event, registeredEventHandler{id: id, handler: handler, returnsWithoutAwait: true})
+}
+
 func (e *Extension) addEventHandler(event string, registered registeredEventHandler) {
 	handler := registered.handler
 	e.InitializeEventHandlers()
 	e.handlerState.mu.Lock()
 	defer e.handlerState.mu.Unlock()
 	e.handlerState.handlers[event] = append(e.handlerState.handlers[event], registered)
+	e.handlerState.present.Store(nil)
 	if e.Handlers == nil {
 		e.Handlers = make(map[string][]HandlerFn)
 	}
@@ -237,6 +269,7 @@ func (e *Extension) RemoveEventHandler(event string, id int) {
 		} else {
 			e.handlerState.handlers[event] = handlers
 		}
+		e.handlerState.present.Store(nil)
 		return
 	}
 }
@@ -262,6 +295,7 @@ func (e *Extension) ReplaceEventHandlers(source *Extension) {
 	e.handlerState.mu.Lock()
 	defer e.handlerState.mu.Unlock()
 	e.handlerState.handlers = handlers
+	e.handlerState.present.Store(nil)
 	if e.Handlers == nil {
 		e.Handlers = legacy
 		return
@@ -285,6 +319,34 @@ func (e *Extension) EventHandlers(event string) []HandlerFn {
 		handlers[i] = handler.handler
 	}
 	return handlers
+}
+
+// HasEventHandlers reports whether EventHandlers(event) is not empty, without a lock or an allocation: the dispatcher asks it before every event it might dispatch.
+func (e *Extension) HasEventHandlers(event string) bool {
+	state := e.handlerState
+	if state == nil {
+		return len(e.Handlers[event]) > 0
+	}
+	present := state.present.Load()
+	if present == nil {
+		present = state.publishPresent()
+	}
+	_, ok := (*present)[event]
+	return ok
+}
+
+// publishPresent builds the set of events that have a handler and publishes it, still holding mu shared so that no change can have run in between.
+func (s *eventHandlerState) publishPresent() *map[string]struct{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	present := make(map[string]struct{}, len(s.handlers))
+	for event, registered := range s.handlers {
+		if len(registered) > 0 {
+			present[event] = struct{}{}
+		}
+	}
+	s.present.Store(&present)
+	return &present
 }
 
 // JSONEventHandlers is EventHandlers with, for each handler, whether it was added with AddJSONEventHandler.

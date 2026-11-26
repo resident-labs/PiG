@@ -172,17 +172,18 @@ func APIModuleStream(ctx context.Context, model *Model, stream func(context.Cont
 
 // apiModuleStreamAs is APIModuleStream for a module whose output message carries api, which is not the model's for every module (apiModuleOutputAPI).
 func apiModuleStreamAs(ctx context.Context, api API, model *Model, stream func(context.Context) (*AssistantMessageEventStream, error)) (*AssistantMessageEventStream, error) {
-	//portlint:allow clock the module's output literal takes Date.now() when its stream starts (lazy.ts:50 for setup); ai's clock seams are per-struct (oauth, bedrock backoff), none covers module streams
-	startedAt := time.Now().UnixMilli()
+	//portlint:allow clock the module's stream and its output literal take Date.now() and performance.now() when the module starts (event-stream.ts:98-99, google-generative-ai.ts:64 and :83; lazy.ts:50 for setup); ai's clock seams are per-struct (oauth, bedrock backoff), none covers module streams
+	started := time.Now()
 	inner, err := stream(ctx)
 	if err == nil {
 		return inner, nil
 	}
-	return apiModuleFailure(ctx, api, model, startedAt, err)
+	return apiModuleFailure(ctx, api, model, started, err)
 }
 
 // apiModuleFailure is the catch block of an API module's stream: the module's message ends its stream with the abort-aware stop reason. A lazySetupError or a missing model stays the returned error.
-func apiModuleFailure(ctx context.Context, api API, model *Model, startedAt int64, err error) (*AssistantMessageEventStream, error) {
+// started is the one reading of the clock at the module's call: it stamps the failed stream (wall time and monotonic reading) and then the message, so the message is timed from the call, as a module whose stream exists before its request is.
+func apiModuleFailure(ctx context.Context, api API, model *Model, started time.Time, err error) (*AssistantMessageEventStream, error) {
 	if _, setup := errors.AsType[*lazySetupError](err); setup || model == nil {
 		return nil, err
 	}
@@ -191,7 +192,12 @@ func apiModuleFailure(ctx context.Context, api API, model *Model, startedAt int6
 		reason = StopReasonAborted
 	}
 	builder := newObservedProviderBuilder(ctx, api, modelProviderID(model), model.ID)
-	builder.partial.Timestamp = startedAt
+	builder.stream.startedAt, builder.stream.startedMono = started.UnixMilli(), started
+	builder.partial.Timestamp = started.UnixMilli()
+	// google-generative-ai.ts:290 reports what its stream threw with formatProviderError(normalizeProviderError(error)), which names the
+	// cause of a fetch rejection. The request is made inside that try block, so a failure before the response headers is reported the
+	// same way as one after them (googleProvider.Stream sets the same on its own builder).
+	builder.transportCauseDetail = api == APIGoogleGenerativeAI
 	builder.fail(reason, err)
 	return builder.stream, nil
 }
@@ -225,17 +231,28 @@ func forwardLazySetup(ctx context.Context, turn *continuationTurn, executor *con
 		awaitContinuation(turn, passthrough)
 	}
 	// lazy.ts createSetupErrorMessage builds the message with errorMessage before timestamp. A failure an API module catches inside its own stream ends the provider's stream instead (for example google.go's request failure).
-	message := &AssistantMessage{Content: []AssistantContentBlock{}, StopReason: StopReasonError, ErrorMessage: err.Error(), ErrorBeforeTimestamp: true, Timestamp: outer.startedAt}
+	// lazy.ts:83 `signal?.aborted ? "aborted" : "error"`: ctx carries the request signal.
+	reason := lazySetupStopReason(ctx)
+	message := &AssistantMessage{Content: []AssistantContentBlock{}, StopReason: reason, ErrorMessage: err.Error(), ErrorBeforeTimestamp: true, Timestamp: outer.startedAt}
 	if model != nil {
 		message.API = model.ProviderMeta.API
 		message.Provider = modelProviderID(model)
 		message.Model = model.ID
 	}
-	event := ErrorEvent{Reason: StopReasonError, Error: message}
+	event := ErrorEvent{Reason: reason, Error: message}
 	_ = outer.Push(event)
 	observation.onEvent(event)
 	observation.onResult(message)
 }
+
+// lazySetupStopReason is lazy.ts:83's `signal?.aborted ? "aborted" : "error"` for a setup that rejected.
+func lazySetupStopReason(ctx context.Context) StopReason {
+	if ctx != nil && ctx.Err() != nil {
+		return StopReasonAborted
+	}
+	return StopReasonError
+}
+
 func (stream *AssistantMessageEventStream) isTerminated() bool {
 	stream.mu.Lock()
 	defer stream.mu.Unlock()

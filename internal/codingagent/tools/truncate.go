@@ -22,9 +22,9 @@ package tools
 
 import (
 	"strings"
-	"unicode/utf16"
-	"unicode/utf8"
 
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/sharedtext"
 	"github.com/MichaelKinsy/PiG/internal/truncate"
 	"github.com/MichaelKinsy/PiG/tui"
 )
@@ -49,6 +49,15 @@ func shareTruncatedContent(tr *TruncationResult, output string) {
 	if tr != nil && strings.HasPrefix(output, tr.Content) {
 		tr.Content = output[:len(tr.Content)]
 	}
+}
+
+// sharedOutput is the text a tool returns as the string the process already holds for an equal text, when it holds one
+// (sharedtext.Share), with tr.Content pointed at its start (shareTruncatedContent). A tool that produces the same large text again, a
+// file read twice or a search repeated, then adds nothing to what the conversation keeps.
+func sharedOutput(tr *TruncationResult, output string) string {
+	output = sharedtext.Share(output)
+	shareTruncatedContent(tr, output)
+	return output
 }
 
 // TruncationOptions is upstream TruncationOptions (truncate.ts:40): the limits truncateHead and truncateTail apply. A nil
@@ -171,8 +180,7 @@ func itoa(n int) string {
 
 func fmtFloat(f float64, suffix string) string {
 	// One decimal, banker-truncated to match upstream `.toFixed(1)`.
-	//portlint:allow fusedmuladd f is bytes/2^10 or bytes/2^20 (formatSize), so f*10 is exact and fusion cannot move the rounding
-	scaled := int64(f*10 + 0.5)
+	scaled := int64(float64(f*10) + 0.5)
 	whole := scaled / 10
 	frac := scaled % 10
 	return itoa(int(whole)) + "." + string('0'+byte(frac)) + suffix
@@ -186,8 +194,7 @@ type TruncateLineResult struct {
 
 // TruncateLine mirrors upstream truncateLine: a line longer than maxChars
 // UTF-16 code units (JavaScript string length) is cut to maxChars units plus
-// "... [truncated]". A cut inside a surrogate pair leaves U+FFFD, as the
-// lone surrogate JavaScript would keep serializes to.
+// "... [truncated]". A cut inside a surrogate pair drops the whole pair.
 func TruncateLine(line string, maxChars int) TruncateLineResult {
 	if maxChars <= 0 {
 		maxChars = GrepMaxLineLengthUpstream
@@ -195,61 +202,8 @@ func TruncateLine(line string, maxChars int) TruncateLineResult {
 	if jsLength(line) <= maxChars {
 		return TruncateLineResult{Text: line}
 	}
-	var b strings.Builder
-	units := 0
-	for _, r := range line {
-		n := utf16.RuneLen(r)
-		if units+n > maxChars {
-			if units < maxChars {
-				b.WriteRune(utf8.RuneError)
-			}
-			break
-		}
-		b.WriteRune(r)
-		units += n
-	}
-	return TruncateLineResult{Text: b.String() + truncatedLineSuffix, WasTruncated: true}
+	return TruncateLineResult{Text: jsstring.SliceHead(line, maxChars) + truncatedLineSuffix, WasTruncated: true}
 }
 
 // truncatedLineSuffix ends a line TruncateLine shortened (truncate.ts truncateLine).
 const truncatedLineSuffix = "... [truncated]"
-
-// MiddleTruncationResult mirrors upstream MiddleTruncationResult.
-type MiddleTruncationResult struct {
-	// Content is the start and end of the input with a `…N chars truncated…`
-	// marker between them.
-	Content      string
-	Truncated    bool
-	RemovedChars int
-	TotalBytes   int
-	TotalLines   int
-}
-
-// TruncateMiddle mirrors upstream truncateMiddle: keep the start and the end
-// of content, half of maxBytes each (the tail takes the odd byte), and replace
-// the middle with a `…N chars truncated…` marker, like Codex does for tool
-// output. It cuts only at character boundaries.
-func TruncateMiddle(content string, maxBytes int) MiddleTruncationResult {
-	totalLines := truncate.CountLines(content)
-	if len(content) <= maxBytes {
-		return MiddleTruncationResult{Content: content, TotalBytes: len(content), TotalLines: totalLines}
-	}
-	// Continuation bytes (10xxxxxx) are not character starts.
-	isBoundary := func(index int) bool { return index >= len(content) || content[index]&0xc0 != 0x80 }
-	headEnd := maxBytes / 2
-	for headEnd > 0 && !isBoundary(headEnd) {
-		headEnd--
-	}
-	tailStart := len(content) - (maxBytes - maxBytes/2)
-	for tailStart < len(content) && !isBoundary(tailStart) {
-		tailStart++
-	}
-	removedChars := utf8.RuneCountInString(content[headEnd:tailStart])
-	return MiddleTruncationResult{
-		Content:      content[:headEnd] + "…" + itoa(removedChars) + " chars truncated…" + content[tailStart:],
-		Truncated:    true,
-		RemovedChars: removedChars,
-		TotalBytes:   len(content),
-		TotalLines:   totalLines,
-	}
-}

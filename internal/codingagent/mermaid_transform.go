@@ -76,15 +76,20 @@ func topLevelMermaidFences(markdown string) []*markedCodeBlock {
 // Mermaid code blocks with terminal diagrams. theme may be nil (plain art).
 // While a message streams, the transformer keeps the last text it found plain (mermaidPlainText), so the frames of one streamed message read only what each delta added.
 func createMermaidMarkdownTransformer(getMode func() string, theme *tui.Theme) extension.MarkdownTransformer {
+	return createCountedMermaidMarkdownTransformer(getMode, theme, nil)
+}
+
+// createCountedMermaidMarkdownTransformer is createMermaidMarkdownTransformer whose pre-check adds the bytes it reads to scanned, the count of the interactive mode that owns the transformer. A nil scanned counts nothing.
+func createCountedMermaidMarkdownTransformer(getMode func() string, theme *tui.Theme, scanned *atomic.Int64) extension.MarkdownTransformer {
 	// pig additive (D92): a Piglet that strips mermaid leaves every block raw, as mermaid_off.go does.
 	if pigstrip.Has(pigstrip.ListFeatures, pigstrip.Mermaid) {
 		return rawMermaidMarkdown
 	}
-	var plain mermaidPlainText
+	plain := mermaidPlainText{scanned: scanned}
 	return func(markdown string, context extension.MarkdownTransformContext) string {
 		mode := getMode()
 		if mode == "off" ||
-			context.MessageType == extension.MarkdownMessageAssistantThinking ||
+			(context.MessageType != extension.MarkdownMessageUser && context.MessageType != extension.MarkdownMessageAssistant && context.MessageType != extension.MarkdownMessageSummary) ||
 			(context.IsStreaming && mode != "streaming") {
 			return markdown
 		}
@@ -93,7 +98,7 @@ func createMermaidMarkdownTransformer(getMode func() string, theme *tui.Theme) e
 		} else if plain.holds(markdown) {
 			return markdown
 		}
-		return transformMermaidBlocks(markdown, context, theme)
+		return transformMermaidBlocksCounted(markdown, context, theme, scanned)
 	}
 }
 
@@ -101,6 +106,8 @@ func createMermaidMarkdownTransformer(getMode func() string, theme *tui.Theme) e
 type mermaidPlainText struct {
 	mu   sync.Mutex
 	text string
+	// scanned takes the bytes the pre-check reads; nil counts nothing.
+	scanned *atomic.Int64
 }
 
 // holds reports whether transformMermaidBlocks returns markdown unchanged because it holds neither a carriage return nor the word, and keeps markdown when it does.
@@ -112,7 +119,7 @@ func (p *mermaidPlainText) holds(markdown string) bool {
 		//portlint:allow utf16units the pre-check scans bytes (containsFoldMermaid is an ASCII scan), so the rest to scan starts at a byte offset
 		rest = markdown[max(0, len(p.text)-len("mermaid")+1):]
 	}
-	if strings.IndexByte(rest, '\r') >= 0 || containsFoldMermaid(rest) {
+	if strings.IndexByte(rest, '\r') >= 0 || containsFoldMermaid(rest, p.scanned) {
 		return false
 	}
 	p.text = markdown
@@ -127,12 +134,17 @@ func (p *mermaidPlainText) forget() {
 
 // transformMermaidBlocks selects direct document code tokens, as Pi mermaid.ts:72-76 does with Marked. Non-code containers retain their raw text; only the selected fence bodies reach the diagram renderer.
 func transformMermaidBlocks(markdown string, context extension.MarkdownTransformContext, theme *tui.Theme) string {
+	return transformMermaidBlocksCounted(markdown, context, theme, nil)
+}
+
+// transformMermaidBlocksCounted is transformMermaidBlocks whose pre-check adds the bytes it reads to scanned.
+func transformMermaidBlocksCounted(markdown string, context extension.MarkdownTransformContext, theme *tui.Theme, scanned *atomic.Int64) string {
 	// Marked's lexer normalizes line endings before producing raw tokens.
 	markdown = strings.ReplaceAll(strings.ReplaceAll(markdown, "\r\n", "\n"), "\r", "\n")
 	// A fence is selected only when its info string's first word equals "mermaid" ignoring case (isMermaidInfo), so text with no such
 	// run holds none and the parse, repeated on every streaming frame, is skipped. No non-ASCII rune simple-folds to a letter of
 	// "mermaid", so the ASCII scan is exact.
-	if !containsFoldMermaid(markdown) {
+	if !containsFoldMermaid(markdown, scanned) {
 		return markdown
 	}
 	fences := topLevelMermaidFences(markdown)
@@ -161,12 +173,11 @@ func transformMermaidBlocks(markdown string, context extension.MarkdownTransform
 	return out.String()
 }
 
-// mermaidFoldScanned counts the bytes containsFoldMermaid has read, the work of the pre-check on each frame.
-var mermaidFoldScanned atomic.Int64
-
-// containsFoldMermaid reports whether s holds "mermaid" in any letter case.
-func containsFoldMermaid(s string) bool {
-	mermaidFoldScanned.Add(int64(len(s)))
+// containsFoldMermaid reports whether s holds "mermaid" in any letter case, and adds the bytes it reads, the work of the pre-check on a frame, to scanned. The count belongs to one interactive mode (InteractiveMode.mermaidFoldScanned): a count of the process would also take the frames other modes render. A nil scanned counts nothing.
+func containsFoldMermaid(s string, scanned *atomic.Int64) bool {
+	if scanned != nil {
+		scanned.Add(int64(len(s)))
+	}
 	const word = "mermaid"
 	for i := 0; i+len(word) <= len(s); i++ {
 		if (s[i] == 'm' || s[i] == 'M') && strings.EqualFold(s[i:i+len(word)], word) {
@@ -276,31 +287,38 @@ func backtickRuns(s string) []int {
 	return runs
 }
 
-// styleSpan applies the theme color associated with each Mermaid semantic span.
-func styleSpan(span mermaid.Span, theme *tui.Theme) string {
-	switch span.Cls {
-	case mermaid.ClsBorder:
-		return theme.Fg("borderMuted", span.Text)
-	case mermaid.ClsText:
-		return theme.Fg("text", span.Text)
-	case mermaid.ClsEdge:
-		return theme.Fg("accent", span.Text)
-	case mermaid.ClsEdgeLabel:
-		return theme.Fg("muted", span.Text)
-	case mermaid.ClsTitle:
-		return theme.Fg("accent", tui.ChalkBold(span.Text))
-	}
-	return span.Text
-}
-
+// themedLines styles the art through the Pi theme, as mermaid.ts themedLines does: each role's SGR parameters are the theme's own foreground
+// escape with its ESC[ and final m removed (slice(2, -1)), and the toAnsi pass applies author classDef styles over them. Only the node
+// text of a link carries the OSC 8 hyperlink, and only when the terminal supports hyperlinks.
 func themedLines(art mermaid.Art, theme *tui.Theme) []string {
-	out := make([]string, len(art.Styled))
-	for i, row := range art.Styled {
-		var b strings.Builder
-		for _, span := range row {
-			b.WriteString(styleSpan(span, theme))
+	foreground := func(color string) string {
+		ansi := theme.GetFgAnsi(color)
+		//portlint:allow utf16units theme escapes are ASCII (ESC [ ... m, plus ESC[2m for faint tokens), so byte offsets equal UTF-16 offsets
+		if len(ansi) < 3 {
+			return ""
 		}
-		out[i] = b.String()
+		//portlint:allow utf16units theme escapes are ASCII (ESC [ ... m, plus ESC[2m for faint tokens), so byte offsets equal UTF-16 offsets
+		return ansi[2 : len(ansi)-1]
 	}
-	return out
+	ansiTheme := mermaid.AnsiTheme{
+		mermaid.RoleBorder:    foreground("borderMuted"),
+		mermaid.RoleText:      foreground("text"),
+		mermaid.RoleEdge:      foreground("accent"),
+		mermaid.RoleEdgeLabel: foreground("text"),
+		mermaid.RoleTitle:     "1;" + foreground("accent"),
+	}
+	linkLabels := tui.GetCapabilities().Hyperlinks
+	displayArt := art
+	// Only osc 8 the text, not the whole box.
+	displayArt.Styled = make([][]mermaid.Span, len(art.Styled))
+	for i, row := range art.Styled {
+		displayArt.Styled[i] = make([]mermaid.Span, len(row))
+		for j, span := range row {
+			if span.Href != nil && !linkLabels || span.Role != mermaid.RoleText {
+				span.Href = nil
+			}
+			displayArt.Styled[i][j] = span
+		}
+	}
+	return mermaid.ToAnsi(displayArt, ansiTheme)
 }

@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MichaelKinsy/PiG/internal/jsnumber"
 	"github.com/MichaelKinsy/PiG/internal/jsonparse"
 	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
@@ -117,6 +118,16 @@ type geminiRequest struct {
 	GenerationConfig  *geminiGenerationConfig `json:"generationConfig,omitempty"`
 }
 
+// geminiParametersOrder is the member order of the object buildParams returns, the one onPayload receives: model, contents, config (google-generative-ai.ts:429-432,
+// google-vertex.ts:518-522), and the config's members in the order its literal creates them: the generation fields, systemInstruction, tools, toolConfig,
+// automaticContinuation (:381-398), then thinkingConfig (:407, :410) assigned after it.
+var geminiParametersOrder = &HookObjectOrder{
+	Keys: []string{"model", "contents", "config"},
+	Nested: map[string]*HookObjectOrder{"config": {Keys: []string{
+		"temperature", "maxOutputTokens", "systemInstruction", "tools", "toolConfig", "automaticContinuation", "thinkingConfig",
+	}}},
+}
+
 // parameters exposes the native Google SDK request before its configuration is lowered into REST fields.
 func (request geminiRequest) parameters(model string) map[string]any {
 	config := map[string]any{}
@@ -140,12 +151,17 @@ func (request geminiRequest) parameters(model string) map[string]any {
 	if request.ToolConfig != nil {
 		config["toolConfig"] = request.ToolConfig
 	}
+	// Pi turns the SDK's automatic continuation off in both adapters (Pi f72f799a4: google-generative-ai.ts:397, google-vertex.ts:507), so an
+	// onPayload handler sees the member. It is an option of the SDK, not a request field: marshalGeminiParameters does not send it.
+	config["automaticContinuation"] = false
 	return map[string]any{"model": model, "contents": request.Contents, "config": config}
 }
 
 // marshalGeminiParameters lowers native model/contents/config after onPayload, including a replacement model and generation configuration.
 func marshalGeminiParameters(payload any, api API) (string, []byte, error) {
-	encoded, err := json.Marshal(payload)
+	// A functionCall and a functionResponse part name a tool, and the name can hold a lone UTF-16 surrogate that Pi does not sanitize (google-shared.ts
+	// convertMessages): the payload a hook handed back is written as JSON.stringify writes it, as wireBody writes the request.
+	encoded, err := jsstring.MarshalKeepingSurrogates(payload)
 	if err != nil {
 		return "", nil, err
 	}
@@ -180,10 +196,15 @@ func marshalGeminiParameters(payload any, api API) (string, []byte, error) {
 			return "", nil, err
 		}
 	}
-	for _, name := range []string{"tools", "toolConfig", "safetySettings", "cachedContent", "serviceTier", "labels", "modelArmorConfig"} {
+	for _, name := range []string{"tools", "toolConfig", "safetySettings", "cachedContent", "serviceTier", "labels", "modelArmorConfig", "continuationToken", "store"} {
 		if value := params.Config[name]; len(value) > 0 && string(value) != "null" {
 			body[name] = value
 		}
+	}
+	// The SDK sends the config's generationOutputConfig as the body's outputConfig (generateContentConfigToVertex; the Gemini API backend
+	// refuses the member, and its dialect has no place for it).
+	if value := params.Config["generationOutputConfig"]; len(value) > 0 && string(value) != "null" {
+		body["outputConfig"] = value
 	}
 	if value := params.Config["systemInstruction"]; len(value) > 0 && string(value) != "null" {
 		body["systemInstruction"] = value
@@ -213,14 +234,16 @@ func isThinkingPart(part geminiPart) bool {
 	return part.Thought != nil && *part.Thought
 }
 
+// geminiPart is one part in the order Pi's convertMessages writes its members (google-shared.ts:243-277): a thinking part is thought, text, thoughtSignature; a
+// text part is text, thoughtSignature; a function call is the call, then thoughtSignature. A part has one of text, functionCall, functionResponse and inlineData.
 type geminiPart struct {
+	Thought *bool `json:"thought,omitempty"`
 	// Text distinguishes an empty text part from a part with no text field.
 	Text             *string             `json:"text,omitempty"`
-	Thought          *bool               `json:"thought,omitempty"`
-	ThoughtSignature string              `json:"thoughtSignature,omitempty"`
 	FunctionCall     *geminiFunctionCall `json:"functionCall,omitempty"`
 	FunctionResponse *geminiFuncResponse `json:"functionResponse,omitempty"`
 	InlineData       *geminiInlineData   `json:"inlineData,omitempty"`
+	ThoughtSignature string              `json:"thoughtSignature,omitempty"`
 }
 
 type geminiFunctionCall struct {
@@ -252,7 +275,8 @@ func (call *geminiFunctionCall) UnmarshalJSON(data []byte) error {
 		call.idName = "null"
 		return nil
 	}
-	if err := json.Unmarshal(raw.Name, &name); err == nil {
+	// JSON.parse keeps a lone UTF-16 surrogate of the name (the agent loop finds the tool by that name).
+	if err := jsstring.UnmarshalKeepingSurrogates(raw.Name, &name); err == nil {
 		call.Name, call.idName = name, name
 		return nil
 	}
@@ -269,7 +293,8 @@ func (call *geminiFunctionCall) generatedIDName() string {
 }
 
 // geminiFuncResponse writes the members in the order convertMessages creates them: name, response, parts, id (google-shared.ts:312-317).
-// The SDK passes a functionResponse through, so its image parts keep inlineData's mimeType before data.
+// The Gemini API backend passes a functionResponse through, so the body keeps this order and its image parts keep inlineData's mimeType
+// before data; the Vertex backend rebuilds it (google_wire.go: id, name, parts, response).
 type geminiFuncResponse struct {
 	Name     string         `json:"name"`
 	Response map[string]any `json:"response"`
@@ -419,9 +444,7 @@ type geminiUsageMetadata struct {
 var (
 	gemini3ProRe   = lazyregexp.New(`gemini-3(?:\.\d+)?-pro`)
 	gemini3FlashRe = lazyregexp.New(`gemini-3(?:\.\d+)?-flash`)
-	// Gemini 4 and later, such as gemini-4-argon (Pi 1692bba6, #10890).
-	gemini4PlusRe = lazyregexp.New(`gemini-(?:[4-9]|[1-9]\d)`)
-	gemma4Re      = lazyregexp.New(`gemma-?4`)
+	gemma4Re       = lazyregexp.New(`gemma-?4`)
 )
 
 func isGemini3Pro(modelID string) bool   { return gemini3ProRe.MatchString(modelID) }
@@ -430,9 +453,11 @@ func isGemma4(modelID string) bool       { return gemma4Re.MatchString(modelID) 
 
 // UsesGoogleThinkingLevel reports whether the model takes Gemini's discrete thinkingLevel control instead of the token-based thinkingBudget control. The levels a model supports come from its thinking-level map; this only selects the Google wire format.
 // Mirrors upstream usesGoogleThinkingLevel (google-shared.ts), which lowercases the id before every comparison.
+// upstream: packages/ai/src/api/google-shared.ts:usesGoogleThinkingLevel (Pi fe8a6f5dc, #12371)
 func UsesGoogleThinkingLevel(model *Model) bool {
 	id := jsstring.ToLower(model.ID)
-	return isGemini3Pro(id) || isGemini3Flash(id) || gemini4PlusRe.MatchString(id) || isGemma4(id) || id == "gemini-flash-latest" || id == "gemini-flash-lite-latest"
+	major, ok := getGeminiMajorVersion(id)
+	return isGemini3Pro(id) || isGemini3Flash(id) || (ok && major >= 4) || isGemma4(id) || id == "gemini-flash-latest" || id == "gemini-flash-lite-latest"
 }
 
 // ─── Message conversion ──────────────────────────────────────────────────────
@@ -472,21 +497,22 @@ func isValidThoughtSignature(sig string) bool {
 	return pad <= 2 && pad < len(sig)
 }
 
-var geminiMajorVersionRE = lazyregexp.New(`^gemini(?:-live)?-(\d+)`)
-
-// getGeminiMajorVersion parses the leading major version from a Gemini model id
-// (^gemini(-live)?-N...). Mirrors google-shared.ts getGeminiMajorVersion.
+// getGeminiMajorVersion parses the major version from a Gemini model id
+// (unanchored gemini(?:-live)?-(\d+), matching usesGoogleThinkingLevel).
+// upstream: packages/ai/src/api/google-shared.ts:getGeminiMajorVersion (Pi fe8a6f5dc, #12371)
 func getGeminiMajorVersion(modelID string) (float64, bool) {
-	m := geminiMajorVersionRE.FindStringSubmatch(jsstring.ToLower(modelID))
-	if m == nil {
-		return 0, false
+	for rest := jsstring.ToLower(modelID); ; {
+		_, after, found := strings.Cut(rest, "gemini-")
+		if !found {
+			return 0, false
+		}
+		digits, _ := strings.CutPrefix(after, "live-")
+		if len(digits) > 0 && digits[0] >= '0' && digits[0] <= '9' {
+			// Number.parseInt(digits, 10) reads the leading ASCII digit run as a float64 (overflowing to +Inf).
+			return jsnumber.ParseInt(digits), true
+		}
+		rest = after
 	}
-	// Number.parseInt: a version longer than a float64 integer stays a large float, and one past float64's range is +Inf (ParseFloat's range error), so both still compare as at least 3.
-	n, err := strconv.ParseFloat(m[1], 64)
-	if err != nil && !errors.Is(err, strconv.ErrRange) {
-		return 0, false
-	}
-	return n, true
 }
 
 // requiresToolCallId reports whether a model reached via the Google APIs needs
@@ -829,8 +855,17 @@ func resolveGoogleFunctionCallingMode(tools []ToolSchema, toolChoice string, sup
 	return "", nil
 }
 
-func supportsGoogleStrictToolSampling(modelID string) bool {
-	major, ok := getGeminiMajorVersion(modelID)
+// supportsGoogleStrictToolSampling reports whether the model enforces required function parameters in VALIDATED tool-calling mode.
+// compat.supportsStrictMode overrides the model ID detection for Gemini models served under IDs without the version.
+// upstream: packages/ai/src/api/google-shared.ts:supportsGoogleStrictToolSampling (Pi fe8a6f5dc, #12371)
+func supportsGoogleStrictToolSampling(model *Model) bool {
+	if model != nil && model.ProviderMeta.Compat != nil && model.ProviderMeta.Compat.SupportsStrictMode != nil {
+		return *model.ProviderMeta.Compat.SupportsStrictMode
+	}
+	if model == nil {
+		return false
+	}
+	major, ok := getGeminiMajorVersion(model.ID)
 	return ok && major >= 3
 }
 
@@ -942,13 +977,6 @@ func geminiThinkingBudget(level ModelThinkingLevel, modelID string) int {
 // Stream preserves omitted native thinking, applies explicit logical/raw thinking, and exposes model/contents/config to OnPayload before REST lowering. A replacement payload also owns the dispatched model and configuration.
 func (p *googleProvider) Stream(ctx context.Context, transcript TranscriptContext, opts StreamOptions) (*AssistantMessageEventStream, error) {
 	// upstream: packages/ai/src/api/google-generative-ai.ts:stream
-	if opts.Fetch != nil && opts.Fetch != http.DefaultClient {
-		adapter := "Google Generative AI"
-		if p.cfg.api == APIGoogleVertex {
-			adapter = "Google Vertex"
-		}
-		return nil, fmt.Errorf("Custom fetch is not supported by the %s adapter", adapter)
-	}
 	// pig divergence (D48): the agent loop asks for the tool-flow repair.
 	if opts.RepairToolFlow {
 		transcript = transcript.withRepairedToolFlow()
@@ -991,13 +1019,14 @@ func (p *googleProvider) Stream(ctx context.Context, transcript TranscriptContex
 
 	tools := borrowedCurrentTools(messages)
 	if len(tools) > 0 {
-		convertedTools, err := geminiConvertTools(tools, false, supportsGoogleStrictToolSampling(model.ID))
+		supportsStrictMode := supportsGoogleStrictToolSampling(&conversionModel)
+		convertedTools, err := geminiConvertTools(tools, false, supportsStrictMode)
 		if err != nil {
 			return nil, fmt.Errorf("google: convert tools: %w", err)
 		}
 		req.Tools = convertedTools
 		choice, _ := toolChoiceName(opts.ToolChoice)
-		mode, err := resolveGoogleFunctionCallingMode(tools, choice, supportsGoogleStrictToolSampling(model.ID))
+		mode, err := resolveGoogleFunctionCallingMode(tools, choice, supportsStrictMode)
 		if err != nil {
 			return nil, fmt.Errorf("google: convert tools: %w", err)
 		}
@@ -1047,7 +1076,7 @@ func (p *googleProvider) Stream(ctx context.Context, transcript TranscriptContex
 	noContents := len(req.Contents) == 0
 	if opts.OnPayload != nil {
 		payload := req.parameters(requestModel)
-		next, payloadErr := opts.OnPayload(payload, providerEventModel(p.cfg.ModelMetadata, cmp.Or(p.cfg.api, APIGoogleGenerativeAI), p.cfg.ProviderID, p.cfg.Model))
+		next, payloadErr := callPayloadHook(opts.OnPayload, payload, geminiParametersOrder, providerEventModel(p.cfg.ModelMetadata, cmp.Or(p.cfg.api, APIGoogleGenerativeAI), p.cfg.ProviderID, p.cfg.Model))
 		if payloadErr != nil {
 			return nil, fmt.Errorf("google: onPayload: %w", payloadErr)
 		}
@@ -1139,6 +1168,7 @@ func (p *googleProvider) Stream(ctx context.Context, transcript TranscriptContex
 		if resp.StatusCode != http.StatusOK {
 			b, _ := readWebText(resp.Body)
 			_ = resp.Body.Close()
+			noteFailureResponse(ctx, resp)
 			return nil, googleHTTPError(resp, b)
 		}
 		return resp, nil
@@ -1152,11 +1182,13 @@ func (p *googleProvider) Stream(ctx context.Context, transcript TranscriptContex
 	}
 
 	builder := newObservedProviderBuilder(ctx, p.cfg.api, p.cfg.ProviderID, p.cfg.Model)
+	builder.transportCauseDetail = true
 	builder.modelCost = opts.ModelCost
 	builder.setProviderEventObserver(opts, providerEventModel(p.cfg.ModelMetadata, p.cfg.api, p.cfg.ProviderID, p.cfg.Model))
 	builder.abort = abort
 	_, builder.managed = resp.Body.(*observedResponseBody)
 	streaming = true
+	//portlint:allow asyncorder Pi's stream() starts a detached async IIFE and returns the stream (google-generative-ai.ts:67, :296); the stream owns this goroutine, which runs the body after the response headers as a turn of the stream's continuation executor (responseTurn in streamResponse), the ordering point with the consumer; TestGoogleProviderConsumerMatchesNodeTickOrder holds each event's segment and round to Pi's
 	go builder.runResponse(func() error { return p.streamResponse(ctx, resp, builder) })
 	return builder.stream, nil
 }
@@ -1469,24 +1501,26 @@ func (p *googleProvider) parseGeminiSSE(ctx context.Context, r io.Reader, builde
 	builder.done(stopReason, &state.usage, errorMessage)
 }
 
-// mapStopReasonString maps a Gemini finish reason to a stop reason; every reason other than STOP and MAX_TOKENS is an error
-// (google-shared.ts:474 mapStopReasonString over a raw string).
+// mapStopReasonString maps a Gemini finish reason to a stop reason; every reason other than STOP, MAX_TOKENS and CONTINUATION is an error
+// (google-shared.ts:474 mapStopReasonString over a raw string). Pi f72f799a4 deleted the TypeScript function; the pinned interface inventory still
+// lists it, so Go keeps it as mapStopReason's string mapper until a pin bump drops that interface ID.
 func mapStopReasonString(reason string) StopReason {
 	switch reason {
 	case "STOP":
 		return StopReasonStop
-	case "MAX_TOKENS":
+	case "MAX_TOKENS", "CONTINUATION":
 		return StopReasonLength
 	default:
 		return StopReasonError
 	}
 }
 
-// mapStopReason is google-shared.ts:441 mapStopReason: the Gemini FinishReason enum members map to stop, length or error, and any other value reaches the
-// exhaustive switch's default, which throws `Unhandled stop reason: <reason>`.
+// mapStopReason is google-shared.ts:495 mapStopReason: the Gemini FinishReason enum members map to stop, length (MAX_TOKENS, and since Pi f72f799a4
+// CONTINUATION, the per-request token limit reached before generation completed: pi does not resume with the continuation token) or error, and any
+// other value reaches the exhaustive switch's default, which throws `Unhandled stop reason: <reason>`.
 func mapStopReason(reason string) (StopReason, error) {
 	switch reason {
-	case "STOP", "MAX_TOKENS", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "SAFETY", "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION", "IMAGE_OTHER", "RECITATION",
+	case "STOP", "MAX_TOKENS", "CONTINUATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "SAFETY", "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION", "IMAGE_OTHER", "RECITATION",
 		"FINISH_REASON_UNSPECIFIED", "OTHER", "LANGUAGE", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS", "NO_IMAGE":
 		return mapStopReasonString(reason), nil
 	default:

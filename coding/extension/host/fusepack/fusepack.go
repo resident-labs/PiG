@@ -9,6 +9,7 @@ package fusepack
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -52,7 +53,27 @@ func registerFactory(name string, factory sdk.Factory) {
 	}
 }
 
+// fusedSources maps a fused extension's name to the digest (subprocess.FusedSourceDigest) of the source it was compiled from. The
+// generated registry fills it through registerSource only for a Piglet built with `build.fusedReload: source`; it is empty otherwise.
+var fusedSources = map[string]string{}
+
+// registerSource records the source digest of one fused extension.
+// pig additive (D31): a fused member whose source changed runs from its source.
+func registerSource(name, digest string) { fusedSources[name] = digest }
+
 type resolver struct{}
+
+func (resolver) BakedSourceDigest(name string) (string, bool) {
+	digest, ok := fusedSources[name]
+	return digest, ok
+}
+
+// BakedSource reports whether the build baked a source digest for the fused extension name. It is false in stock pig and in a
+// Piglet Binary built without `build.fusedReload: source`.
+func BakedSource(name string) bool {
+	_, ok := fusedSources[name]
+	return ok
+}
 
 func (resolver) FusedServe(cfg subprocess.ExtConfig) (func(net.Conn) error, bool) {
 	serve, ok := fusedServes[cfg.Name]
@@ -117,6 +138,11 @@ func HostHelpers() *sdk.HostHelpers {
 			}
 			exitCode, err := subprocess.LocalExec(ctx, args, managedToolsDir(), onData)
 			if err != nil {
+				var timeout *tools.ShellTimeoutError
+				if errors.As(err, &timeout) && timeout.ShellExit != nil {
+					// The SDK cannot name the host's error type: it reads the shell's exit through a method of the error it is given.
+					return nil, shellTimeoutAfterExit{timeout}
+				}
 				return nil, err
 			}
 			return json.Marshal(subprocess.BuiltinToolLocalExecResult{ExitCode: exitCode})
@@ -125,13 +151,21 @@ func HostHelpers() *sdk.HostHelpers {
 			return subprocess.BuiltinToolExecute(ctx, args, managedToolsDir(), subprocess.BuiltinToolPeer{Callback: peer.Callback, Update: peer.Update, Exec: peer.Exec})
 		},
 		HighlightCode: subprocess.HighlightCodeLines,
-		TypeEngine:    engine.Serve,
+		TypeEngine:    engine.NewSession().Serve,
 		LoadTheme:     subprocess.LoadThemeJSON,
 		WithFileMutationQueue: func(filePath string, fn func() error) error {
 			_, err := tools.WithFileMutationQueue(filePath, func() (struct{}, error) { return struct{}{}, fn() })
 			return err
 		},
 	}
+}
+
+// shellTimeoutAfterExit is the host's timeout of a command whose shell had exited before the deadline, as a fused extension's SDK reads it: the message of the
+// error, and the shell's exit through ShellExitReport.
+type shellTimeoutAfterExit struct{ *tools.ShellTimeoutError }
+
+func (e shellTimeoutAfterExit) ShellExitReport() (exitCode int, afterSeconds float64, ok bool) {
+	return e.ShellExit.ExitCode, e.ShellExit.AfterSeconds, true
 }
 
 // managedToolsDir is the directory a command's PATH starts with and the built-in tools resolve rg and fd in (Pi's process-wide getBinDir()): <agentDir>/bin of the

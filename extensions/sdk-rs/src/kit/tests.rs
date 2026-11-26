@@ -159,6 +159,49 @@ fn defaults_match_upstream_constructors() {
 }
 
 #[test]
+fn structural_kinds_carry_an_id() {
+    // Every node kind can carry an id: an a11y, focus or drawing record of a
+    // mounted view names a node by it.
+    let encoded = View::new(
+        Container::new()
+            .id("id-container")
+            .child(
+                Box::new(1, 1)
+                    .id("id-box")
+                    .child(Text::new("t", 0, 0).id("id-text")),
+            )
+            .child(TruncatedText::new("t", 0, 0).id("id-truncated-text"))
+            .child(Markdown::new("m", 0, 0).id("id-markdown"))
+            .child(Spacer::new(1).id("id-spacer"))
+            .child(DynamicBorder::new("border").id("id-dynamic-border"))
+            .child(Image::new(b"png".to_vec(), "image/png").id("id-image"))
+            .child(Loader::new("l").id("id-loader"))
+            .child(HStack::new().id("id-hstack"))
+            .child(VStack::new().id("id-vstack"))
+            .child(Lines::new(vec!["row".to_string()]).id("id-lines"))
+            .child(UserMessage::new("u").id("id-user-message"))
+            .child(Diff::new("d").id("id-diff")),
+    )
+    .encode(false)
+    .unwrap();
+    fn ids(node: &Value, out: &mut Vec<(String, Option<String>)>) {
+        out.push((
+            node["kind"].as_str().unwrap().to_string(),
+            node.get("id").and_then(Value::as_str).map(str::to_string),
+        ));
+        for child in node["children"].as_array().into_iter().flatten() {
+            ids(child, out);
+        }
+    }
+    let mut got = Vec::new();
+    ids(&encoded.body["root"], &mut got);
+    assert_eq!(got.len(), 14);
+    for (kind, id) in got {
+        assert_eq!(id, Some(format!("id-{kind}")), "the {kind} node");
+    }
+}
+
+#[test]
 fn theme_override_replaces_an_earlier_value_for_the_token() {
     let body = View::new(Spacer::new(1))
         .theme("accent", "#000000")
@@ -182,6 +225,7 @@ fn image_ref_is_the_sha256_of_its_bytes() {
     let image = Image::new(b"png-bytes".to_vec(), "image/png")
         .max_width_cells(20)
         .max_height_cells(10)
+        .image_id(4242)
         .filename("cover.png")
         .fallback_color("dim");
     assert_eq!(image.reference(), sha(b"png-bytes"));
@@ -189,7 +233,7 @@ fn image_ref_is_the_sha256_of_its_bytes() {
     assert_eq!(
         encoded.body["root"],
         json!({"kind": "image", "ref": sha(b"png-bytes"), "mimeType": "image/png", "maxWidthCells": 20,
-               "maxHeightCells": 10, "filename": "cover.png", "fallbackColor": "dim"})
+               "maxHeightCells": 10, "imageId": 4242, "filename": "cover.png", "fallbackColor": "dim"})
     );
     assert_eq!(encoded.images.len(), 1);
 }
@@ -413,6 +457,55 @@ fn mouse_region_encodes_its_handler_as_a_description() {
     assert_eq!(
         wire_view(&ledger, &View::new(MouseRegion::new("m", Spacer::new(1))))["root"]["region"],
         json!({})
+    );
+}
+
+// The grid node (D614): the encoded node holds exactly the wire members the
+// author set. `columns` is always sent, and an optional member left unset is
+// absent, not null, zero or empty.
+#[test]
+fn grid_holds_exactly_the_members_set() {
+    let ledger = ViewLedger::default();
+    let grid = Grid::new(
+        "month",
+        7,
+        vec![
+            GridCell::new().label("30").dim(true),
+            GridCell::new()
+                .value("d1")
+                .label("1")
+                .chip(GridChip::new("standup").color("#3366cc"))
+                .chip(GridChip::new("lunch"))
+                .more(2),
+            GridCell::new()
+                .value("d2")
+                .label("2")
+                .mark("current")
+                .color("accent"),
+            GridCell::new().value("d3"),
+            GridCell::new(),
+        ],
+    )
+    .head(["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"])
+    .chip_rows(2)
+    .selected("d2");
+    let view = View::new(
+        Container::new()
+            .child(grid)
+            .child(Grid::new("bare", 1, vec![])),
+    );
+    assert_eq!(
+        wire_view(&ledger, &view)["root"],
+        json!({"kind": "container", "children": [
+            {"kind": "grid", "id": "month", "columns": 7, "chipRows": 2, "head": ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"], "cells": [
+                {"label": "30", "dim": true},
+                {"value": "d1", "label": "1", "chips": [{"text": "standup", "color": "#3366cc"}, {"text": "lunch"}], "more": 2},
+                {"value": "d2", "label": "2", "mark": "current", "color": "accent"},
+                {"value": "d3"},
+                {},
+            ], "selected": "d2"},
+            {"kind": "grid", "id": "bare", "columns": 1},
+        ]})
     );
 }
 

@@ -174,16 +174,24 @@ func assertChat(model *ai.Model) error {
 	return ai.AssertChatModel(model)
 }
 
-// failedStream returns a stream that ends with an error result, as a lazy stream does when its setup rejects (model-runtime.ts stream: assertChatModel inside lazyStream). lazy.ts reports every setup rejection with reason "error", even under a cancelled signal.
-func (runtime *ModelRuntime) failedStream(model *ai.Model, err error) *ai.AssistantMessageEventStream {
+// failedStream returns a stream that ends with an error result, as a lazy stream does when its setup rejects (model-runtime.ts stream: assertChatModel inside lazyStream). lazy.ts:83 reports the rejection as "aborted" under an aborted signal and "error" otherwise (Pi f3a64af07); ctx is the request signal.
+func (runtime *ModelRuntime) failedStream(ctx context.Context, model *ai.Model, err error) *ai.AssistantMessageEventStream {
 	outer := ai.NewAssistantMessageEventStream()
-	// upstream: packages/ai/src/api/lazy.ts:lazyStream pushes reason "error" for a setup rejection.
-	runtime.fail(context.Background(), outer, model, err)
+	runtime.fail(ctx, outer, model, err)
 	return outer
 }
 
 // builtinStream is the stream function of a built-in or legacy-registered provider: it builds the model's API provider from its catalog entry.
 func (runtime *ModelRuntime) builtinStream(id string) ai.ModelsStreamFunction {
+	return runtime.builtinStreamMode(id, false)
+}
+
+// builtinStreamSimple is the simple-stream function of a built-in or legacy-registered provider: it shares prepareSimpleStreamOptions with ModelRuntime.StreamSimple.
+func (runtime *ModelRuntime) builtinStreamSimple(id string) ai.ModelsStreamFunction {
+	return runtime.builtinStreamMode(id, true)
+}
+
+func (runtime *ModelRuntime) builtinStreamMode(id string, simple bool) ai.ModelsStreamFunction {
 	return func(ctx context.Context, model *ai.Model, transcript ai.TranscriptContext, options ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
 		entry := icodingagent.NativeModelEntry(model)
 		// pig additive (D36): the provider's TLS opt-in reaches the transport its API builds.
@@ -193,6 +201,9 @@ func (runtime *ModelRuntime) builtinStream(id string) ai.ModelsStreamFunction {
 			return nil, err
 		}
 		options.IsReasoning = model.ProviderMeta.Reasoning || model.Capabilities.MaxThinking != ""
+		if simple {
+			options = prepareSimpleStreamOptions(model, transcript, options)
+		}
 		return provider.Stream(ctx, transcript, options)
 	}
 }

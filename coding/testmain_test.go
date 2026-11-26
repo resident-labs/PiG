@@ -35,7 +35,7 @@ func TestMain(m *testing.M) {
 	if runtime.GOOS != "windows" {
 		configvalue.SetExecutorForTest(shellWithoutTimeout)
 	}
-	testRoot, err := os.MkdirTemp("", "pig-coding-")
+	testRoot, err := testenv.MkdirShortTemp("pig-coding-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "create isolated test config root:", err)
 		os.Exit(2)
@@ -54,6 +54,14 @@ func TestMain(m *testing.M) {
 	}
 	if err := os.Setenv("PIG_HOME", filepath.Join(testRoot, "pig")); err != nil {
 		fmt.Fprintln(os.Stderr, "set isolated PIG_HOME:", err)
+		_ = os.RemoveAll(testRoot)
+		os.Exit(2)
+	}
+	// Tests run offline by default and opt in where they mean to reach the network, as Pi's coding-agent suite does: its vitest.config.ts sets
+	// env: { PI_OFFLINE: "1" } for every test (line 12) and a test that wants the network calls allowNetwork() (test/test-network-env.ts), which here is
+	// t.Setenv("PI_OFFLINE", ""). Without it a registry refresh with no options asks pi-in-go.dev for the catalog.
+	if err := os.Setenv("PI_OFFLINE", "1"); err != nil {
+		fmt.Fprintln(os.Stderr, "set offline test mode:", err)
 		_ = os.RemoveAll(testRoot)
 		os.Exit(2)
 	}

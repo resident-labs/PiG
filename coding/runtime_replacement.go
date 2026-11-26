@@ -61,15 +61,22 @@ func (instance *runtimeInstance) retireResources(reason string) {
 }
 
 type runtimeReplacement struct {
-	current       atomic.Pointer[runtimeInstance]
-	closed        atomic.Bool
-	quitEmitted   atomic.Bool
-	createRuntime CreateAgentSessionRuntimeFactory
-	rebindSession func(context.Context, *Session) error
+	current     atomic.Pointer[runtimeInstance]
+	closed      atomic.Bool
+	quitEmitted atomic.Bool
+	// quitInvalidated is set once the quit's dispose ran the mode's beforeSessionInvalidate hook, which then does not run again at Close.
+	quitInvalidated atomic.Bool
+	createRuntime   CreateAgentSessionRuntimeFactory
+	rebindSession   func(context.Context, *Session) error
 	// reload is the mode's session.reload() for the current Session (agent-session.ts:3575-3625); nil until the mode installs it.
 	reload func(context.Context, *Session) error
 	// drain settles mode-owned work of the outgoing Session after cancellable before hooks approved the replacement and before the Session aborts and shuts down.
 	drain func(context.Context) error
+	// quitSettle is the mode's settle of its active run for the dispose of a quit whose input ended (SetBeforeQuitDispose).
+	quitSettle func()
+	// reportedDiagnosticKeys holds `type\x00message` of every diagnostic TakeUnreportedDiagnostics returned so far (agent-session-runtime.ts reportedDiagnosticKeys). It belongs to the Runtime, not to one construction, so a replacement's diagnostic that an earlier construction reported is not reported again.
+	reportedMu             sync.Mutex
+	reportedDiagnosticKeys map[string]struct{}
 }
 
 // NewAgentSessionRuntime is upstream's `new AgentSessionRuntime(session, services, createRuntime, diagnostics, modelFallbackMessage)` (agent-session-runtime.ts:81-93):
@@ -186,10 +193,20 @@ func (rt *Runtime) EmitQuitShutdown() {
 		return
 	}
 	if session := rt.Session(); session != nil {
-		// pig divergence (D247): dispose awaits the interrupted run's settlement before session_shutdown (Pi main 7a53c310a, #9126).
+		// dispose awaits the interrupted run's settlement before session_shutdown (Pi main 7a53c310a, #9126).
 		//portlint:allow ctxbackground Pi's dispose awaits session.abort() with no signal and no timeout (agent-session-runtime.ts dispose); the mode's quit has no caller context
 		_ = session.Abort(context.Background())
 		session.EmitSessionShutdown("quit")
+	}
+	// Pi's dispose() runs beforeSessionInvalidate right after session_shutdown (agent-session-runtime.ts:415-424), where the mode's quit calls it: the
+	// session title the hook writes comes before the resume hint of a quit and before the terminal restore of a signal's exit.
+	rt.runQuitInvalidate()
+}
+
+// runQuitInvalidate runs the mode's beforeSessionInvalidate hook for the quit, once: at the quit's dispose, or at Close for a mode that emits the event through EmitQuitShutdownContext.
+func (rt *Runtime) runQuitInvalidate() {
+	if hook := rt.beforeSessionInvalidate; hook != nil && rt.replacement.quitInvalidated.CompareAndSwap(false, true) {
+		hook()
 	}
 }
 
@@ -202,7 +219,6 @@ func (rt *Runtime) EmitQuitShutdownContext(ctx context.Context) {
 	if session == nil {
 		return
 	}
-	// No abort here, unlike EmitQuitShutdown: the pinned Pi's dispose emits session_shutdown at once (agent-session-runtime.ts dispose, Pi 1.5.0), and the signal hook of print mode holds the Agent while this runs (HoldAgentEvents), so an aborted run could not settle and the wait for it would never end.
 	if runner := session.currentRunner(); runner != nil && runner.HasHandlers(icodingagent.EventSessionShutdown) {
 		_, _ = runner.Emit(ctx, extension.SessionShutdownEvent{Type: icodingagent.EventSessionShutdown, Reason: "quit"})
 	}
@@ -366,7 +382,8 @@ func (rt *Runtime) NewSession(ctx context.Context, options *extension.NewSession
 }
 
 func (rt *Runtime) freshSessionManager(parent string) (*SessionManager, error) {
-	if !rt.Session().inner.IsPersisted() {
+	in := rt.Session().inner.Load()
+	if !in.IsPersisted() {
 		manager, err := NewInMemorySessionManager(rt.CWD())
 		if err == nil && parent != "" {
 			_, err = manager.NewSession(&icodingagent.NewSessionOptions{ParentSession: parent})
@@ -377,7 +394,7 @@ func (rt *Runtime) freshSessionManager(parent string) (*SessionManager, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newSessionManagerForDir(rt.Services(), rt.Session().inner.GetSessionDir()).Create(id, parent)
+	return newSessionManagerForDir(rt.Services(), in.GetSessionDir()).Create(id, parent)
 }
 
 // SwitchSessionOptions is the options object of AgentSessionRuntime.switchSession (agent-session-runtime.ts:196-201).
@@ -476,7 +493,7 @@ func forkSessionOf(ctx context.Context) *Session {
 
 // forkTarget is the check Pi's fork makes against the current Session once the before handlers returned: the entry exists, and for position "before" it is a user message. It returns the leaf to branch at and the selected text.
 func (s *Session) forkTarget(entryID, position string) (leaf, selected *string, err error) {
-	entry, ok := s.inner.GetEntry(entryID)
+	entry, ok := s.inner.Load().GetEntry(entryID)
 	if !ok {
 		return nil, nil, errors.New("Invalid entry ID for forking")
 	}
@@ -501,8 +518,8 @@ func (s *Session) ValidateFork(entryID, position string) error {
 	if _, _, err := s.forkTarget(entryID, position); err != nil {
 		return err
 	}
-	if s.inner.IsPersisted() {
-		if _, err := os.Stat(s.inner.Path()); errors.Is(err, os.ErrNotExist) {
+	if in := s.inner.Load(); in.IsPersisted() {
+		if _, err := os.Stat(in.Path()); errors.Is(err, os.ErrNotExist) {
 			return errors.New("This session has not been saved yet. Send a message before cloning or forking it.")
 		}
 	}
@@ -542,7 +559,7 @@ func (rt *Runtime) Fork(ctx context.Context, entryID string, options *extension.
 	if err != nil {
 		return RuntimeForkResult{}, err
 	}
-	if source := forkFrom.inner; !source.IsPersisted() {
+	if source := forkFrom.inner.Load(); !source.IsPersisted() {
 		outgoing := rt.Session()
 		previous := source.Path()
 		if err := rt.teardownCurrent(ctx, "fork", previous); err != nil {
@@ -566,7 +583,7 @@ func (rt *Runtime) Fork(ctx context.Context, entryID string, options *extension.
 	if leaf == nil {
 		manager, err = rt.freshSessionManager(forkFrom.Path())
 	} else {
-		source := forkFrom.inner
+		source := forkFrom.inner.Load()
 		storage := newSessionManagerForDir(rt.Services(), source.GetSessionDir())
 		if source.IsPersisted() {
 			if _, err := os.Stat(source.Path()); errors.Is(err, os.ErrNotExist) {
@@ -601,7 +618,7 @@ func (rt *Runtime) ImportFromJsonl(ctx context.Context, input string, cwdOverrid
 	if _, err := os.Stat(path); err != nil {
 		return extension.CancelledResult{}, &SessionImportFileNotFoundError{FilePath: path}
 	}
-	dir := rt.Session().inner.GetSessionDir()
+	dir := rt.Session().inner.Load().GetSessionDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return extension.CancelledResult{}, err
 	}
@@ -633,6 +650,10 @@ func (rt *Runtime) ImportFromJsonl(ctx context.Context, input string, cwdOverrid
 		return extension.CancelledResult{}, err
 	}
 	if err := icodingagent.AssertSessionCwdExists(manager, rt.CWD()); err != nil {
+		// The import did not happen; drop the copy so a retry with a cwd override or a fork leaves no stray file (Pi #11060).
+		if !alreadyStored {
+			_ = os.Remove(destination)
+		}
 		return extension.CancelledResult{}, err
 	}
 	if err := rt.replaceRuntime(ctx, manager, "resume", nil); err != nil {

@@ -1,35 +1,46 @@
 import {
   AssistantMessageEventStream,
+  CACHE_WARMING_IDLE_CONTINUATION_PROBABILITY,
+  CACHE_WARMING_MAX_AGE_MS,
+  CACHE_WARMING_MAX_IDLE_AGE_MS,
+  CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS,
   DEFAULT_MAX_AGENT_RETRY_DELAY_MS,
   EventStream,
-  StreamingJsonParser,
   StringEnum,
-  ToolCallArgumentsStream,
   cleanupSessionResources,
   createAssistantMessageEventStream,
   createFauxCore,
+  evaluateCacheWarming,
   fauxAssistantMessage,
   fauxProvider,
   fauxText,
   fauxThinking,
   fauxToolCall,
+  getCacheWarmingDelayMs,
+  getCacheWarmingRequestOptions,
   getOverflowPatterns,
+  getPromptCacheTtlMs,
+  isCacheWarmingReplayable,
   isContextOverflow,
   isRecoverableLength,
   isRetryableAssistantError,
   lazyApi,
   lazyStream,
-  parseJsonWithRepair,
-  parseStreamingJson,
-  parseToolCallArguments,
   registerSessionResourceCleanup,
-  repairJson,
   retryAssistantCall,
   retryDelayMs,
   uuidv7,
   validateToolArguments,
   validateToolCall
-} from "./chunk-LM2GRTGA.js";
+} from "./chunk-6EXNEHUS.js";
+import {
+  StreamingJsonParser,
+  ToolCallArgumentsStream,
+  parseJsonWithRepair,
+  parseStreamingJson,
+  parseToolCallArguments,
+  repairJson
+} from "./chunk-EDPW3NGU.js";
 import {
   ANTHROPIC_API_KEY_ENV,
   ANTHROPIC_AUTH_TOKEN_ENV,
@@ -53,11 +64,11 @@ import {
   openAICodexResponsesApi,
   openAIResponsesApi,
   piMessagesApi
-} from "./chunk-DH6PKDEX.js";
+} from "./chunk-VBDWGXJT.js";
 import {
   anthropicMessagesApi,
   openAICompletionsApi
-} from "./chunk-57EFHYMA.js";
+} from "./chunk-L4H5LGN5.js";
 import {
   envApiKeyAuth,
   lazyOAuth
@@ -67,55 +78,57 @@ import {
   InMemoryCredentialStore,
   InMemoryModelsStore,
   ModelsError,
-  PI_AI_VERSION,
-  PI_ATTRIBUTION,
-  appendAssistantMessageDiagnostic,
   calculateCost,
   clampThinkingLevel,
   collapseSystemMessages,
-  contentText,
-  createAssistantMessageDiagnostic,
   createInitialSystemMessage,
   createModels,
   createProvider,
   declarationsEqual,
   defaultProviderAuthContext,
-  extractDiagnosticError,
-  formatThrownValue,
-  formatUserAgent,
-  getAttributionHeaders,
-  getClientVersion,
   getCurrentSystemMessage,
   getCurrentSystemPrompt,
   getCurrentTools,
   getDeclaredTools,
-  getIdentityHeaders,
   getInitialSystemMessage,
   getModelType,
-  getOpenCodeSessionHeaders,
   getSupportedThinkingLevels,
-  getSystemMessageText,
   getToolStateChanges,
   hasApi,
   hasNonAdditiveToolChanges,
   hasToolRedefinitions,
   isModelType,
-  mergeClientIdentity,
   modelsAreEqual,
   normalizeContext,
-  renderSystemMessageUpdate,
   resolveTranscript,
   resolveTranscriptTools,
   toToolDeclaration,
-  withClientIdentity,
   withoutInitialSystemMessage
-} from "./chunk-YGHTO7GP.js";
+} from "./chunk-35BKLGWE.js";
+import {
+  PI_AI_VERSION,
+  PI_ATTRIBUTION,
+  appendAssistantMessageDiagnostic,
+  contentText,
+  createAssistantMessageDiagnostic,
+  extractDiagnosticError,
+  formatThrownValue,
+  formatUserAgent,
+  getAttributionHeaders,
+  getClientVersion,
+  getIdentityHeaders,
+  getOpenCodeSessionHeaders,
+  getSystemMessageText,
+  mergeClientIdentity,
+  renderSystemMessageUpdate,
+  withClientIdentity
+} from "./chunk-TA77CKFD.js";
 import {
   __name
 } from "./chunk-SHUYVCID.js";
 
 // pi-dist/pi-ai/compat.js
-import { setBedrockProviderModule, bedrockConverseStreamApi } from "../api/bedrock-converse-stream.lazy.js";
+import { setBedrockProviderModule, setBedrockProviderLoader, bedrockConverseStreamApi } from "../api/bedrock-converse-stream.lazy.js";
 
 // pi-dist/pi-ai/image-models.js
 var imageModelsByProvider = /* @__PURE__ */ new Map();
@@ -427,6 +440,10 @@ export {
   ANTHROPIC_SERVICE_ACCOUNT_ID_ENV,
   ANTHROPIC_WORKSPACE_ID_ENV,
   AssistantMessageEventStream,
+  CACHE_WARMING_IDLE_CONTINUATION_PROBABILITY,
+  CACHE_WARMING_MAX_AGE_MS,
+  CACHE_WARMING_MAX_IDLE_AGE_MS,
+  CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS,
   DEFAULT_MAX_AGENT_RETRY_DELAY_MS,
   EventStream,
   InMemoryCredentialStore,
@@ -457,6 +474,7 @@ export {
   declarationsEqual,
   defaultProviderAuthContext,
   envApiKeyAuth,
+  evaluateCacheWarming,
   extractDiagnosticError,
   fauxAssistantMessage,
   fauxProvider,
@@ -471,6 +489,8 @@ export {
   getApiProvider,
   getApiProviders,
   getAttributionHeaders,
+  getCacheWarmingDelayMs,
+  getCacheWarmingRequestOptions,
   getClientVersion,
   getCurrentSystemMessage,
   getCurrentSystemPrompt,
@@ -488,6 +508,7 @@ export {
   getModels,
   getOpenCodeSessionHeaders,
   getOverflowPatterns,
+  getPromptCacheTtlMs,
   getProviders,
   getSupportedThinkingLevels,
   getSystemMessageText,
@@ -497,6 +518,7 @@ export {
   hasApi,
   hasNonAdditiveToolChanges,
   hasToolRedefinitions,
+  isCacheWarmingReplayable,
   isContextOverflow,
   isModelType,
   isRecoverableLength,
@@ -528,6 +550,7 @@ export {
   resolveTranscriptTools,
   retryAssistantCall,
   retryDelayMs,
+  setBedrockProviderLoader,
   setBedrockProviderModule,
   stream,
   streamAnthropic,

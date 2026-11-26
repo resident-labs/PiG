@@ -10,6 +10,7 @@
   :pathname "src/"
   :components ((:file "package")
                (:file "errors")
+               (:file "diagnostic")
                (:file "json")
                (:file "wire")
                (:file "extension")
@@ -62,6 +63,7 @@
                (:file "virtual-model")
                (:file "mcp")
                (:file "kit")
+               (:file "ui-view")
                (:file "ui-custom")
                (:file "overlay")
                (:file "widgets")
@@ -78,6 +80,7 @@
   :pathname "tests/"
   :components ((:file "harness")
                (:file "json-tests")
+               (:file "deep-tests")
                (:file "sdk-tests")
                (:file "core-tests")
                 (:file "type-tests")
@@ -89,6 +92,7 @@
                 (:file "session-tests")
                 (:file "provider-tests")
                 (:file "ui-tests")
+                (:file "ui-view-tests")
                 (:file "editor-tests")
                 (:file "tui-alt-tests")
                 )

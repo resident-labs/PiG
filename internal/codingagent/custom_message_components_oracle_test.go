@@ -70,8 +70,7 @@ func TestCustomMessageAndEntryComponentsMatchPi(t *testing.T) {
 	if err := json.Unmarshal(output, &expected); err != nil {
 		t.Fatal(err)
 	}
-	previousCaps := tui.GetCapabilities()
-	t.Cleanup(func() { tui.SetCapabilities(previousCaps) })
+	restoreStartupTheme(t)
 	tui.SetCapabilities(tui.TerminalCapabilities{TrueColor: true})
 	tui.SetTheme("dark")
 	tui.SetKeybindings(tui.NewKeybindingsManager(tui.TUIKeybindingDefinitionsFor(tui.HostKeybindingPlatform()), nil))
@@ -93,7 +92,7 @@ func TestCustomMessageAndEntryComponentsMatchPi(t *testing.T) {
 				renderer = func(*tui.CustomMessage, tui.MessageRenderOptions) tui.Component { return nil }
 			}
 			var c *tui.CustomMessageComponent
-			c = tui.NewCustomMessageComponent(&tui.CustomMessage{CustomType: "note", Content: probe.Content}, renderer, nil, probe.Pad)
+			c = tui.NewCustomMessageComponent(&tui.CustomMessage{CustomType: "note", Content: probe.Content}, renderer, nil, probe.Pad, nil, "", "")
 			for _, step := range []struct {
 				expanded bool
 				pad      int
@@ -112,7 +111,7 @@ func TestCustomMessageAndEntryComponentsMatchPi(t *testing.T) {
 				}
 				return tui.NewPaddedText(fmt.Sprintf("custom expanded=%t pad=-", options.Expanded), 0, 0, nil)
 			}
-			c := NewCustomEntryComponent(CustomEntry{CustomType: "note"}, renderer, probe.Pad)
+			c := NewCustomEntryComponent(CustomEntry{CustomType: "note"}, renderer, nil, probe.Pad)
 			for _, step := range []struct {
 				expanded bool
 				pad      int

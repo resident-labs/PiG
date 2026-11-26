@@ -671,14 +671,20 @@ impl EditorWorker {
         call: impl FnOnce(&mut dyn EditorComponent) -> Result<T, String>,
     ) -> Option<T> {
         let component = &mut self.component;
-        match catch_unwind(AssertUnwindSafe(|| call(component.as_mut()))) {
+        match crate::diagnostic::recover(|| call(component.as_mut())) {
             Ok(Ok(value)) => Some(value),
             Ok(Err(message)) => {
                 self.fail(what, message);
                 None
             }
-            Err(_) => {
-                self.fail(what, "the component panicked".to_string());
+            Err(payload) => {
+                // The panic's value is the message, as the exception's is in Python and the condition's in Lisp.
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|text| text.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "the component panicked".to_string());
+                self.fail(what, message);
                 None
             }
         }

@@ -16,7 +16,7 @@ PiG loads prompt templates from:
 
 Disable discovery with `--no-prompt-templates`. Run `/reload` after you add or change a template in an active session.
 
-A leading `~` in a `prompts` setting entry expands to your home directory, also in `!`, `+`, `-` and wildcard entries such as `"!~/prompts/old.md"`, as in Pi 1.5.0.
+A leading `~` in a `prompts` setting entry expands to your home directory, also in `!`, `+`, `-` and wildcard entries such as `"!~/prompts/old.md"`, as in Pi 1.6.0.
 
 ## Format
 
@@ -75,7 +75,7 @@ Templates support positional arguments, defaults, and simple slicing:
 - `${@:N}` for args from the Nth position (1-indexed)
 - `${@:N:L}` for `L` args starting at N
 
-Arguments follow shell-like quoting, so `/review "API compatibility"` supplies one argument that contains a space.
+Arguments follow shell-like quoting, so `/review "API compatibility"` supplies one argument that contains a space. A quote only starts quoting at the beginning of an argument, so apostrophes inside words such as `doesn't` stay as text, and a quote with no closing match is kept as text. Inside a quoted argument, a backslash before the same quote character keeps it as text, so `/review "the \"fast\" path"` supplies `the "fast" path`; other backslashes are kept as typed.
 
 Example:
 

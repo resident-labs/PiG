@@ -25,7 +25,7 @@ import ignore from "../../../ignore/index.js";
 import { minimatch } from "../../../minimatch/dist/esm/index.js";
 import { gt, maxSatisfying, rcompare, satisfies, valid, validRange } from "../../../semver/index.js";
 import { CONFIG_DIR_NAME } from "../config.js";
-import { spawnProcess, spawnProcessSync } from "../utils/child-process.js";
+import { spawnProcess, spawnProcessSync, waitForChildProcess } from "../utils/child-process.js";
 import { parseGitUrl } from "../utils/git.js";
 import { canonicalizePath, getPathComparisonKey, isLocalPath, markPathIgnoredByCloudSync, normalizePath, pathsEqual, resolvePath, } from "../utils/paths.js";
 import { stripBom } from "../utils/text.js";
@@ -33,9 +33,24 @@ import { isStdoutTakenOver } from "./output-guard.js";
 import { readPiManifest } from "./pi-manifest.js";
 import { BUILTIN_PATH_PREFIX, getResourcePathKey } from "./source-info.js";
 const NETWORK_TIMEOUT_MS = 10000;
+/** End of a captured command's output kept for its error message. */
+const CAPTURED_OUTPUT_TAIL_CHARS = 8000;
+/** Output of git, or of ssh run by git, that failed because it could not ask for credentials. */
+const GIT_PROMPT_FAILURE = /terminal prompts disabled|could not read (Username|Password)|Permission denied \(publickey|Host key verification failed|passphrase/i;
+const GIT_CREDENTIALS_HINT = "git cannot ask for a password or passphrase while pi runs. Set up a git credential helper or an ssh agent, or install the package once from the shell with `pi install <source>`.";
+/** Make git and ssh fail instead of prompting on the terminal, which a captured command cannot answer. */
+function getNonInteractiveGitEnv(env) {
+    return {
+        ...env,
+        GIT_TERMINAL_PROMPT: "0",
+        // A user-defined GIT_SSH_COMMAND is kept: it may be needed to reach the host at all.
+        GIT_SSH_COMMAND: env.GIT_SSH_COMMAND ?? "ssh -o BatchMode=yes",
+    };
+}
 const UPDATE_CHECK_CONCURRENCY = 4;
 const GIT_UPDATE_CONCURRENCY = 4;
-function isOfflineModeEnabled() {
+/** Whether PI_OFFLINE is set; package installs and updates then skip all network access. */
+export function isOfflineModeEnabled() {
     const value = process.env.PI_OFFLINE;
     if (!value)
         return false;
@@ -639,11 +654,13 @@ export class DefaultPackageManager {
     globalNpmRoot;
     globalNpmRootCommandKey;
     progressCallback;
+    commandOutput;
     constructor(options) {
         this.cwd = resolvePath(options.cwd);
         this.agentDir = resolvePath(options.agentDir);
         this.settingsManager = options.settingsManager;
         this.builtinExtensions = options.builtinExtensions ?? [];
+        this.commandOutput = options.commandOutput ?? "inherit";
     }
     setProgressCallback(callback) {
         this.progressCallback = callback;
@@ -914,10 +931,8 @@ export class DefaultPackageManager {
         const npmCheckResults = await this.runWithConcurrency(npmCheckTasks, UPDATE_CHECK_CONCURRENCY);
         const userNpmUpdates = [];
         const projectNpmUpdates = [];
-        for (const result of npmCheckResults) {
-            if (!result.shouldUpdate) {
-                continue;
-            }
+        const npmUpdates = npmCheckResults.filter((result) => result.shouldUpdate);
+        for (const result of npmUpdates) {
             if (result.entry.scope === "user") {
                 userNpmUpdates.push(result.entry);
             }
@@ -932,13 +947,59 @@ export class DefaultPackageManager {
         if (projectNpmUpdates.length > 0) {
             tasks.push(this.updateNpmBatch(projectNpmUpdates, "project"));
         }
+        const gitUpdates = [];
         if (gitCandidates.length > 0) {
             const gitTasks = gitCandidates.map((entry) => async () => this.withProgress("update", entry.source, `Updating ${entry.source}...`, async () => {
+                const targetDir = this.getGitInstallPath(entry.parsed, entry.scope);
+                const from = await this.getGitHead(targetDir);
                 await this.updateGit(entry.parsed, entry.scope);
+                const to = await this.getGitHead(targetDir);
+                if (from !== to) {
+                    gitUpdates.push({ source: entry.source, type: "git", scope: entry.scope, from, to });
+                }
             }));
             tasks.push(this.runWithConcurrency(gitTasks, GIT_UPDATE_CONCURRENCY).then(() => { }));
         }
         await Promise.all(tasks);
+        const updated = [];
+        for (const { entry } of npmUpdates) {
+            const installedPath = this.getManagedNpmInstallPath(entry.parsed, entry.scope);
+            const to = existsSync(installedPath) ? this.getInstalledNpmVersion(installedPath) : undefined;
+            if (to !== entry.installedVersion) {
+                updated.push({ source: entry.source, type: "npm", scope: entry.scope, from: entry.installedVersion, to });
+            }
+        }
+        // Keep git results in configured order, independent of completion order.
+        for (const entry of gitCandidates) {
+            const update = gitUpdates.find((u) => u.source === entry.source && u.scope === entry.scope);
+            if (update)
+                updated.push(update);
+        }
+        // Report each changed package, e.g. "npm:foo 1.2.0 -> 1.3.0".
+        for (const pkg of updated) {
+            const format = (value) => value === undefined ? "(none)" : pkg.type === "git" ? value.slice(0, 7) : value;
+            const scope = pkg.scope === "project" ? " (project)" : "";
+            this.emitProgress({
+                type: "result",
+                action: "update",
+                source: pkg.source,
+                message: `${pkg.source}${scope} ${format(pkg.from)} -> ${format(pkg.to)}`,
+            });
+        }
+    }
+    async getGitHead(targetDir) {
+        if (!existsSync(targetDir))
+            return undefined;
+        try {
+            const head = await this.runCommandCapture("git", ["rev-parse", "HEAD"], {
+                cwd: targetDir,
+                timeoutMs: NETWORK_TIMEOUT_MS,
+            });
+            return head.trim() || undefined;
+        }
+        catch {
+            return undefined;
+        }
     }
     async shouldUpdateNpmSource(source, scope) {
         const installedPath = this.getManagedNpmInstallPath(source, scope);
@@ -1078,7 +1139,7 @@ export class DefaultPackageManager {
                 // A source that cannot be installed (no network, missing package, failing git prepare step)
                 // must not abort startup. Skip its resources, like offline mode does, and report the failure.
                 try {
-                    await this.installParsedSource(parsed, resolvedScope);
+                    await this.withProgress("install", resolvedSource, `Installing ${resolvedSource}...`, () => this.installParsedSource(parsed, resolvedScope));
                     return true;
                 }
                 catch (error) {
@@ -2309,6 +2370,9 @@ export class DefaultPackageManager {
         });
     }
     runCommand(command, args, options) {
+        if (this.commandOutput === "capture") {
+            return this.runCommandCaptured(command, args, options);
+        }
         return new Promise((resolvePromise, reject) => {
             const child = this.spawnCommand(command, args, options);
             child.on("error", reject);
@@ -2321,6 +2385,30 @@ export class DefaultPackageManager {
                 }
             });
         });
+    }
+    /**
+     * Run a command without touching the terminal: output is piped and git and ssh cannot prompt.
+     * Only the end of the output is kept, for the error message.
+     */
+    async runCommandCaptured(command, args, options) {
+        const child = spawnProcess(command, args, {
+            cwd: options?.cwd,
+            stdio: ["ignore", "pipe", "pipe"],
+            env: getNonInteractiveGitEnv(getEnv()),
+        });
+        let output = "";
+        const append = (chunk) => {
+            output = (output + chunk.toString()).slice(-CAPTURED_OUTPUT_TAIL_CHARS);
+        };
+        child.stdout.on("data", append);
+        child.stderr.on("data", append);
+        // Waits for the pipes too, but not for a background process an npm script left holding them.
+        const code = await waitForChildProcess(child);
+        if (code === 0)
+            return;
+        const tail = output.trim();
+        const hint = command === "git" && GIT_PROMPT_FAILURE.test(tail) ? `\n${GIT_CREDENTIALS_HINT}` : "";
+        throw new Error(`${command} ${args.join(" ")} failed with code ${code}${tail ? `:\n${tail}` : ""}${hint}`);
     }
     runCommandSync(command, args) {
         const env = getEnv();

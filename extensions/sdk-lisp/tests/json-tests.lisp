@@ -93,3 +93,58 @@
 (deftest malformed-json-is-an-error
   (dolist (bad '("" "{" "[1,]" "{\"a\"}" "01" "1." "-" "tru" "\"\\x\"" "[1] 2" "{\"a\":1,}" "\"a" "nul"))
     (check-error pig:json-error (dec bad))))
+
+;; A value nested past the reader's bound (10016 levels) is Pi's RangeError, not the end of the connection (wire.lisp read-frame): the request it came in is answered with
+;; that error and the connection goes on. A frame up to the bound (past the 10000 levels of the host's own marshal) reads.
+(defun nested (depth)
+  (concatenate 'string (make-string depth :initial-element #\[) "1" (make-string depth :initial-element #\])))
+
+(deftest nesting-up-to-the-bound-reads-and-past-it-is-refused
+  (check (vectorp (dec (nested 4000))))
+  (check (vectorp (dec (nested 9996))))
+  (check (vectorp (dec (nested pig::*max-json-depth*))))
+  (check-error pig:json-error (dec (nested (1+ pig::*max-json-depth*)))))
+
+;; The reader and the writer keep the containers on a stack of their own: a value nested to the bound round-trips on the image's default control stack.
+(defun nested-objects (depth)
+  (concatenate 'string (apply #'concatenate 'string (loop repeat depth collect "{\"a\":")) "1" (make-string depth :initial-element #\})))
+
+(deftest deep-values-round-trip-on-the-default-control-stack
+  (check-equal (nested 10000) (enc (dec (nested 10000))))
+  (check-equal (nested-objects 10000) (enc (dec (nested-objects 10000))))
+  (check-equal "[[],{},[1,[2]]]" (enc (dec "[[],{},[1,[2]]]")))
+  ;; Around the depth where the recursive reader and writer hand over to the walk with a stack of its own.
+  (dolist (depth '(254 255 256 257 258 600))
+    (check-equal (nested depth) (enc (dec (nested depth))))
+    (check-equal (nested-objects depth) (enc (dec (nested-objects depth))))
+    (let ((mixed (format nil "{\"k\":[~A,{\"z\":~A}],\"n\":2}" (nested depth) (nested-objects depth))))
+      (check-equal mixed (enc (dec mixed))))))
+
+(defun frame-body (text) (sb-ext:string-to-octets text :external-format :utf-8))
+
+(deftest a-frame-nested-too-deep-stands-for-an-error-answer
+  (let ((deep (nested 30000)))
+    (check-equal '("request" "c-7") (multiple-value-list (pig::frame-head (frame-body (format nil "{\"type\":\"request\",\"id\":\"c-7\",\"request\":{\"args\":~A,\"s\":\"]}\"}}" deep)))))
+    (check-equal '("call_result" "a\"b") (multiple-value-list (pig::frame-head (frame-body (format nil "{\"id\":\"a\\\"b\",\"pad\":[{\"type\":\"x\"}],\"type\":\"call_result\",\"v\":~A}" deep)))))
+    (let ((request (pig::too-deep-envelope (frame-body (format nil "{\"type\":\"request\",\"id\":\"c-1\",\"request\":{\"args\":~A}}" deep)))))
+      (check-equal "request" (pig:jget request "type"))
+      (check-equal "c-1" (pig:jget request "id"))
+      (check-equal "Maximum call stack size exceeded" (pig:jget request "refused")))
+    (let ((result (pig::too-deep-envelope (frame-body (format nil "{\"type\":\"call_result\",\"id\":\"h-2\",\"call_result\":{\"result\":~A}}" deep)))))
+      (check-equal "Maximum call stack size exceeded" (pig:jget (pig:jget (pig:jget result "call_result") "error") "message")))
+    (check-equal "refused" (pig:jget (pig::too-deep-envelope (frame-body (format nil "{\"type\":\"notify\",\"notify\":{\"args\":~A}}" deep))) "type"))))
+
+;; A string with an escape or a non-ASCII character was decoded into a buffer as long as the rest of the frame, so a frame of N bytes holding K such strings
+;; consed K x N characters: a 16 MiB frame took 20 s. The buffer is as long as the string.
+(deftest decoding-strings-with-escapes-conses-in-proportion-to-the-frame
+  (let* ((text (format nil "~{~A~^,~}"
+                       (loop for i below 2000 collect (format nil "\"line ~D\\nsecond \\\"line\\\" \\u00e9 ~A\"" i (make-string 400 :initial-element #\x)))))
+         (body (frame-body (format nil "[~A]" text)))
+         (before (sb-ext:get-bytes-consed))
+         (value (pig:decode-json body))
+         (consed (- (sb-ext:get-bytes-consed) before)))
+    (check (= 2000 (length value)))
+    (check-equal (format nil "line 7~%second \"line\" ~C ~A" (code-char 233) (make-string 400 :initial-element #\x)) (aref value 7))
+    ;; 2000 strings of about 450 characters (4 bytes each) in a frame of about 1 MB: well under 100 bytes consed per frame byte; the buffer sized by the rest of the
+    ;; frame conses about 4 MB per string, 8 GB in all.
+    (check (< consed (* 100 (length body))))))

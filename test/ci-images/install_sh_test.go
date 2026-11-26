@@ -88,10 +88,10 @@ func writeFile(t *testing.T, path string, data []byte, mode os.FileMode) {
 	}
 }
 
-// releaseArchive builds <name>/pig, a script printing the release version.
+// releaseArchive builds <name>/pig, a script that answers as PiG does: `--version` prints Pi's package version and `version` names the release and the pin.
 func releaseArchive(t *testing.T, name string) []byte {
 	t.Helper()
-	pig := []byte("#!/bin/sh\necho \"" + installVersion + "+" + coding.UpstreamVersion + "\"\n")
+	pig := []byte("#!/bin/sh\nif [ \"$1\" = version ]; then printf 'pig: " + installVersion + "\\nupstream pi: " + coding.UpstreamVersion + "\\n'; else echo \"" + coding.UpstreamPackageVersion + "\"; fi\n")
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
@@ -171,7 +171,12 @@ type installResult struct {
 // `curl ... | sh` would, never the test process's own.
 func (f installFixture) run(t *testing.T, extraEnv ...string) installResult {
 	t.Helper()
-	cmd := exec.Command(testenv.Sh(t), filepath.Join(repoRoot(t), "docs", "site", "public", "install.sh"))
+	return f.runScript(t, filepath.Join(repoRoot(t), "docs", "site", "public", "install.sh"), extraEnv...)
+}
+
+func (f installFixture) runScript(t *testing.T, script string, extraEnv ...string) installResult {
+	t.Helper()
+	cmd := exec.Command(testenv.Sh(t), script)
 	cmd.Env = append([]string{
 		"PATH=" + filepath.Join(f.root, "fakebin") + ":/usr/bin:/bin:/usr/sbin:/sbin",
 		"HOME=" + f.home,
@@ -216,16 +221,28 @@ func TestInstallShInstallsTheLatestReleaseAfterVerifyingItsSHA256(t *testing.T) 
 	if !strings.Contains(got.stdout, "Verified SHA-256 "+f.archiveSHA) {
 		t.Fatalf("stdout does not report the verified digest:\n%s", got.stdout)
 	}
-	want := installVersion + "+" + coding.UpstreamVersion
-	if !regexp.MustCompile(`Installed ` + regexp.QuoteMeta(want) + ` to `).MatchString(got.stdout) {
-		t.Fatalf("stdout does not report the installed version %s:\n%s", want, got.stdout)
+	if !regexp.MustCompile(`Installed pig ` + regexp.QuoteMeta(installVersion) + ` to `).MatchString(got.stdout) {
+		t.Fatalf("stdout does not report the installed release %s:\n%s", installVersion, got.stdout)
 	}
-	out, err := exec.Command(filepath.Join(f.installDir, "pig"), "--version").Output()
+	assertInstalledVersions(t, filepath.Join(f.installDir, "pig"))
+}
+
+// assertInstalledVersions checks an installed pig the way users read it: `--version` is Pi's package version and the `pig:` line of `pig version` is the release.
+func assertInstalledVersions(t *testing.T, pig string) {
+	t.Helper()
+	out, err := exec.Command(pig, "--version").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(string(out)) != want {
-		t.Fatalf("installed pig --version = %q, want %q", out, want)
+	if got := strings.TrimSpace(string(out)); got != coding.UpstreamPackageVersion {
+		t.Fatalf("installed pig --version = %q, want %q", got, coding.UpstreamPackageVersion)
+	}
+	out, err = exec.Command(pig, "version").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first, _, _ := strings.Cut(string(out), "\n"); first != "pig: "+installVersion {
+		t.Fatalf("installed pig version starts with %q, want %q", first, "pig: "+installVersion)
 	}
 }
 
@@ -378,9 +395,7 @@ func TestInstallShInstallsTheAndroidReleaseIntoTermuxPrefixBin(t *testing.T) {
 		t.Fatalf("install.sh did not request %s:\n%s", archive, f.requested(t))
 	}
 	installed := filepath.Join(prefix, "bin", "pig")
-	if out, err := exec.Command(installed, "--version").Output(); err != nil || !strings.Contains(string(out), installVersion) {
-		t.Fatalf("%s --version = %q, %v", installed, out, err)
-	}
+	assertInstalledVersions(t, installed)
 	if strings.Contains(got.stdout, "Add ") {
 		t.Fatalf("install.sh asks to add a directory to PATH although $PREFIX/bin is on it:\n%s", got.stdout)
 	}
@@ -477,4 +492,61 @@ func TestInstallShKeepsNonAndroidPlatformNames(t *testing.T) {
 			}
 		})
 	}
+}
+
+const remoteHint = `  ssh you@your-computer
+  pig
+Install PiG on that computer with:
+  curl -fsSL https://pi-in-go.dev/install.sh | sh
+`
+
+const iosMessage = `pig-install: error: PiG can't run on iPhone or iPad: iOS lets terminal apps run only code built into the app.
+To use PiG from this device, connect to a computer that has PiG installed, then run pig there:
+` + remoteHint
+
+const ishMessage = `pig-install: error: PiG has no build for iSH, which emulates 32-bit x86 Linux.
+To use PiG from this device, connect to a computer that has PiG installed, then run pig there:
+` + remoteHint
+
+// a-Shell on an iPhone or iPad reports uname -s Darwin and a device identifier as uname -m. The installer prints the remote-use hint and exits 1, as it does for every unsupported platform, before it fetches anything.
+func TestInstallShExplainsThatPiGDoesNotRunOnIOS(t *testing.T) {
+	for _, tc := range []struct{ unameS, unameM string }{
+		{"Darwin", "iPhone18,3"},
+		{"Darwin", "iPad14,1"},
+		{"Linux", "iPhone12,1"},
+	} {
+		t.Run(tc.unameM, func(t *testing.T) {
+			f := newInstallFixture(t)
+			got := f.runOn(t, tc.unameS, tc.unameM, "")
+			if got.status != 1 || got.stderr != iosMessage || got.stdout != "" {
+				t.Fatalf("status %d, want 1\nstdout:\n%s\nstderr:\n%s\nwant stderr:\n%s", got.status, got.stdout, got.stderr, iosMessage)
+			}
+			if _, err := os.Stat(filepath.Join(f.root, "fixtures", ".requests")); !os.IsNotExist(err) {
+				t.Fatalf("install.sh fetched something: %v", err)
+			}
+			f.assertNothingInstalled(t)
+		})
+	}
+}
+
+// iSH is 32-bit x86 Linux emulation that exposes /proc/ish. The test points the script at a stand-in for that file, because the test cannot create /proc/ish.
+func TestInstallShExplainsThatPiGDoesNotSupportISH(t *testing.T) {
+	f := newInstallFixture(t)
+	marker := filepath.Join(f.root, "proc-ish")
+	writeFile(t, marker, nil, 0o644)
+	script, err := os.ReadFile(filepath.Join(repoRoot(t), "docs", "site", "public", "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(script), "/proc/ish") {
+		t.Fatal("install.sh does not check /proc/ish")
+	}
+	patched := filepath.Join(f.root, "install-ish.sh")
+	writeFile(t, patched, []byte(strings.ReplaceAll(string(script), "/proc/ish", marker)), 0o644)
+	writeFile(t, filepath.Join(f.root, "fakebin", "uname"), []byte(fakeUname), 0o755)
+	got := f.runScript(t, patched, "PIG_INSTALL_DIR=", "FAKE_UNAME_S=Linux", "FAKE_UNAME_M=i686")
+	if got.status != 1 || got.stderr != ishMessage || got.stdout != "" {
+		t.Fatalf("status %d, want 1\nstdout:\n%s\nstderr:\n%s\nwant stderr:\n%s", got.status, got.stdout, got.stderr, ishMessage)
+	}
+	f.assertNothingInstalled(t)
 }

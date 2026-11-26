@@ -2,6 +2,7 @@ package mcp_test
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -21,7 +22,17 @@ import (
 const fixtureEnv = "MCP_TEST_FIXTURE"
 
 func TestMain(m *testing.M) {
+	testenv.GrabTerminalIfRequested()
 	switch os.Getenv(fixtureEnv) {
+	case "own-session":
+		// The server reports its process id, process group and session on stderr.
+		stat, err := os.ReadFile("/proc/self/stat")
+		if err != nil {
+			os.Exit(1)
+		}
+		fields := strings.Fields(string(stat[bytes.LastIndexByte(stat, ')')+1:]))
+		fmt.Fprintf(os.Stderr, "%d %s %s", os.Getpid(), fields[2], fields[3])
+		return
 	case "stdio-server":
 		runStdioServerFixture()
 		return
@@ -38,6 +49,9 @@ func TestMain(m *testing.M) {
 		return
 	case "term-server":
 		runShutdownFixture(false)
+		return
+	case "exiting-parent-server":
+		runExitingParentFixture()
 		return
 	case "cwd":
 		wd, err := os.Getwd()
@@ -198,4 +212,17 @@ func sleepForever() {
 	for {
 		time.Sleep(time.Hour)
 	}
+}
+
+// runExitingParentFixture is exiting-parent-server.mjs: it starts a helper
+// that inherits stdout and stderr, reports it on stderr, then exits while the
+// helper keeps running.
+func runExitingParentFixture() {
+	helper := exec.Command(os.Args[0])
+	helper.Env = append(os.Environ(), fixtureEnv+"=sigterm-sleep")
+	helper.Stdout, helper.Stderr = os.Stdout, os.Stderr
+	if err := helper.Start(); err != nil {
+		panic(err)
+	}
+	fmt.Fprintf(os.Stderr, "helper %d\n", helper.Process.Pid)
 }

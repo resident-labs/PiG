@@ -98,7 +98,7 @@ type RemoteOverlayOptions struct {
 	// position and size. Nil leaves them to the host's defaults.
 	OverlayOptions *OverlayOptions `json:"overlayOptions,omitempty"`
 	// Blocked is upstream ui.custom()'s blocked option: while an inline component (Overlay false) is visible, the terminal's program
-	// status reports pi as blocked on it. An overlay ignores it.
+	// status reports pi as blocked on it. An overlay reports it until it ends, also while hidden with SetHidden.
 	Blocked *RemoteOverlayBlocked `json:"blocked,omitempty"`
 	// OnHandle is upstream ui.custom()'s onHandle: it receives the mounted overlay's [OverlayHandle] (Overlay must be true). It stays in
 	// this process.
@@ -250,6 +250,10 @@ func hostOptionalString(c Context, method, field string) (*string, error) {
 // Context provides the extension handler with access to host UI methods,
 // session state, and message injection. It is passed to every tool, command,
 // and event handler.
+//
+// Context has no method that continues a turn or appends a compaction at a turn's end. A turn_end or agent_before_settle handler does both with its result:
+// "entries" (custom, custom_message, context_edit and compaction drafts) and "continue" (one more provider request, no new user message). An extension that owns
+// compaction continues a turn after a provider overflow this way; see "Own compaction and continue after an overflow" in the extensions guide.
 type Context struct {
 	ext        *Extension
 	toolCallID string // set for tool handlers
@@ -267,6 +271,8 @@ type Context struct {
 	systemPrompt *SystemPrompt
 	// replacement is set for a withSession context: the replacement Session's locally answered values.
 	replacement *replacementState
+	// req is the event request a handler is serving, for ObjectKeys.
+	req *requestMsg
 }
 
 // RegisterTool registers a model-callable tool and waits for the host registry refresh. It shares Extension.RegisterTool's validation and panic behavior.
@@ -349,22 +355,14 @@ func (c Context) callHostAfterBegin(method string, args any, detached bool, sent
 		sent()
 	}
 	result, err := c.hostConnection().waitCall(pending)
-	// The host sends the state a publishing call changed before the call's result, and the main loop applies notifies after the read loop routed the result here: wait for those notifies so the caller's next replicated read sees the write.
-	if err == nil && result != nil && statePublishingCalls[method] && c.ext != nil && c.hostConnection() == c.ext.conn {
+	// The host pushes its state before the result of a call that changed it, and before any result when a host-side change has not reached this extension yet (Host.replyToCall). The main loop applies notifies after the read loop routed the result here, so wait for them: the caller's next replicated read is then never older than the result, or than the write the call made. The wait is a counter compare when no state precedes the result.
+	if err == nil && result != nil && c.ext != nil && c.hostConnection() == c.ext.conn {
 		c.ext.waitNotifications(result.notifySeq, nil)
 	}
 	if !effect {
 		c.reportRequestState("progress", "")
 	}
 	return result, err
-}
-
-// statePublishingCalls are the Session writes after which the host pushes its state before the call's result (coding/extension/host/subprocess
-// host_calls.go publishesStateBeforeResult): the calls whose effect an SDK reads from replicated state. Pi's equivalents change the Session
-// synchronously, so a read after the call must see the write (agent-session.ts setModel, setSessionName, sessionManager.appendLabelChange and
-// appendCustomEntry, sendCustomMessage).
-var statePublishingCalls = map[string]bool{
-	"setModel": true, "appendEntry": true, "setLabel": true, "setSessionName": true, "sendMessage": true,
 }
 
 // rpcSynchronousUIEffects are the UI calls Pi's RPC mode applies at once, inside the handler's synchronous part (rpc-mode.ts
@@ -608,12 +606,15 @@ func (c Context) EditorWithoutPrefill(title string) (any, bool, error) {
 
 // SendMessageOptions configures how the message is delivered.
 //
-// Both fields are optional, as upstream's are: a nil TriggerTurn or empty
+// TriggerTurn and DeliverAs are optional, as upstream's are: a nil TriggerTurn or empty
 // DeliverAs is sent as unset, and the host applies upstream's default for the
 // session's state (while a turn streams, an unset triggerTurn steers).
 type SendMessageOptions struct {
 	TriggerTurn *bool  // nil: host default; true starts or joins a turn; false never does
 	DeliverAs   string // "steer", "followUp", or "nextTurn"; empty: host default
+	// Details is upstream's message `details`: extension data kept with the message and not sent to the model. Nil leaves the member out;
+	// json.RawMessage("null") writes it as null.
+	Details any
 }
 
 // SendMessage injects a custom message into the conversation. With TriggerTurn the run it starts keeps [Context.IsIdle] busy until the handler yields ([Context.Yield], [Context.Sleep]) or returns; a handler that polls for that run with a raw time.Sleep stays busy.
@@ -625,14 +626,11 @@ func (c Context) SendMessage(customType, content string, display bool, opts Send
 	if opts.DeliverAs != "" {
 		options["deliverAs"] = opts.DeliverAs
 	}
-	result, err := c.callHost("sendMessage", map[string]any{
-		"message": map[string]any{
-			"customType": customType,
-			"content":    content,
-			"display":    display,
-		},
-		"options": options,
-	})
+	message := map[string]any{"customType": customType, "content": content, "display": display}
+	if !omittedMember(opts.Details) {
+		message["details"] = opts.Details
+	}
+	result, err := c.callHost("sendMessage", map[string]any{"message": message, "options": options})
 	if err != nil {
 		return err
 	}
@@ -690,11 +688,16 @@ func (c Context) SendCustomMessage(msg CustomMessage, opts SendMessageOptions) e
 	return nil
 }
 
-// SendUserMessage injects a user message containing a string or text/image content blocks.
+// SendUserMessage injects a user message containing a string or text/image content blocks. deliverAs is "steer" or "followUp"; "" sends no deliverAs, as pi.sendUserMessage(content) does: an idle agent runs the message at once and a streaming agent refuses it with Pi's error ("Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.", an extension error event send_user_message; the call itself returns), so pass "followUp" to queue it behind a run.
 func (c Context) SendUserMessage(content any, deliverAs string) error {
+	return c.SendUserMessageWith(content, SendUserMessageOptions{DeliverAs: deliverAs})
+}
+
+// SendUserMessageWith is pi.sendUserMessage with Pi's whole options object (types.ts:1792). ExpandPromptTemplates true dispatches an extension command and expands a skill command or prompt template in the text as typed input would; nil is Pi's default, false. On a withSession context the call runs on the replacement Session and returns after it.
+func (c Context) SendUserMessageWith(content any, options SendUserMessageOptions) error {
 	result, err := c.callHost("sendUserMessage", map[string]any{
 		"content": content,
-		"options": map[string]any{"deliverAs": deliverAs},
+		"options": options,
 	})
 	if err != nil {
 		return err
@@ -705,16 +708,18 @@ func (c Context) SendUserMessage(content any, deliverAs string) error {
 	return nil
 }
 
-// AppendEntry appends a custom entry to the session for persistence.
+// AppendEntry appends a custom entry to the session for persistence. A nil data leaves the entry without a data member, as Pi's appendEntry(customType)
+// does; json.RawMessage("null") writes the member as null, as appendEntry(customType, null) does.
 func (c Context) AppendEntry(customType string, data any) error {
-	result, err := c.callHost("appendEntry", map[string]any{
-		"customType": customType,
-		"data":       data,
-	})
+	args := map[string]any{"customType": customType}
+	if !omittedMember(data) {
+		args["data"] = data
+	}
+	result, err := c.callHost("appendEntry", args)
 	if err != nil {
 		return err
 	}
-	// upstream: agent-session.ts:3406-3411 (appendEntry): the entry is in the session log when appendEntry returns. callHost waits for the state the host pushed before the result (statePublishingCalls), so the caller's next session read sees the entry.
+	// upstream: agent-session.ts:3406-3411 (appendEntry): the entry is in the session log when appendEntry returns. callHost waits for the state the host pushed before the result, so the caller's next session read sees the entry.
 	return callResultError(result, nil)
 }
 
@@ -737,8 +742,11 @@ func (c Context) PasteToEditor(text string) {
 
 // ── Session State ────────────────────────────────────────────────────────────
 
-// GetSessionName returns the current session name. Pi's getSessionName is `string | undefined`: nil means the session has no name, and a host or transport failure is returned as an error.
+// GetSessionName returns the current session name. Pi's getSessionName is `string | undefined`: nil means the session has no name, and a host or transport failure is returned as an error. Like [Context.GetSessionID] it is replicated, and a [Context.SetSessionName] is visible to the next read.
 func (c Context) GetSessionName() (*string, error) {
+	if s, known, err := c.localSession(); known {
+		return optionalString(s.name), err
+	}
 	return hostOptionalString(c, "getSessionName", "name")
 }
 
@@ -754,10 +762,20 @@ func (c Context) SetSessionName(name string) error {
 	return nil
 }
 
-// SetLabel sets or clears an entry label. The host's failure is returned, as
-// upstream's setLabel throws when the session cannot record the label.
+// SetLabel sets or clears an entry label. The label is written as given: an empty one clears the label and its entry holds `"label":""`, as Pi's
+// setLabel(entryId, "") writes it. The host's failure is returned, as upstream's setLabel throws when the session cannot record the label.
 func (c Context) SetLabel(entryID, label string) error {
-	result, err := c.callHost("setLabel", map[string]string{"entryId": entryID, "label": label})
+	return c.SetLabelValue(entryID, label)
+}
+
+// SetLabelValue is SetLabel for every form Pi's setLabel(entryId, label?) takes. A nil label is the call without a label, whose entry has no label
+// member; json.RawMessage("null") is a null label, written as null; a string is written as given. All but a string that is not empty clear the label.
+func (c Context) SetLabelValue(entryID string, label any) error {
+	args := map[string]any{"entryId": entryID}
+	if label != nil {
+		args["label"] = label
+	}
+	result, err := c.callHost("setLabel", args)
 	if err != nil {
 		return err
 	}
@@ -791,10 +809,42 @@ func (c Context) SetThinkingLevel(level string) {
 	_, _ = c.callHost("setThinkingLevel", map[string]string{"level": level})
 }
 
-// SetModel changes the active model.
-func (c Context) SetModel(model string) (bool, error) {
-	result, err := c.callHost("setModel", map[string]string{"model": model})
-	if err != nil {
+// SetModel is Pi's pi.setModel(model): it makes model, a Pi model object, the Session's model and reports whether it did. It reports false, and changes
+// nothing, when the model's provider has no configured auth. The Session uses the object as given, with the members the caller left on it (its context
+// window, limits, base URL, compat): a model taken from ModelRegistry and edited, or one built by hand for a provider the host knows. The model_select
+// handlers have run when it returns. A Go map has no member order, so an edited or hand-built object reaches model_select with its members sorted.
+//
+// SetModelNamed takes a `provider/id` name instead.
+func (c Context) SetModel(model map[string]any) (bool, error) {
+	return c.setModel(model)
+}
+
+// SetModelNamed is SetModel for the model a `provider/id` name stands for: the registry's model of that name. An id no catalog lists names no model: the
+// error is "Model not found: provider/id", as for Pi's RPC set_model, and nothing is set. A name with no slash is an openai model. It asks the host for the model object and then sets it, two calls: the
+// object the first call returned is the one set, whatever the registry became in between, and an error of the first call is returned without setting.
+func (c Context) SetModelNamed(spec string) (bool, error) {
+	result, err := c.callHost("resolveModel", map[string]string{"spec": spec})
+	if err := callResultError(result, err); err != nil {
+		return false, err
+	}
+	if result == nil {
+		return false, nil
+	}
+	var resolved struct {
+		Model json.RawMessage `json:"model"`
+		Error string          `json:"error,omitempty"`
+	}
+	_ = json.Unmarshal(result.Result, &resolved)
+	if resolved.Error != "" {
+		return false, fmt.Errorf("%s", resolved.Error)
+	}
+	return c.setModel(resolved.Model)
+}
+
+func (c Context) setModel(model any) (bool, error) {
+	result, err := c.callHost("setModel", map[string]any{"model": model})
+	// The host rejects a value that is not a chat model object; Pi's Promise rejects.
+	if err := callResultError(result, err); err != nil {
 		return false, err
 	}
 	if result == nil {
@@ -1101,8 +1151,16 @@ func decodeModelProvider(raw json.RawMessage) string {
 	return ""
 }
 
-// GetModelInfo returns structured metadata about the active model. Pi's model is `Model | undefined`: nil means no model is set, and a host or transport failure is returned as an error.
+// GetModelInfo returns structured metadata about the active model. Pi's model is `Model | undefined`: nil means no model is set, and a host or transport failure is returned as an error. The host's state snapshots replicate the model object, so the read costs no host round trip; a replacement context, or one made before the first snapshot, asks the host. A context of a replaced or reloaded runtime returns the stale message, as the host answered it.
 func (c Context) GetModelInfo() (*ModelInfo, error) {
+	if c.replacement == nil && c.ext != nil {
+		if err := c.staleError(); err != nil {
+			return nil, err
+		}
+		if info, known, err := c.ext.replicatedModelInfo(); known {
+			return info, err
+		}
+	}
 	info, err := hostDecoded[ModelInfo](c, "getModelInfo", nil)
 	if err != nil || info.ID == "" {
 		return nil, err
@@ -1330,13 +1388,19 @@ func (c Context) GetEntries() ([]json.RawMessage, error) {
 	return c.ext.session.getEntries(), nil
 }
 
-// GetSessionID returns the current session ID, including for in-memory sessions.
+// GetSessionID returns the current session ID, including for in-memory sessions. The host's state snapshots replicate it, so the read costs no host round trip; a replacement context, or one made before the first snapshot, asks the host. A context of a replaced or reloaded runtime returns the stale message, as the host answered it.
 func (c Context) GetSessionID() (string, error) {
+	if s, known, err := c.localSession(); known {
+		return s.id, err
+	}
 	return hostRequired[string](c, "getSessionID", nil, "sessionId")
 }
 
-// GetSessionFile returns the current session file path. Pi's getSessionFile is `string | undefined`: nil means an in-memory session.
+// GetSessionFile returns the current session file path. Pi's getSessionFile is `string | undefined`: nil means an in-memory session. Like [Context.GetSessionID] it is replicated: the host pushes it when a Session is replaced.
 func (c Context) GetSessionFile() (*string, error) {
+	if s, known, err := c.localSession(); known {
+		return optionalString(s.file), err
+	}
 	return hostOptionalString(c, "getSessionFile", "sessionFile")
 }
 
@@ -1526,9 +1590,7 @@ func snapshotEvent(event map[string]any, finalKey string, final map[string]any) 
 		return nil, nil, err
 	}
 	shown := make(map[string]any, len(event))
-	for key, value := range event {
-		shown[key] = value
-	}
+	maps.Copy(shown, event)
 	shown[finalKey] = finalWire
 	wire, err = json.MarshalJS(shown)
 	return wire, finalWire, err
@@ -1552,7 +1614,8 @@ func (s *ModelEventStream) Events(ctx context.Context) <-chan map[string]any {
 }
 
 // drain hands the queued events to emit in source order until the stream is terminal and empty or ctx is done. An event is consumed once emit returns true; when emit returns
-// false drain stops and the event stays queued.
+// false drain stops and the event stays queued. ctx is read again after an event is taken: an author that saw the cancel pushed its later events after ctx was done, so none of
+// them is handed to emit, also when the cancel arrived between the read at the top of the loop and the take.
 func (s *ModelEventStream) drain(ctx context.Context, emit func(modelStreamItem) bool) {
 	for {
 		select {
@@ -1565,7 +1628,7 @@ func (s *ModelEventStream) drain(ctx context.Context, emit func(modelStreamItem)
 		if len(s.queue) > 0 {
 			item := s.queue[0]
 			s.mu.Unlock()
-			if !emit(item) {
+			if ctx.Err() != nil || !emit(item) {
 				s.delivery.Unlock()
 				return
 			}
@@ -1712,11 +1775,11 @@ func (r ModelRegistry) Stream(model, request, options map[string]any) *ModelEven
 }
 
 func (r ModelRegistry) stream(model, request, options map[string]any, simple bool) *ModelEventStream {
-	return r.streamOn("", model, request, options, simple)
+	return r.streamOn(nil, model, request, options, simple)
 }
 
-// streamOn runs the stream on the session graph ModelRuntime runtime names; empty is the Session's runtime.
-func (r ModelRegistry) streamOn(runtime string, model, request, options map[string]any, simple bool) *ModelEventStream {
+// streamOn runs the stream on the session graph ModelRuntime object owner; nil is the Session's runtime.
+func (r ModelRegistry) streamOn(owner *graphObject, model, request, options map[string]any, simple bool) *ModelEventStream {
 	stream := newModelEventStream()
 	streamID := fmt.Sprintf("model-stream-%d", r.context.ext.modelStreamSeq.Add(1))
 	r.context.ext.modelStreamsMu.Lock()
@@ -1736,9 +1799,11 @@ func (r ModelRegistry) streamOn(runtime string, model, request, options map[stri
 		r.context.ext.modelStreamsMu.Unlock()
 	}
 	go func() {
+		// The host runs the stream on the runtime's object by handle: it stays reachable until the stream's call is answered.
+		defer keepAlive(owner)
 		call := map[string]any{"streamId": streamID, "model": model, "request": merged, "simple": simple}
-		if runtime != "" {
-			call["runtime"] = runtime
+		if owner != nil {
+			call["runtime"] = owner.handle
 		}
 		if callbacks != nil {
 			callbacks.flags(call)
@@ -1826,7 +1891,7 @@ type ExecOptions struct {
 	MaxBuffer *float64 `json:"maxBuffer,omitempty"`
 	// Signal is upstream's options.signal. When it is done the host terminates the command, as Pi does: the command alone
 	// receives SIGTERM (the process is killed on Windows), no descendant is signalled, and the call returns the output
-	// written so far with Killed set and ExitCode 0, which is what a command that a signal ended reports. A Signal that is done
+	// written so far with Killed set and ExitCode 143 (128 + SIGTERM), which is what a command that a signal ended reports. A Signal that is done
 	// before the call starts the command and ends it at once. SIGKILL follows the SIGTERM five seconds later if the command has not
 	// exited, as it does for a timeout or a MaxBuffer overflow.
 	//
@@ -1957,8 +2022,11 @@ func (c Context) SetTheme(name string) (bool, string) {
 // A [kit.View] is the kit form of a widget component factory (D107): the host
 // renders it at the widget's width every frame. Without options it goes out
 // as a widget_push, and with options as a ui.setWidget call; neither carries
-// lines.
+// lines. After the session was replaced or reloaded, every form returns the stale message as an error and sends nothing.
 func (c Context) SetWidget(key string, content any, options ...WidgetOptions) error {
+	if err := c.staleError(); err != nil {
+		return err
+	}
 	if view, ok := content.(kit.View); ok {
 		return c.setWidgetView(key, view, options)
 	}
@@ -2117,7 +2185,7 @@ func (c Context) runRemoteComponent(component overlayComponent, options any) (_ 
 	if err != nil {
 		return nil, err
 	}
-	if err := overlay.render(c.hostConnection(), key, c.Width()); err != nil {
+	if err := overlay.render(c.hostConnection(), key, c.terminalWidth()); err != nil {
 		_ = c.hostConnection().notify("ui.custom.close", map[string]any{"key": key})
 		_, _ = c.hostConnection().waitCall(pending)
 		return nil, err
@@ -2324,8 +2392,14 @@ func (c Context) HasUI() bool {
 	return c.ext.hasUI
 }
 
-// Width returns the terminal width (from the ready message).
+// Width returns the terminal width (from the ready message). It panics with the stale message after the session was replaced or reloaded.
 func (c Context) Width() int {
+	c.assertActive()
+	return c.terminalWidth()
+}
+
+// terminalWidth is the width the host last reported, without the stale check: the SDK's own renders and pushes read it, and a push from a stale context fails with the host's error, never with a panic on a goroutine of the SDK.
+func (c Context) terminalWidth() int {
 	c.ext.mu.RLock()
 	defer c.ext.mu.RUnlock()
 	return c.ext.width
@@ -2333,7 +2407,9 @@ func (c Context) Width() int {
 
 // Height returns the current terminal height in rows. Updated by height_change
 // notifications from the host. Returns 0 if the host has not reported a height.
+// It panics with the stale message after the session was replaced or reloaded.
 func (c Context) Height() int {
+	c.assertActive()
 	c.ext.mu.RLock()
 	defer c.ext.mu.RUnlock()
 	return c.ext.height
@@ -2414,6 +2490,9 @@ func (c Context) ToolCallID() string {
 // string or a ToolResult (or any value with its wire shape). The host shows
 // updates in order, before the tool's final result.
 func (c Context) OnUpdate(partial any) error {
+	if err := c.staleError(); err != nil {
+		return err
+	}
 	if c.toolCallID == "" || c.requestID == "" {
 		return errors.New("OnUpdate is only available while a tool runs")
 	}
@@ -2496,7 +2575,7 @@ func (c Context) CompactWithOptions(opts CompactOptions) {
 		// must not take the extension down with it.
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				fmt.Fprintf(os.Stderr, "extension: recovered from panic in compact callback: %v\n%s\n", recovered, debug.Stack())
+				diagnosticf("extension: recovered from panic in compact callback: %v\n%s\n", recovered, debug.Stack())
 			}
 		}()
 		result, err := conn.call("compact", args)

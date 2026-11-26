@@ -389,7 +389,7 @@ export function composeModelProvider(providerId, base, modelConfig, extension) {
         return simple
             ? api.streamSimple(model, context, options)
             : api.stream(model, context, options);
-    });
+    }, undefined, options?.signal);
     const provider = {
         id: providerId,
         name: extension?.name ?? config?.name ?? base?.name ?? extension?.oauth?.name ?? providerId,
@@ -398,6 +398,8 @@ export function composeModelProvider(providerId, base, modelConfig, extension) {
         auth: { ...(apiKey ? { apiKey } : {}), ...(oauth ? { oauth } : {}) },
         getModels: () => getAllModels().filter((model) => isModelType(model, "chat")),
         getAllModels,
+        // Extension hooks read context.credential, so they need the default credential refresh.
+        refreshModelsAuth: extension?.refreshModels || extension?.oauth?.modifyModels ? undefined : base?.refreshModelsAuth,
         refreshModels: base?.refreshModels || extension?.refreshModels || extension?.oauth?.modifyModels
             ? async (context) => {
                 await base?.refreshModels?.(context);

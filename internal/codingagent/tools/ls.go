@@ -6,14 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"unicode/utf8"
-
-	"golang.org/x/text/collate"
-	"golang.org/x/text/language"
 
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/jsstring/localecompare"
@@ -94,14 +92,19 @@ func (t *LsTool) operations() LsOperations {
 func (t *LsTool) Name() string  { return "ls" }
 func (t *LsTool) Label() string { return "" }
 
-func (t *LsTool) Schema() ai.ToolSchema {
+func (t *LsTool) Schema() ai.ToolSchema { return t.schema(false) }
+
+// BorrowedSchema is Schema with the parameters shared, not copied: the caller reads them and never modifies them.
+func (t *LsTool) BorrowedSchema() ai.ToolSchema { return t.schema(true) }
+
+func (t *LsTool) schema(borrow bool) ai.ToolSchema {
 	return toolSchemaWithParameters(ai.ToolSchema{
 		Name:        "ls",
 		Description: "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first).",
 	}, `{"type":"object","properties":{
 		"path":{"type":"string","description":"Directory to list (default: current directory)"},
 		"limit":{"type":"number","description":"Maximum number of entries to return (default: 500)"}
-	}}`)
+	}}`, borrow)
 }
 
 func (t *LsTool) ExecutionMode() agent.ToolExecutionMode { return agent.ToolModeParallel }
@@ -131,6 +134,8 @@ func (t *LsTool) Execute(ctx context.Context, _ string, rawParams json.RawMessag
 	if p.Limit != nil {
 		effectiveLimit = *p.Limit
 	}
+	// Pi main 676af1d77 (#11747) reads a limit below 1 as 1 and floors a fractional one.
+	effectiveLimit = math.Max(1, math.Floor(effectiveLimit))
 	ops := t.operations()
 	if exists, err := ops.Exists(dirPath); err != nil || !exists {
 		return lsError("Path not found: " + dirPath), nil
@@ -191,9 +196,9 @@ func (t *LsTool) Execute(ctx context.Context, _ string, rawParams json.RawMessag
 	result := agent.AgentToolResult{}
 	if len(notices) > 0 {
 		output += "\n\n[" + strings.Join(notices, ". ") + "]"
-		shareTruncatedContent(details.Truncation, output)
 		result.Details = details
 	}
+	output = sharedOutput(details.Truncation, output)
 	result.Content = []ai.ToolResultMessageContent{ai.TextContent{Text: output}}
 	return result, nil
 }
@@ -204,7 +209,7 @@ func lsError(message string) agent.AgentToolResult {
 
 // sortEntriesLikeLocaleCompare is upstream ls.ts:109 `entries.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))`:
 // localeCompare is ICU root collation, and Array.prototype.sort is stable. Each name is lowercased and weighed once: comparing collation
-// keys orders names as localecompare.Collator.CompareString does, which compares with collate.New(language.Und) unless a name holds U+FFFD
+// keys orders names as localecompare.Collator.CompareString does unless a name holds U+FFFD
 // (TestLsCollationKeysOrderLikeCollator checks the two orders agree). Names holding U+FFFD sort by localecompare.Collator itself. Collators
 // keep scratch state, so each call owns one: ls runs in parallel mode.
 func sortEntriesLikeLocaleCompare(entries []string) {
@@ -213,20 +218,28 @@ func sortEntriesLikeLocaleCompare(entries []string) {
 		key         []byte
 	}
 	sorted := make([]sortEntry, len(entries))
-	replacement := false
+	replacement, lowerBytes := false, 0
 	for i, entry := range entries {
 		lower := jsstring.ToLower(entry)
 		sorted[i] = sortEntry{name: entry, lower: lower}
 		replacement = replacement || strings.Contains(lower, "\uFFFD")
+		lowerBytes += len(lower)
 	}
 	if replacement {
 		collator := localecompare.NewCollator()
 		slices.SortStableFunc(sorted, func(a, b sortEntry) int { return collator.CompareString(a.lower, b.lower) })
 	} else {
-		collator := collate.New(language.Und)
-		var buf collate.Buffer
+		collator := localecompare.NewCollator()
+		keys := make([]byte, 0, 8*lowerBytes) // a key takes about 5 bytes per ASCII byte of name; growing it by doubling costs 4 MB of copies at 10,000 names
+		ends := make([]int, len(sorted))
 		for i := range sorted {
-			sorted[i].key = collator.KeyFromString(&buf, sorted[i].lower)
+			keys = collator.AppendKey(keys, sorted[i].lower)
+			ends[i] = len(keys)
+		}
+		start := 0
+		for i := range sorted {
+			sorted[i].key = keys[start:ends[i]:ends[i]]
+			start = ends[i]
 		}
 		slices.SortStableFunc(sorted, func(a, b sortEntry) int { return bytes.Compare(a.key, b.key) })
 	}

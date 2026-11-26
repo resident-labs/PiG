@@ -5,27 +5,30 @@
 // started the extension with those arguments, the same stdio, and its exit
 // status. package.json names the package the way Pi's CLI entry's does, which
 // is how extensions (pi-subagents) recognize a Pi entry.
+//
+// Pi's entry is the agent itself, so SIGKILL of the entry ends the agent. Here
+// the entry is a wrapper and SIGKILL cannot be forwarded, so the entry never
+// starts the binary: it starts a supervisor (supervisor.mjs) that does, and
+// that kills the binary when its IPC channel to the entry closes. No instant
+// has a running binary without a supervisor to end it, whenever and however the
+// entry dies. Signals sent to the entry reach the binary through the channel.
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { exitAfterStderr } from "../exit-after-stderr.mjs";
+import { endLike, signals } from "./relay.mjs";
 
-const binary = process.env.PIG_HARNESS_BINARY;
-if (!binary) {
-  exitAfterStderr("PIG_HARNESS_BINARY is not set: this entry runs the PiG binary that started the extension");
-  await new Promise(() => {});
-}
+run();
 
-const signals = ["SIGINT", "SIGTERM", "SIGHUP"];
-const child = spawn(binary, process.argv.slice(2), { stdio: "inherit" });
-const forward = (signal) => child.kill(signal);
-for (const signal of signals) process.on(signal, forward);
-child.on("error", (error) => {
-  exitAfterStderr(`${binary}: ${error.message}`);
-});
-child.on("exit", (code, signal) => {
-  if (signal) {
-    for (const name of signals) process.off(name, forward);
-    process.kill(process.pid, signal);
+function run() {
+  if (!process.env.PIG_HARNESS_BINARY) {
+    exitAfterStderr("PIG_HARNESS_BINARY is not set: this entry runs the PiG binary that started the extension");
     return;
   }
-  process.exit(code ?? 1);
-});
+  const supervisor = spawn(process.execPath, [fileURLToPath(new URL("./supervisor.mjs", import.meta.url)), ...process.argv.slice(2)], {
+    stdio: ["inherit", "inherit", "inherit", "ipc"],
+  });
+  const forward = (signal) => supervisor.connected && supervisor.send({ signal }, () => {});
+  for (const signal of signals) process.on(signal, forward);
+  supervisor.on("error", (error) => exitAfterStderr(`${process.execPath}: ${error.message}`));
+  supervisor.on("exit", (code, signal) => endLike(code, signal, forward));
+}

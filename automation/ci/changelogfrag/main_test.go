@@ -37,16 +37,19 @@ func TestFragmentRules(t *testing.T) {
 		files map[string]string
 		want  string // empty: no problem
 	}{
-		"valid":              {map[string]string{"loop-0123abc.md": good}, ""},
-		"name without sha":   {map[string]string{"loop.md": good}, "is named <lane>-<sha>.md"},
-		"uppercase lane":     {map[string]string{"Loop-0123abc.md": good}, "is named <lane>-<sha>.md"},
-		"short sha":          {map[string]string{"loop-012.md": good}, "is named <lane>-<sha>.md"},
-		"no heading":         {map[string]string{"loop-0123abc.md": "- The loop exits.\n"}, "before the first"},
-		"unknown section":    {map[string]string{"loop-0123abc.md": "### Misc\n\n- x\n"}, "is not one of"},
-		"paragraph":          {map[string]string{"loop-0123abc.md": "### Fixed\n\nFixed the loop.\n"}, "neither a bullet"},
-		"no bullet":          {map[string]string{"loop-0123abc.md": "### Fixed\n"}, "no bullet"},
-		"not markdown":       {map[string]string{"loop-0123abc.txt": good}, "only .md"},
-		"legacy name exempt": {map[string]string{}, ""},
+		"valid":               {map[string]string{"loop-0123abc.md": good}, ""},
+		"name without sha":    {map[string]string{"loop.md": good}, "is named <lane>-<sha>.md"},
+		"uppercase lane":      {map[string]string{"Loop-0123abc.md": good}, "is named <lane>-<sha>.md"},
+		"short sha":           {map[string]string{"loop-012.md": good}, "is named <lane>-<sha>.md"},
+		"no heading":          {map[string]string{"loop-0123abc.md": "- The loop exits.\n"}, "before the first"},
+		"unknown section":     {map[string]string{"loop-0123abc.md": "### Misc\n\n- x\n"}, "is not one of"},
+		"paragraph":           {map[string]string{"loop-0123abc.md": "### Fixed\n\nFixed the loop.\n"}, "neither a bullet"},
+		"no bullet":           {map[string]string{"loop-0123abc.md": "### Fixed\n"}, "no bullet"},
+		"not markdown":        {map[string]string{"loop-0123abc.txt": good}, "only .md"},
+		"data-only go.mod":    {map[string]string{"go.mod": "module example.com/changelog.d\n"}, ""},
+		"go.mod lookalike":    {map[string]string{"go.mod.bak": "module example.com/changelog.d\n"}, "go.mod.bak: only .md"},
+		"stray beside go.mod": {map[string]string{"go.mod": "module example.com/changelog.d\n", "notes.txt": "x"}, "notes.txt: only .md"},
+		"legacy name exempt":  {map[string]string{}, ""},
 	} {
 		t.Run(name, func(t *testing.T) {
 			saved := legacyList
@@ -180,6 +183,78 @@ func TestFoldAppendsToTheReleaseAndDeletesTheFragments(t *testing.T) {
 	assertFile(t, changelog, strings.Replace(want, "- Old fix. <!-- fix: 89abcdef01 -->\n", "- Old fix. <!-- fix: 89abcdef01 -->\n- Fix C. <!-- fix: 0123abcdef -->\n", 1))
 }
 
+// foldTree writes a changelog.d holding the named files, a changelog with an empty release, and a version-records file
+// that lists the directory, and returns their paths.
+func foldTree(t *testing.T, files map[string]string) (dir, changelog, legacyPath, recordsPath, records string) {
+	t.Helper()
+	root := t.TempDir()
+	dir = filepath.Join(root, "changelog.d")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, text := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	changelog = filepath.Join(root, "CHANGELOG.md")
+	legacyPath = filepath.Join(root, "legacy.txt")
+	recordsPath = filepath.Join(root, "version-records.toml")
+	records = "[[record]]\nversion = \"1.4.0\"\nreason = \"r\"\npaths = [\"docs/a.md\", \"" + filepath.ToSlash(dir) + "/\"]\n"
+	for path, text := range map[string]string{
+		changelog:   "# Changelog\n\n## [Unreleased]\n\n## [1.0.0] - 2026-10-15\n\n### Fixed\n\n- Fix X.\n",
+		legacyPath:  "",
+		recordsPath: records,
+	} {
+		if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir, changelog, legacyPath, recordsPath, records
+}
+
+func TestFoldKeepsTheDataOnlyGoModAndStillDropsTheRecordEntry(t *testing.T) {
+	saved := legacyList
+	defer func() { legacyList = saved }()
+	legacyList = ""
+	const goMod = "// This directory holds data only.\nmodule example.com/changelog.d\n"
+	dir, changelog, legacyPath, recordsPath, _ := foldTree(t, map[string]string{
+		"go.mod":       goMod,
+		"a-0123abc.md": "### Fixed\n\n- Fix A. <!-- fix: 0123abcdef -->\n",
+	})
+	fragments, problems := load(dir)
+	if len(problems) != 0 || len(fragments) != 1 {
+		t.Fatalf("load = %v, %v: want the one fragment and no problem", fragments, problems)
+	}
+	if err := foldInto(dir, changelog, legacyPath, recordsPath, "1.0.0", fragments); err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, filepath.Join(dir, "go.mod"), goMod)
+	if left, _ := os.ReadDir(dir); len(left) != 1 {
+		t.Fatalf("changelog.d holds %d files after the fold, want only go.mod", len(left))
+	}
+	assertFile(t, recordsPath, "[[record]]\nversion = \"1.4.0\"\nreason = \"r\"\npaths = [\"docs/a.md\"]\n")
+}
+
+func TestFoldKeepsTheRecordEntryWhileAStrayFileRemains(t *testing.T) {
+	saved := legacyList
+	defer func() { legacyList = saved }()
+	legacyList = ""
+	dir, changelog, legacyPath, recordsPath, records := foldTree(t, map[string]string{
+		"go.mod":       "module example.com/changelog.d\n",
+		"notes.txt":    "x",
+		"a-0123abc.md": "### Fixed\n\n- Fix A. <!-- fix: 0123abcdef -->\n",
+	})
+	fragments, problems := load(dir)
+	if len(problems) != 1 || !strings.Contains(problems[0].Error(), "notes.txt: only .md") || len(fragments) != 1 {
+		t.Fatalf("load = %v, %v: want the one fragment and the notes.txt problem", fragments, problems)
+	}
+	if err := foldInto(dir, changelog, legacyPath, recordsPath, "1.0.0", fragments); err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, recordsPath, records)
+}
+
 func TestFoldRefusesUnsortedFragmentsAndAMissingRelease(t *testing.T) {
 	const changelog = "## [Unreleased]\n\n## [1.0.0] - 2026-10-15\n\n### Fixed\n\n- Fix X.\n"
 	if _, err := fold(changelog, []fragment{{name: "old.md", unsorted: "- Old."}}, "1.0.0"); err == nil || !strings.Contains(err.Error(), "old.md") {
@@ -207,6 +282,71 @@ func TestFoldRefusesABulletTheLedgerWouldGuessAbout(t *testing.T) {
 	}
 }
 
+// set-version leaves the entries under "## [Unreleased]" there unless it is given --move-unreleased, and the fold only
+// moves fragments, so a fold at release would publish a section that lacks them (0.8.0's Security entry). The fold
+// refuses until they are moved, and refuses before it changes anything.
+func TestFoldRefusesWhileUnreleasedHoldsEntries(t *testing.T) {
+	const withEntry = "## [Unreleased]\n\n### Security\n\n- Update a dependency.\n\n## [1.0.0] - 2026-10-15\n\n### Fixed\n\n- Fix X.\n"
+	marked := []fragment{{name: "a-0123abc.md", items: map[string][]string{"Fixed": {"Fix A. <!-- fix: 0123abcdef -->"}}}}
+	for name, fragments := range map[string][]fragment{"with fragments": marked, "without fragments": nil} {
+		_, err := fold(withEntry, fragments, "1.0.0")
+		if err == nil || !strings.Contains(err.Error(), "[Unreleased]") || !strings.Contains(err.Error(), "--move-unreleased") {
+			t.Errorf("%s: fold with an entry under Unreleased: err = %v", name, err)
+		}
+	}
+	// Whitespace alone is not an entry, and entries of a released section are not Unreleased's.
+	for _, changelog := range []string{
+		"## [Unreleased]\n\n## [1.0.0] - 2026-10-15\n\n### Fixed\n\n- Fix X.\n",
+		"# Changelog\n\n## [Unreleased]\n\n\n\n## [1.0.0] - 2026-10-15\n\n### Fixed\n\n- Fix X.\n",
+	} {
+		if _, err := fold(changelog, marked, "1.0.0"); err != nil {
+			t.Errorf("fold with an empty Unreleased: %v", err)
+		}
+	}
+
+	root := t.TempDir()
+	dir := filepath.Join(root, "changelog.d")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fragmentText := "### Fixed\n\n- Fix A. <!-- fix: 0123abcdef -->\n"
+	changelog := filepath.Join(root, "CHANGELOG.md")
+	legacyPath := filepath.Join(root, "legacy.txt")
+	recordsPath := filepath.Join(root, "version-records.toml")
+	for path, text := range map[string]string{filepath.Join(dir, "a-0123abc.md"): fragmentText, changelog: withEntry, legacyPath: "", recordsPath: ""} {
+		if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fragments, problems := load(dir)
+	if len(problems) != 0 {
+		t.Fatal(problems)
+	}
+	if err := foldInto(dir, changelog, legacyPath, recordsPath, "1.0.0", fragments); err == nil {
+		t.Fatal("foldInto succeeded with an entry under Unreleased")
+	}
+	assertFile(t, changelog, withEntry)
+	assertFile(t, filepath.Join(dir, "a-0123abc.md"), fragmentText)
+}
+
+// Fragments are assembled under Unreleased by `make changelog-unreleased` and never written there, so -fold=Unreleased is
+// refused with its own message, not the one that tells the user to run set-version for a version called Unreleased.
+func TestFoldRefusesUnreleasedAsTheTarget(t *testing.T) {
+	marked := []fragment{{name: "a-0123abc.md", items: map[string][]string{"Fixed": {"Fix A. <!-- fix: 0123abcdef -->"}}}}
+	for name, changelog := range map[string]string{
+		"empty Unreleased":   "## [Unreleased]\n\n## [1.0.0] - 2026-10-15\n\n### Fixed\n\n- Fix X.\n",
+		"Unreleased entries": "## [Unreleased]\n\n### Security\n\n- Update a dependency.\n\n## [1.0.0] - 2026-10-15\n\n### Fixed\n\n- Fix X.\n",
+	} {
+		_, err := fold(changelog, marked, "Unreleased")
+		if err == nil || !strings.Contains(err.Error(), "not a release") || !strings.Contains(err.Error(), "make changelog-unreleased") {
+			t.Errorf("%s: fold into Unreleased: err = %v, want the not-a-release message", name, err)
+		}
+		if err != nil && strings.Contains(err.Error(), "VERSION=Unreleased") {
+			t.Errorf("%s: the message tells the user to run set-version for Unreleased: %v", name, err)
+		}
+	}
+}
+
 func assertFile(t *testing.T, path, want string) {
 	t.Helper()
 	got, err := os.ReadFile(path)
@@ -215,5 +355,33 @@ func assertFile(t *testing.T, path, want string) {
 	}
 	if string(got) != want {
 		t.Fatalf("%s:\n%q\nwant:\n%q", path, got, want)
+	}
+}
+
+func TestFoldRemovesVersionRecordsPerFragmentEntry(t *testing.T) {
+	saved := legacyList
+	defer func() { legacyList = saved }()
+	legacyList = ""
+	dir, clPath, legacyPath, recordsPath, _ := foldTree(t, map[string]string{
+		"d243-123827b998.md": "### Fixed\n\n- SDK local bash fix. <!-- fix: 123827b998 -->\n",
+	})
+	entry := filepath.ToSlash(dir) + "/d243-123827b998.md"
+	records := "[[record]]\nversion = \"1.5.1\"\nreason = \"Fragment names an earlier Pi release.\"\npaths = [\n  \"docs/site/docs/bug-ledger.md\",\n  \"" + entry + "\",\n]\n"
+	if err := os.WriteFile(recordsPath, []byte(records), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	frags, problems := load(dir)
+	if len(problems) != 0 || len(frags) != 1 {
+		t.Fatalf("load = %v, %v", frags, problems)
+	}
+	if err := foldInto(dir, clPath, legacyPath, recordsPath, "1.0.0", frags); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(recordsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), entry) {
+		t.Fatalf("per-fragment record path survived fold:\n%s", got)
 	}
 }

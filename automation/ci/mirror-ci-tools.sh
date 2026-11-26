@@ -10,13 +10,16 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 repo="${FETCH_OCI_REPO:-michaelkinsy/pig-ci-tools}" registry=ghcr.io
+sc=0.11.0
 assets=(
+  "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198 https://github.com/koalaman/shellcheck/releases/download/v$sc/shellcheck-v$sc.linux.x86_64.tar.xz"
+  "12b331c1d2db6b9eb13cfca64306b1b157a86eb69db83023e261eaa7e7c14588 https://github.com/koalaman/shellcheck/releases/download/v$sc/shellcheck-v$sc.linux.aarch64.tar.xz"
   "c1d593d01551f2c9a3df5ca0a0be4385a839bd9b86d4a76e18d7b17d16559127 https://github.com/google/go-containerregistry/releases/download/v0.20.6/go-containerregistry_Linux_x86_64.tar.gz"
 )
-# The table above must carry the pin the seeder carries.
+# The table above must carry the pins the installers carry.
 for entry in "${assets[@]}"; do
   digest=${entry%% *}
-  grep -qs -- "$digest" "$root/automation/ci/seed-ci-image-bases.sh" || { echo "mirror-ci-tools.sh: $digest is no longer pinned by the seeder" >&2; exit 1; }
+  grep -qs -- "$digest" "$root/automation/ci/install-shellcheck.sh" "$root/automation/ci/seed-ci-image-bases.sh" || { echo "mirror-ci-tools.sh: $digest is no longer pinned by the installers" >&2; exit 1; }
 done
 # The TinyGo the Durable jobs install (tinygo-install.sh) is the linux/amd64 tinygo row of automation/dev/toolchains.lock: its digest and url, so the mirror
 # never carries a pin of its own for it.

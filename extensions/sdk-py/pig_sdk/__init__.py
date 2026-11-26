@@ -33,6 +33,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, NotRequired, Protocol, TypeAlias, TypedDict
 from . import editor_component as _editor_component
+from ._diagnostic import diagnose
 from .editor_component import EditorBase as EditorBase, EditorComponent as EditorComponent, EditorFactory as EditorFactory, EditorStatus as EditorStatus
 from .autocomplete import AutocompleteProvider as AutocompleteProvider, AutocompleteProviderFactory, _AutocompleteRegistry
 from .session_manager import ReadonlySessionManager, SessionManager as SessionManager, SetupSessionManager
@@ -93,7 +94,7 @@ from .llm_convert import convert_to_llm as convert_to_llm
 from .serialize_conversation import _ordered_keys, serialize_conversation as serialize_conversation
 from .session_entry_messages import session_entry_to_context_messages as session_entry_to_context_messages
 from .session_context import SESSION_LEAF_LAST as SESSION_LEAF_LAST, build_session_context as build_session_context
-from .type_engine import BIGINT_STRINGIFY_ERROR, BigInt as BigInt, holds_bigint as _holds_bigint
+from .type_engine import BIGINT_STRINGIFY_ERROR, BigInt as BigInt, Value as Value, TLocalizedValidationError as TLocalizedValidationError, holds_bigint as _holds_bigint
 from .type_schema import Refinement as Refinement, TSchema as TSchema, TSchemaArray as TSchemaArray, Type as Type, type_to_json as type_to_json
 from .stored_credential import read_stored_credential as read_stored_credential
 from .pi_ai_helpers import (
@@ -139,6 +140,9 @@ from . import kit as kit
 from . import _tui_state
 from . import tui as tui  # loaded here with every other module: tests/test_staged_directory_independence.py
 from .kit import ViewComponent as ViewComponent
+from . import ui_view as _ui_view
+
+from .ui_view import ViewAbilities as ViewAbilities, ViewAsset as ViewAsset, ViewClaim as ViewClaim, ViewDrawingAbilities as ViewDrawingAbilities, ViewNotice as ViewNotice, ViewSlotClaims as ViewSlotClaims, ViewError as ViewError, ViewInput as ViewInput, ViewIntent as ViewIntent, ViewIntentInvocation as ViewIntentInvocation, ViewIntentResult as ViewIntentResult, ViewLimits as ViewLimits, ViewRef as ViewRef, ViewShape as ViewShape, ViewStatus as ViewStatus, ViewTarget as ViewTarget
 from .event_bus import EventBus as EventBus, EventBusHandler as EventBusHandler, _EventBusHub
 from .state_feed import StateFeed
 from .user_bash import BashExecOptions as BashExecOptions, BashOperations as BashOperations, _BashOperationsTable, _data_update, _run_user_bash_exec, _user_bash_operations_reply
@@ -158,11 +162,41 @@ from .provider import (
     dispatch_operation as _dispatch_provider_operation,
 )
 
+# Default of finish_view's result: a call that passes no result at all, told apart from one that passes None.
+_NO_VIEW_RESULT: Any = object()
+
 # Maximum frame size (128 MB). Bounds a single length-prefixed frame to guard
 # against unbounded allocation while allowing large host responses such as
 # getBranch on a long session. Must match the host and other-language SDK
 # MaxFrameSize constants.
 MAX_FRAME_SIZE = 128 * 1024 * 1024
+
+
+class _Null:
+    """The type of :data:`NULL`."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "pig_sdk.NULL"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+NULL: Any = _Null()
+"""An optional session entry member written as JSON null.
+
+``None`` leaves such a member out, as Pi leaves out an argument that is not given (``appendEntry(customType)``). ``NULL`` writes it as null, as
+``appendEntry(customType, null)`` does. It is accepted for the data of ``append_entry``, for the details of ``send_message`` and anywhere in a handler's
+result (a draft's ``data``, ``details`` or ``usage``, a compaction's ``details`` or ``usage``), where ``None`` under a key is also null."""
+
+
+def _json_default(value: Any) -> Any:
+    """The hook json.dumps calls for a value it cannot encode: NULL is JSON null."""
+    if value is NULL:
+        return None
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 # Winsock's AF_UNIX family and sockaddr_un path capacity (afunix.h).
 _WINSOCK_AF_UNIX = 1
@@ -275,12 +309,24 @@ EventHandler: TypeAlias = Callable[["Context", dict[str, Any]], Any]
 
 
 def _clone_stream_value(value: Any) -> Any:
-    """Copies the containers of a decoded event payload; strings are immutable and shared."""
-    if isinstance(value, dict):
-        return {key: _clone_stream_value(member) for key, member in value.items()}
-    if isinstance(value, list):
-        return [_clone_stream_value(member) for member in value]
-    return value
+    """Copies the containers of a decoded event payload; strings are immutable and shared. It walks with a stack of its own: a payload nested past the interpreter's recursion limit is copied too."""
+    if not isinstance(value, (dict, list)):
+        return value
+    root: Any = {} if isinstance(value, dict) else []
+    stack = [(value, root)]
+    while stack:
+        source, target = stack.pop()
+        for key, member in source.items() if isinstance(source, dict) else enumerate(source):
+            if isinstance(member, (dict, list)):
+                child: Any = {} if isinstance(member, dict) else []
+                stack.append((member, child))
+            else:
+                child = member
+            if isinstance(target, dict):
+                target[key] = child
+            else:
+                target.append(child)
+    return root
 
 
 def _apply_stream_ops(root: Any, ops: Any) -> Any:
@@ -340,6 +386,24 @@ class ProjectTrustResult(TypedDict):
 ProjectTrustHandler: TypeAlias = Callable[["Context", dict[str, Any]], ProjectTrustResult]
 ShortcutHandler: TypeAlias = Callable[["Context"], None]
 RendererHandler: TypeAlias = Callable[["Context", dict[str, Any], dict[str, Any], int], list[str]]
+# An event handler of a message view renderer's view: (ctx, message, options, event); see Extension.message_view_event.
+MessageViewEventHandler: TypeAlias = Callable[["Context", dict[str, Any], "MessageRenderOptions", kit.Event], Any]
+# An event handler of an entry view renderer's view: (ctx, entry, options, event); see Extension.entry_view_event.
+EntryViewEventHandler: TypeAlias = Callable[["Context", dict[str, Any], "EntryRenderOptions", kit.Event], Any]
+
+
+class _RenderCard:
+    """The renderer state of one displayed message or entry, which the host names with a key. Requests for one card run
+    one at a time, as Pi draws a message on one thread. ``subject`` is the message or entry as its first request decoded
+    it: every request for the card receives that one object, as Pi's renderer receives one message object."""
+
+    __slots__ = ("lock", "state", "subject")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.state: dict[str, Any] = {}
+        self.subject: dict[str, Any] | None = None
+
 
 
 # Upstream 0.99.1 extension API additions (types.ts:509-607, 1708-1855, 2161-2169).
@@ -429,6 +493,11 @@ class ToolRenderContext:
     state: dict[str, Any]
     # Recorded execution time of a final result in milliseconds. Absent while the result is partial and for results stored without one. upstream: ToolRenderContext.durationMs
     duration_ms: int | None = None
+    #: What the renderer of this phase (call or result) of this card returned on its previous run, as upstream's
+    #: ``ToolRenderContext.lastComponent`` is the component the renderer returned before. A renderer that returns lines or a
+    #: :class:`kit.View` returns no component object, so those lines (a list) or that view stand in for it. ``None`` on the
+    #: card's first run of the phase and after a run that raised (upstream forgets the component a throwing renderer left).
+    last_component: "list[str] | kit.View | None" = None
     _invalidate: Callable[[], None] = field(repr=False, default=lambda: None)
 
     def invalidate(self) -> None:
@@ -445,7 +514,16 @@ class ToolRenderContext:
 
 class MessageRenderOptions(dict[str, Any]):
     """The options a custom-message renderer receives: the host's ``{"expanded", "outputPad"}`` mapping plus the host's
-    keybinding hints (Pi 9376c8d1 #4748)."""
+    keybinding hints (Pi 9376c8d1 #4748).
+
+    ``state`` is the renderer state of the displayed message, the dict a Pi renderer keeps in a WeakMap keyed by the
+    message: every request for one message (the host names it with a key) receives the same dict, so a click handler
+    registered with :meth:`Extension.message_view_event` and the renderer share it. A request without a key gets a
+    fresh dict. It is an attribute, not a key of the mapping."""
+
+    def __init__(self, wire: Any = (), state: dict[str, Any] | None = None) -> None:
+        super().__init__(wire)
+        self.state: dict[str, Any] = {} if state is None else state
 
     def key_text(self, keybinding: str) -> str:
         """``KeybindingHints.keyText``: the keys of a keybinding as the host's configured keybindings show them, empty when it has none."""
@@ -458,7 +536,7 @@ class MessageRenderOptions(dict[str, Any]):
 
 class EntryRenderOptions(MessageRenderOptions):
     """The options a custom-entry renderer receives: the host's ``{"expanded"}`` mapping plus the host's keybinding hints
-    (Pi 9376c8d1 #4748)."""
+    (Pi 9376c8d1 #4748) and the displayed entry's ``state`` (see :class:`MessageRenderOptions`)."""
 
 
 # A call renderer: (ctx, args, render context, width) -> lines.
@@ -1135,6 +1213,10 @@ class _RemoteOverlayState:
         """Queue the host's ui.custom.focus behind the input already queued."""
         return self._enqueue("focus", focused)
 
+    def enqueue_invalidate(self, count: int) -> bool:
+        """Queue the host's ui.custom.invalidate (its TUI was invalidated ``count`` times) behind the input already queued."""
+        return self._enqueue("invalidate", count)
+
     @property
     def is_view(self) -> bool:
         """Whether the component describes its frames as kit views."""
@@ -1283,8 +1365,8 @@ def _dispose_remote_component(component: RemoteComponent) -> None:
     if callable(set_invalidate):
         try:
             set_invalidate(None)
-        except Exception:  # noqa: BLE001 - reported on stderr, the extension log, as the Go SDK's overlay stop does
-            print(f"extension: recovered from exception in a component's set_invalidate(None):\n{traceback.format_exc()}", file=sys.stderr, end="")
+        except Exception:  # noqa: BLE001 - reported in the extension log, as the Go SDK's overlay stop does
+            diagnose(f"extension: recovered from exception in a component's set_invalidate(None):\n{traceback.format_exc()}")
     dispose = getattr(component, "dispose", None)
     if callable(dispose):
         try:
@@ -1293,9 +1375,69 @@ def _dispose_remote_component(component: RemoteComponent) -> None:
             pass
 
 
+def _json_text(value: Any) -> str:
+    """json.dumps of ``value``, written with a stack of its own when the value is nested past the interpreter's recursion limit."""
+    try:
+        return json.dumps(value, default=_json_default)
+    except RecursionError:
+        return _dumps_deep(value)
+
+
+def _event_edit_messages(name: str, data: dict[str, Any]) -> list[Any]:
+    """The message objects of an event a handler may edit in place, by the position the reply names them at (``_pigEventEdits``): message_end has one, turn_end its assistant message and then its tool results. The reply is about these objects, so assigning another value to the member changes nothing, as assigning event.message changes nothing in Pi."""
+    if name in ("message_start", "message_end"):
+        return [data.get("message")]
+    if name == "agent_end":
+        messages = data.get("messages")
+        return list(messages) if isinstance(messages, list) else []
+    if name == "turn_end":
+        results = data.get("toolResults")
+        return [data.get("message"), *(results if isinstance(results, list) else [])]
+    return []
+
+
+def _snapshot_event_messages(messages: list[Any]) -> list[str | None]:
+    """The JSON text of each message as the handler received it (member order included), or None for a value that is no dict."""
+    return [_json_text(message) if isinstance(message, dict) else None for message in messages]
+
+
+def _event_message_edits(messages: list[Any], before: list[str | None]) -> list[dict[str, Any]]:
+    """The messages whose JSON text the handler changed, each at its position, as the handler left it."""
+    return [{"at": at, "message": message} for at, (message, text) in enumerate(zip(messages, before, strict=True)) if text is not None and _json_text(message) != text]
+
+
+# The events whose own members a handler may assign, reassign or delete for the later handlers of the dispatch: Pi hands every handler of an emit the one event object (runner.ts emit).
+_MEMBER_EVENTS = frozenset({"message_start", "message_update", "turn_start", "agent_start", "agent_end"})
+
+
+def _same_member(was: Any, now: Any) -> bool:
+    """Whether the handler left a member as it received it: a scalar by value and type, a dict or a list by identity (an edit inside a message is carried by the message entries)."""
+    return was is now or (isinstance(was, (str, int, float)) and type(was) is type(now) and was == now)
+
+
+def _event_member_edits(data: dict[str, Any], before: dict[str, Any]) -> list[dict[str, Any]]:
+    """The members the handler left different from the ones it received, as the second form of the reply's ``_pigEventEdits`` entries: ``{"member", "value"}`` for one it added or reassigned, ``{"member", "deleted": True}`` for one it deleted."""
+    edits: list[dict[str, Any]] = []
+    for name, value in before.items():
+        if name not in data:
+            edits.append({"member": name, "deleted": True})
+        elif not _same_member(value, data[name]):
+            edits.append({"member": name, "value": data[name]})
+    edits.extend({"member": name, "value": value} for name, value in data.items() if name not in before)
+    return edits
+
+
+def _json_loads(text: str) -> Any:
+    """json.loads of ``text``, read with a stack of its own when it nests past the interpreter's limit (the host's values nest up to 10000 levels). A value nested past MAX_FRAME_DEPTH raises RecursionError; malformed JSON raises ValueError."""
+    try:
+        return json.loads(text)
+    except RecursionError:
+        return _loads_deep(text.encode("utf-8", "surrogatepass"))
+
+
 def _ensure_jsonable(value: Any, what: str) -> None:
     try:
-        json.dumps(value)
+        _json_text(value)
     except (TypeError, ValueError) as exc:
         if _holds_bigint(value):
             raise TypeError(BIGINT_STRINGIFY_ERROR) from exc  # a schema that holds a bigint: JSON.stringify's message
@@ -1313,6 +1455,9 @@ class HostCallError(RuntimeError):
         super().__init__(message if not code else f"{code}: {message}")
         self.code = code
         self.message = message
+        # Pi's ShellTimeoutError.shellExit (not exported by Pi): set only by the SDK, on the error of a local shell command that timed out after its shell had
+        # exited. Pi's bash tool tells that error by class, so only this error, raised from an exec unchanged, keeps it (see _local_exec).
+        self._shell_exit: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -1890,7 +2035,7 @@ class ModelRegistry:
     def stream(self, model: dict[str, Any], request: dict[str, Any], options: dict[str, Any] | None = None) -> ModelEventStream:
         return self._stream(model, request, options, False)
 
-    def _stream(self, model: dict[str, Any], request: dict[str, Any], options: dict[str, Any] | None, simple: bool, runtime: str | None = None) -> ModelEventStream:
+    def _stream(self, model: dict[str, Any], request: dict[str, Any], options: dict[str, Any] | None, simple: bool, owner: Any = None) -> ModelEventStream:
         stream = ModelEventStream()
         extension = self._context.extension
         with extension._model_stream_lock:
@@ -1909,11 +2054,12 @@ class ModelRegistry:
             with extension._model_stream_lock:
                 extension._model_stream_callbacks[stream_id] = (model, callbacks)
 
+        # The host runs the stream on the runtime's object by handle: this closure keeps the object, whose release names the handle, until the stream's call is answered.
         def run() -> None:
             try:
                 call = {"streamId": stream_id, "model": model, "request": payload, "simple": simple}
-                if runtime:
-                    call["runtime"] = runtime
+                if owner is not None:
+                    call["runtime"] = owner.handle
                 call.update({name: True for name in callbacks})
                 self._context._call("modelStream", call)
             except Exception as exc:  # noqa: BLE001 - transport failure becomes terminal model error
@@ -2219,6 +2365,9 @@ class _RequestParent:
     socket: Any
     state: str = "active"
     finished: bool = False
+    # pig divergence (D617): the Python SDK has one static Context type, so the method exists on every context; the host answers a command-only call from a context that did not send this mark with not_a_command_context.
+    # True for the request of a command handler or a withSession callback, whose context is Pi's command context. The context keeps the kind after the request ended, and the host refuses the command-only session actions (new_session, fork, navigate_tree, switch_session, reload) from any other.
+    command: bool = False
 
 
 def _surface_args(lines: list[str], width: int) -> dict[str, Any]:
@@ -2263,7 +2412,7 @@ class _SurfaceRenderer:
         with self._lock:
             if self._stopped:
                 return
-            width = ctx.width
+            width = ctx._terminal_width()
             try:
                 rendered = self.render(width)
                 # The Node runtime sends [] for a render result that is not an
@@ -2377,6 +2526,8 @@ class _ToolStart:
         self._previous = previous
         self.done = threading.Event()
         self._order = order
+        # The id of the request, which ``_ToolBatches.reserve`` sets; only ``_ToolBatches._observer`` reads it.
+        self._request_id = ""
         # Set when the request waits for its first host call and every earlier request passed its place; made only when the request has to wait. It, _dialog_passed, _dialog_opened, _ended and _slot are guarded by the order's lock.
         self._dialog_waiting: threading.Event | None = None
         self._dialog_passed = False
@@ -2388,11 +2539,16 @@ class _ToolStart:
     def begin(self) -> None:
         if self._previous is not None:
             self._previous.wait()
+        batches = self._order._batches
+        if batches is not None and batches._observer is not None:
+            batches._observer("tool_call", self._request_id)
         self.done.set()
 
     def end(self) -> None:
         """Hand the places on when the request's thread ends, also for a request that failed before it reached its handler. Like ``begin`` it waits for the earlier requests first, so a request without a handler cannot let a later handler start before an earlier one. Idempotent."""
-        self.begin()
+        if self._previous is not None:
+            self._previous.wait()
+        self.done.set()
         self._finish()
 
     def release(self) -> None:
@@ -2473,18 +2629,27 @@ class _ToolStart:
 class _RequestStart:
     """One request's place in the order the handlers start (``_starts_in_arrival_order``). ``begin`` returns when every earlier request began its handler or ended without one."""
 
-    def __init__(self, previous: threading.Event | None) -> None:
+    def __init__(self, previous: threading.Event | None, order: "_RequestStartOrder", method: str, request_id: str) -> None:
         self._previous = previous
         self.done = threading.Event()
+        self._order = order
+        self._method = method
+        self._request_id = request_id
 
+    # pig divergence (D658): the place is handed on before the handler's first statement runs, so a descheduled thread can be overtaken; Pi runs a handler to its first await in invocation order.
     def begin(self) -> None:
         if self._previous is not None:
             self._previous.wait()
+        observer = self._order._observer
+        if observer is not None:
+            observer(self._method, self._request_id)
         self.done.set()
 
     def end(self) -> None:
         """Hand the place on when the request's thread ends, also for a request that failed before it reached its handler. Like ``begin`` it waits for the earlier requests first, so a request without a handler cannot let a later handler start before an earlier one. Idempotent."""
-        self.begin()
+        if self._previous is not None:
+            self._previous.wait()
+        self.done.set()
 
     def release(self) -> None:
         """Hand the place on at once, for a request whose thread never started. The reader calls it, so it must not wait for the earlier requests. Idempotent."""
@@ -2505,11 +2670,13 @@ class _RequestStartOrder:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._tail: threading.Event | None = None
+        # Set by tests before the extension serves, never while it runs. It is called with the method and id of each request that invokes a handler, after the earlier places were released and before this one is.
+        self._observer: Callable[[str, str], None] | None = None
 
-    def reserve(self) -> _RequestStart:
+    def reserve(self, method: str, request_id: str) -> _RequestStart:
         """Take the next place. The reader calls this in arrival order, before it starts the request's thread."""
         with self._lock:
-            start = _RequestStart(self._tail)
+            start = _RequestStart(self._tail, self, method, request_id)
             self._tail = start.done
             return start
 
@@ -2568,14 +2735,18 @@ class _ToolBatches:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._orders: dict[str, _ToolStartOrder] = {}
+        # Set by tests before the extension serves, never while it runs. It is called with "tool_call" and the id of each request whose handler is invoked, after the earlier places of its batch were released and before this one is.
+        self._observer: Callable[[str, str], None] | None = None
 
-    def reserve(self, batch: str) -> _ToolStart:
+    def reserve(self, batch: str, request_id: str) -> _ToolStart:
         """Take the next place in the batch's order. The reader calls this in arrival order, before it starts the request's thread."""
         with self._lock:
             order = self._orders.get(batch)
             if order is None:
                 order = self._orders[batch] = _ToolStartOrder(self, batch)
-            return order.reserve()
+            start = order.reserve()
+            start._request_id = request_id
+            return start
 
     def _drop(self, batch: str, order: _ToolStartOrder) -> None:
         with self._lock:
@@ -2761,12 +2932,12 @@ class _SystemPrompt:
     def __init__(self, ctx: "Context", options: dict[str, Any], prompt: Any) -> None:
         self._ctx = ctx
         self._options = options
-        self._key = json.dumps(options)
+        self._key = _json_text(options)
         self._prompt = prompt if isinstance(prompt, str) else ""
         self._lock = threading.Lock()
 
     def get(self) -> str:
-        key = json.dumps(self._options)
+        key = _json_text(self._options)
         with self._lock:
             if key != self._key:
                 self._prompt = self._ctx._reply_field("renderSystemPrompt", "prompt", {"options": self._options})
@@ -2808,6 +2979,9 @@ _RPC_SYNCHRONOUS_UI_EFFECTS = frozenset({
 })
 
 
+# Context has no method that continues a turn or appends a compaction at a turn's end: a turn_end or agent_before_settle handler does both with its result,
+# "entries" (custom, custom_message, context_edit and compaction drafts) and "continue" (one more provider request, no new user message). See "Own compaction
+# and continue after an overflow" in the extensions guide.
 @dataclass
 class Context:
     extension: "Extension"
@@ -2869,6 +3043,7 @@ class Context:
         ``partial`` is a string or a mapping with the tool-result shape. The
         host shows updates in order, before the tool's final result.
         """
+        self._assert_call_active()
         if not self.tool_call_id or not self.request_id:
             raise RuntimeError("on_update is only available while a tool runs")
         result = {"content": partial} if isinstance(partial, str) else partial
@@ -2929,6 +3104,16 @@ class Context:
     def call_host(self, method: str, args: Any = None) -> Any:
         return self._call(method, args).get("result")
 
+    def with_file_mutation_queue(self, file_path: str, fn: Callable[[], Any]) -> Any:
+        """Pi's ``withFileMutationQueue`` for a handler that has its context: run ``fn`` in the host's file mutation queue for ``file_path`` and return its result.
+
+        A tool that takes the queue through its context registers in the order Pi's one thread runs the batch's tools (D187); the free ``with_file_mutation_queue``
+        registers in the order the calls reach the host. See :func:`pig_sdk.file_mutation_queue.with_context_file_mutation_queue`.
+        """
+        from .file_mutation_queue import with_context_file_mutation_queue
+
+        return with_context_file_mutation_queue(self, file_path, fn)
+
     def create_agent_session(self, options: CreateAgentSessionOptions | None = None) -> AgentSession:
         """Pi's ``createAgentSession``: create a child agent session in the host and return once it is ready.
 
@@ -2969,6 +3154,7 @@ class Context:
         Raises ``RuntimeError`` until the host has sent them, as upstream's
         ``getSettings`` throws before the runner binds.
         """
+        self._assert_call_active()
         return self.extension._get_settings()
 
     @property
@@ -3100,7 +3286,7 @@ class Context:
         optional, as upstream's are: None is sent as unset and the host applies
         upstream's default for the session's state. ``details`` is upstream's
         message ``details``, extension data kept with the message and not sent
-        to the model; None leaves it unset.
+        to the model; None leaves it unset and ``NULL`` writes it as null.
 
         ``trigger_turn=True`` marks the session busy, and ``is_idle`` stays
         busy until the code that sent it yields, as in Pi until its first
@@ -3119,21 +3305,36 @@ class Context:
             message["details"] = details
         self._call("sendMessage", {"message": message, "options": options})
 
-    def send_user_message(self, content: str | list[dict[str, Any]], deliver_as: str = "followUp") -> None:
-        """Send text or a list of text/image content blocks as a user message."""
-        self._call("sendUserMessage", {"content": content, "options": {"deliverAs": deliver_as}})
+    def send_user_message(self, content: str | list[dict[str, Any]], deliver_as: str | None = None, expand_prompt_templates: bool | None = None) -> None:
+        """Send text or a list of text/image content blocks as a user message. ``deliver_as`` is ``"steer"`` or ``"followUp"``; None sends no ``deliverAs``, as ``pi.sendUserMessage(content)`` does: an idle agent runs the message at once and a streaming agent refuses it with Pi's error (``Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.``, an extension error event ``send_user_message``; the call itself returns), so pass ``deliver_as="followUp"`` to queue it behind a run. ``expand_prompt_templates=True`` dispatches an extension command and expands a skill command or prompt template in the text as typed input would (types.ts:1792); None is Pi's default, False."""
+        options: dict[str, Any] = {}
+        if deliver_as is not None:
+            options["deliverAs"] = deliver_as
+        if expand_prompt_templates is not None:
+            options["expandPromptTemplates"] = bool(expand_prompt_templates)
+        self._call("sendUserMessage", {"content": content, "options": options})
 
     def scoped_models(self) -> list[dict[str, Any]]:
         """Return the resolved session scope in selection order."""
         return self._call("getScopedModels", {}).get("result") or []
 
     def append_entry(self, custom_type: str, data: Any) -> None:
-        self._call("appendEntry", {"customType": custom_type, "data": data})
+        """Append a custom entry. ``None`` leaves the entry without a ``data`` member, as Pi's ``appendEntry(customType)`` does; ``NULL`` writes the member as null, as ``appendEntry(customType, null)`` does."""
+        args: dict[str, Any] = {"customType": custom_type}
+        if data is not None:
+            args["data"] = data
+        self._call("appendEntry", args)
 
     # Editor/session/model state -------------------------------------------
 
     @property
     def width(self) -> int:
+        """The terminal width. Raises the stale message after the session was replaced or reloaded."""
+        self._assert_active()
+        return self._terminal_width()
+
+    def _terminal_width(self) -> int:
+        """The width the host last reported, without the stale check: the SDK's own renders and pushes read it, and a push from a stale context fails with the host's error, never with an exception on a thread of the SDK."""
         with self.extension._state_lock:
             return self.extension._width
 
@@ -3141,19 +3342,30 @@ class Context:
     def height(self) -> int:
         """Terminal height in rows, or 0 when the host has not reported one.
 
-        Updated by ``height_change`` notifications.
+        Updated by ``height_change`` notifications. Raises the stale message after the session was replaced or reloaded.
         """
+        self._assert_active()
         with self.extension._state_lock:
             return self.extension._height
 
-    def _assert_active(self) -> None:
-        """Raise the Host's stale message once the session was replaced or reloaded, as Pi's ExtensionContext getters throw it (runner.ts:571-600). A replacement context belongs to the new session and is not stale."""
+    def _stale_message(self) -> str | None:
+        """The Host's stale message once the session was replaced or reloaded, else None. A replacement context belongs to the new session and is not stale."""
         if self._replacement is not None:
-            return
+            return None
         with self.extension._state_lock:
-            message = self.extension._stale_message
+            return self.extension._stale_message
+
+    def _assert_active(self) -> None:
+        """Raise the Host's stale message once the session was replaced or reloaded, as Pi's ExtensionContext getters throw it (runner.ts:571-600)."""
+        message = self._stale_message()
         if message is not None:
             raise RuntimeError(message)
+
+    def _assert_call_active(self) -> None:
+        """Raise the stale message as the HostCallError a call to the host raises, for the calls that send no host call to be answered with it."""
+        message = self._stale_message()
+        if message is not None:
+            raise HostCallError(message)
 
     def _current_model(self) -> tuple[str, str]:
         """The model's id and provider id. A replacement context asks the host, since this process replicates only the requesting Session's model."""
@@ -3248,14 +3460,21 @@ class Context:
         self._call("ui.pasteToEditor", {"text": text})
 
     def get_session_name(self) -> str | None:
-        """The session name, or None when the session has no name (Pi's ``string | undefined``)."""
+        """The session name, or None when the session has no name (Pi's ``string | undefined``). Answered from the replicated snapshot, as :meth:`get_session_id` is."""
+        replicated = self._replicated_session()
+        if replicated is not None:
+            return replicated[1] or None
         return self._optional_string_field("getSessionName", "name")
 
     def set_session_name(self, name: str) -> None:
         self._call("setSessionName", {"name": name})
 
-    def set_label(self, entry_id: str, label: str) -> None:
-        self._call("setLabel", {"entryId": entry_id, "label": label})
+    def set_label(self, entry_id: str, label: Any = None) -> None:
+        """Set or clear an entry label. ``None`` (or no argument) leaves the entry without a ``label`` member, as Pi's ``setLabel(entryId)`` does; ``NULL`` writes it as null, as ``setLabel(entryId, null)`` does; a string is written as given. All but a string that is not empty clear the label."""
+        args: dict[str, Any] = {"entryId": entry_id}
+        if label is not None:
+            args["label"] = label
+        self._call("setLabel", args)
 
     def get_flag(self, name: str) -> Any:
         """Read the host value or first registered default, preserving falsy overrides."""
@@ -3317,7 +3536,24 @@ class Context:
         """Pi's stripFrontmatter over this handler's own connection."""
         return self.parse_frontmatter(content).body
 
-    def set_model(self, model: str) -> tuple[bool, str]:
+    def set_model(self, model: dict[str, Any] | str) -> tuple[bool, str]:
+        """Pi's ``pi.setModel(model)``: make ``model``, a Pi model object, the Session's model. Returns ``(switched, error)``.
+
+        ``switched`` is false, and nothing changes, when the model's provider has no configured auth. The Session uses the object as given, with the
+        members the caller left on it (its context window, limits, base URL, compat): a model taken from ``ctx.model_registry`` and edited, or one
+        built by hand for a provider the host knows. The ``model_select`` handlers have run when it returns.
+
+        A ``provider/id`` string stands for the registry's model of that name. An id no catalog lists names no model: the error is
+        ``Model not found: provider/id``, as for Pi's RPC set_model, and nothing is set; a name with no slash is an openai model. The string form asks the host for the model object and then sets it, two calls: the
+        object the first call returned is the one set, whatever the registry became in between, and an error of the first call is returned without
+        setting.
+        """
+        if isinstance(model, str):
+            resolved = self._call("resolveModel", {"spec": model}).get("result") or {}
+            error = str(resolved.get("error") or "")
+            if error:
+                return False, error
+            model = resolved.get("model")
         result = self._call("setModel", {"model": model}).get("result") or {}
         return bool(result.get("success", result.get("ok", False))), str(result.get("error") or "")
 
@@ -3390,6 +3626,13 @@ class Context:
         return result
 
     def get_model_info(self) -> dict[str, Any] | None:
+        """The active model's info (name, context window, costs...), ``None`` while the Session has no model. The replicated snapshot answers it; a copy is returned per call. A replacement context, and a context that predates the first snapshot, ask the host."""
+        if self._replacement is None:
+            self._assert_active()
+            with self.extension._state_lock:
+                known, model = self.extension._model_known, self.extension._model_info
+            if known:
+                return copy.deepcopy(model) if isinstance(model, dict) and model.get("id") else None
         result = self._call("getModelInfo").get("result")
         return result if isinstance(result, dict) and result.get("id") else None
 
@@ -3416,13 +3659,135 @@ class Context:
 
     @property
     def theme(self) -> Theme:
-        """Upstream ``ctx.ui.theme``: the host's active theme, kept current."""
+        """Upstream ``ctx.ui.theme``: the host's active theme, kept current. Raises the stale message after the session was replaced or reloaded."""
+        self._assert_active()
         return self.extension._theme
 
     @property
     def footer_data(self) -> "FooterData":
         """Pi's ``ReadonlyFooterDataProvider`` (footer-data-provider.ts:103-163,387), the third argument of a ``ui.setFooter`` factory. A footer renderer reads it from the context it was installed with; ``set_footer_renderer`` renders again when the host's footer data changes."""
         return FooterData(self.extension)
+
+    # D614 plugin UI mounts ---------------------------------------------------
+
+    def view_abilities(self) -> ViewAbilities | None:
+        """What the attached client draws, or ``None`` while none is attached."""
+        self._assert_active()
+        return self.extension._view_state.abilities()
+
+    def _view_call(self, method: str, args: dict[str, Any]) -> ViewStatus:
+        self._assert_active()
+        try:
+            return _ui_view.decode_status(self._call(method, args).get("result"))
+        except HostCallError as err:
+            if err.code in ("invalid", "unsupported", "limit", "stale", "terminal", "not_found"):
+                raise ViewError(err.code, err.message) from err
+            raise
+
+    def _view_wire(self, view: "kit.View") -> dict[str, Any]:
+        encoded = self.extension._views.encode(view)
+        wire = dict(encoded.body)
+        if encoded.images:
+            wire["images"] = [{"ref": i.ref, "mimeType": i.mime_type, "data": base64.b64encode(i.data).decode("ascii")} for i in encoded.images]
+        return wire
+
+    def _view_content(self, view: "kit.View", intents: Any, assets: Any, fallback: Any, alternatives: Any = (), drawing: Any = None, a11y: Any = (), focus: Any = (), bindings: Any = (), title: str = "") -> dict[str, Any]:
+        fallback_wire = None if fallback is None else self.extension._views.encode(kit.View(root=fallback)).body
+        alts = []
+        for alt in alternatives or ():
+            entry = {"when": alt["when"], "view": self._view_wire(alt["view"])}
+            if alt.get("drawing") is not None:
+                entry["drawing"] = alt["drawing"]
+            alts.append(entry)
+        return _ui_view.encode_content(self._view_wire(view), intents, assets, fallback_wire, alts, drawing, a11y, focus, bindings, title)
+
+    def mount_view(
+        self,
+        key: str,
+        slot: str,
+        view: "kit.View",
+        *,
+        target: ViewTarget | None = None,
+        title: str = "",
+        intents: Any = (),
+        assets: Any = (),
+        fallback: Any = None,
+        alternatives: Any = (),
+        drawing: Any = None,
+        a11y: Any = (),
+        focus: Any = (),
+        bindings: Any = (),
+    ) -> ViewStatus:
+        """Mount ``view`` in a slot the attached client draws. ``key`` names the mount among this extension's.
+
+        ``alternatives`` (at most 8) are dicts ``{"when": {"any": [{"all": [{"claim", "op", "value"}]}]}, "view": kit.View,
+        "drawing": ...}``; a client draws the first whose ``when`` holds for its claims. ``drawing`` is the wire record
+        (``profile`` ``scene`` with ``shapes`` or ``pixels`` with ``pixels``, and ``regions``); ``a11y`` and ``focus`` are
+        lists of wire records naming view nodes by id (at most 256 each); a focus record's ``request`` is ``"mount"`` or
+        ``"update"``. ``title`` is the short text a client labels the mount with (at most 64 bytes on one line). ``bindings``
+        (at most 32) are wire records ``{"key" or "gesture", "intent", "arg", "name"}`` that tie a key id (``"d"``,
+        ``"shift+left"``) or a gesture (``"swipe-left"``, ``"swipe-right"``, ``"swipe-up"``, ``"swipe-down"``) to an intent that
+        names no node; a client fires one only while the mount holds the focus and the focused node did not take the key. The
+        host checks every bound."""
+        args = self._view_content(view, intents, assets, fallback, alternatives, drawing, a11y, focus, bindings, title)
+        args["key"], args["slot"] = key, slot
+        if target is not None:
+            args["target"] = target._wire()
+        return self._view_call("ui.view.mount", args)
+
+    def update_view(
+        self,
+        mount: ViewRef,
+        view: "kit.View",
+        *,
+        title: str = "",
+        intents: Any = (),
+        assets: Any = (),
+        fallback: Any = None,
+        alternatives: Any = (),
+        drawing: Any = None,
+        a11y: Any = (),
+        focus: Any = (),
+        bindings: Any = (),
+    ) -> ViewStatus:
+        """Replace the content of a mount, its ``title`` included. Fails with ``ViewError`` code ``"stale"`` unless ``mount`` carries the epoch and rev the last operation returned."""
+        args = self._view_content(view, intents, assets, fallback, alternatives, drawing, a11y, focus, bindings, title)
+        args["mount"] = mount._wire()
+        return self._view_call("ui.view.update", args)
+
+    def hide_view(self, mount: ViewRef) -> ViewStatus:
+        return self._view_call("ui.view.hide", {"mount": mount._wire()})
+
+    def show_view(self, mount: ViewRef) -> ViewStatus:
+        return self._view_call("ui.view.show", {"mount": mount._wire()})
+
+    def finish_view(self, mount: ViewRef, *, result: Any = _NO_VIEW_RESULT) -> ViewStatus:
+        """End a mount as completed. Terminal: a later operation on the mount fails with code ``"terminal"``.
+
+        ``result``, any JSON value of at most 65536 encoded bytes, is the extension's last word on the mount; the reply
+        and ``view_state`` carry it as ``ViewStatus.result``."""
+        args: dict[str, Any] = {"mount": mount._wire()}
+        if result is not _NO_VIEW_RESULT:
+            args["result"] = result
+        return self._view_call("ui.view.finish", args)
+
+    def remove_view(self, mount: ViewRef) -> ViewStatus:
+        """End a mount as withdrawn. Terminal."""
+        return self._view_call("ui.view.remove", {"mount": mount._wire()})
+
+    def view_state(self, key: str) -> ViewStatus:
+        return self._view_call("ui.view.state", {"key": key})
+
+    def view_diagnostics(self, key: str) -> list[ViewNotice]:
+        """The notices of the mount under ``key``, oldest first: what the host rejected or ended and what a client could
+        not draw. The host keeps at most 32 and counts repeats."""
+        self._assert_active()
+        try:
+            return _ui_view.decode_notices(self._call("ui.view.diagnostics", {"key": key}).get("result"))
+        except HostCallError as err:
+            if err.code in ("invalid", "not_found"):
+                raise ViewError(err.code, err.message) from err
+            raise
 
     def has_ui(self) -> bool:
         """Whether the host binds a UI context: interactive and RPC, not print/JSON."""
@@ -3465,6 +3830,7 @@ class Context:
         ``widget_push`` frame, as a string list does; with options (upstream
         ``ExtensionWidgetOptions``) it waits for the host.
         """
+        self._assert_call_active()
         if isinstance(content, kit.View):
             self.extension._set_widget_view(self, key, content, options)
             return
@@ -3481,6 +3847,7 @@ class Context:
 
         It follows the contract of :meth:`set_footer_renderer`: the SDK renders at the width the host reports and again after every width change, sends each set of rows with the width it was rendered for, and the host paints them only at that width, so a widget never shows rows laid out for the old width. ``options`` is the placement (``{"placement": "aboveEditor" | "belowEditor"}``). ``None`` clears the widget. An exception in ``render`` is reported as "widget render failed: ..." and leaves the previous rows. :meth:`set_widget` with the same key replaces the renderer.
         """
+        self._assert_call_active()
         if render is None:
             self.set_widget(key, None, options)
             return
@@ -3574,7 +3941,7 @@ class Context:
         if lines is None:
             self._call(method, {"clear": True})
             return
-        self._call(method, _surface_args([str(line) for line in lines], self.width))
+        self._call(method, _surface_args([str(line) for line in lines], self._terminal_width()))
 
     def _set_surface_view(self, method: str, view: kit.View) -> None:
         # An authoritative view: no rows and no width, since the host renders it at its own width.
@@ -3696,7 +4063,7 @@ class Context:
         the order the host sent the widths, never on the thread that reads the
         host's replies, so a handler can make a blocking host call such as
         :meth:`set_footer`. A slow handler delays the later deliveries, not the
-        extension's other handlers. A handler that raises is reported on stderr
+        extension's other handlers. A handler that raises is reported in the extension's log
         and does not stop the others. Returns an idempotent unsubscribe
         callable; a delivery already queued still reaches the handlers that
         were subscribed when the width arrived.
@@ -3710,7 +4077,7 @@ class Context:
 
         Pi calls a widget component's ``invalidate()`` on a theme change, and the component reads ``ctx.ui.theme`` at its next render, so it never paints the colors of an old theme. A subprocess extension pushes rows that were colored when it built them, so it re-renders from this subscription. :meth:`set_widget_renderer` colors through the live theme at every render and needs no handler for it.
 
-        Handlers run on a worker thread, one at a time in the order the changes arrived, never on the thread that reads the host's replies, so a handler can make a blocking host call. A handler that raises is reported on stderr and does not stop the others. Returns an idempotent unsubscribe callable; a delivery already queued still reaches the handlers subscribed when the change arrived. A palette equal to the one before is not a change.
+        Handlers run on a worker thread, one at a time in the order the changes arrived, never on the thread that reads the host's replies, so a handler can make a blocking host call. A handler that raises is reported in the extension's log and does not stop the others. Returns an idempotent unsubscribe callable; a delivery already queued still reaches the handlers subscribed when the change arrived. A palette equal to the one before is not a change.
         """
         if not callable(handler):
             raise TypeError("on_theme_change requires a callable handler")
@@ -3760,11 +4127,27 @@ class Context:
     # Session identity -------------------------------------------------------
 
     def get_session_id(self) -> str:
-        """The current session's id, including in-memory sessions."""
+        """The current session's id, including in-memory sessions. The replicated snapshot answers it; a replacement context, and a context that predates the first snapshot, ask the host."""
+        replicated = self._replicated_session()
+        if replicated is not None:
+            return replicated[0]
         return self._reply_field("getSessionID", "sessionId")
 
+    def _replicated_session(self) -> tuple[str, str, str] | None:
+        """The session id, name and file of the last snapshot (``""`` for no name or an in-memory session), ``None`` when this context must ask the host: a replacement context or no snapshot yet. Raises the stale message after invalidation."""
+        if self._replacement is not None:
+            return None
+        self._assert_active()
+        with self.extension._state_lock:
+            if not self.extension._session_known:
+                return None
+            return self.extension._session_id, self.extension._session_name, self.extension._session_file
+
     def get_session_file(self) -> str | None:
-        """The current session file path, or None for an in-memory session (Pi's ``string | undefined``)."""
+        """The current session file path, or None for an in-memory session (Pi's ``string | undefined``). Answered from the replicated snapshot, as :meth:`get_session_id` is."""
+        replicated = self._replicated_session()
+        if replicated is not None:
+            return replicated[2] or None
         return self._optional_string_field("getSessionFile", "sessionFile")
 
     def get_leaf_id(self) -> str | None:
@@ -3789,7 +4172,7 @@ class Context:
         the ``signal`` (a :class:`ProviderSignal`) terminates the command, as
         Pi does: the command alone receives SIGTERM (the process is killed on
         Windows), no descendant is signalled, and the call returns the output
-        written so far with ``killed`` set and ``exit_code`` 0, which is what a
+        written so far with ``killed`` set and ``exit_code`` 143 (128 + SIGTERM), which is what a
         command that a signal ended reports. A signal that is set before the
         call starts the command and ends it at once. SIGKILL follows the
         SIGTERM five seconds later if the command has not exited, for a
@@ -3984,6 +4367,7 @@ _OAUTH_METHODS = frozenset(
         "oauth_login",
         "oauth_refresh",
         "oauth_get_api_key",
+        "oauth_modify_models",
         "oauth_credential_status",
         "oauth_store_credentials",
         "oauth_delete_credentials",
@@ -4184,6 +4568,10 @@ class OAuthProvider:
     credential_store: OAuthCredentialStore | None = None
     # Whether access through this OAuth method is subscription-backed.
     is_subscription: bool = False
+    # Pi's legacy synchronous credential-dependent model projection (oauth.modifyModels, types.ts:2034): receives the provider's chat models as Pi's model objects and the stored OAuth credential and returns the models that replace them.
+    modify_models: Callable[[list[dict[str, Any]], OAuthCredentials], list[dict[str, Any]]] | None = None
+    # Pi's deprecated flag, retained for source compatibility: canonical auth flows ignore it (types.ts:2026), so it changes nothing.
+    uses_callback_server: bool = False
 
 
 class OAuthLoginCallbacks:
@@ -4246,12 +4634,249 @@ def _user_bash_event_result(value: Any) -> Any:
 
 
 def _js_ordered(value: Any) -> Any:
-    """``value`` with every object's members in the order JavaScript's Object.keys gives: array-index keys ascending, then the others in insertion order."""
-    if isinstance(value, dict):
-        return {key: _js_ordered(value[key]) for key in _ordered_keys(value)}
-    if isinstance(value, list):
-        return [_js_ordered(item) for item in value]
-    return value
+    """``value`` with every object's members in the order JavaScript's Object.keys gives: array-index keys ascending, then the others in insertion order.
+
+    It walks with a stack of its own, not the interpreter's: arguments nested thousands of levels deep (Pi takes 4000) are read, and no depth ends in a RecursionError."""
+    if not isinstance(value, (dict, list)):
+        return value
+    root = {} if isinstance(value, dict) else []
+    stack = [(value, root)]
+    while stack:
+        source, target = stack.pop()
+        if isinstance(source, dict):
+            for key in _ordered_keys(source):
+                item = source[key]
+                if isinstance(item, (dict, list)):
+                    child = {} if isinstance(item, dict) else []
+                    stack.append((item, child))
+                    target[key] = child
+                else:
+                    target[key] = item
+        else:
+            for item in source:
+                if isinstance(item, (dict, list)):
+                    child = {} if isinstance(item, dict) else []
+                    stack.append((item, child))
+                    target.append(child)
+                else:
+                    target.append(item)
+    return root
+
+
+TOO_DEEP_MESSAGE = "Maximum call stack size exceeded"
+
+
+def _frame_head(body: bytes | bytearray) -> tuple[str | None, str | None]:
+    """The ``type`` and ``id`` strings of the envelope in ``body``, read without decoding the members that nest: the brackets are counted and the strings read whole."""
+    from json.decoder import scanstring
+
+    text = bytes(body).decode("utf-8", "replace")
+    end, size, found = 0, len(text), {}
+    try:
+        while end < size and text[end] in " \t\r\n":
+            end += 1
+        if end >= size or text[end] != "{":
+            return None, None
+        end += 1
+        while True:
+            while end < size and text[end] in " \t\r\n":
+                end += 1
+            if end >= size or text[end] != '"':
+                break
+            key, end = scanstring(text, end + 1)
+            while end < size and text[end] in " \t\r\n":
+                end += 1
+            if end >= size or text[end] != ":":
+                break
+            end += 1
+            while end < size and text[end] in " \t\r\n":
+                end += 1
+            if end < size and text[end] == '"':
+                value, end = scanstring(text, end + 1)
+                found[key] = value
+            else:
+                depth = 0
+                while end < size:
+                    char = text[end]
+                    if char == '"':
+                        _, end = scanstring(text, end + 1)
+                        continue
+                    if char in "{[":
+                        depth += 1
+                    elif char in "}]":
+                        if depth == 0:
+                            break
+                        depth -= 1
+                    elif char == "," and depth == 0:
+                        break
+                    end += 1
+            while end < size and text[end] in " \t\r\n":
+                end += 1
+            if end < size and text[end] == ",":
+                end += 1
+            else:
+                break
+    except (ValueError, IndexError):
+        pass
+    return found.get("type"), found.get("id")
+
+
+def _diagnose(message: str) -> None:
+    """One diagnostic line in the extension's log (see ``_diagnostic``); one that cannot be written does not end the extension."""
+    diagnose(f"pig_sdk: {message}\n")
+
+
+def _refusal(kind: str | None, frame_id: str | None) -> dict[str, Any]:
+    if not isinstance(frame_id, str):
+        return {"type": "refused"}
+    if kind == "request":
+        return {"type": "request", "id": frame_id, "refused": TOO_DEEP_MESSAGE}
+    if kind == "call_result":
+        return {"type": "call_result", "id": frame_id, "call_result": {"error": {"message": TOO_DEEP_MESSAGE}}}
+    return {"type": "refused"}
+
+
+def _too_deep_envelope(body: bytes | bytearray) -> dict[str, Any]:
+    """What a frame nested too deep to decode stands for: a request that is answered with an error, a host call's result that is an error, or nothing."""
+    return _refusal(*_frame_head(body))
+
+
+# The host's own marshal refuses a value nested past 10000 levels, so a frame it sends is at most that deep; the headroom covers the envelope around the arguments.
+MAX_FRAME_DEPTH = 10100
+_JSON_WHITESPACE = re.compile(r"[ \t\n\r]*")
+
+
+def _loads_deep(body: bytes | bytearray) -> Any:
+    """json.loads for a frame the interpreter's own reader cannot take: CPython 3.11's C reader is bound by sys.getrecursionlimit() (about 990 levels) and 3.12's stops near 9997.
+
+    It nests with a stack of its own, so the interpreter's stack and recursion limit do not matter, and it takes up to MAX_FRAME_DEPTH levels; a value nested deeper raises RecursionError. A malformed frame raises ValueError."""
+    from json.decoder import JSONDecodeError, JSONDecoder, scanstring
+
+    text = bytes(body).decode("utf-8", "surrogatepass")
+    scan = JSONDecoder().scan_once
+    skip = _JSON_WHITESPACE.match
+    stack: list[Any] = []
+    keys: list[str | None] = []
+    root: Any = None
+    mode = "value"
+    pos = skip(text, 0).end()
+    while True:
+        if mode == "value":
+            pos = skip(text, pos).end()
+            char = text[pos : pos + 1]
+            if char == "[" or char == "{":
+                container: Any = [] if char == "[" else {}
+                if not stack:
+                    root = container
+                elif isinstance(stack[-1], list):
+                    stack[-1].append(container)
+                else:
+                    stack[-1][keys[-1]] = container
+                pos = skip(text, pos + 1).end()
+                if text[pos : pos + 1] == ("]" if char == "[" else "}"):
+                    pos += 1
+                    mode = "after"
+                    continue
+                if len(stack) >= MAX_FRAME_DEPTH:
+                    raise RecursionError(TOO_DEEP_MESSAGE)
+                stack.append(container)
+                keys.append(None)
+                mode = "value" if char == "[" else "key"
+                continue
+            try:
+                value, pos = scan(text, pos)
+            except StopIteration:
+                raise JSONDecodeError("Expecting value", text, pos) from None
+            if not stack:
+                root = value
+            elif isinstance(stack[-1], list):
+                stack[-1].append(value)
+            else:
+                stack[-1][keys[-1]] = value
+            mode = "after"
+        elif mode == "key":
+            pos = skip(text, pos).end()
+            if text[pos : pos + 1] != '"':
+                raise JSONDecodeError("Expecting property name enclosed in double quotes", text, pos)
+            key, pos = scanstring(text, pos + 1)
+            pos = skip(text, pos).end()
+            if text[pos : pos + 1] != ":":
+                raise JSONDecodeError("Expecting ':' delimiter", text, pos)
+            pos += 1
+            keys[-1] = key
+            mode = "value"
+        else:
+            pos = skip(text, pos).end()
+            if not stack:
+                if pos != len(text):
+                    raise JSONDecodeError("Extra data", text, pos)
+                return root
+            is_list = isinstance(stack[-1], list)
+            char = text[pos : pos + 1]
+            if char == ",":
+                pos += 1
+                mode = "value" if is_list else "key"
+            elif char == ("]" if is_list else "}"):
+                stack.pop()
+                keys.pop()
+                pos += 1
+            else:
+                raise JSONDecodeError("Expecting ',' delimiter", text, pos)
+
+
+def _json_scalar(item: Any) -> str:
+    """The JSON of a null, boolean, number or string, a non-finite number as null."""
+    if isinstance(item, float) and not math.isfinite(item):
+        return "null"
+    return json.dumps(item)
+
+
+def _dumps_deep(value: Any) -> str:
+    """The compact JSON of ``value`` for a value json.dumps cannot write for its depth (its C writer is bound by the recursion limit): the same text, NaN and the infinities written as null as JSON.stringify writes them.
+
+    It nests with a stack of its own and takes up to MAX_FRAME_DEPTH levels; a value nested deeper (or one that holds itself) raises RecursionError. A value that is not JSON raises TypeError."""
+    out: list[str] = []
+    stack: list[Any] = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        if isinstance(item, str) and depth < 0:
+            out.append(item)
+            continue
+        if item is None:
+            out.append("null")
+        elif item is True:
+            out.append("true")
+        elif item is False:
+            out.append("false")
+        elif isinstance(item, (int, float, str)):
+            out.append(_json_scalar(item))
+        elif isinstance(item, (list, tuple, dict)):
+            if depth >= MAX_FRAME_DEPTH:
+                raise RecursionError(TOO_DEEP_MESSAGE)
+            if isinstance(item, dict):
+                out.append("{")
+                stack.append(("}", -1))
+                members = list(item.items())
+                for index in range(len(members) - 1, -1, -1):
+                    key, member = members[index]
+                    if key is None or isinstance(key, (bool, int, float)):
+                        key = "null" if key is None else _json_scalar(key)
+                    elif not isinstance(key, str):
+                        raise TypeError(f"keys must be str, int, float, bool or None, not {type(key).__name__}")
+                    stack.append((member, depth + 1))
+                    stack.append((json.dumps(key) + ":", -1))
+                    if index:
+                        stack.append((",", -1))
+            else:
+                out.append("[")
+                stack.append(("]", -1))
+                for index in range(len(item) - 1, -1, -1):
+                    stack.append((item[index], depth + 1))
+                    if index:
+                        stack.append((",", -1))
+        else:
+            raise TypeError(f"Object of type {type(item).__name__} is not JSON serializable")
+    return "".join(out)
 
 
 class Extension:
@@ -4259,6 +4884,8 @@ class Extension:
         self._name = name
         self._tools: list[dict[str, Any]] = []
         self._tool_registration_lock = threading.RLock()
+        # Orders each tool change with its registerTool publication (taken before the registration lock; reentrant because tool_renderers reads the tool and publishes it under one hold).
+        self._tool_publish_lock = threading.RLock()
         self._tools_live = False
         # Raw terminal-input handlers, consulted synchronously while the host
         # holds the user's keystroke. Empty means the host never round-trips.
@@ -4305,6 +4932,7 @@ class Extension:
         self._renderers: list[dict[str, Any]] = []
         self._entry_renderers: list[dict[str, Any]] = []
         self._markdown_transformer: Callable[[str, dict[str, Any]], Any] | None = None
+        self._markdown_message_types: list[str] | None = None
         self._owns_thinking_runs = False
         self._tool_renderer_resolvers: list[ToolRendererResolver] = []
         self._resolved_tool_renderers: dict[str, ToolRenderers] = {}
@@ -4328,12 +4956,18 @@ class Extension:
         self._entry_renderer_handlers: dict[str, RendererHandler] = {}
         self._message_view_renderers: dict[str, Callable[..., kit.View]] = {}
         self._entry_view_renderers: dict[str, Callable[..., kit.View]] = {}
+        self._message_view_event_handlers: dict[str, MessageViewEventHandler] = {}
+        self._entry_view_event_handlers: dict[str, EntryViewEventHandler] = {}
+        # One card per displayed message or entry the host names with a key; renders of one card run one at a time.
+        self._render_cards: dict[str, _RenderCard] = {}
+        self._render_cards_lock = threading.Lock()
         self._tool_call_renderers: dict[str, ToolRenderCallHandler] = {}
         self._tool_result_renderers: dict[str, ToolRenderResultHandler] = {}
         self._tool_call_view_renderers: dict[str, ToolRenderCallViewHandler] = {}
         self._tool_result_view_renderers: dict[str, ToolRenderResultViewHandler] = {}
         # One renderer state per tool card; renders of one card run one at a time.
-        self._tool_render_cards: dict[str, tuple[threading.Lock, dict[str, Any]]] = {}
+        # card id -> (lock, renderer state, last output by phase)
+        self._tool_render_cards: dict[str, tuple[threading.Lock, dict[str, Any], dict[str, Any]]] = {}
         self._tool_render_lock = threading.Lock()
         self._flag_defaults: dict[str, Any] = {}
         self._session_name: str = ""
@@ -4344,6 +4978,12 @@ class Extension:
         self._width: int = 0
         self._height: int = 0
         self._model: str = ""
+        # The snapshot's model object, kept for get_model_info; _model_known is set once a snapshot carried the member (null included).
+        self._model_info: Any = None
+        self._model_known = False
+        # The snapshot's session id; _session_known is set once a snapshot carried the session object (the id, name and file are then known).
+        self._session_id: str = ""
+        self._session_known = False
         self._has_ui: bool = False
         self._theme = Theme()
         self._sock: socket.socket | None = None
@@ -4382,6 +5022,10 @@ class Extension:
         self._overlay_lock = threading.Lock()
         # The frontend flag, the image refs sent, and the live widget, header and footer views (D107).
         self._views = kit._ViewLedger()
+        # D614 plugin UI mounts: the replicated client abilities and the intent handler.
+        self._view_state = _ui_view.ViewState()
+        # A change of the replicated client abilities reaches the on_view_abilities handlers on a worker of its own (StateFeed).
+        self._view_abilities_feed = StateFeed(self, "view abilities")
         self._shutdown = ProviderSignal()
         self._shutdown_noted = False
         # The replicated signal of the run in progress: (host run number, signal), None while no run is active (Context.signal).
@@ -4435,19 +5079,22 @@ class Extension:
         declaration = {key: value for key, value in declaration.items() if key != "prepares_arguments"}
         if prepare is not None:
             declaration["prepares_arguments"] = True
-        with self._tool_registration_lock:
-            index = next((i for i, tool in enumerate(self._tools) if tool["name"] == name), None)
-            if index is None:
-                self._tools.append(declaration)
-            else:
-                self._tools[index] = declaration
-            self._tool_handlers[name] = handler
-            for handlers, callback in ((self._tool_prepare_handlers, prepare), (self._tool_call_renderers, render_call), (self._tool_result_renderers, render_result), (self._tool_loadout_handlers, prepare_loadout), (self._tool_reach_handlers, reaches_tools), (self._tool_call_view_renderers, call_view), (self._tool_result_view_renderers, result_view)):
-                if callback is None:
-                    handlers.pop(name, None)
+        with self._tool_publish_lock:
+            with self._tool_registration_lock:
+                index = next((i for i, tool in enumerate(self._tools) if tool["name"] == name), None)
+                if index is None:
+                    self._tools.append(declaration)
                 else:
-                    handlers[name] = callback
-            if self._tools_live:
+                    self._tools[index] = declaration
+                self._tool_handlers[name] = handler
+                for handlers, callback in ((self._tool_prepare_handlers, prepare), (self._tool_call_renderers, render_call), (self._tool_result_renderers, render_result), (self._tool_loadout_handlers, prepare_loadout), (self._tool_reach_handlers, reaches_tools), (self._tool_call_view_renderers, call_view), (self._tool_result_view_renderers, result_view)):
+                    if callback is None:
+                        handlers.pop(name, None)
+                    else:
+                        handlers[name] = callback
+                live = self._tools_live
+            # The host refreshes the registry before it answers and asks every tool's prepare_loadout hook while it does: the hook is answered from another thread that reads the tables under the registration lock, so the call is made without it. The publish lock keeps changes and their publications in one order.
+            if live:
                 self._call("registerTool", declaration)
 
     def register_tool(self, definition: ToolDefinition) -> None:
@@ -4619,7 +5266,7 @@ class Extension:
         return self._wait_call(call_id, event, method)
 
     def _read_during_load(self, waiting: threading.Event | None = None) -> dict[str, Any] | None:
-        """Read the next message while the extension loads. Pings, call results, listener dispatches and the release of a listener are served as the main loop serves them, as a node runtime serves a dispatch during its factory; any other message is returned. With ``waiting`` given, return None once that call's result has arrived."""
+        """Read the next message while the extension loads. Pings, call results, listener dispatches and notifies are served as the main loop serves them, as a node runtime serves a dispatch during its factory; any other message is returned. With ``waiting`` given, return None once that call's result has arrived."""
         while True:
             env = self._read()
             kind = env.get("type")
@@ -4629,10 +5276,14 @@ class Extension:
                 self._deliver_call_result(env)
                 if waiting is not None and waiting.is_set():
                     return None
+            elif kind == "refused":
+                continue  # nested past the reader and already reported in the extension log by _read
+            elif kind == "request" and env.get("refused"):
+                self._respond(env.get("id", ""), None, {"message": env["refused"]})
             elif kind == "request" and (env.get("request") or {}).get("method") == "events.dispatch":
                 self._start_request(env)
-            elif kind == "notify" and (env.get("notify") or {}).get("method") == "events.release":
-                # A listener that a load-time dispatch unsubscribed is released as soon as its dispatch ends, which can precede ready.
+            elif kind == "notify":
+                # A notify before ready is applied as the main loop applies it: the release of a listener a load-time dispatch unsubscribed, which follows its dispatch, or a state the host pushed to a connection that had not registered.
                 self._handle_notify(env)
             else:
                 return env
@@ -4817,6 +5468,12 @@ class Extension:
                 if not callable(implementation):
                     raise TypeError(f"provider {kind} implementation for {api} must be callable")
             operations[kind] = dict(implementations)
+        # ProviderConfig.refreshModels (types.ts:1930): a callable the host runs with provider_operation kind "refreshModels".
+        refresh = config.pop("refreshModels", None)
+        if refresh is not None:
+            if not callable(refresh):
+                raise TypeError("refreshModels must be callable")
+            operations["refreshModels"] = refresh
         _ensure_jsonable(config, f"provider config for {name}")
         if callback is not None:
             self._provider_streams[name] = callback
@@ -4830,15 +5487,17 @@ class Extension:
         declaration = {"name": name, "config": config}
         if callback is not None:
             declaration["stream_simple"] = True
+        if refresh is not None:
+            declaration["refresh_models"] = True
         if operations.get("images"):
             declaration["image_apis"] = sorted(operations["images"])
         if operations.get("classifiers"):
             declaration["classifier_apis"] = sorted(operations["classifiers"])
         return declaration
 
-    def _held_provider_callbacks(self, name: str) -> tuple[Callable | None, dict[str, dict[str, Callable]] | None]:
+    def _held_provider_callbacks(self, name: str) -> tuple[Callable | None, dict[str, Any] | None]:
         operations = self._provider_operations.get(name)
-        return self._provider_streams.get(name), None if operations is None else {kind: dict(implementations) for kind, implementations in operations.items()}
+        return self._provider_streams.get(name), None if operations is None else {kind: dict(implementations) if isinstance(implementations, dict) else implementations for kind, implementations in operations.items()}
 
     def _restore_provider_callbacks(self, name: str, kept: tuple[Callable | None, dict[str, dict[str, Callable]] | None]) -> None:
         stream, operations = kept
@@ -4878,6 +5537,10 @@ class Extension:
             "has_refresh": provider.refresh_token is not None,
             "has_get_api_key": provider.get_api_key is not None,
         }
+        if provider.uses_callback_server:
+            oauth["usesCallbackServer"] = True
+        if provider.modify_models is not None:
+            oauth["has_modify_models"] = True
         if provider.credential_store is not None:
             oauth["has_credential_store"] = True
         config["oauth"] = oauth
@@ -4918,24 +5581,29 @@ class Extension:
         """
         if render_shell not in {"default", "self"}:
             raise ValueError("render_shell must be 'default' or 'self'")
-        with self._tool_registration_lock:
-            for tool in self._tools:
-                if tool.get("name") != name:
-                    continue
+        with self._tool_publish_lock:
+            with self._tool_registration_lock:
+                tool = next((tool for tool in self._tools if tool.get("name") == name), None)
+                if tool is None:
+                    return
                 declaration = dict(tool)
-                declaration["render_shell"] = render_shell
-                declaration["renders_call"] = render_call is not None or call_view is not None
-                declaration["renders_result"] = render_result is not None or result_view is not None
-                self._register_tool(declaration, self._tool_handlers[name], self._tool_prepare_handlers.get(name), render_call, render_result, call_view=call_view, result_view=result_view)
-                break
+                handler = self._tool_handlers[name]
+                prepare = self._tool_prepare_handlers.get(name)
+                prepare_loadout = self._tool_loadout_handlers.get(name)
+                reaches_tools = self._tool_reach_handlers.get(name)
+            declaration["render_shell"] = render_shell
+            declaration["renders_call"] = render_call is not None or call_view is not None
+            declaration["renders_result"] = render_result is not None or result_view is not None
+            self._register_tool(declaration, handler, prepare, render_call, render_result, prepare_loadout, call_view, result_view, reaches_tools)
 
     def _render_tool(self, ctx: "Context", name: str, args: dict[str, Any]) -> tuple[Any, bool]:
         """Run the tool's renderer for the request's phase: its lines, or its view when the renderer is a view form
         (which wins over the line form), with whether it is a view."""
         card_id = str(args.get("card") or "")
         with self._tool_render_lock:
-            card = self._tool_render_cards.setdefault(card_id, (threading.Lock(), {}))
+            card = self._tool_render_cards.setdefault(card_id, (threading.Lock(), {}, {}))
         wire = args.get("context") or {}
+        phase = "result" if args.get("phase") == "result" else "call"
         with card[0]:
             render = ToolRenderContext(
                 args=args.get("args") or {},
@@ -4950,6 +5618,7 @@ class Extension:
                 output_pad=int(wire.get("outputPad") or 0),
                 duration_ms=None if wire.get("durationMs") is None else int(wire["durationMs"]),
                 state=card[1],
+                last_component=card[2].pop(phase, None),
                 _invalidate=lambda: self._notify("tool_render_invalidate", {"card": card_id}),
             )
             width = int(args.get("width") or 0)
@@ -4965,8 +5634,12 @@ class Extension:
             if handler is None:
                 raise RuntimeError(f"tool {name} has no {'result' if result_phase else 'call'} renderer")
             if result_phase:
-                return handler(ctx, args.get("result") or {"content": []}, args.get("options") or {}, render, width), view is not None
-            return handler(ctx, args.get("args") or {}, render, width), view is not None
+                rendered = handler(ctx, args.get("result") or {"content": []}, args.get("options") or {}, render, width)
+            else:
+                rendered = handler(ctx, args.get("args") or {}, render, width)
+            # a renderer that raised left no component: last_component was popped above and is not restored
+            card[2][phase] = rendered
+            return rendered, view is not None
 
     def tool_renderer(self, resolver: ToolRendererResolver) -> None:
         """Register a tool renderer resolver (Pi's pi.registerToolRenderer). Resolvers run in extension load order, and
@@ -5045,16 +5718,83 @@ class Extension:
             self._entry_view_renderers[custom_type] = handler
             self._publish_declaration({"entry_renderers": [declaration]})
 
-    def markdown_transformer(self, transformer: Callable[[str, dict[str, Any]], Any]) -> None:
+    def message_view_event(self, custom_type: str, handler: "MessageViewEventHandler") -> None:
+        """Register the handler of the events of ``custom_type``'s :meth:`message_view_renderer` views, as the closure of a
+        Pi component that the renderer returned handles the pointer: a click on a :class:`kit.MouseRegion` of the view
+        arrives as a ``kit.MOUSE`` event of that node, with coordinates local to the region. The handler changes
+        ``options.state``; the render that follows (every event the host took is applied first) sees it. ``message`` and
+        ``options`` are the ones of the message's last render. A later registration replaces an earlier one; an event
+        without a handler is ignored. Local to the extension: nothing is declared to the host."""
+        # pig additive (D276)
+        with self._tool_registration_lock:
+            self._message_view_event_handlers[custom_type] = handler
+
+    def entry_view_event(self, custom_type: str, handler: "EntryViewEventHandler") -> None:
+        """Register the handler of the events of ``custom_type``'s :meth:`entry_view_renderer` views; see
+        :meth:`message_view_event`."""
+        # pig additive (D276)
+        with self._tool_registration_lock:
+            self._entry_view_event_handlers[custom_type] = handler
+
+    def _render_card(self, key: str) -> "_RenderCard":
+        """The card of ``key``, created on first use. An empty key gets a card of its own that nothing keeps."""
+        if not key:
+            return _RenderCard()
+        with self._render_cards_lock:
+            card = self._render_cards.get(key)
+            if card is None:
+                card = self._render_cards[key] = _RenderCard()
+            return card
+
+    def _render_transcript(
+        self,
+        args: dict[str, Any],
+        subject_key: str,
+        options_type: type[MessageRenderOptions],
+        handle: "Callable[[Any, MessageRenderOptions, kit.Event], Any] | None",
+        render: "Callable[[Any, MessageRenderOptions], Any]",
+    ) -> Any:
+        """Answer a render_message or render_entry request: the events the host's view took go to ``handle`` in order,
+        then ``render`` draws the subject. The subject is the message or entry as the key's first request decoded it:
+        every request for the key receives that one object. A handler error does not stop the later events or the
+        render; the first one is raised after the render, unless the render fails first."""
+        card = self._render_card(str(args.get("key") or ""))
+        wire_options = args.get("options") or {}
+        with card.lock:
+            if card.subject is None:
+                card.subject = args.get(subject_key) or {}
+            failure: Exception | None = None
+            for wire in args.get("events") or []:
+                decoded = kit.Event._from_wire(wire) if isinstance(wire, dict) else None
+                if decoded is None or handle is None:
+                    continue
+                try:
+                    handle(card.subject, options_type(wire_options, card.state), decoded[1])
+                except Exception as exc:  # noqa: BLE001 - the render still runs; the first error answers the request.
+                    if failure is None:
+                        failure = exc
+            value = render(card.subject, options_type(wire_options, card.state))
+            if failure is not None:
+                raise failure
+            return value
+
+    def markdown_transformer(self, transformer: Callable[[str, dict[str, Any]], Any], message_types: list[str] | None = None) -> None:
         """Register the extension's display-only Markdown transform (Pi's
-        pi.registerMarkdownTransformer). The host applies it to user and
-        assistant Markdown in the interactive transcript, after its own
-        transformers; a later registration replaces an earlier one. It receives
+        pi.registerMarkdownTransformer). The host applies it to user, assistant
+        and thinking Markdown in the interactive transcript, after its own
+        transformers, or to the surfaces message_types lists (Pi's
+        options.messageTypes): "user", "assistant", "assistant-thinking",
+        "custom" (custom messages without a message renderer, expanded skill
+        blocks), "summary" (expanded branch and compaction summaries) and
+        "changelog" (What's New, /changelog, Extension Updates, the Update
+        Available note). None selects the first three; an empty list runs the
+        transformer nowhere. A later registration replaces an earlier one. It receives
         the Markdown and Pi's MarkdownTransformContext (messageType,
         isStreaming, availableWidth, and messageId and timestamp when rendering a
         persisted session entry); anything but a str return, or a raise,
         keeps the input."""
         self._markdown_transformer = transformer
+        self._markdown_message_types = None if message_types is None else list(message_types)
 
     # pig additive (D214)
     def own_thinking_runs(self, enabled: bool = True) -> None:
@@ -5095,7 +5835,7 @@ class Extension:
             try:
                 self._call("event.subscribe", {"event": event, "handlerId": handler_id})
             except Exception as exc:  # noqa: BLE001 - report where the host shows extension output
-                print(f"extension: event.subscribe {event!r}: {exc}", file=sys.stderr)
+                diagnose(f"extension: event.subscribe {event!r}: {exc}" + "\n")
         removed = threading.Lock()
 
         def unsubscribe() -> None:
@@ -5110,7 +5850,7 @@ class Extension:
                 try:
                     self._call("event.unsubscribe", {"event": event, "handlerId": handler_id})
                 except Exception as exc:  # noqa: BLE001 - upstream's unsubscribe cannot fail; report it
-                    print(f"extension: event.unsubscribe {event!r}: {exc}", file=sys.stderr)
+                    diagnose(f"extension: event.unsubscribe {event!r}: {exc}" + "\n")
 
         return unsubscribe
 
@@ -5125,6 +5865,9 @@ class Extension:
 
         self._sock = host_helpers.take_helper_socket(sock_path) or _connect_unix(sock_path)
         self._served_socket = sock_path
+        # What the host sent while the factory's calls waited on this connection is applied before the run reads on, in arrival order.
+        for early in host_helpers.take_early_notifies(sock_path):
+            self._handle_notify(early)
         host_helpers._State.running.append(self)
         try:
             self._serve()
@@ -5151,7 +5894,7 @@ class Extension:
 
         self._bus.register_pending()
         with self._tool_registration_lock:
-            self._send({"type": "register", "register": {"name": self._name, "tools": self._tools, "commands": self._commands, "shortcuts": self._shortcuts, "handlers": self._handlers, "flags": self._flags, "providers": self._providers, "message_renderers": self._renderers, "entry_renderers": self._entry_renderers, **({"markdown_transformer": True} if self._markdown_transformer is not None else {}), **({"owns_thinking_runs": True} if self._owns_thinking_runs else {}), **({"tool_renderers": len(self._tool_renderer_resolvers)} if self._tool_renderer_resolvers else {}), **({"mcp_servers": self._mcp_servers_pending} if self._mcp_servers_pending else {}), **({"virtual_models": self._virtual_models_pending} if self._virtual_models_pending else {}), **({"unregister_virtual_models": self._virtual_model_unregistrations} if self._virtual_model_unregistrations else {})}})
+            self._send({"type": "register", "register": {"name": self._name, "tools": self._tools, "commands": self._commands, "shortcuts": self._shortcuts, "handlers": self._handlers, "flags": self._flags, "providers": self._providers, "message_renderers": self._renderers, "entry_renderers": self._entry_renderers, **({"markdown_transformer": True, "markdown_message_types": ["user", "assistant", "assistant-thinking"] if self._markdown_message_types is None else self._markdown_message_types} if self._markdown_transformer is not None else {}), **({"owns_thinking_runs": True} if self._owns_thinking_runs else {}), **({"tool_renderers": len(self._tool_renderer_resolvers)} if self._tool_renderer_resolvers else {}), **({"mcp_servers": self._mcp_servers_pending} if self._mcp_servers_pending else {}), **({"virtual_models": self._virtual_models_pending} if self._virtual_models_pending else {}), **({"unregister_virtual_models": self._virtual_model_unregistrations} if self._virtual_model_unregistrations else {})}})
             if self._shutdown_noted or host_helpers.take_shutdown(self._served_socket):
                 raise _ShutdownBeforeReady()
             ready = self._read_during_load()
@@ -5176,7 +5919,6 @@ class Extension:
             self._apply_ui_state(initial_state)
         initial_session = initial_state.get("session")
         if initial_session:
-            self._session_file = str(initial_session.get("sessionFile") or "")
             self._session_mirror.apply_update(initial_session)
         self._run_loaded()
         while True:
@@ -5195,23 +5937,30 @@ class Extension:
                 continue
             if env.get("type") == "notify":
                 self._handle_notify(env)
+            elif env.get("type") == "request" and env.get("refused"):
+                self._respond(env.get("id", ""), None, {"message": env["refused"]})
             elif env.get("type") == "request":
                 self._apply_event_stream(env.get("request") or {})
                 self._start_request(env)
             elif env.get("type") == "cancel":
-                req_id = (env.get("cancel") or {}).get("request_id") or env.get("id")
-                reason = (env.get("cancel") or {}).get("reason")
+                cancel_frame = env.get("cancel") or {}
+                req_id = cancel_frame.get("request_id") or env.get("id")
+                reason = cancel_frame.get("reason")
                 with self._state_lock:
                     active = self._active.get(req_id)
                     if active:
                         self._active[req_id] = (active[0], reason)
-                        stream = self._provider_active.get(req_id)
-                        if stream is not None:
-                            stream.end(None)
-                    parent = self._request_parents.get(req_id)
-                    if parent is not None:
-                        parent.state = "cancelled"
-                    cancelled_calls = self._cancel_parent_calls_locked(req_id)
+                    cancelled_calls = []
+                    if not cancel_frame.get("signal_only"):
+                        # An ordinary cancel ends the request and its host calls. A signal-only cancel (session_before_compact / session_before_tree: Pi's abort fires event.signal and nothing else) only aborts the signal the handler holds: its host calls, pending and later, are answered and its reply is delivered.
+                        if active:
+                            stream = self._provider_active.get(req_id)
+                            if stream is not None:
+                                stream.end(None)
+                        parent = self._request_parents.get(req_id)
+                        if parent is not None:
+                            parent.state = "cancelled"
+                        cancelled_calls = self._cancel_parent_calls_locked(req_id)
                 if active:
                     active[0].set()
                 for event in cancelled_calls:
@@ -5246,9 +5995,9 @@ class Extension:
         batch = req.get("batch")
         # Only the calls of one parallel batch (the host's `batch` member, the same on each of them) take part in the dialog and continuation orders; any other tool_call is never gated.
         if req.get("method") == "tool_call" and isinstance(batch, str) and batch:
-            ctx._tool_start = self._tool_batches.reserve(batch)
+            ctx._tool_start = self._tool_batches.reserve(batch, env.get("id", ""))
         if _starts_in_arrival_order(req):
-            ctx._request_start = self._request_starts.reserve()
+            ctx._request_start = self._request_starts.reserve(req.get("method", ""), env.get("id", ""))
         self._request_state(env.get("id", ""), "started")
         worker = threading.Thread(
             target=self._handle_request_thread,
@@ -5324,6 +6073,7 @@ class Extension:
                     raise RuntimeError(f"{name} delta applies to payload {base}, the replica holds a different one")
                 root = _apply_stream_ops(replica[1], stream.get("ops"))
             replicas[ident] = (int(stream.get("seq") or 0), root)
+            # pig divergence (D657): the handler gets a clone of the replica, not the replica itself, so a write by one handler reaches no other handler. Pi hands every handler the one event object.
             req["args"] = _clone_stream_value(root)
         except Exception as exc:  # noqa: BLE001 - The request that follows reports why its payload is missing.
             replicas.pop(ident, None)
@@ -5331,10 +6081,27 @@ class Extension:
         for evicted in stream.get("evict") or ():
             replicas.pop((name, str(evicted)), None)
 
+    def on_view_intent(self, handler: "_ui_view.ViewIntentHandler") -> None:
+        """Answer the intents of this extension's mounts (D614). ``handler(invocation)`` returns a :class:`ViewIntentResult`. A later call replaces it."""
+        if not callable(handler):
+            raise TypeError("on_view_intent requires a callable handler")
+        self._view_state.handler = handler
+
+    def on_view_abilities(self, handler: "Callable[[ViewAbilities | None, Context], Any]") -> None:
+        """Run ``handler(abilities, ctx)`` when what the attached client draws changed (D614): the first client attached, the abilities changed, or the last client left (``abilities`` is ``None``; a client that draws no slot is a record with no slots).
+
+        It is where an extension mounts its views for a client that arrives while the session is idle, and stops work no client can see. The handler receives the abilities of the change it is delivered for, and :meth:`Context.view_abilities` already reports them when it runs, so a mount it makes is checked against that client. The state an extension starts in is not a change: an extension loaded while a client is attached reads :meth:`Context.view_abilities` at ``session_start``. A session no client attaches to never runs the handler.
+
+        Handlers run in registration order on a worker thread, one change at a time in the order the changes arrived, never on the thread that reads the host's replies, so a handler can make a blocking host call. The host does not wait for them. A handler that raises is reported in the extension's log and does not stop the others.
+        """
+        if not callable(handler):
+            raise TypeError("on_view_abilities requires a callable handler")
+        self._view_abilities_feed.subscribe(lambda abilities: handler(abilities, Context(self)))
+
     def on_loaded(self, handler: "Callable[[Context], Any]") -> None:
         """Run ``handler(ctx)`` once the extension is registered with the host and has received its state, before it serves any request (session_start included).
 
-        It is the place for work a factory cannot do: a :class:`Context` exists, so the handler can read session state, call the host and emit on ``ctx.events``. Handlers run in registration order, one at a time on a thread of their own, so a host call the host answers itself is answered. The host's requests wait behind them (a listener dispatch excepted), so a handler must not wait for something that needs this extension to serve a request, such as a call that runs one of its own tools or event handlers: that wait never ends. A handler that raises is reported on stderr and does not stop the next. Pi has no such hook: its factory runs with no context and the extension's first handler is ``session_start``. A handler registered after the extension started never runs.
+        It is the place for work a factory cannot do: a :class:`Context` exists, so the handler can read session state, call the host and emit on ``ctx.events``. Handlers run in registration order, one at a time on a thread of their own, so a host call the host answers itself is answered. The host's requests wait behind them (a listener dispatch excepted), so a handler must not wait for something that needs this extension to serve a request, such as a call that runs one of its own tools or event handlers: that wait never ends. A handler that raises is reported in the extension's log and does not stop the next. Pi has no such hook: its factory runs with no context and the extension's first handler is ``session_start``. A handler registered after the extension started never runs.
         """
         if not callable(handler):
             raise TypeError("on_loaded requires a callable handler")
@@ -5352,7 +6119,7 @@ class Extension:
                     try:
                         handler(Context(self))
                     except Exception:  # noqa: BLE001 - one handler's failure must not stop the next
-                        print(f"pig: on_loaded handler failed:\n{traceback.format_exc()}", file=sys.stderr, end="")
+                        diagnose(f"pig: on_loaded handler failed:\n{traceback.format_exc()}")
             finally:
                 self._loaded.set()
                 with self._request_threads_lock:
@@ -5392,6 +6159,10 @@ class Extension:
         args = notify.get("args") or {}
         if method == "autocomplete.release":
             self._autocomplete.release(args.get("id"))
+            return
+        if method == "render_release":
+            with self._render_cards_lock:
+                self._render_cards.pop(str(args.get("key") or ""), None)
             return
         if method == "tool_render_release":
             with self._tool_render_lock:
@@ -5474,6 +6245,17 @@ class Extension:
             if overlay is not None and not overlay.enqueue_focus(bool(args.get("focused"))):
                 self._notify("ui.custom.close", {"key": key, "error": "focused input queue is full"})
             return
+        if method == "ui.custom.invalidate":
+            # The theme_change that precedes it on the connection is applied by now; the component's worker runs invalidate() and renders.
+            key = str(args.get("key") or "")
+            count = args.get("count")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                return
+            with self._overlay_lock:
+                overlay = self._overlays.get(key)
+            if overlay is not None and not overlay.enqueue_invalidate(count):
+                self._notify("ui.custom.close", {"key": key, "error": "focused input queue is full"})
+            return
         if method == "ui.custom.input":
             key = str(args.get("key") or "")
             with self._overlay_lock:
@@ -5497,16 +6279,14 @@ class Extension:
                 # Session replication: apply incremental entries.
                 session = state.get("session")
                 if session:
-                    if session.get("sessionFile"):
-                        self._session_file = str(session["sessionFile"])
                     self._session_mirror.apply_update(session)
                 self._apply_ui_state(state)
             elif method == "theme_change":
                 palette = notify.get("args")
                 if isinstance(palette, str):
                     try:
-                        palette = json.loads(palette)
-                    except ValueError:
+                        palette = _json_loads(palette)
+                    except (ValueError, RecursionError):
                         palette = {}
                 self._set_theme_palette(palette if isinstance(palette, dict) and palette else {})
                 _tui_state.set_host_theme(palette)
@@ -5586,7 +6366,7 @@ class Extension:
             with self._width_dispatch_lock:
                 self._width_deliveries.clear()
                 self._width_worker_running = False
-            print(f"pig: start width change handlers: {exc}", file=sys.stderr)
+            diagnose(f"pig: start width change handlers: {exc}" + "\n")
 
     def _run_width_deliveries(self) -> None:
         try:
@@ -5614,11 +6394,11 @@ class Extension:
                     handler(width)
                 except Exception:  # noqa: BLE001 - one handler's failure must not stop the others, as a thrown handler error rejects one call in upstream
                     if not self._shutdown.is_set():
-                        print(f"pig: width change handler failed:\n{traceback.format_exc()}", file=sys.stderr, end="")
+                        diagnose(f"pig: width change handler failed:\n{traceback.format_exc()}")
 
     def _set_theme_palette(self, palette: dict[str, Any]) -> None:
         """Install the host's palette and deliver a snapshot of the theme to the on_theme_change handlers when it differs from the one before. The caller holds the state lock."""
-        changed = self._theme_known and self._theme_palette != palette
+        changed = self._theme_known and not _tui_state.json_equal(self._theme_palette, palette)
         self._theme._set_palette(palette)
         self._theme_palette = palette
         self._theme_known = True
@@ -5629,13 +6409,25 @@ class Extension:
     def _apply_ui_state(self, state: dict[str, Any]) -> None:
         """Record the snapshot's replicated values: hasUI, theme, settings, MCP servers, the model and the session name. The ready state and every state_update pass through here. Caller holds _state_lock."""
         self._views.apply_state(state)
+        abilities_changed, abilities = self._view_state.apply_state(state)
+        if abilities_changed:
+            self._view_abilities_feed.publish(abilities)
         if "model" in state:
-            # An absent key keeps the replica; an explicit null clears it (the Session holds no model).
-            self._model, self._model_provider = _model_identity(state["model"])
+            # An absent key keeps the replica; an explicit null clears it (the Session holds no model). A push that repeats the model derives nothing.
+            model = state["model"]
+            if not self._model_known or model != self._model_info:
+                self._model_info = copy.deepcopy(model)
+                self._model, self._model_provider = _model_identity(model)
+                self._model_known = True
         session = state.get("session")
         if isinstance(session, dict):
-            # Every session snapshot carries the name; "" is the host's carrier for a session with no name.
+            # sessionId is omitted only when empty.
+            session_id = session.get("sessionId")
+            self._session_id = session_id if isinstance(session_id, str) else ""
+            self._session_known = True
+            # Every session snapshot carries the name and the file, both always replacing the replica: "" is the host's carrier for no name and for an in-memory session.
             self._session_name = str(session.get("sessionName") or "")
+            self._session_file = str(session.get("sessionFile") or "")
         has_ui = state.get("hasUI")
         if isinstance(has_ui, bool):
             self._has_ui = has_ui
@@ -5661,12 +6453,18 @@ class Extension:
         req_id = env.get("id", "")
         req = env.get("request") or {}
         cancel = ProviderSignal()
-        parent = _RequestParent(req_id, self._sock)
+        parent = _RequestParent(req_id, self._sock, command=req.get("method") in ("command", "with_session"))
         with self._state_lock:
             self._active[req_id] = (cancel, None)
             self._request_parents[req_id] = parent
         ctx = Context(self, req.get("tool_call_id"), req_id, cancel, _parent=parent, _tool_context=req.get("method") == "tool_call", _tool_index=req.get("tool_call_index"), _tool_args=req.get("args") if req.get("method") == "tool_call" else None)
         ctx._reason_provider = lambda: self._active.get(req_id, (None, None))[1]
+        if req.get("signal_aborted"):
+            # session_before_compact / session_before_tree dispatched after the event's signal aborted: the handler starts with its signal aborted (runner.ts emit awaits it so), so is_cancelled() is true on its first line, but the request is not cancelled: its host calls run, as Pi's ctx.ui.notify never fails on abort.
+            reason = "context canceled"
+            with self._state_lock:
+                self._active[req_id] = (cancel, reason)
+            cancel.set()
         return ctx
 
     def _handle_request(self, env: dict[str, Any], ctx: Context | None = None) -> None:
@@ -5692,19 +6490,30 @@ class Extension:
                 result = _run_user_bash_exec(self._bash_operations, req, cancel, lambda data: self._notify("tool_update", {"request_id": req_id, "result": _data_update(data)}))
                 self._respond(req_id, result, None)
             elif method == "provider_stream_simple":
-                cancel = ctx._cancelled
                 args = req.get("args") or {}
                 stream = self._provider_streams[req.get("tool", "")](ctx, args["model"], args["context"], args["options"])
+
+                # An ordinary cancel ends the request: the read loop marks the request's parent cancelled and ends its stream, under the state lock, so the loop below stops and
+                # the answer is the abort. A signal-only cancel, the abort of a turn, sets the signal the author holds (ctx.is_cancelled()) and nothing else: Pi's consumer has no
+                # check of the signal (packages/agent/src/agent-loop.ts:424-478), so what the author's stream gives after it is forwarded and its result is the answer.
+                def request_ended() -> bool:
+                    with self._state_lock:
+                        parent = self._request_parents.get(req_id)
+                        return parent is not None and parent.state == "cancelled"
+
                 with self._state_lock:
                     self._provider_active[req_id] = stream
-                    if cancel.is_set():
+                    parent = self._request_parents.get(req_id)
+                    if parent is not None and parent.state == "cancelled":
                         stream.end(None)
                 try:
                     for event in _wire_events(stream):
-                        if cancel.is_set():
+                        if request_ended():
                             raise RuntimeError("provider stream aborted")
                         self._notify("provider_stream_event", {"request_id": req_id, "result": event})
-                    if cancel.is_set():
+                    # The read loop writes the request's state with the end of its stream under the state lock, before it sets the request's signal: a stream the cancel ended
+                    # is never answered as one its author ended.
+                    if request_ended():
                         raise RuntimeError("provider stream aborted")
                     self._respond(req_id, _wire_result_of(stream), None)
                 finally:
@@ -5833,7 +6642,7 @@ class Extension:
                 # runner.ts:1096-1125: the handlers of concurrent requests start in arrival order.
                 if ctx._request_start is not None:
                     ctx._request_start.begin()
-                self._command_handlers[name](ctx, args if isinstance(args, str) else json.dumps(args))
+                self._command_handlers[name](ctx, args if isinstance(args, str) else _json_text(args))
                 self._respond(req_id, None, None)
             elif method == "command_argument_completions":
                 name = req.get("tool", "")
@@ -5843,9 +6652,8 @@ class Extension:
             elif method == "terminal_input":
                 # The host is blocked on this reply and upstream's handler is
                 # synchronous, so handlers run inline. A raising handler is
-                # reported on stderr, which the host captures in the extension
-                # log, and degrades to not-consumed rather than capturing the
-                # keystroke.
+                # reported in the extension's log, and degrades to
+                # not-consumed rather than capturing the keystroke.
                 original = (req.get("args") or {}).get("data") or ""
                 current = original
                 consume = False
@@ -5853,7 +6661,7 @@ class Extension:
                     try:
                         consumes, data = _terminal_input_verdict(h(current))
                     except Exception:  # a failing handler does not stop the others
-                        print(f"extension: recovered from exception in a terminal input handler:\n{traceback.format_exc()}", file=sys.stderr, end="")
+                        diagnose(f"extension: recovered from exception in a terminal input handler:\n{traceback.format_exc()}")
                         continue
                     if consumes:
                         consume = True
@@ -5872,9 +6680,10 @@ class Extension:
                 if handler is None:
                     raise RuntimeError(f"unknown event handler {handler_id} for {req.get('event', '')}")
                 data = req.get("args") or {}
-                # pig additive (D19): preserve boundary mutations alongside handler errors.
+                # pig additive (D19): preserve boundary mutations alongside handler errors. A turn_end handler also edits the turn's messages in place (Pi hands every handler the turn's message objects): the reply carries the ones it left different, beside the boundary members.
                 if req.get("event") in ("agent_before_settle", "turn_end"):
-                    entries = data.get("entries", [])
+                    event_messages = _event_edit_messages(req["event"], data)
+                    before = _snapshot_event_messages(event_messages)
                     result = None
                     error = None
                     try:
@@ -5883,12 +6692,20 @@ class Extension:
                         result = handler(ctx, data)
                     except Exception as exc:  # noqa: BLE001 - Preserve mutations and report the handler error.
                         error = {"message": str(exc)}
-                    self._respond(req_id, {"_pigBoundaryEntries": entries, "_pigBoundaryResult": result}, error)
+                    # The entries the handler left in data["entries"], assigned or edited in place, as the Go, Rust and Lisp SDKs carry them (v0.3.0, v0.7.0); the Node runtime follows Pi, which does not (runner.ts emitBoundary).
+                    reply = {"_pigBoundaryEntries": data.get("entries", []), "_pigBoundaryResult": result}
+                    try:
+                        edits = _event_message_edits(event_messages, before)
+                        if edits:
+                            reply["_pigEventEdits"] = edits
+                    except Exception as exc:  # noqa: BLE001 - A message that cannot be written is the handler's error.
+                        error = error or {"message": str(exc)}
+                    self._respond(req_id, reply, error)
                     return
                 # Pi's handler edits event.input in place and the runner reads it back (runner.ts emitToolCall). The host cannot share the dict, so the reply carries the input the handler left when it differs from the one it received, member order included, even if the handler failed. The tool runs with the object the event carried (agent-loop.ts prepareToolCall), so assigning a new dict to data["input"] changes nothing the tool receives.
                 if req.get("event") == "tool_call":
                     tool_input = data.get("input")
-                    before = json.dumps(tool_input)
+                    before = _json_text(tool_input)
                     result = None
                     error = None
                     try:
@@ -5898,9 +6715,94 @@ class Extension:
                     except Exception as exc:  # noqa: BLE001 - Preserve input edits before reporting the handler error.
                         error = {"message": str(exc)}
                     reply: dict[str, Any] = {"_pigToolCallResult": result}
-                    if json.dumps(tool_input) != before:
+                    if _json_text(tool_input) != before:
                         reply["_pigToolCallInput"] = tool_input
+                    # A new dict assigned to data["input"] is the input the next handlers read (runner.ts emitToolCall hands them the one event); the tool keeps the dict it carried.
+                    if data.get("input") is not tool_input:
+                        reply["_pigToolCallEventInput"] = data.get("input")
                     self._respond(req_id, reply, error)
+                    return
+                # Pi hands every message_end handler the one message and stores that object (runner.ts emitMessageEnd, agent-session.ts appendMessage), so a handler's in-place edit of event.message is the message the next handlers, turn_end, agent_end, the entry and the next request hold, even when it fails afterwards. The host cannot share the dict, so the reply carries the message the handler left when its JSON text differs from the one it received (member order included). Assigning a new dict to data["message"] changes nothing, as assigning event.message changes nothing in Pi.
+                if req.get("event") in ("message_start", "message_end", "agent_end"):
+                    event_messages = _event_edit_messages(req["event"], data)
+                    before = _snapshot_event_messages(event_messages)
+                    members_before = dict(data) if req["event"] in _MEMBER_EVENTS else None
+                    result = None
+                    error = None
+                    try:
+                        if ctx._request_start is not None:
+                            ctx._request_start.begin()
+                        result = handler(ctx, data)
+                    except Exception as exc:  # noqa: BLE001 - Preserve message edits before reporting the handler error.
+                        error = {"message": str(exc)}
+                    reply = {"_pigEventResult": result}
+                    try:
+                        edits = _event_message_edits(event_messages, before)
+                        if members_before is not None:
+                            edits = [*edits, *_event_member_edits(data, members_before)]
+                        if edits:
+                            reply["_pigEventEdits"] = edits
+                    except Exception as exc:  # noqa: BLE001 - A message that cannot be written is the handler's error.
+                        error = error or {"message": str(exc)}
+                    self._respond(req_id, reply, error)
+                    return
+                # Pi hands every tool_result handler the one currentEvent, so a member a handler assigns on it (content, details, isError, structuredContent, usage) is what the next handler sees, and an edit made to an object the caller handed over (a block of the content, a member of the details) is in the caller's result too (runner.ts emitToolResult, agent-session.ts _afterToolCall). The host cannot share the dict, so the reply names the members the handler left different from the ones it received (JSON text, member order included), with their new values, and, of those, the ones it edited in the very object it received instead of replacing; the reply carries them also when the handler failed.
+                if req.get("event") == "tool_result":
+                    names = ("content", "details", "isError", "structuredContent", "usage")
+                    received = {name: data[name] for name in names if name in data}
+                    before = {name: _json_text(value) for name, value in received.items()}
+                    result = None
+                    error = None
+                    try:
+                        if ctx._request_start is not None:
+                            ctx._request_start.begin()
+                        result = handler(ctx, data)
+                    except Exception as exc:  # noqa: BLE001 - Preserve member edits before reporting the handler error.
+                        error = {"message": str(exc)}
+                    reply = {"_pigToolResultResult": result}
+                    try:
+                        changed = [name for name in names if (name in data) != (name in received) or (name in data and _json_text(data[name]) != before[name])]
+                        if changed:
+                            reply["_pigToolResultEdits"] = {
+                                "members": {name: data[name] for name in changed if name in data},
+                                "changed": changed,
+                                "shared": [name for name in changed if name in data and name in received and data[name] is received[name] and isinstance(data[name], (dict, list))],
+                            }
+                    except Exception as exc:  # noqa: BLE001 - A member that cannot be written is the handler's error.
+                        error = error or {"message": str(exc)}
+                    self._respond(req_id, reply, error)
+                    return
+                # Pi hands every before_provider_request handler the one payload and sends what the runner returns: a handler that edits it in place and returns nothing changes the request (runner.ts emitBeforeProviderRequest returns currentPayload), even when it fails afterwards. The host cannot share the dict, so a handler that returned no result sends the payload it left when its JSON text differs from the one it received (member order included). Assigning a new dict to data["payload"] changes nothing, as assigning event.payload changes nothing in Pi.
+                if req.get("event") == "before_provider_request":
+                    provider_payload = data.get("payload")
+                    before = _json_text(provider_payload) if isinstance(provider_payload, (dict, list)) else None
+                    result = None
+                    error = None
+                    try:
+                        if ctx._request_start is not None:
+                            ctx._request_start.begin()
+                        result = handler(ctx, data)
+                    except Exception as exc:  # noqa: BLE001 - Preserve payload edits before reporting the handler error.
+                        error = {"message": str(exc)}
+                    if result is None and before is not None:
+                        try:
+                            if _json_text(provider_payload) != before:
+                                result = provider_payload
+                        except Exception as exc:  # noqa: BLE001 - A payload that cannot be written is the handler's error.
+                            error = error or {"message": str(exc)}
+                    self._respond(req_id, result, error)
+                    return
+                # Pi's before_provider_headers handlers mutate event.headers in place and the return value is ignored (runner.ts emitBeforeProviderHeaders): the reply is the headers object the handler left, even when it failed.
+                if req.get("event") == "before_provider_headers":
+                    provider_headers = data.get("headers")
+                    error = None
+                    try:
+                        if ctx._request_start is not None:
+                            ctx._request_start.begin()
+                        handler(ctx, data)
+                    except Exception as exc:  # noqa: BLE001 - Preserve header edits before reporting the handler error.
+                        error = {"message": str(exc)}
+                    self._respond(req_id, provider_headers if provider_headers is not None else {}, error)
                     return
                 if req.get("event") == "before_agent_start":
                     options = data["systemPromptOptions"]
@@ -5928,17 +6830,43 @@ class Extension:
                         error,
                     )
                     return
+                # message_update, turn_start and agent_start (message_start and agent_end replied above): a member a handler assigns, reassigns or deletes is what the later handlers of the dispatch see (runner.ts emit), so the reply carries the members it left different, also from a handler that raised.
+                if req.get("event") in _MEMBER_EVENTS:
+                    members_before = dict(data)
+                    if ctx._request_start is not None:
+                        ctx._request_start.begin()
+                    try:
+                        result = handler(ctx, data)
+                    except Exception as exc:  # noqa: BLE001 - A member edit is kept when the handler raises, as in Pi.
+                        member_edits = _event_member_edits(data, members_before)
+                        if not member_edits:
+                            raise
+                        self._respond(req_id, {"_pigEventEdits": member_edits}, {"message": str(exc)})
+                        return
+                    member_edits = _event_member_edits(data, members_before)
+                    self._respond(req_id, {"_pigEventEdits": member_edits, "_pigEventResult": result} if member_edits else result, None)
+                    return
                 messages = data.get("messages")
                 snapshot = list(messages) if isinstance(messages, list) else None
                 # A reply for a list the handler left as it was, with no edit to any message, omits the list: the host already holds it.
                 encoded_before = _context_messages_encoding(messages) if snapshot is not None and req.get("event") in {"context", "context_with_system"} else None
                 if ctx._request_start is not None:
                     ctx._request_start.begin()
-                result = handler(ctx, data)
+                try:
+                    result = handler(ctx, data)
+                except Exception as exc:  # noqa: BLE001 - A context handler's edit of a message is kept when it throws, as in Pi.
+                    if req.get("event") != "context" or snapshot is None:
+                        raise
+                    # Pi hands a context handler a filtered copy of the list over the one set of message objects (runner.ts emitContext): an edit to a message stays after a throw and a change to the list does not, so the reply carries the messages the handler was handed, as it left them.
+                    self._respond(req_id, {"messages": snapshot, "_pigContextUnchanged": True}, {"message": str(exc)})
+                    return
                 if req.get("event") == "user_bash":
                     result = _user_bash_operations_reply(self._bash_operations, result) or _user_bash_event_result(result)
                 if req.get("event") in {"context", "context_with_system"} and snapshot is not None:
                     returned = result.get("messages") if isinstance(result, dict) else None
+                    if returned is None:
+                        # The list the handler assigned to data["messages"] is carried, as the Go and Rust SDKs carry it (v0.2.0, v0.3.0); the Node runtime follows Pi, which does not (runner.ts emitContext).
+                        returned = data.get("messages")
                     if returned is None:
                         returned = messages
                     unchanged = len(returned) == len(snapshot) and all(a is b for a, b in zip(returned, snapshot))
@@ -5947,6 +6875,8 @@ class Extension:
                     else:
                         result = {"messages": returned, "_pigContextUnchanged": unchanged}
                 self._respond(req_id, result, None)
+            elif method == "ui.view.intent":
+                self._respond(req_id, _ui_view.handle_intent(self._view_state, ctx, req.get("args") or {}), None)
             elif method == "shortcut":
                 key = req.get("tool", "")
                 self._shortcut_handlers[key](ctx)
@@ -5956,7 +6886,13 @@ class Extension:
                 args = req.get("args") or {}
                 view_handler = self._message_view_renderers.get(custom_type)
                 handler = view_handler or self._renderer_handlers[custom_type]
-                value = handler(ctx, args.get("message") or {}, MessageRenderOptions(args.get("options") or {}), int(args.get("width") or 0))
+                width = int(args.get("width") or 0)
+                event_handler = self._message_view_event_handlers.get(custom_type)
+                value = self._render_transcript(
+                    args, "message", MessageRenderOptions,
+                    None if event_handler is None else lambda subject, options, event: event_handler(ctx, subject, options, event),
+                    lambda subject, options: handler(ctx, subject, options, width),
+                )
                 self._respond(req_id, self._views.result(value, view_handler is not None), None)
             elif method == "render_tool":
                 value, is_view = self._render_tool(ctx, req.get("tool", ""), req.get("args") or {})
@@ -5978,7 +6914,13 @@ class Extension:
                 args = req.get("args") or {}
                 view_handler = self._entry_view_renderers.get(custom_type)
                 handler = view_handler or self._entry_renderer_handlers[custom_type]
-                value = handler(ctx, args.get("entry") or {}, EntryRenderOptions(args.get("options") or {}), int(args.get("width") or 0))
+                width = int(args.get("width") or 0)
+                event_handler = self._entry_view_event_handlers.get(custom_type)
+                value = self._render_transcript(
+                    args, "entry", EntryRenderOptions,
+                    None if event_handler is None else lambda subject, options, event: event_handler(ctx, subject, options, event),
+                    lambda subject, options: handler(ctx, subject, options, width),
+                )
                 self._respond(req_id, self._views.result(value, view_handler is not None), None)
             elif method in _OAUTH_METHODS:
                 self._dispatch_oauth(req_id, req)
@@ -5987,6 +6929,8 @@ class Extension:
         except Exception as exc:  # noqa: BLE001 - SDK boundary reports handler errors.
             # A handler whose dialog was answered before another's responds after it, error or not (_ToolStartOrder).
             error = {"message": str(exc)}
+            if isinstance(exc, HostCallError) and exc._shell_exit is not None:
+                error["shellExit"] = exc._shell_exit
             if ctx._tool_start is not None:
                 ctx._tool_start.respond(lambda: self._respond(req_id, None, error))
             else:
@@ -6023,6 +6967,13 @@ class Extension:
             resolved = OAuthCredentials._from_wire(req.get("args"))
             key = provider.get_api_key(resolved) if provider.get_api_key else ""
             self._respond(req_id, {"apiKey": key}, None)
+        elif method == "oauth_modify_models":
+            if provider.modify_models is None:
+                self._respond(req_id, None, {"message": "provider does not support modifyModels"})
+                return
+            args = req.get("args") or {}
+            models = provider.modify_models(args.get("models") or [], OAuthCredentials._from_wire(args.get("credentials")))
+            self._respond(req_id, {"models": models if models is not None else []}, None)
         elif method == "oauth_credential_status":
             store = provider.credential_store
             if store is None:
@@ -6061,10 +7012,10 @@ class Extension:
                 for line in session_file:
                     if len(line.encode("utf-8")) > MAX_FRAME_SIZE:
                         return []
-                    entry = json.loads(line)
+                    entry = _json_loads(line)
                     if entry.get("type") != "session":
                         entries.append(entry)
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError, RecursionError):
             return []
         return entries
 
@@ -6172,6 +7123,8 @@ class Extension:
             call = {"method": method, "args": args}
             if parent_request_id:
                 call["parent_request_id"] = parent_request_id
+            if parent is not None and parent.command:
+                call["command_context"] = True
             if timer:
                 call["timer"] = True
             try:
@@ -6200,7 +7153,10 @@ class Extension:
             raise RuntimeError("extension shut down during host call")
         if result.get("error"):
             err = result["error"]
-            raise HostCallError(err.get("message", "host call failed"), err.get("code"))
+            failure = HostCallError(err.get("message", "host call failed"), err.get("code"))
+            if isinstance(err.get("shellExit"), dict):
+                failure._shell_exit = err["shellExit"]
+            raise failure
         return result
 
     def _notify(self, method: str, args: Any = None) -> None:
@@ -6266,6 +7222,13 @@ class Extension:
                     continue
                 if kind == "focus":
                     overlay.apply_focus(bool(data))
+                elif kind == "invalidate":
+                    # Pi's optional Component.invalidate(): the host's TUI was invalidated (a theme change, a cell-size report, a change
+                    # of image support). A component without it is rendered again all the same.
+                    invalidate = getattr(overlay.component, "invalidate", None)
+                    if callable(invalidate):
+                        for _ in range(data):
+                            invalidate()
                 elif kind in ("input", "view_event", "mouse"):
                     if kind == "input":
                         result = overlay.component.handle_input(data or "")
@@ -6434,7 +7397,7 @@ class Extension:
                             ctx._call(method, {"view": views.wire(encoded)})
             except Exception as exc:  # noqa: BLE001 - a failed resend leaves the host's previous frame, as a failed send would
                 if not self._shutdown.is_set():
-                    print(f"pig: resend evicted view images: {exc}", file=sys.stderr)
+                    diagnose(f"pig: resend evicted view images: {exc}" + "\n")
 
         threading.Thread(target=resend, name="pig-view-evicted", daemon=True).start()
 
@@ -6575,11 +7538,17 @@ class Extension:
         if self._sock is None:
             raise RuntimeError("extension socket is not connected")
         try:
-            data = json.dumps(env, separators=(",", ":"), allow_nan=False).encode()
+            data = json.dumps(env, separators=(",", ":"), allow_nan=False, default=_json_default).encode()
         except ValueError:
             # Python writes NaN and Infinity as bare words, which is not JSON: the host refused the frame and the extension's connection ended.
             # JSON.stringify writes them as null, so each SDK sends null.
-            data = json.dumps(_non_finite_to_null(env), separators=(",", ":"), allow_nan=False).encode()
+            try:
+                data = json.dumps(_non_finite_to_null(env), separators=(",", ":"), allow_nan=False, default=_json_default).encode()
+            except RecursionError:
+                data = _dumps_deep(env).encode()
+        except RecursionError:
+            # A value nested past the interpreter's limit (the host sends and takes up to 10000 levels).
+            data = _dumps_deep(env).encode()
         if len(data) > MAX_FRAME_SIZE:
             raise RuntimeError(f"frame too large: {len(data)} bytes exceeds {MAX_FRAME_SIZE}")
         # One write: a header and a body sent apart cost the host two reads and, on a stream socket, two segments.
@@ -6594,7 +7563,22 @@ class Extension:
         size = struct.unpack(">I", hdr)[0]
         if size > MAX_FRAME_SIZE:
             raise RuntimeError(f"frame too large: {size}")
-        return json.loads(self._read_exact(size))
+        body = self._read_exact(size)
+        try:
+            return json.loads(body)
+        except RecursionError:
+            pass
+        # pig divergence (D268): Pi fails a call at a V8-stack-dependent depth (about 4400 levels); the SDK reads every frame the host can send.
+        # The interpreter's reader stops at its recursion limit (about 990 levels on 3.11), and the host sends values nested up to 10000: the frame is read again with a stack of its own.
+        try:
+            return _loads_deep(body)
+        except RecursionError:
+            # A value nested past what the host can send is Pi's RangeError, not the end of the connection: the request it came in is answered with that error.
+            kind, frame_id = _frame_head(body)
+            envelope = _refusal(kind, frame_id)
+            if envelope["type"] == "refused":
+                _diagnose(f"dropped a {kind if isinstance(kind, str) else 'malformed'} frame nested deeper than the reader takes")
+            return envelope
 
     def _read_exact(self, n: int) -> bytes | bytearray:
         """Read exactly ``n`` bytes straight into one buffer: a large frame is not grown chunk by chunk and copied again. ``b""`` means the peer closed before the first byte."""

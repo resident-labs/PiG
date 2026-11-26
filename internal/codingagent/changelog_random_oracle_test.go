@@ -74,7 +74,14 @@ emit(input.changelogs.map((_, i) => {
 		}
 		check("parse", entries, want[i][0])
 		for k, last := range lastVersions {
-			check("since "+last, GetNewEntries(entries, last), want[i][k+1])
+			got, ok := GetNewEntries(entries, last)
+			if !ok {
+				got = nil // Pi's getNewEntries returns undefined, which the oracle emits as null
+				if want[i][k+1] != nil {
+					t.Errorf("changelog %d since %s: Go has no entries (unreadable last-seen), Pi %+v", i, last, want[i][k+1])
+				}
+			}
+			check("since "+last, got, want[i][k+1])
 		}
 	}
 	if failures > 8 {

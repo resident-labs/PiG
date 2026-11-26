@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 	"weak"
 
@@ -14,8 +15,8 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/internal/nexttest"
 )
 
-// pi: packages/chord/src/next/host/adapted.ts
-// Ports packages/chord/test/next/host/adapted.test.ts (Q10, §22, slice 7b §7): consumers bound at an older version a provider
+// pi: packages/chord/src/host/adapted.ts
+// Ports packages/chord/test/host/adapted.test.ts (Q10, §22, slice 7b §7): consumers bound at an older version a provider
 // accepts read its state mapped (diffs per commit), call it with mapped arguments and results or its replacement of a
 // removed method, read keyed members mapped per key, and are refused a member the provider refuses. Every describe of the
 // file is ported, in its order; the helpers are in host_adapted_support_test.go.
@@ -345,7 +346,7 @@ func TestReloadAdaptedMembersFollowTheProvidersTopologyRebuildsAnExistingAdapted
 
 // Mirrors "reload: adapted members publish one coherent frame (fix round 1) › does not publish the new mapping applied to the old attempt's state".
 //
-// Pi: packages/chord/test/next/host/adapted.test.ts:282 (does not publish the new mapping applied to the old attempt's state)
+// Pi: packages/chord/test/host/adapted.test.ts:282 (does not publish the new mapping applied to the old attempt's state)
 func TestReloadAdaptedMembersPublishOneCoherentFrameDoesNotPublishTheNewMappingAppliedToTheOldAttemptsState(t *testing.T) {
 	v1 := adaptedLocal("astra.atomic", contracts.Mem("n", contracts.Int()))
 	v2 := adaptedEvolve(v1, func(e *contracts.LocalEditor) *contracts.LocalEditor { return e.State("n", contracts.Int()) })
@@ -370,7 +371,7 @@ func TestReloadAdaptedMembersPublishOneCoherentFrameDoesNotPublishTheNewMappingA
 
 // Mirrors "› never computes a new accepted-version mapping over the old provider shape".
 //
-// Pi: packages/chord/test/next/host/adapted.test.ts:306 (never computes a new accepted-version mapping over the old provider shape)
+// Pi: packages/chord/test/host/adapted.test.ts:306 (never computes a new accepted-version mapping over the old provider shape)
 func TestReloadAdaptedMembersPublishOneCoherentFrameNeverComputesANewAcceptedVersionMappingOverTheOldProviderShape(t *testing.T) {
 	v1 := adaptedLocal("sol.mapping-publication", contracts.Mem("x", contracts.Int()))
 	v2 := adaptedEvolve(v1, func(e *contracts.LocalEditor) *contracts.LocalEditor { return e.State("x", adaptedObjOf("n")) })
@@ -821,6 +822,56 @@ func TestReloadAVersionRefusalKeepsTheWaitingReferencesLastValuesKeepsAnOlderWat
 	old.Release()
 }
 
+// Go-only: host/object.ts `#unfit` (object.ts:1413) offers a refusal only to a holder whose version AND fingerprint the new
+// provider binds (`binds(provider, version, fingerprint)`); one holding the same version under another fingerprint is told the
+// version is not served here, even though the provider accepts that version number for its own fingerprint.
+func TestReloadAHolderOfAVersionTheProviderAcceptsUnderAnotherFingerprintWaitsUnboundAsNotServed(t *testing.T) {
+	accepted := mustContract(declareLocal("app.fingerprint.moved", contracts.LocalDeclaration{
+		Version: 1, Params: contracts.Params{}, Members: []contracts.LocalEntry{contracts.Mem("n", contracts.Int())},
+	}))
+	held := mustContract(declareLocal("app.fingerprint.moved", contracts.LocalDeclaration{
+		Version: 1, Params: contracts.Params{}, Members: []contracts.LocalEntry{contracts.Mem("n", contracts.Int()), contracts.Mem("other", contracts.Int())},
+	}))
+	if held.Fingerprint == accepted.Fingerprint {
+		t.Fatal("the two version 1 contracts share a fingerprint")
+	}
+	next := adaptedEvolve(accepted, func(e *contracts.LocalEditor) *contracts.LocalEditor {
+		return e.State("n", contracts.Obj(contracts.Prop("value", contracts.Int())))
+	})
+	first := DefineFacet(func(h FacetHost, _ FacetSelf) error {
+		return h.Serve(held, func(*delta.JsonObject, Self) (contracts.Implementation, error) {
+			return contracts.Implementation{Members: contracts.VariantImplementation{State: map[string]chord.Watchable[delta.JsonValue]{
+				"n": constant(1.0), "other": constant(2.0),
+			}}}, nil
+		}, ServeOptions{})
+	})
+	second := DefineFacet(func(h FacetHost, _ FacetSelf) error {
+		return h.Serve(next, func(*delta.JsonObject, Self) (contracts.Implementation, error) {
+			return contracts.Implementation{Members: contracts.VariantImplementation{State: map[string]chord.Watchable[delta.JsonValue]{
+				"n": constant(jsonObject("value", 4.0)),
+			}}}, nil
+		}, ServeOptions{Accepts: contracts.AcceptsTable{{Name: "1", Value: contracts.VersionMappings{
+			State: []contracts.Entry[contracts.StateMapping]{{Name: "n", Value: contracts.StateMapping{
+				Func: func(v delta.JsonValue) (delta.JsonValue, error) { return v.(*delta.JsonObject).Value("value"), nil },
+			}}},
+		}}}})
+	})
+	host := newHost(t, HostOptions{OnError: func(HostError) {}})
+	defer closeHosts(t, host)
+	mustLoad(t)(host.Load([]HostFacet{{Name: "@app/fingerprint", Facet: first}}, background))
+	ref := mustGet(t, host, held, jsonObject())
+	reloadMust(t)(host.Reload([]HostFacet{{Name: "@app/fingerprint", Facet: second}}, background, ReloadOptions{}))
+	deliveredOn(host)
+	state := stateOfRef(ref)
+	if state.Kind != RefStateFailed || state.Cause.Kind != data.FailureWaiting {
+		t.Fatalf("state = %+v, want failed waiting: the provider binds no version 1 of this fingerprint", state)
+	}
+	if message := state.Cause.Error.Message; !strings.Contains(message, "app.fingerprint.moved v1 is not served here") {
+		t.Fatalf("message = %q, want it to say app.fingerprint.moved v1 is not served here", message)
+	}
+	ref.Release()
+}
+
 // Mirrors "› heals a watch of the previous current version once a later provider accepts it (Sol)".
 func TestReloadAVersionRefusalKeepsTheWaitingReferencesLastValuesHealsAWatchOfThePreviousCurrentVersionOnceALaterProviderAcceptsIt(t *testing.T) {
 	v1 := adaptedLocal("app.version.return", contracts.Mem("n", contracts.Int()))
@@ -900,8 +951,8 @@ func TestReloadAnOlderConsumersReadsWhileItsTypeIsRemovedReadsItsLastMappedValue
 	old.Release()
 }
 
-// Mirrors "reload: an older consumer's first read during a parked swap (fix round 2) › maps with the provider whose attempt is shown until the new one goes live (Sol)".
-func TestReloadAnOlderConsumersFirstReadDuringAParkedSwapMapsWithTheProviderWhoseAttemptIsShownUntilTheNewOneGoesLive(t *testing.T) {
+// Mirrors "reload: an older consumer's first read during a parked restart (fix round 2) › maps with the provider whose attempt is shown until the new one goes live (Sol)".
+func TestReloadAnOlderConsumersFirstReadDuringAParkedRestartMapsWithTheProviderWhoseAttemptIsShownUntilTheNewOneGoesLive(t *testing.T) {
 	v1 := adaptedLocal("app.lazy", contracts.Mem("x", contracts.Int()))
 	v2 := adaptedEvolve(v1, func(e *contracts.LocalEditor) *contracts.LocalEditor { return e.State("x", adaptedObjOf("n")) })
 	missing := adaptedLocal("app.lazy.missing")
@@ -1199,10 +1250,10 @@ func TestReloadStoppingAKeyedWatchDropsItsPinAndLastValueWhileItsReferenceWaitsD
 	ref.Release()
 }
 
-// --- reload: a reference that never had values reads none during a parked swap (fix round 4) --------------------------------
+// --- reload: a reference that never had values reads none during a parked restart (fix round 4) --------------------------------
 
-// Mirrors "reload: a reference that never had values reads none during a parked swap (fix round 4) › has a newer reference read nothing during a parked swap, its watch waiting, then the new instance's values (Sol)".
-func TestReloadAReferenceThatNeverHadValuesReadsNoneDuringAParkedSwapHasANewerReferenceReadNothingDuringAParkedSwapItsWatchWaitingThenTheNewInstancesValues(t *testing.T) {
+// Mirrors "reload: a reference that never had values reads none during a parked restart (fix round 4) › has a newer reference read nothing during a parked restart, its watch waiting, then the new instance's values (Sol)".
+func TestReloadAReferenceThatNeverHadValuesReadsNoneDuringAParkedRestartHasANewerReferenceReadNothingDuringAParkedRestartItsWatchWaitingThenTheNewInstancesValues(t *testing.T) {
 	n1 := adaptedLocal("app.unshown", contracts.Mem("x", contracts.Int()))
 	n2 := adaptedEvolve(n1, func(e *contracts.LocalEditor) *contracts.LocalEditor { return e.State("x", adaptedObjOf("n")) })
 	missing := adaptedLocal("app.unshown.missing")
@@ -1217,7 +1268,7 @@ func TestReloadAReferenceThatNeverHadValuesReadsNoneDuringAParkedSwapHasANewerRe
 	newer := mustHold(t, host, n2, jsonObject())
 	adaptedWantWaiting(t, newer)
 	// The swap parks: the shown values are v1's; a v2 reference never had values, never v1's shape: its read throws the
-	// parked swap's failure.
+	// parked restart's failure.
 	if got := memberOf(t, old, "x"); got != 1.0 {
 		t.Fatalf("old x = %v, want 1", got)
 	}

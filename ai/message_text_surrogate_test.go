@@ -21,8 +21,12 @@ func TestMessageTextSanitizesLoneSurrogatesOnTheWire(t *testing.T) {
 			continue
 		}
 		seen[key] = true
+		model, ok := LookupModelExact(tc.provider + "/" + tc.model)
+		if ok && !BuiltAPI(model.API) {
+			// A build with this API's pig_strip tag sends no request for the model.
+			continue
+		}
 		t.Run(key, func(t *testing.T) {
-			model, ok := LookupModelExact(tc.provider + "/" + tc.model)
 			if !ok {
 				t.Fatal("missing upstream model")
 			}
@@ -35,10 +39,6 @@ func TestMessageTextSanitizesLoneSurrogatesOnTheWire(t *testing.T) {
 				}
 				for _, role := range []string{"system", "user-text", "assistant", "user-block"} {
 					expected := role + ": " + want
-					if role == "system" && tc.provider == "openai-codex" {
-						// openai-codex-responses.ts:552 sends the system message text as it is, so its lone surrogate stays: the body carries its escape, which decodes to U+FFFD.
-						expected = "system: unpaired \ufffd end"
-					}
 					if !jsonContainsText(decoded, expected) {
 						t.Errorf("%s text was not sanitized: %v", role, decoded)
 					}

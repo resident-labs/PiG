@@ -20,6 +20,7 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/jsnumber"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
+	"github.com/MichaelKinsy/PiG/internal/screenwriter"
 	"github.com/MichaelKinsy/PiG/tui/widthx"
 
 	"golang.org/x/term"
@@ -98,6 +99,10 @@ type ProcessTerminal struct {
 	outMu  sync.Mutex
 	// writeLog receives every Write when PI_TUI_WRITE_LOG names a log.
 	writeLog *terminalWriteLog
+	// screen is the screen writer under write (D624): nil when the terminal was given none, as before an interactive run starts and in byte mode; a writer that was dropped stays and passes every write on as it came (terminal_screen_writer.go).
+	screen atomic.Pointer[screenwriter.Writer]
+	// sent counts the writes that were sent on; a frame the screen writer sends nothing of is not one (writesSent, frame_pacing.go).
+	sent atomic.Uint64
 
 	// startMu guards reader, resize and protocol-query ownership. Start is idempotent until Stop releases that ownership.
 	startMu         sync.Mutex
@@ -112,8 +117,11 @@ type ProcessTerminal struct {
 	progressMu        sync.Mutex
 	progressTicker    *time.Ticker
 	progressStop      chan struct{}
+	progressCancel    context.CancelFunc // ends a keepalive tick that waits for the owner dispatcher
 	progressDone      chan struct{}
 	progressKeepalive time.Duration
+	// keepaliveDispatch, when set, takes each keepalive write to the loop that renders (SetOwnerDispatcher of the renderer on this terminal).
+	keepaliveDispatch atomic.Pointer[func(ctx context.Context, fn func()) error]
 
 	// programStatusMu guards the OSC 7501 state below. The input goroutine confirms support while the owner loop reports.
 	programStatusMu sync.Mutex
@@ -129,8 +137,14 @@ type ProcessTerminal struct {
 	colorSchemeReports atomic.Bool
 	// exitRestored is set once the exit restore has written: every later write is dropped, so a frame still in flight cannot repaint over a crash report or hide the cursor again. Entering raw mode again clears it.
 	exitRestored atomic.Bool
+	// stopModesWritten is set once a renderer's exit stop wrote the mode resets of Pi's terminal.stop() (WriteStopModes); the restore that follows then does not write them a second time. Entering raw mode clears it.
+	stopModesWritten atomic.Bool
+	// stopGate orders the writes of goroutines other than the one that stops the terminal against the stop (stop_transaction.go).
+	stopGate stopGate
 	// sizeCache is the window size kept between SIGWINCHs while the interactive resize handler holds it.
 	sizeCache terminalSizeCache
+	// continues marks the process terminal owned while raw mode is armed, from before MakeRaw until after RestoreCooked (continue_signal.go).
+	continues continueOwnership
 }
 
 const (
@@ -161,13 +175,15 @@ func NewProcessTerminalWithOutput(stdin, stdout *os.File, out io.Writer) *Proces
 }
 
 func newProcessTerminal(stdin, stdout *os.File, out io.Writer) *ProcessTerminal {
-	return &ProcessTerminal{
+	t := &ProcessTerminal{
 		stdin:             stdin,
 		stdout:            stdout,
 		out:               out,
 		writeLog:          newTerminalWriteLog(),
 		progressKeepalive: terminalProgressKeepalive,
 	}
+	t.screen.Store(newTerminalScreenWriter(t, os.Getenv))
+	return t
 }
 
 var processTerminal = NewStdioProcessTerminal()
@@ -366,22 +382,49 @@ func EnterRawModeForHandoff() (restore func(), err error) {
 	return processTerminal.enterRawMode(false)
 }
 
+// RearmRawMode re-applies raw termios, bracketed paste, and keyboard protocol queries on the process terminal without overwriting the
+// saved cooked termios state held by the active restore closure (or restoring cooked mode in between). Used when re-arming after an
+// external SIGTSTP and fg: the stdin reader stays running (avoiding a deadlock if SIGTSTP caught the reader between poll and read) and
+// shells that restored raw termios on fg do not cause the saved cooked state to be overwritten with raw termios.
+func RearmRawMode() error {
+	return processTerminal.rearmRawMode()
+}
+
+func (t *ProcessTerminal) rearmRawMode() error {
+	if t.stdin == nil || t.out == nil {
+		return fmt.Errorf("terminal raw mode requires stdin/stdout")
+	}
+	fd := int(t.stdin.Fd())
+	if _, err := MakeRaw(fd); err != nil {
+		return err
+	}
+	t.exitRestored.Store(false)
+	t.stopModesWritten.Store(false)
+	t.openForeignWrites()
+	t.enableVTProcessing()
+	t.disableKeyboardProtocol()
+	t.writeUnlogged("\x1b[?2004h")
+	t.queryAndEnableKittyProtocol()
+	return nil
+}
+
 // EnterRawMode puts this terminal into raw mode and returns a restore closure
 // that drains late extended-key releases before restoring cooked mode.
 func (t *ProcessTerminal) EnterRawMode() (restore func(), err error) {
 	return t.enterRawMode(true)
 }
 
-// makeRawTerminal and restoreTerminal are the raw-mode ioctls (TCGETS/TCSETS, TIOCGETA/TIOCSETA); tests replace them to interrupt the call.
+// makeRawTerminal and restoreTerminal are the raw-mode calls: Pi's raw mode (libuv's uv_tty_set_mode with UV_TTY_MODE_RAW, see libuvRawMode) and the
+// restore of the mode before it (TCSETS, TIOCSETA); tests replace them to interrupt the call.
 var (
-	makeRawTerminal = term.MakeRaw
+	makeRawTerminal = libuvRawMode
 	restoreTerminal = term.Restore
 )
 
-// makeRaw puts fd into raw mode and returns the state to restore. It retries the ioctl while it fails with EINTR, as libuv's
+// MakeRaw puts fd into raw mode and returns the state to restore. It retries the ioctl while it fails with EINTR, as libuv's
 // uv_tty_set_mode and uv__tcsetattr do (deps/uv/src/unix/tty.c): setRawMode returns after the process was stopped inside the call
 // and continued, where a plain ioctl fails with EINTR on macOS and ended the session on `fg` (#397).
-func makeRaw(fd int) (*term.State, error) {
+func MakeRaw(fd int) (*term.State, error) {
 	for {
 		state, err := makeRawTerminal(fd)
 		if !isEINTR(err) {
@@ -390,8 +433,8 @@ func makeRaw(fd int) (*term.State, error) {
 	}
 }
 
-// restoreCooked hands fd back in the mode state captured, retrying EINTR as makeRaw does.
-func restoreCooked(fd int, state *term.State) error {
+// RestoreCooked hands fd back in the mode state captured, retrying EINTR as MakeRaw does.
+func RestoreCooked(fd int, state *term.State) error {
 	for {
 		err := restoreTerminal(fd, state)
 		if !isEINTR(err) {
@@ -405,24 +448,29 @@ func (t *ProcessTerminal) enterRawMode(drainOnRestore bool) (restore func(), err
 		return nil, fmt.Errorf("terminal raw mode requires stdin/stdout")
 	}
 	fd := int(t.stdin.Fd())
-	state, err := makeRaw(fd)
+	t.continues.begin()
+	state, err := MakeRaw(fd)
 	if err != nil {
+		t.continues.end()
 		return nil, err
 	}
 	rememberSignalRestore(fd, state)
 	t.exitRestored.Store(false)
+	t.stopModesWritten.Store(false)
+	t.openForeignWrites()
 	// On Windows, enable VT output processing so pig's ANSI renderer displays;
-	// term.MakeRaw only configures raw input. No-op on unix.
+	// the raw mode above sets only the console's input. No-op on unix.
 	vtRestore := t.enableVTProcessing()
 	t.writeUnlogged("\x1b[?2004h")
 	t.queryAndEnableKittyProtocol()
 	// The process-exit restore (RestoreTerminalOnExit) owns the terminal from here until restore runs, as Pi's exit handler
 	// owns it from start() to stop(). It also hands the terminal back in cooked mode, which libuv does when Node exits.
 	registerExitRestoreTerminal(t, func() {
-		_ = restoreCooked(fd, state)
+		_ = RestoreCooked(fd, state)
 		vtRestore()
 	})
 	return func() {
+		defer t.continues.end()
 		unregisterExitRestoreTerminal(t)
 		t.stopProgramStatus()
 		// Stop the terminal generating extended-key sequences before anything
@@ -431,12 +479,14 @@ func (t *ProcessTerminal) enterRawMode(drainOnRestore bool) (restore func(), err
 		// Disable bracketed paste before restoring cooked mode. A caller that
 		// is exiting the interactive process drains late key releases; a
 		// ProcessTerminal Stop preserves unread input for the next consumer,
-		// matching upstream stop().
-		t.writeUnlogged("\x1b[?2004l")
+		// matching upstream stop(). A renderer's exit stop wrote it already, in Pi's place.
+		if !t.stopModesWritten.Swap(false) {
+			t.writeUnlogged("\x1b[?2004l")
+		}
 		if drainOnRestore {
 			_ = t.DrainInput(time.Second, 50*time.Millisecond)
 		}
-		_ = restoreCooked(fd, state)
+		_ = RestoreCooked(fd, state)
 		vtRestore()
 		t.protocolQueried = false
 	}, nil
@@ -690,6 +740,20 @@ func (t *ProcessTerminal) Stop() {
 	}
 }
 
+// WriteStopModes writes the mode resets of Pi's terminal.stop() that precede the input restore: the progress clear when one is active, the program
+// status clear, bracketed paste off and the keyboard protocol pops. A renderer's exit stop calls it where Pi's stop() calls terminal.stop(), before the
+// alternate screen is left; the restore that follows does not write bracketed paste off again (stopModesWritten).
+// upstream: packages/tui/src/terminal.ts:stop (:481-512)
+func (t *ProcessTerminal) WriteStopModes() {
+	if t.clearProgressInterval() {
+		t.writeUnlogged(terminalProgressClearSeq)
+	}
+	t.stopProgramStatus()
+	t.writeUnlogged("\x1b[?2004l")
+	t.disableKeyboardProtocol()
+	t.stopModesWritten.Store(true)
+}
+
 // DrainInput drains pending stdin bytes for up to maxWait, exiting early once
 // no new bytes arrive within idleWait. This mirrors upstream's slow-SSH guard
 // against key release sequences leaking into the parent shell on exit. A read
@@ -791,12 +855,42 @@ func (t *ProcessTerminal) write(data string) {
 	if t.out == nil || t.exitRestored.Load() {
 		return
 	}
-	WriteToTerminal(t.out, data)
+	if screen := t.screen.Load(); screen != nil {
+		if data = screen.Translate(data); data == "" {
+			return
+		}
+	}
+	t.sent.Add(1)
+	writeTerminalText(t.out, data)
 }
 
 // WriteToTerminal writes data to out and hands a failed write to the handler OnTerminalWriteError installed, as a failed process.stdout.write
-// reaches the "error" listener in Pi. Every write to the user's terminal that is not a ProcessTerminal's own goes through it.
+// reaches the "error" listener in Pi. A lone UTF-16 surrogate in data becomes U+FFFD here, as in Node's UTF-8 encoding of the string; rows are measured before it.
+// Every write to the user's terminal that is not a ProcessTerminal's own goes through it. A write through a ProcessTerminal is encoded once, by
+// ProcessTerminal.Write, so it is not scanned again here.
 func WriteToTerminal(out io.Writer, data string) {
+	if !encodesOwnWrites(out) {
+		data = jsstring.StreamText(data)
+		screenWriterWrittenPast(out, data)
+	}
+	writeTerminalText(out, data)
+}
+
+// encodesOwnWrites reports whether out is a renderer's writer over a ProcessTerminal, whose Write encodes what it sends (HideCursor and ShowCursor send constants).
+func encodesOwnWrites(out io.Writer) bool {
+	switch w := out.(type) {
+	case terminalWriter:
+		_, ok := w.terminal.(*ProcessTerminal)
+		return ok
+	case terminalCursorWriter:
+		_, ok := w.terminal.(*ProcessTerminal)
+		return ok
+	}
+	return false
+}
+
+// writeTerminalText writes data, already encoded, to out and hands a failed write to the OnTerminalWriteError handler.
+func writeTerminalText(out io.Writer, data string) {
 	if _, err := writeString(out, data); err != nil {
 		if handler := terminalWriteErrorHandler.Load(); handler != nil {
 			(*handler)(err)
@@ -809,6 +903,11 @@ func WriteToTerminal(out io.Writer, data string) {
 func writeString(out io.Writer, data string) (int, error) {
 	if sw, ok := out.(io.StringWriter); ok {
 		return sw.WriteString(data)
+	}
+	//portlint:allow utf16units a byte count against the write pool's byte bound maxPooledTerminalWrite, not a text length; terminal.ts has no pool and takes no length here
+	if len(data) > maxPooledTerminalWrite {
+		// The pool keeps no buffer of this size, so a pooled copy would cost the bytes and a new holder for the pool on every such write. The copy alone is the one allocation io.WriteString makes.
+		return out.Write([]byte(data))
 	}
 	buf := terminalWriteBuffers.Get().(*[]byte)
 	*buf = append((*buf)[:0], data...)
@@ -924,13 +1023,21 @@ func (t *ProcessTerminal) ClearFromCursor() { t.writeUnlogged("\x1b[J") }
 func (t *ProcessTerminal) ClearScreen() { t.writeUnlogged("\x1b[2J\x1b[H") }
 
 // SetTitle writes an OSC 0 title update sequence. A BEL or ESC in the title would end the sequence early and send the rest to the terminal as escape
-// sequences (session names come from session files), so control characters become spaces (terminal.ts setTitle).
+// sequences (session names come from session files), so control characters become spaces (terminal.ts setTitle). It is a write of a goroutine other than
+// the stop's: it is ordered against a stop (WriteOutsideStop), so it is before the stop's bytes or after them.
 func (t *ProcessTerminal) SetTitle(title string) {
-	t.writeUnlogged("\x1b]0;" + widthx.ReplaceControlCharacters(title) + "\x07")
+	sequence := "\x1b]0;" + widthx.ReplaceControlCharacters(title) + "\x07"
+	t.WriteOutsideStop(func() { t.writeUnlogged(sequence) })
 }
 
 // SetProgress writes the OSC 9;4 progress indicator and keeps it alive during agent work. Clearing stops the keepalive and writes OSC 9;4;0 followed directly by BEL.
+// Like SetTitle it is ordered against a stop; a terminal that a signal's stop sealed does not start the keepalive again.
 func (t *ProcessTerminal) SetProgress(active bool) {
+	t.WriteOutsideStop(func() { t.setProgress(active) })
+}
+
+// setProgress is SetProgress without the order against a stop, for the writer that holds the terminal.
+func (t *ProcessTerminal) setProgress(active bool) {
 	if active {
 		t.writeUnlogged(terminalProgressActiveSeq)
 		t.progressMu.Lock()
@@ -944,8 +1051,11 @@ func (t *ProcessTerminal) SetProgress(active bool) {
 		}
 		ticker := time.NewTicker(keepalive)
 		stopCh := make(chan struct{})
+		//portlint:allow ctxbackground this context is the progress interval's own lifetime: clearProgressInterval cancels it, and the terminal has no caller context (Pi's setInterval has none)
+		ctx, cancel := context.WithCancel(context.Background())
 		t.progressTicker = ticker
 		t.progressStop = stopCh
+		t.progressCancel = cancel
 		done := make(chan struct{})
 		t.progressDone = done
 		go func() {
@@ -960,7 +1070,7 @@ func (t *ProcessTerminal) SetProgress(active bool) {
 						return
 					default:
 					}
-					t.writeUnlogged(terminalProgressActiveSeq)
+					t.keepalive(ctx, stopCh)
 				}
 			}
 		}()
@@ -968,6 +1078,36 @@ func (t *ProcessTerminal) SetProgress(active bool) {
 	}
 	t.clearProgressInterval()
 	t.writeUnlogged(terminalProgressClearSeq)
+}
+
+// keepalive writes one tick of the progress keepalive. Pi's setInterval callback runs on its one event loop, between renders, so the tick is before the
+// bytes of a frame or after them: with an owner dispatcher the loop writes it, and a tick that waits for the loop ends with ctx when the progress is cleared.
+func (t *ProcessTerminal) keepalive(ctx context.Context, stopped <-chan struct{}) {
+	write := func() {
+		// The loop writes the tick after the frame it waited for, and the progress may have been cleared since.
+		select {
+		case <-stopped:
+			return
+		default:
+		}
+		t.writeUnlogged(terminalProgressActiveSeq)
+	}
+	// The tick is ordered against a stop like any write of another goroutine; one made during a stop runs after it and finds the progress cleared.
+	ordered := func() { t.WriteOutsideStop(write) }
+	if dispatch := t.keepaliveDispatch.Load(); dispatch != nil {
+		_ = (*dispatch)(ctx, ordered)
+		return
+	}
+	ordered()
+}
+
+// setKeepaliveDispatch routes the progress keepalive's writes through dispatch, the renderer's owner dispatcher; nil returns them to the ticker goroutine.
+func (t *ProcessTerminal) setKeepaliveDispatch(dispatch func(ctx context.Context, fn func()) error) {
+	if dispatch == nil {
+		t.keepaliveDispatch.Store(nil)
+		return
+	}
+	t.keepaliveDispatch.Store(&dispatch)
 }
 
 func (t *ProcessTerminal) clearProgressInterval() bool {
@@ -978,27 +1118,18 @@ func (t *ProcessTerminal) clearProgressInterval() bool {
 	}
 	t.progressTicker.Stop()
 	close(t.progressStop)
+	t.progressCancel()
 	<-t.progressDone
 	t.progressTicker = nil
 	t.progressStop = nil
+	t.progressCancel = nil
 	t.progressDone = nil
 	return true
-}
-
-// SetTerminalTitle writes an OSC 0 sequence to stdout to update the terminal
-// window title. An empty title clears back to terminal default.
-func SetTerminalTitle(title string) {
-	processTerminal.SetTitle(title)
 }
 
 // SetTerminalProgramStatus reports program status (OSC 7501) on the process terminal.
 func SetTerminalProgramStatus(status ProgramStatus) {
 	processTerminal.SetProgramStatus(status)
-}
-
-// SetTerminalProgress toggles the OSC 9;4 terminal progress indicator.
-func SetTerminalProgress(active bool) {
-	processTerminal.SetProgress(active)
 }
 
 // BuildTerminalTitle formats the pig terminal title from a session name

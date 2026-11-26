@@ -76,6 +76,19 @@
 //
 //  16. no-behavior-assertion: non-TUI behavioral scenarios need an observable
 //     oracle; execution-only tripwires must be tagged smoke-only.
+//
+//  17. transcript-sequences-*: a transcript_sequences_equal window belongs to an
+//     interactive-tmux scenario, names `window = "startup"` or a from/until
+//     marker, and declares each floating sequence as exactly one complete escape
+//     sequence (or one OSC number) with a reason, the recorded Pi runs and at
+//     least two distinct recorded positions, under a `# floating-evidence:`
+//     comment: a sequence that never moves is compared, not skipped.
+//     erasures_only narrows a window to its erase-in-display sequences (ESC[2J,
+//     ESC[3J) and does not combine with floating. write_kinds reduces a window to
+//     the kinds of its writes (frame, standalone cursor placement, title, other
+//     sequences) and does not combine with erasures_only; collapse_frame_runs
+//     (only with write_kinds) counts a run of frames as one entry and needs a
+//     `# frame-count-evidence:` comment naming two recorded Pi runs that differ.
 package main
 
 import (
@@ -91,53 +104,65 @@ import (
 )
 
 type scenario struct {
-	Name             string             `toml:"name"`
-	Description      string             `toml:"description"`
-	Covers           []string           `toml:"covers"`
-	Tags             []string           `toml:"tags"`
-	Driver           string             `toml:"driver"`
-	OpenAIFixture    bool               `toml:"openai_fixture"`
-	ProviderFixture  string             `toml:"provider_fixture"`
-	ChangelogFixture string             `toml:"changelog_fixture"`
-	Model            string             `toml:"model"`
-	Group            string             `toml:"group"`
-	Assert           assertBlock        `toml:"assert"`
-	Env              envBlock           `toml:"env"`
-	Tmux             tmuxBlock          `toml:"tmux"`
-	Cli              cliBlock           `toml:"cli"`
-	Print            printBlock         `toml:"print"`
-	RPC              rpcBlock           `toml:"rpc"`
-	ExtensionHost    extensionHostBlock `toml:"extension_host"`
-	Diverge          divergeBlock       `toml:"diverge"`
+	Name            string   `toml:"name"`
+	Description     string   `toml:"description"`
+	Covers          []string `toml:"covers"`
+	Tags            []string `toml:"tags"`
+	Driver          string   `toml:"driver"`
+	OpenAIFixture   bool     `toml:"openai_fixture"`
+	ProviderFixture string   `toml:"provider_fixture"`
+	// ProviderFixtureBasePath and ProviderFixtureCompat shape the fixture's model (test/parity/runner/schema.go).
+	ProviderFixtureBasePath string             `toml:"provider_fixture_base_path"`
+	ProviderFixtureCompat   map[string]any     `toml:"provider_fixture_compat"`
+	ChangelogFixture        string             `toml:"changelog_fixture"`
+	Model                   string             `toml:"model"`
+	Group                   string             `toml:"group"`
+	Assert                  assertBlock        `toml:"assert"`
+	Env                     envBlock           `toml:"env"`
+	Tmux                    tmuxBlock          `toml:"tmux"`
+	Cli                     cliBlock           `toml:"cli"`
+	Print                   printBlock         `toml:"print"`
+	RPC                     rpcBlock           `toml:"rpc"`
+	ExtensionHost           extensionHostBlock `toml:"extension_host"`
+	Diverge                 divergeBlock       `toml:"diverge"`
 }
 
 // providerFixtureAPIs lists the APIs the runner's provider fixture serves (test/parity/runner/provider_fixture.go).
-var providerFixtureAPIs = []string{"openai-completions", "mistral-conversations", "anthropic-messages", "google-generative-ai"}
+var providerFixtureAPIs = []string{"openai-completions", "openai-responses", "mistral-conversations", "anthropic-messages", "google-generative-ai"}
 
 type assertBlock struct {
-	JSONOutputEqual       bool                    `toml:"json_output_equal"`
-	StderrEqual           bool                    `toml:"stderr_equal"`
-	JSONAliases           []jsonAliasRule         `toml:"json_aliases"`
-	ArtifactEqual         bool                    `toml:"artifact_equal"`
-	ExitCode              *int                    `toml:"exit_code"`
-	PigExitCode           *int                    `toml:"pig_exit_code"`
-	PiExitCode            *int                    `toml:"pi_exit_code"`
-	BothContain           []string                `toml:"both_contain"`
-	BothNotContain        []string                `toml:"both_not_contain"`
-	PigContains           []string                `toml:"pig_contains"`
-	PigNotContain         []string                `toml:"pig_not_contain"`
-	PiContains            []string                `toml:"pi_contains"`
-	PiNotContain          []string                `toml:"pi_not_contain"`
-	BothMatchRegex        []string                `toml:"both_match_regex"`
-	OutputEqual           bool                    `toml:"output_equal"`
-	OutputNormalizedEqual bool                    `toml:"output_normalized_equal"`
-	OutputLayoutEqual     bool                    `toml:"output_layout_equal"`
-	EscapedOutputEqual    bool                    `toml:"escaped_output_equal"`
-	RuntimeRatioMax       float64                 `toml:"runtime_ratio_max"`
-	BothReachReady        bool                    `toml:"both_reach_ready"`
-	Runs                  int                     `toml:"runs"`
-	NormalizeReplace      []normalizeReplaceBlock `toml:"normalize_replace"`
-	Extensions            extensionAssertBlock    `toml:"extensions"`
+	JSONOutputEqual         bool                    `toml:"json_output_equal"`
+	JSONOutputOrderedEqual  bool                    `toml:"json_output_ordered_equal"`
+	StderrEqual             bool                    `toml:"stderr_equal"`
+	JSONAliases             []jsonAliasRule         `toml:"json_aliases"`
+	JSONPigOnlyRecords      []jsonPigOnlyRecordRule `toml:"json_pig_only_records"`
+	ArtifactEqual           bool                    `toml:"artifact_equal"`
+	ExitCode                *int                    `toml:"exit_code"`
+	PigExitCode             *int                    `toml:"pig_exit_code"`
+	PiExitCode              *int                    `toml:"pi_exit_code"`
+	BothContain             []string                `toml:"both_contain"`
+	BothNotContain          []string                `toml:"both_not_contain"`
+	PigContains             []string                `toml:"pig_contains"`
+	PigNotContain           []string                `toml:"pig_not_contain"`
+	PiContains              []string                `toml:"pi_contains"`
+	PiNotContain            []string                `toml:"pi_not_contain"`
+	BothMatchRegex          []string                `toml:"both_match_regex"`
+	OutputEqual             bool                    `toml:"output_equal"`
+	OutputNormalizedEqual   bool                    `toml:"output_normalized_equal"`
+	OutputLayoutEqual       bool                    `toml:"output_layout_equal"`
+	EscapedOutputEqual      bool                    `toml:"escaped_output_equal"`
+	RuntimeRatioMax         float64                 `toml:"runtime_ratio_max"`
+	BothReachReady          bool                    `toml:"both_reach_ready"`
+	PigNoStaleFrames        bool                    `toml:"pig_no_stale_frames"`
+	NoFramesAfterReply      bool                    `toml:"no_frames_after_reply"`
+	FinalFrameCursorOnlyPig *int                    `toml:"final_frame_cursor_only_pig"`
+	FinalFrameCursorOnlyPi  *int                    `toml:"final_frame_cursor_only_pi"`
+	Runs                    int                     `toml:"runs"`
+	NormalizeReplace        []normalizeReplaceBlock `toml:"normalize_replace"`
+	StderrNormalizeReplace  []normalizeReplaceBlock `toml:"stderr_normalize_replace"`
+	Extensions              extensionAssertBlock    `toml:"extensions"`
+
+	TranscriptSequencesEqual []sequenceWindowBlock `toml:"transcript_sequences_equal"`
 
 	ArtifactNormalizedEqual bool     `toml:"artifact_normalized_equal"`
 	ArtifactBothContain     []string `toml:"artifact_both_contain"`
@@ -156,6 +181,33 @@ type jsonAliasRule struct {
 	Pattern  string   `toml:"pattern"`
 	Optional bool     `toml:"optional"`
 	Reason   string   `toml:"reason"`
+}
+
+type jsonPigOnlyRecordRule struct {
+	Divergence string `toml:"divergence"`
+	Record     string `toml:"record"`
+	Count      int    `toml:"count"`
+	BeforeType string `toml:"before_type"`
+	Reason     string `toml:"reason"`
+}
+
+type sequenceWindowBlock struct {
+	Window       string                  `toml:"window"`
+	From         string                  `toml:"from"`
+	Until        string                  `toml:"until"`
+	Floating     []floatingSequenceBlock `toml:"floating"`
+	ErasuresOnly bool                    `toml:"erasures_only"`
+	WriteKinds   bool                    `toml:"write_kinds"`
+	// CollapseFrameRuns is checked with WriteKinds: runner/transcript_sequences.go counts a run of frames as one entry only for a window that compares write kinds.
+	CollapseFrameRuns bool `toml:"collapse_frame_runs"`
+}
+
+type floatingSequenceBlock struct {
+	Sequence          string `toml:"sequence"`
+	OSC               *int   `toml:"osc"`
+	Reason            string `toml:"reason"`
+	EvidenceRuns      int    `toml:"evidence_runs"`
+	EvidencePositions []int  `toml:"evidence_positions"`
 }
 
 type normalizeReplaceBlock struct {
@@ -202,6 +254,7 @@ type tmuxBlock struct {
 	CaptureEndRegex     string          `toml:"capture_end_regex"`
 	CaptureStartLast    bool            `toml:"capture_start_last"`
 	CaptureHistory      bool            `toml:"capture_history"`
+	PreTuiLines         int             `toml:"pre_tui_lines"`
 	CaptureJoinWrapped  bool            `toml:"capture_join_wrapped"`
 	CWD                 string          `toml:"cwd"`
 	GitBranch           string          `toml:"git_branch"`
@@ -221,6 +274,22 @@ type tmuxStepBlock struct {
 	WaitTimeoutSeconds     int      `toml:"wait_timeout_seconds"`
 
 	WaitStableMilliseconds int `toml:"wait_stable_milliseconds"`
+
+	FrameWatch *frameWatchBlock `toml:"frame_watch"`
+	FinalFrame *finalFrameBlock `toml:"final_frame"`
+	Signal     string           `toml:"signal"`
+}
+
+type finalFrameBlock struct {
+	Text              string `toml:"text"`
+	QuietMilliseconds int    `toml:"quiet_milliseconds"`
+	WriteLog          string `toml:"write_log"`
+}
+
+type frameWatchBlock struct {
+	StaleContains       []string `toml:"stale_contains"`
+	StaleUnlessContains []string `toml:"stale_unless_contains"`
+	MinSamples          int      `toml:"min_samples"`
 }
 
 type cliBlock struct {
@@ -404,7 +473,7 @@ func decodeScenarioWithUnknownKeyLint(path, source string, sc *scenario, violati
 func lintScenario(path, source string, sc *scenario, known map[string]bool, knownDivergences map[string]bool) []violation {
 	var out []violation
 
-	hasEq := sc.Assert.OutputEqual || sc.Assert.OutputNormalizedEqual || sc.Assert.OutputLayoutEqual || sc.Assert.EscapedOutputEqual
+	hasEq := sc.Assert.OutputEqual || sc.Assert.OutputNormalizedEqual || sc.Assert.OutputLayoutEqual || sc.Assert.EscapedOutputEqual || len(sc.Assert.TranscriptSequencesEqual) > 0
 	isTmux := sc.Driver == "interactive-tmux" || sc.Driver == "headless-terminal"
 	isBootOnly := strings.HasPrefix(sc.Description, "boot-only:")
 	isDeferred := hasTag(sc.Tags, "deferred")
@@ -413,6 +482,9 @@ func lintScenario(path, source string, sc *scenario, known map[string]bool, know
 
 	if sc.Tmux.CaptureHistory && sc.Driver != "interactive-tmux" {
 		out = append(out, violation{path, "history-driver", "capture_history requires interactive-tmux"})
+	}
+	if sc.Tmux.PreTuiLines < 0 || sc.Tmux.PreTuiLines > 0 && sc.Driver != "interactive-tmux" {
+		out = append(out, violation{path, "pre-tui-driver", "pre_tui_lines is a count of lines printed before an interactive-tmux binary starts"})
 	}
 	if sc.Assert.ChangelogHeadersComplete && (sc.Driver != "interactive-tmux" || !sc.Tmux.CaptureHistory) {
 		out = append(out, violation{path, "changelog-history", "changelog_headers_complete requires complete tmux history"})
@@ -423,8 +495,23 @@ func lintScenario(path, source string, sc *scenario, known map[string]bool, know
 	if sc.ProviderFixture != "" && !slices.Contains(providerFixtureAPIs, sc.ProviderFixture) {
 		out = append(out, violation{path, "provider-fixture-api", fmt.Sprintf("provider_fixture %q is not one of %s", sc.ProviderFixture, strings.Join(providerFixtureAPIs, ", "))})
 	}
+	if sc.ProviderFixture == "" && !sc.OpenAIFixture && (sc.ProviderFixtureBasePath != "" || len(sc.ProviderFixtureCompat) > 0) {
+		out = append(out, violation{path, "provider-fixture-option", "provider_fixture_base_path and provider_fixture_compat require provider_fixture or openai_fixture"})
+	}
+	if base := sc.ProviderFixtureBasePath; base != "" && (!strings.HasPrefix(base, "/") || strings.HasSuffix(base, "/")) {
+		out = append(out, violation{path, "provider-fixture-base-path", fmt.Sprintf("provider_fixture_base_path %q must start with a slash and not end with one", base)})
+	}
 	if len(sc.RPC.InputLines) > 0 && len(sc.RPC.Steps) > 0 {
 		out = append(out, violation{path, "rpc-input-conflict", "rpc input_lines and steps are mutually exclusive"})
+	}
+	for i, step := range sc.Tmux.Steps {
+		// A final_frame that reads a write log reads the file both binaries were told to write: a log one side does not write would fail every run.
+		if step.FinalFrame == nil || step.FinalFrame.WriteLog == "" {
+			continue
+		}
+		if want := "PI_TUI_WRITE_LOG=" + step.FinalFrame.WriteLog; !slices.Contains(sc.Env.Pig, want) || !slices.Contains(sc.Env.Pi, want) {
+			out = append(out, violation{path, "final-frame-write-log", fmt.Sprintf("tmux step %d final_frame write_log requires %s in env.pig and env.pi", i+1, want)})
+		}
 	}
 	for i, step := range sc.RPC.Steps {
 		if strings.TrimSpace(step.Line) == "" {
@@ -607,8 +694,25 @@ func lintScenario(path, source string, sc *scenario, known map[string]bool, know
 			out = append(out, violation{path, "normalize-rule-reason-missing", fmt.Sprintf("normalize_replace %q requires its own reason", rule.Pattern)})
 		}
 	}
-	if sc.Assert.JSONOutputEqual && (sc.Assert.OutputNormalizedEqual || len(sc.Assert.NormalizeReplace) > 0) {
+	for _, rule := range sc.Assert.StderrNormalizeReplace {
+		if strings.TrimSpace(rule.Reason) == "" {
+			out = append(out, violation{path, "normalize-rule-reason-missing", fmt.Sprintf("stderr_normalize_replace %q requires its own reason", rule.Pattern)})
+		}
+	}
+	out = append(out, lintTranscriptSequences(path, source, sc)...)
+	if sc.Assert.JSONOutputEqual && sc.Assert.JSONOutputOrderedEqual {
+		out = append(out, violation{path, "json-ordered-and-equal", "json_output_ordered_equal already compares everything json_output_equal does and member order too; declare one of them"})
+	}
+	if (sc.Assert.JSONOutputEqual || sc.Assert.JSONOutputOrderedEqual) && (sc.Assert.OutputNormalizedEqual || len(sc.Assert.NormalizeReplace) > 0) {
 		out = append(out, violation{path, "json-text-normalization", "full JSON comparison cannot use text normalization"})
+	}
+	if len(sc.Assert.JSONPigOnlyRecords) > 0 && !sc.Assert.JSONOutputEqual && !sc.Assert.JSONOutputOrderedEqual {
+		out = append(out, violation{path, "json-pig-only-without-json", "json_pig_only_records applies only to json_output_equal or json_output_ordered_equal"})
+	}
+	for _, rule := range sc.Assert.JSONPigOnlyRecords {
+		if rule.Divergence == "" || rule.Record == "" || rule.Count < 1 || rule.BeforeType == "" || strings.TrimSpace(rule.Reason) == "" {
+			out = append(out, violation{path, "json-pig-only-incomplete", "json_pig_only_records requires a divergence, the exact record, a count of at least 1, the type of the record that follows it, and a reason"})
+		}
 	}
 	for _, rule := range sc.Assert.JSONAliases {
 		if rule.Kind == "literal" && (rule.Pig == "" || rule.Pi == "") {
@@ -624,12 +728,82 @@ func lintScenario(path, source string, sc *scenario, known map[string]bool, know
 	return out
 }
 
+// oneEscapeSequence matches exactly one complete escape sequence: a CSI sequence, a string sequence (OSC, DCS, SOS, PM, APC) ending in BEL or ST, or a short escape sequence. A prefix such as ESC [ does not match.
+var oneEscapeSequence = regexp.MustCompile("^\\x1b(?:\\[[0-?]*[ -/]*[@-~]|[\\]PX^_][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)|[ -/]*[0-?@-OQ-WYZ\\\\`-~])$")
+
+// lintTranscriptSequences checks the transcript_sequences_equal windows of a scenario (rule 17); runner/transcript_sequences.go enforces the same rules when the scenario loads.
+func lintTranscriptSequences(path, source string, sc *scenario) []violation {
+	windows := sc.Assert.TranscriptSequencesEqual
+	if len(windows) == 0 {
+		return nil
+	}
+	var out []violation
+	bad := func(rule, format string, args ...any) {
+		out = append(out, violation{path, rule, fmt.Sprintf(format, args...)})
+	}
+	if sc.Driver != "interactive-tmux" {
+		bad("transcript-sequences-driver", "transcript_sequences_equal reads the terminal transcript, which only interactive-tmux panes have")
+	}
+	floats := 0
+	for _, w := range windows {
+		switch {
+		case w.Window != "" && w.Window != "startup":
+			bad("transcript-sequences-window", "transcript_sequences_equal window %q is unknown: the only name is \"startup\"", w.Window)
+		case w.Window != "" && (w.From != "" || w.Until != ""):
+			bad("transcript-sequences-window", "transcript_sequences_equal window %q replaces from and until", w.Window)
+		case w.Window == "" && w.From == "" && w.Until == "":
+			bad("transcript-sequences-window", "transcript_sequences_equal needs a window name or a from or until marker: the whole stream is not a stable comparison")
+		}
+		if w.WriteKinds && w.ErasuresOnly {
+			bad("transcript-sequences-write-kinds", "transcript_sequences_equal write_kinds and erasures_only are two reductions of the window; name one")
+		}
+		if w.CollapseFrameRuns && !w.WriteKinds {
+			bad("transcript-sequences-write-kinds", "transcript_sequences_equal collapse_frame_runs belongs to write_kinds")
+		}
+		if w.CollapseFrameRuns && !strings.Contains(source, "# frame-count-evidence:") {
+			bad("frame-count-evidence-missing", "scenario %q collapses frame runs without a '# frame-count-evidence:' comment naming two recorded Pi runs with different frame counts and the reply whose timing moves them", sc.Name)
+		}
+		if w.ErasuresOnly && len(w.Floating) > 0 {
+			bad("transcript-sequences-erasures", "transcript_sequences_equal erasures_only compares the erase sequences alone, and floating names sequences left out of a full comparison")
+		}
+		for _, f := range w.Floating {
+			floats++
+			label := fmt.Sprintf("%q", f.Sequence)
+			if f.OSC != nil {
+				label = fmt.Sprintf("osc %d", *f.OSC)
+			}
+			if (f.Sequence == "") == (f.OSC == nil) {
+				bad("transcript-sequences-floating", "floating needs exactly one of sequence and osc")
+			}
+			if f.Sequence != "" && !oneEscapeSequence.MatchString(f.Sequence) {
+				bad("transcript-sequences-floating", "floating sequence %q is not exactly one complete escape sequence: name one sequence kind, never a prefix or a list", f.Sequence)
+			}
+			if f.OSC != nil && *f.OSC < 0 {
+				bad("transcript-sequences-floating", "floating osc %d is not an operating system command number", *f.OSC)
+			}
+			if strings.TrimSpace(f.Reason) == "" {
+				bad("transcript-sequences-floating", "floating %s requires a reason", label)
+			}
+			positions := slices.Clone(f.EvidencePositions)
+			slices.Sort(positions)
+			positions = slices.Compact(positions)
+			if f.EvidenceRuns < 2 || len(positions) < 2 || positions[0] < 0 {
+				bad("transcript-sequences-floating", "floating %s needs evidence_runs of at least 2 and at least 2 distinct non-negative evidence_positions: a sequence that does not move does not float", label)
+			}
+		}
+	}
+	if floats > 0 && !strings.Contains(source, "# floating-evidence:") {
+		bad("floating-evidence-missing", "scenario %q declares floating sequences without a '# floating-evidence:' comment naming the Pi runs recorded, the positions seen and how they were recorded", sc.Name)
+	}
+	return out
+}
+
 func hasBehaviorAssertion(sc *scenario) bool {
 	a := sc.Assert
 	return a.ExitCode != nil || a.PigExitCode != nil || a.PiExitCode != nil ||
 		len(a.BothContain) > 0 || len(a.PigContains) > 0 || len(a.PiContains) > 0 ||
 		a.ChangelogHeadersComplete || len(a.BothMatchRegex) > 0 || a.OutputEqual || a.OutputNormalizedEqual ||
-		a.OutputLayoutEqual || a.EscapedOutputEqual || a.JSONOutputEqual || a.StderrEqual || a.ArtifactEqual || a.BothReachReady ||
+		a.OutputLayoutEqual || a.EscapedOutputEqual || a.JSONOutputEqual || a.JSONOutputOrderedEqual || a.StderrEqual || a.ArtifactEqual || a.BothReachReady || a.PigNoStaleFrames || a.NoFramesAfterReply || a.FinalFrameCursorOnlyPig != nil || a.FinalFrameCursorOnlyPi != nil ||
 		len(a.Extensions.RegisteredTools) > 0 || len(a.Extensions.RegisteredCommands) > 0 ||
 		len(a.Extensions.RegisteredProviders) > 0 || len(a.Extensions.RegisteredShortcuts) > 0 ||
 		a.Extensions.NoDiagnostics || len(a.Extensions.PlacementStrategy) > 0 ||

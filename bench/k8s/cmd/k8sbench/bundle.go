@@ -66,11 +66,11 @@ type agentPins struct {
 // version whose sha512 the registry publishes.
 var publishedAgentPins = agentPins{
 	files: map[string]string{
-		"pi-agent/package.json":      "2c0524e9556a475c087ea43c5b4ef6af232b180dfac5724a33dfe3e309349472",
-		"pi-agent/package-lock.json": "d3d2abb9ed4e078b7978ecd0f6316cc4357cb8d7777d344020acfa23190e24b4",
+		"pi-agent/package.json":      "4b61ca991909e436adf8238af90e865314dd32354d58f2e20ebfa8cc419e1baf",
+		"pi-agent/package-lock.json": "11fa077f9cde7b5b2b6c1341dd31dbf1bc88ce5e432c1ad7cd5f84618259d2dd",
 		piAgentCLI:                   "e79626f2dd6f94aa45d30f3fa63cd84319a6eefcd150b353cfaf274366926774",
 	},
-	tree: "df258d6a334f74497115f9f2f0e9bdea855bc8c2319ef321f6c64941a9ed2c02",
+	tree: "9455f37e417502f5d12600b3730282f956a34bc813e23acd44703c67090179668",
 }
 
 // sourceAgentPins pin a commit pin's install, by commit: the project pinnedProject writes from the frozen closure, whose
@@ -271,6 +271,14 @@ var sourceAgentPins = map[string]agentPins{
 			piAgentCLI:                   "e79626f2dd6f94aa45d30f3fa63cd84319a6eefcd150b353cfaf274366926774",
 		},
 		tree: "798c5b09a1f48406ed8c8ff21d6a457e87b888ba82596cf63ef03ffc5fc2ba59",
+	},
+	"c23b9ec1ef12a63573d739d4c294f81a377b7d57": {
+		files: map[string]string{
+			"pi-agent/package.json":      "1f2e1682a2bdbb2cc10c54564ed1bc4e39c293a91a90a88edfb00255ca159516",
+			"pi-agent/package-lock.json": "262b8293c8e2077063d2295180aa9d2e7ea814adf8dd8d63c8176dbab159fd09",
+			piAgentCLI:                   "e79626f2dd6f94aa45d30f3fa63cd84319a6eefcd150b353cfaf274366926774",
+		},
+		tree: "a315053fca59f1a86335db9e4476b328dd2e6091e4c7174e22b2a162c7bad5da",
 	},
 }
 
@@ -700,7 +708,7 @@ func cmdBundle(ctx context.Context, args []string, stderr io.Writer, getenv func
 	}
 	pin := committedPiPin()
 	store := filepath.Join(cmp.Or(*piBuilds, piBuildStore(getenv)), pin.Commit)
-	piDurable, err := writePinnedInstall(root, filepath.Join(outDir, "pi-durable"), filepath.Join(store, durableReference.packs), durableReference, pin)
+	piDurable, err := writePinnedInstall(root, filepath.Join(outDir, "pi-durable"), "", durableReference, pin)
 	if err != nil {
 		return err
 	}

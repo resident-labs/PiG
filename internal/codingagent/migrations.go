@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	jsjson "github.com/MichaelKinsy/PiG/extensions/sdk/json"
+	"github.com/MichaelKinsy/PiG/internal/atomicfile"
 	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/orderedjson"
@@ -23,8 +24,10 @@ import (
 )
 
 const (
-	migrationGuideURL = "https://github.com/earendil-works/pi/blob/main/packages/coding-agent/CHANGELOG.md#extensions-migration"
-	extensionsDocURL  = "https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md"
+	// MigrationGuideURL and ExtensionsDocURL are the two links the deprecated-extension-directory warning prints (migrations.ts MIGRATION_GUIDE_URL, EXTENSIONS_DOC_URL).
+	MigrationGuideURL = "https://github.com/earendil-works/pi/blob/main/packages/coding-agent/CHANGELOG.md#extensions-migration"
+	// pig divergence (D2): the warning links PiG's own extensions page where Pi links its repository's ("Product name in messages").
+	ExtensionsDocURL = "https://pi-in-go.dev/docs/latest/extensions"
 )
 
 // RunMigrations runs the startup migrations, including the persisted keybinding-name rewrite. Auth writes return errors; malformed or unwritable keybindings are left alone, as in upstream runMigrations.
@@ -63,7 +66,8 @@ func migrateKeybindingsConfigFile(agentDir string) {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(path, out, 0o666) // upstream: packages/coding-agent/src/migrations.ts:migrateKeybindingsConfigFile
+	// pig divergence (D651): replaced through a private temporary file and a rename, in place where that is refused; Pi writes the file in place.
+	_ = atomicfile.WriteFile(path, out, 0o666) // upstream: packages/coding-agent/src/migrations.ts:migrateKeybindingsConfigFile
 }
 
 // marshalMigratedKeybindings retains the TUI_KEYBINDINGS and app definition order before UTF-16-sorted extras, including lone surrogates, as core/keybindings.ts:342-358 requires. Raw values retain nested object order through JSON.parse/stringify canonicalization.
@@ -166,6 +170,7 @@ func migrateAuthToAuthJSON(agentDir string) ([]string, error) {
 				apiKeys, _ := orderedJSONObject(apiKeysRaw)
 				for _, provider := range apiKeys.Keys() {
 					raw, _ := apiKeys.Get(provider)
+					// pig divergence (D645): the migrated credentials are own entries, so a legacy settings.json apiKeys entry of a provider named like an Object.prototype member (constructor, toString) is moved to auth.json like any other; Pi's `!migrated[provider]` on a plain object finds the inherited member and drops the key while it deletes apiKeys.
 					if migrated.Has(provider) {
 						continue
 					}
@@ -179,8 +184,9 @@ func migrateAuthToAuthJSON(agentDir string) ([]string, error) {
 				}
 				settings.Delete("apiKeys")
 				if updated, err := stringifyIndented(rawObject(settings)); err == nil {
-					// The file exists (it was just read); the request is Pi's, writeFileSync(settingsPath, ...) with no mode (migrations.ts:60): 0666.
-					_ = os.WriteFile(settingsPath, updated, 0o666) // upstream: coding-agent/src/migrations.ts:migrateAuthToAuthJson
+					// pig divergence (D651): replaced through a private temporary file and a rename, in place where that is refused; Pi writes the file in place.
+					// The file exists (it was just read), so its mode is kept; the request is Pi's, writeFileSync(settingsPath, ...) with no mode (migrations.ts:60): 0666.
+					_ = atomicfile.WriteFile(settingsPath, updated, 0o666) // upstream: coding-agent/src/migrations.ts:migrateAuthToAuthJson
 				}
 			}
 		}
@@ -194,7 +200,8 @@ func migrateAuthToAuthJSON(agentDir string) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("migrate credentials to auth.json: %w", err)
 		}
-		if err := os.WriteFile(authPath, out, 0o600); err != nil {
+		// pig divergence (D651): replaced through a private temporary file and a rename, in place where that is refused; Pi writes the file in place.
+		if err := atomicfile.WriteFile(authPath, out, 0o600); err != nil {
 			return nil, fmt.Errorf("migrate credentials to auth.json: %w", err)
 		}
 	}

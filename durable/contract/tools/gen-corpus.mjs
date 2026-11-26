@@ -54,6 +54,16 @@ const E = {
 	"35-durable-on-the-store": ["store", "a Harness on Chord's store"],
 	"36-durable-views": ["store", "Durable views on Chord's store"],
 	"37-harness-registry": ["loop", "a Harness over a registry"],
+	"38-signals": ["session", "typed signals delivered to a live task from outside"],
+	"39-ask-a-person": ["session", "a plugin task that sleeps on a signal or deadline"],
+	"40-tool-waits-for-webhook": ["loop", "a tool that parks on a signal and cancels on stop"],
+	"41-tool-polls": ["loop", "a tool that polls by parking on time with backoff"],
+	"42-parallel-children": ["loop", "a tool that starts nested calls without waiting and parks until any ends"],
+	"43-subagent-waits": ["session", "a subagent tool that parks on its child submission settling"],
+	"44-approval-gate": ["loop", "beforeTool gates that park a tool call until approved or expired"],
+	"45-review-on-yield": ["loop", "an onYield hook task that reviews an answer while input stays open"],
+	"46-after-tools-terminate": ["loop", "an afterTools hook task that parks and steers or terminates a run"],
+	"47-fit-images": ["loop", "fitting images to model limits before storing them in the transcript"],
 }
 const U = {
 	"codemode-checkpoints": "loop", "harness-blocked": "session", "harness-deferred-progress": "session", "harness-failed-run-inbox": "session", "harness-host-inputs": "session",
@@ -69,12 +79,14 @@ const U = {
 	"harness-tools-recovery": "loop", "harness-tools": "loop", "harness-view": "session", "jsonl-storage": "host", "memory-storage": "host",
 	"provider-session-cache-e2e": "loop", "session-checkpoints-migrations": "session", "session-definitions": "session", "session-documents": "session",
 	"session-forks": "store", "session-tables": "store", "session-watches": "session", "spec-usage": "store",
-	"sqlite-cloudflare": "host", "sqlite-facade": "host", "sqlite-migrations": "store", "sqlite-storage": "store", "storage-runtime-boundary": "store",
+	"sqlite-cloudflare": "host", "sqlite-facade": "host", "sqlite-migrations": "store", "sqlite-storage": "store", "sqlite-commit": "store", "storage-runtime-boundary": "store",
 	"system-order-cache-e2e": "loop", "tools-read-differential": "loop", "tools": "loop", "types": "store",
 	"codemode-imports": "loop", "harness-after-run": "loop", "harness-continue": "session", "harness-hook-reads": "loop", "harness-submit-in-commit": "session", "harness-tool-hooks": "loop",
 	"harness-turn-limit": "loop", "harness-registry-reader": "loop", "store-storage": "store",
 	"harness-context-range": "loop", "harness-group-commit": "session", "harness-idle-scopes": "session", "search": "loop", "session-cached-storage": "session",
 	"session-conversation-tails": "session", "session-group-commit": "session", "store-storage-commit": "store", "tool-args-typebox": "loop",
+	"env-node-list-race": "host", "harness-hook-tasks": "loop", "harness-park-children": "loop", "harness-signals": "session",
+	"harness-tool-gates": "loop", "harness-tool-parks": "loop", "images-fit": "loop",
 }
 // Sources that gained, after Pi 5f312dac, what the follow's Durable port on Chord's store and the registry covers (14b4c56e,
 // 6eb99ad6). The row is pending until that port lands: the candidates cannot pass it, and a row that
@@ -90,6 +102,24 @@ const LATER = {
 	"harness-observers": pendingDStore("a Session close fails an observer (S1) and ends a watch ended (6eb99ad6)"),
 	"session-observers": pendingDStore("a Session close fails an observer (S1) and ends a watch ended (6eb99ad6)"),
 	"SC": pendingDStore("it refuses a creation and a change of one document in one commit (14b4c56e)"),
+	"38-signals": "pending durable/core v1.6.0 signals/parks/fit-images port: typed task signals (473515f9)",
+	"39-ask-a-person": "pending durable/core v1.6.0 signals/parks/fit-images port: task sleep on signal or deadline (473515f9)",
+	"40-tool-waits-for-webhook": "pending durable/core v1.6.0 signals/parks/fit-images port: parked tools and cancel (473515f9)",
+	"41-tool-polls": "pending durable/core v1.6.0 signals/parks/fit-images port: parked tools polling on time (473515f9)",
+	"42-parallel-children": "pending durable/core v1.6.0 signals/parks/fit-images port: non-waiting nested calls and wait parks (473515f9)",
+	"43-subagent-waits": "pending durable/core v1.6.0 signals/parks/fit-images port: submission settlement signals (473515f9)",
+	"44-approval-gate": "pending durable/core v1.6.0 signals/parks/fit-images port: beforeTool approval gates (473515f9)",
+	"45-review-on-yield": "pending durable/core v1.6.0 signals/parks/fit-images port: onYield hook tasks (473515f9)",
+	"46-after-tools-terminate": "pending durable/core v1.6.0 signals/parks/fit-images port: afterTools hook tasks (473515f9)",
+	"47-fit-images": "pending durable/core v1.6.0 signals/parks/fit-images port: fit-images extension (76c79d8b)",
+	"env-node-list-race": "pending durable/core v1.6.0 signals/parks/fit-images port: env node listDir race handling (75ca6e7d)",
+	"harness-hook-tasks": "pending durable/core v1.6.0 signals/parks/fit-images port: afterTools and onYield hook tasks (473515f9)",
+	"harness-park-children": "pending durable/core v1.6.0 signals/parks/fit-images port: parked tool children and settlement signals (473515f9)",
+	"harness-idle-scopes": "pending durable/core v1.6.0 signals/parks/fit-images port: top-level defineSignal and parked task idle-context test (473515f9)",
+	"harness-signals": "pending durable/core v1.6.0 signals/parks/fit-images port: signals and parked task wakes (473515f9)",
+	"harness-tool-gates": "pending durable/core v1.6.0 signals/parks/fit-images port: beforeTool gates (473515f9)",
+	"harness-tool-parks": "pending durable/core v1.6.0 signals/parks/fit-images port: parked tools and cancel (473515f9)",
+	"images-fit": "pending durable/core v1.6.0 signals/parks/fit-images port: fitImage/fitImages and fit-images extension (76c79d8b)",
 }
 const out = []
 const emit = (...lines) => out.push(...lines, "")
@@ -104,7 +134,7 @@ emit(
 	"# status: ready (a runner exists and the reference capture is deterministic), pending (no candidate can run it yet, with the",
 	"# reason and the owner; `--strict` fails on it), skipped (nobody can run it here, with the reason).",
 	"",
-	"[pin]", `reference = ${q("earendil-works/pi")}`, `commit = ${q("b556cfe5b0300a91f39c7bc5369a65a25fb7fcd5")}`, `release = ${q("1.0.4")}`,
+	"[pin]", `reference = ${q("earendil-works/pi")}`, `commit = ${q("faac585884ae2c013a6b1400f3e9e77f10b34bac")}`, `release = ${q("1.0.4")}`,
 )
 for (const f of readdirSync(join(pi, "packages/durable/test/examples")).filter(f => /^\d\d-.*\.ts$/.test(f)).sort()) {
 	const name = f.replace(/\.ts$/, "")
@@ -124,7 +154,7 @@ for (const f of readdirSync(join(pi, "packages/durable/test/examples")).filter(f
 // host's SQL, so no candidate can run it without handing the reference's class back.
 const REFERENCE_STORAGE = "the upstream storage conformance suite this file registers runs against the core as row SC (CONTRACT 3.10); the rest tests this Storage class's own internals, which no candidate can run without handing the reference's own class back"
 const NOT_THE_CORE = {
-	"memory-storage": REFERENCE_STORAGE, "jsonl-storage": REFERENCE_STORAGE, "sqlite-facade": REFERENCE_STORAGE, "sqlite-storage": REFERENCE_STORAGE, "sqlite-migrations": REFERENCE_STORAGE,
+	"memory-storage": REFERENCE_STORAGE, "jsonl-storage": REFERENCE_STORAGE, "sqlite-facade": REFERENCE_STORAGE, "sqlite-storage": REFERENCE_STORAGE, "sqlite-commit": "tests SqliteStorage.commit() over its own batch path (statement counts and tables of the reference class), which the core replaces with its encoder and the host's SQL; Durable's Go twin is durable/storage/sqlite/sqlite_commit_test.go", "sqlite-migrations": REFERENCE_STORAGE,
 	"indexeddb-storage": REFERENCE_STORAGE,
 }
 // A row's real-time tests, with the measurement that shows the window binds the reference as well (gate.mjs reads real_time_tests).
@@ -132,6 +162,36 @@ const NOT_THE_CORE = {
 // because the window is filled by the run's own work and any other row's processes on the host stretch that work past it.
 // Read-only: assigned once at initialization.
 const REAL_TIME = {
+	// The next two are not real-time windows. Each is a total CPU budget the reference clears with headroom (Pi's 60 s for a chain the reference
+	// needs 24 s for; vitest's 5 s for 201 cycles the reference needs 0.6 s for), made exclusive because the gate's own `-j 8` load starves the
+	// candidate past the budget: the candidate costs more CPU for the same test (ownership 1.02x the reference's time, retention 2-4x).
+	"harness-ownership": [
+		"# `tracks ownership chains deeper than the call stack` builds a 20,000-task chain inside Pi's own 60 s budget (`}, 60_000)`): 24 s of CPU in the",
+		"# reference and 24.5 s in the candidate, alone. A process the host gives under ~40% of a CPU for that stretch misses the budget. The gate's own",
+		"# load did that (a full run at 5 gates on one host: the candidate ended at 62 s, 1 of 5), so the gate runs the row alone.",
+		`exclusive = true`,
+	],
+	"harness-idle-scopes": [
+		"# `incremental idle state equals a full recompute after every step of random nested work` runs under vitest's default 5 s test budget. The",
+		"# reference takes 0.9 s at 8 CPUs, the candidate 1.6 s (2.0 s at most), 1.5-2.1 times as long (5 alternated runs, so no cost bound): enough that a",
+		"# process the host gives about a third of a CPU misses the budget on the candidate alone. At 4 CPUs under the gate's -j 8 it failed 2 of 2 full",
+		"# rounds of the U-harness rows (\"after 5082 ms\"), the reference passing; so the gate runs the row alone.",
+		`exclusive = true`,
+	],
+	"harness-scheduler-retention": [
+		"# `forgets ended subagent chains once their work ends` runs 201 subagent cycles under vitest's default 5 s test budget (Pi's config sets none). The",
+		"# reference clears it with headroom (0.5-0.7 s at 8 CPUs); the candidate costs 2-4 times that CPU (1.4-2.0 s at 8 CPUs, 2.3 s at 2 and 4.6 s at 1):",
+		"# the core is a separate process behind the facade, so each step of the test is a pipe round trip.",
+		"# A process the host gives under ~40% of a CPU misses the 5 s budget on the candidate alone: 8 concurrent runs of the row (the shape of -j 8) on",
+		"# 4 CPUs all ended at 10-11 s, alone it passes. The gate therefore runs the row alone, and because that no longer lets a slowdown show as a missed",
+		"# budget, the row records a bound on the candidate's time for the test over the reference's: 5x (cost_max_ratio), 1.3 times the largest ratio",
+		"# measured in 20 paired runs at 8 CPUs (2.1-3.9, median 2.9; durable/contract/README.md, Exclusive rows). The gate reads it in costOf (gate.mjs).",
+		"# Pi's own 5 s budget has about 3x margin for the native candidate (a pipe round trip per core call; the shipped Go path has no such hop), so the row",
+		"# can still miss that budget alone at a host load above about 100: recorded here, not excused by the gate.",
+		`exclusive = true`,
+		`cost_test = "scheduler retention forgets ended subagent chains"`,
+		`cost_max_ratio = 5`,
+	],
 	"harness-tools": [
 		"# The test sleeps 20 ms (real setTimeout) inside the 100 ms output throttle window; a process stall longer than ~80 ms flushes the",
 		"# buffered output in the reference as well as in the candidate (checked with an 85 ms stall: both fail; 70 ms: both pass).",
@@ -150,11 +210,23 @@ const REAL_TIME = {
 // A row's measured value of an approved divergence (gate.mjs reads measured_*): the candidate fails the test with this failure, and only with it.
 // No divergence is measured at present.
 const MEASURED = {}
+// Tests of a ready row the owner chose to skip by name (gate.mjs runVitestRow reads skip_tests and the row's reason): the row passes when every
+// other test passes and these are the only failures; a name that passes in the candidate, or is gone from the reference, fails the row.
+// Owner decision A (2026-11-11), 0.8.0: the pin-bump lane after 0.8.0 owns making these two tests run.
+const SKIP_TESTS = {
+	"harness-tasks": {
+		tests: [
+			"task scheduling finalizes a holder whose last child is published while a finalize pass plans other holders",
+			"task scheduling runs a waiter whose last dependency is published while a reservation pass plans",
+		],
+		reason: "Pi 1.5.2's two #11892 tests release a held publication from inside a monkeypatched session.touch, which Pi's TaskScheduler calls once per key of every decision region. Here scheduler decision regions run inside the Go core, and the facade's harness.touch is reached only by line jobs, so the patched touch is never called. The scheduling fix itself is ported and unit-tested in durable/core/session/sched_candidates_test.go (TestAPassKeepsTheCandidateMadeWhilePlanning, TestAPassDoesNotReturnACandidateThatEndedOrHoldsMeanwhile, TestAPassListsATaskMadeACandidateAgainOnce, TestAJobRunAgainKeepsTheCandidatesItTook); running these two tests needs a core-to-host report of the keys each region reads, owner decision, post-0.8.0.",
+	},
+}
 for (const f of readdirSync(join(pi, "packages/durable/test")).filter(f => f.endsWith(".test.ts")).sort()) {
 	const name = f.replace(/\.test\.ts$/, "")
 	const status = NOT_THE_CORE[name] ? [`status = "skipped"`, `reason = ${q(NOT_THE_CORE[name])}`] : LATER[name] ? [`status = "pending"`, `reason = ${q(LATER[name])}`] : [`status = "ready"`]
 	emit("[[scenario]]", `id = ${q("U-" + name)}`, `family = "upstream-test"`, `runner = "vitest"`, `source = ${q("packages/durable/test/" + f)}`, `sha256 = ${q(sha("packages/durable/test/" + f))}`,
-		`owner = ${q("dcore-" + U[name])}`, `levels = ["tests"]`, ...status, ...(REAL_TIME[name] ?? []), ...(MEASURED[name] ?? []))
+		`owner = ${q("dcore-" + U[name])}`, `levels = ["tests"]`, ...status, ...(SKIP_TESTS[name] ? [`skip_tests = ${JSON.stringify(SKIP_TESTS[name].tests)}`, `reason = ${q(SKIP_TESTS[name].reason)}`] : []), ...(REAL_TIME[name] ?? []), ...(MEASURED[name] ?? []))
 }
 emit("[[scenario]]", `id = "SC"`, `family = "storage-conformance"`, `runner = "storage-conformance"`, `source = "packages/durable/src/testing/storage-conformance.ts"`, `sha256 = ${q(sha("packages/durable/src/testing/storage-conformance.ts"))}`,
 	`owner = "dcore-store"`, `about = "the core's write encoder wrapped as a Storage passes the upstream storage conformance suite (CONTRACT 3.10): the suite registered by memory-storage, jsonl-storage, sqlite-storage, sqlite-cloudflare, sqlite-facade and indexeddb-storage"`, `levels = ["tests"]`,
@@ -219,6 +291,12 @@ for (const profile of ["gate", "node"]) {
 for (const profile of ["gate", "node"]) {
 	emit("[[scenario]]", `id = ${q(`F-ticks-output-${profile}`)}`, `family = "differential"`, `runner = "diff"`, `source = "durable/contract/scenarios/output-ticks.mjs"`, `seed = 0`, `profile = ${q(profile)}`, `owner = "dcore-host"`,
 		`about = ${q(`microtask passes from a tool's api.output() to its update event and from its return to its end event, on the ${profile} storage profile`)}`, `levels = ["store", "commit", "context", "output", "order"]`, `status = "ready"`)
+}
+// F-ticks-warm: the passes of a warm turn (scenarios/warm-ticks.mjs): five turns of eight sequential lookups, each turn's submit and its wait. The wait is the sum of
+// every await of Pi's turn, so an await the core spends too many or too few moves the count; F-ticks-node pins a cold submit and a short wait only.
+for (const profile of ["gate", "node"]) {
+	emit("[[scenario]]", `id = ${q(`F-ticks-warm-${profile}`)}`, `family = "differential"`, `runner = "diff"`, `source = "durable/contract/scenarios/warm-ticks.mjs"`, `seed = 0`, `profile = ${q(profile)}`, `owner = "dcore-host"`,
+		`about = ${q(`microtask passes of the submit and the wait of five warm turns of eight sequential lookups on the ${profile} storage profile`)}`, `levels = ["store", "commit", "context", "output", "order"]`, `status = "ready"`)
 }
 // F-fail: a Storage `commit` that throws fails the Session (Pi 42a SessionEnd; scenarios/storage-failure.mjs): the commit number k throws once,
 // and the call that hit it, every later call and wait, the event stream and the Harness end exactly as Pi's do, with the same store behind.

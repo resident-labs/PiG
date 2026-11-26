@@ -1,10 +1,12 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -13,6 +15,7 @@ import (
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/minimatch"
 	"github.com/MichaelKinsy/PiG/internal/nodepath"
 	"github.com/MichaelKinsy/PiG/internal/nodespawn"
 )
@@ -51,20 +54,28 @@ type FindTool struct {
 	FdPath     string
 	Tools      *ToolsManager
 	Operations *FindOperations
+
+	// gitRepoLookup replaces the .git lookup above the search path in tests.
+	gitRepoLookup func(searchPath string) bool
 }
 
 func (t *FindTool) Name() string  { return "find" }
 func (t *FindTool) Label() string { return "" }
 
-func (t *FindTool) Schema() ai.ToolSchema {
+func (t *FindTool) Schema() ai.ToolSchema { return t.schema(false) }
+
+// BorrowedSchema is Schema with the parameters shared, not copied: the caller reads them and never modifies them.
+func (t *FindTool) BorrowedSchema() ai.ToolSchema { return t.schema(true) }
+
+func (t *FindTool) schema(borrow bool) ai.ToolSchema {
 	return toolSchemaWithParameters(ai.ToolSchema{
 		Name:        "find",
 		Description: "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first).",
 	}, `{"type":"object","required":["pattern"],"properties":{
-		"pattern":{"type":"string","description":"Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'"},
+		"pattern":{"type":"string","description":"Glob pattern relative to the search directory, e.g. 'src/**/*.ts'. Without '/', e.g. '*.ts', it matches file names at any depth"},
 		"path":{"type":"string","description":"Directory to search in (default: current directory)"},
 		"limit":{"type":"number","description":"Maximum number of results (default: 1000)"}
-	}}`)
+	}}`, borrow)
 }
 
 func (t *FindTool) ExecutionMode() agent.ToolExecutionMode { return agent.ToolModeParallel }
@@ -94,6 +105,9 @@ func (t *FindTool) Execute(ctx context.Context, _ string, rawParams json.RawMess
 	if p.Limit != nil {
 		effectiveLimit = *p.Limit
 	}
+	// Pi main 676af1d77 (#11747) reads a limit below 1 as 1 (fd treats --max-results 0 as unlimited)
+	// and floors a fractional one.
+	effectiveLimit = math.Max(1, math.Floor(effectiveLimit))
 
 	if t.Operations != nil && t.Operations.Glob != nil {
 		return t.findWithOperations(ctx, p.Pattern, searchPath, effectiveLimit), nil
@@ -107,35 +121,34 @@ func (t *FindTool) Execute(ctx context.Context, _ string, rawParams json.RawMess
 		return findError("fd is not available and could not be downloaded"), nil
 	}
 
-	args := []string{"--glob", "--color=never", "--hidden"}
-	// fd ignores .gitignore outside git repos unless --no-require-git; inside
-	// a repo its git-aware default stops parent rules at nested repos
-	// (upstream #5960).
-	if !insideGitRepo(searchPath) {
-		args = append(args, "--no-require-git")
+	// Pi 1.5.1 (#9262, #11972): see newFindFdInvocation for the arguments and the Windows path matcher.
+	invocation, err := newFindFdInvocation(p.Pattern, searchPath, effectiveLimit, runtime.GOOS == "windows", t.insideGitRepo(searchPath))
+	if err != nil {
+		return findError(err.Error()), nil
 	}
-	args = append(args, "--max-results", jsNumber(effectiveLimit))
-	// fd --glob matches the basename unless --full-path is set; in
-	// --full-path mode it matches the absolute candidate path, so a
-	// path-containing pattern needs a leading "**/".
-	effectivePattern := p.Pattern
-	if strings.Contains(p.Pattern, "/") {
-		args = append(args, "--full-path")
-		if !strings.HasPrefix(p.Pattern, "/") && !strings.HasPrefix(p.Pattern, "**/") && p.Pattern != "**" {
-			effectivePattern = "**/" + p.Pattern
-		}
-		if runtime.GOOS == "windows" {
-			effectivePattern = strings.ReplaceAll(effectivePattern, "/", `[/\\]`)
-		}
+	// An abort during the .git lookup above already returned the aborted result, but there was no child to stop yet. Do not start fd (Pi 1.5.1 #11974).
+	if ctx.Err() != nil {
+		return findError("Operation aborted"), nil
 	}
-	args = append(args, "--", effectivePattern, searchPath)
 
+	// A Windows path matcher lists every entry, so fd stops once one match past the limit arrived (--max-results would count non-matching entries).
+	fdCtx, stopFd := context.WithCancel(ctx)
+	defer stopFd()
 	//nolint:gosec // G204 (class b): program is fd resolved by PiG's tools manager; args are fixed flags, then -- and the pattern and search path from the find tool call, so the model cannot reach an fd option.
-	cmd := exec.CommandContext(ctx, fdPath, args...)
+	cmd := exec.CommandContext(fdCtx, fdPath, invocation.args...)
 	// Upstream's spawn finds fd with libuv's search on Windows.
 	nodespawn.SetProgram(cmd)
 	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
+	var filter *findPathFilter
+	if invocation.pathMatcher != nil {
+		filter = &findPathFilter{matcher: invocation.pathMatcher, limit: effectiveLimit, stop: stopFd}
+		if invocation.matchRelative {
+			filter.relativize = func(line string) string { return relativizeFindResultPath(line, searchPath) }
+		}
+		cmd.Stdout = filter
+	} else {
+		cmd.Stdout = &stdout
+	}
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		// Upstream's catch rejects with an error spawn throws unchanged; only
@@ -149,10 +162,21 @@ func (t *FindTool) Execute(ctx context.Context, _ string, rawParams json.RawMess
 	if ctx.Err() != nil {
 		return findError("Operation aborted"), nil
 	}
+	if filter != nil {
+		filter.finish()
+		stdout.WriteString(filter.kept.String())
+	}
 	// readline decodes the child's bytes as UTF-8 (one U+FFFD per ill-formed subpart) before it splits them.
 	lines := readlineLines(jsstring.FromUTF8([]byte(stdout.String())))
-	output := strings.Join(lines, "\n")
-	if waitErr != nil && output == "" {
+	var relativized []string
+	for _, raw := range lines {
+		line := jsstring.Trim(strings.TrimSuffix(raw, "\r"))
+		if line == "" {
+			continue
+		}
+		relativized = append(relativized, relativizeFindResultPath(line, searchPath))
+	}
+	if waitErr != nil && len(relativized) == 0 {
 		msg := jsstring.Trim(stderr.String())
 		if msg == "" {
 			code := -1
@@ -163,19 +187,15 @@ func (t *FindTool) Execute(ctx context.Context, _ string, rawParams json.RawMess
 		}
 		return findError(msg), nil
 	}
-	if output == "" {
+	if len(relativized) == 0 {
 		return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "No files found matching pattern"}}}, nil
 	}
-
-	var relativized []string
-	for _, raw := range lines {
-		line := jsstring.Trim(strings.TrimSuffix(raw, "\r"))
-		if line == "" {
-			continue
-		}
-		relativized = append(relativized, relativizeFindResultPath(line, searchPath))
+	resultLimitReached := float64(len(relativized)) > effectiveLimit
+	if resultLimitReached {
+		//portlint:allow numbers len(relativized) > effectiveLimit and effectiveLimit is floored above, so int holds it exactly and slice(0, effectiveLimit) takes the first effectiveLimit results
+		relativized = relativized[:int(effectiveLimit)]
 	}
-	return formatFindResults(relativized, effectiveLimit, false), nil
+	return formatFindResults(relativized, effectiveLimit, resultLimitReached, false), nil
 }
 
 func (t *FindTool) findWithOperations(ctx context.Context, pattern, searchPath string, limit float64) agent.AgentToolResult {
@@ -193,7 +213,7 @@ func (t *FindTool) findWithOperations(ctx context.Context, pattern, searchPath s
 	if !exists {
 		return findError("Path not found: " + searchPath)
 	}
-	results, err := ops.Glob(pattern, searchPath, FindGlobOptions{Ignore: []string{"**/node_modules/**", "**/.git/**"}, Limit: limit})
+	results, err := ops.Glob(pattern, searchPath, FindGlobOptions{Ignore: []string{"**/node_modules/**", "**/.git/**"}, Limit: limit + 1})
 	if ctx.Err() != nil {
 		return findError("Operation aborted")
 	}
@@ -203,15 +223,21 @@ func (t *FindTool) findWithOperations(ctx context.Context, pattern, searchPath s
 	if len(results) == 0 {
 		return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "No files found matching pattern"}}}
 	}
+	limitReached := false
+	// A custom glob receives limit+1; the extra result only reports that the limit was reached.
+	if float64(len(results)) > limit {
+		//portlint:allow numbers len(results) > limit and limit is the whole number the caller floored, so int holds it exactly and slice(0, limit) takes the first limit results
+		results = results[:int(limit)]
+		limitReached = true
+	}
 	relativized := make([]string, len(results))
 	for i, result := range results {
 		relativized[i] = relativizeFindResultPath(result, searchPath)
 	}
-	return formatFindResults(relativized, limit, true)
+	return formatFindResults(relativized, limit, limitReached, true)
 }
 
-func formatFindResults(relativized []string, effectiveLimit float64, custom bool) agent.AgentToolResult {
-	resultLimitReached := float64(len(relativized)) >= effectiveLimit
+func formatFindResults(relativized []string, effectiveLimit float64, resultLimitReached, custom bool) agent.AgentToolResult {
 	// Number.MAX_SAFE_INTEGER is observable in the truncation details, even though only bytes cap this tool.
 	tr := TruncateHead(strings.Join(relativized, "\n"), truncationLimits(DefaultMaxBytes, 1<<53-1))
 	resultOutput := tr.Content
@@ -233,9 +259,9 @@ func formatFindResults(relativized []string, effectiveLimit float64, custom bool
 	result := agent.AgentToolResult{}
 	if len(notices) > 0 {
 		resultOutput += "\n\n[" + strings.Join(notices, ". ") + "]"
-		shareTruncatedContent(details.Truncation, resultOutput)
 		result.Details = details
 	}
+	resultOutput = sharedOutput(details.Truncation, resultOutput)
 	result.Content = []ai.ToolResultMessageContent{ai.TextContent{Text: resultOutput}}
 	return result
 }
@@ -300,4 +326,150 @@ func relativizeFindResultPathFor(resultPath, searchPath string, windows bool, en
 		return posixPath + "/"
 	}
 	return posixPath
+}
+
+// insideGitRepo is the .git lookup above the search path; gitRepoLookup replaces it in tests.
+func (t *FindTool) insideGitRepo(searchPath string) bool {
+	if t.gitRepoLookup != nil {
+		return t.gitRepoLookup(searchPath)
+	}
+	return insideGitRepo(searchPath)
+}
+
+// findFdInvocation is the fd command line of one find call and, on Windows for a pattern with a path separator, the matcher that picks the
+// paths fd lists.
+type findFdInvocation struct {
+	args        []string
+	pathMatcher *minimatch.Minimatch
+	// matchRelative says pathMatcher matches a listed path relative to the search path (a relative path pattern), not the absolute path fd
+	// printed (an absolute pattern).
+	matchRelative bool
+}
+
+// findGlobEscaper is find.ts's searchPath.replace(/[\\*?[\]{}]/g, "\\$&"): the search path as literal text of an fd glob.
+var findGlobEscaper = strings.NewReplacer(`\`, `\\`, `*`, `\*`, `?`, `\?`, `[`, `\[`, `]`, `\]`, `{`, `\{`, `}`, `\}`)
+
+// newFindFdInvocation builds find.ts's fd arguments. On Windows `\` in the pattern is a path separator and becomes `/` (#9262); on POSIX it stays
+// a glob escape. fd before 10.5.1 never matches --full-path globs on Windows and workarounds for that break on fd 10.5.1 (sharkdp/fd#2067), so on
+// Windows a path pattern (one with `/`) is not given to fd: fd lists every entry and the matcher decides (#11972), against the path relative to
+// the search path, or the absolute path for an absolute pattern. Its options keep fd's glob behaviour: `*` matches dotfiles, `+(a|b)` is literal,
+// and an all-lowercase pattern matches case-insensitively (smart case). A trailing `/**` matches as `/**/*`, because minimatch's `src/**` also
+// matches `src` itself and fd's does not.
+// Pi 282b01c80 (#12116, #12066): a relative path pattern is anchored at the search path, like grep's glob: "src/*.ts" finds "src/a.ts" but not
+// "pkg/src/b.ts", and "**/src/*.ts" finds both. The former leading "**/" matched through the folders above the search path.
+func newFindFdInvocation(pattern, searchPath string, effectiveLimit float64, windows, insideGit bool) (findFdInvocation, error) {
+	args := []string{"--color=never", "--hidden"}
+	// fd ignores .gitignore outside git repos unless --no-require-git; inside a repo its git-aware default stops parent rules at nested repos
+	// (upstream #5960).
+	if !insideGit {
+		args = append(args, "--no-require-git")
+	}
+	// fd --glob matches the basename unless --full-path is set; in --full-path mode it matches the absolute candidate path.
+	effectivePattern := pattern
+	if windows {
+		effectivePattern = strings.ReplaceAll(pattern, `\`, "/")
+	}
+	// fd's full paths never contain "/./", so "./src/*.ts" would find nothing; drop the leading "./" (upstream #12020).
+	for strings.HasPrefix(effectivePattern, "./") {
+		//portlint:allow utf16units the two bytes are the ASCII "./" the loop condition matched, so a byte and a UTF-16 offset agree
+		effectivePattern = effectivePattern[2:]
+	}
+	isPathPattern := strings.Contains(effectivePattern, "/")
+	// fd's smart case: an all-lowercase pattern matches case-insensitively.
+	ignoreCase := effectivePattern == jsstring.ToLower(effectivePattern)
+	// Absolute patterns are matched as given (path.isAbsolute of the host's path module).
+	isAbsolute := nodepath.PosixIsAbsolute
+	if windows {
+		isAbsolute = nodepath.Win32IsAbsolute
+	}
+	isRelativePathPattern := isPathPattern && !isAbsolute(effectivePattern)
+	if windows && isPathPattern {
+		globPattern := effectivePattern
+		if strings.HasSuffix(globPattern, "/**") {
+			globPattern = strings.TrimSuffix(globPattern, "**") + "**/*"
+		}
+		matcher, err := minimatch.New(globPattern, minimatch.Options{Dot: true, NoExt: true, NoCase: ignoreCase, Platform: "win32"})
+		if err != nil {
+			return findFdInvocation{}, err
+		}
+		return findFdInvocation{args: append(args, "--", "", searchPath), pathMatcher: matcher, matchRelative: isRelativePathPattern}, nil
+	}
+	// One result past the limit tells "exactly N matches" from "more than N".
+	args = append(args, "--glob", "--max-results", jsNumber(effectiveLimit+1))
+	if isPathPattern {
+		args = append(args, "--full-path")
+	}
+	if isRelativePathPattern {
+		// fd matches the absolute path, so the pattern is prefixed with the glob-escaped search path. Smart case is decided by the user's
+		// pattern, not by the search path's letters, so it is set explicitly.
+		effectivePattern = findGlobEscaper.Replace(strings.TrimRight(searchPath, "/")) + "/" + effectivePattern
+		if ignoreCase {
+			args = append(args, "--ignore-case")
+		}
+	}
+	return findFdInvocation{args: append(args, "--", effectivePattern, searchPath)}, nil
+}
+
+// findPathFilter is the writer fd's stdout goes to when a path matcher decides the results: it keeps the lines the matcher accepts, one past the
+// limit at most, and stops fd once it has them.
+type findPathFilter struct {
+	matcher *minimatch.Minimatch
+	// relativize, when set, turns a listed path into the path relative to the search path, which the matcher of a relative pattern matches.
+	relativize func(line string) string
+	limit      float64
+	stop       func()
+
+	pending []byte
+	count   float64
+	done    bool
+	// kept is the accepted lines, each followed by a newline.
+	kept strings.Builder
+}
+
+func (f *findPathFilter) Write(p []byte) (int, error) {
+	if f.done {
+		return len(p), nil
+	}
+	f.pending = append(f.pending, p...)
+	for !f.done {
+		end := bytes.IndexByte(f.pending, '\n')
+		if end < 0 {
+			break
+		}
+		f.line(f.pending[:end])
+		f.pending = f.pending[end+1:]
+	}
+	if f.done {
+		f.pending = nil
+	}
+	return len(p), nil
+}
+
+// finish handles the text after the last newline, which readline emits as a final line.
+func (f *findPathFilter) finish() {
+	if !f.done && len(f.pending) > 0 {
+		f.line(f.pending)
+	}
+	f.pending = nil
+}
+
+func (f *findPathFilter) line(raw []byte) {
+	line := jsstring.Trim(strings.TrimSuffix(jsstring.FromUTF8(raw), "\r"))
+	if line == "" {
+		return
+	}
+	candidate := line
+	if f.relativize != nil {
+		candidate = f.relativize(line)
+	}
+	if !f.matcher.Match(candidate) {
+		return
+	}
+	f.kept.WriteString(line)
+	f.kept.WriteByte('\n')
+	f.count++
+	if f.count > f.limit {
+		f.done = true
+		f.stop()
+	}
 }

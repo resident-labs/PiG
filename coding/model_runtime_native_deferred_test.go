@@ -24,8 +24,8 @@ func TestModelRuntimeDeferredOperationsOfAnExtensionRegisteredProvider(t *testin
 			CheckAuth: func(context.Context, *ai.Credential) (*ai.AuthCheck, error) {
 				return &ai.AuthCheck{Type: ai.CredentialAPIKey}, nil
 			},
-			ResolveAuth: func(context.Context, *ai.Credential, ai.AuthResolutionOverrides) (*ai.AuthResult, *ai.Credential, error) {
-				return &ai.AuthResult{Auth: ai.ModelAuth{APIKey: "resolved-key", BaseURL: "https://resolved.test/v1"}}, nil, nil
+			ResolveAuth: func(context.Context, ai.CredentialStore, ai.AuthResolutionOverrides) (*ai.AuthResult, error) {
+				return &ai.AuthResult{Auth: ai.ModelAuth{APIKey: "resolved-key", BaseURL: "https://resolved.test/v1"}}, nil
 			},
 			ResolveRefreshCredential: func(context.Context, *ai.Credential) (*ai.Credential, *ai.Credential, error) { return nil, nil, nil },
 			Stream: func(context.Context, *ai.Model, ai.TranscriptContext, ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
@@ -75,7 +75,7 @@ func TestModelRuntimeDeferredOperationsOfAnExtensionRegisteredProvider(t *testin
 				return doneStream(request), nil
 			}
 		})
-		reply := runtime.FetchDeferred(t.Context(), model, handle, ai.DeferredFetchOptions{Wait: new(float64(25)), StreamOptions: ai.StreamOptions{Headers: ai.ProviderHeaders{"X-A": new("a")}}})
+		reply := runtime.FetchDeferred(t.Context(), model, handle, ai.DeferredFetchOptions{Wait: new(float64(25)), Headers: ai.ProviderHeaders{"X-A": new("a")}})
 		if reply.StopReason != ai.StopReasonStop || reply.Model != "model" {
 			t.Fatalf("reply = %+v", reply)
 		}
@@ -115,8 +115,8 @@ func TestModelRuntimeDeferredOperationsOfAnExtensionRegisteredProvider(t *testin
 		t.Run("unconfigured provider", func(t *testing.T) {
 			called := false
 			runtime, model := register(t, func(p *extension.NativeProvider) {
-				p.ResolveAuth = func(context.Context, *ai.Credential, ai.AuthResolutionOverrides) (*ai.AuthResult, *ai.Credential, error) {
-					return nil, nil, nil
+				p.ResolveAuth = func(context.Context, ai.CredentialStore, ai.AuthResolutionOverrides) (*ai.AuthResult, error) {
+					return nil, nil
 				}
 				p.FetchDeferred = func(_ context.Context, request *ai.Model, _ ai.DeferredHandle, _ ai.DeferredFetchOptions) (*ai.AssistantMessageEventStream, error) {
 					called = true
@@ -124,7 +124,7 @@ func TestModelRuntimeDeferredOperationsOfAnExtensionRegisteredProvider(t *testin
 				}
 			})
 			reply := within(t, func() *ai.AssistantMessage { return runtime.FetchDeferred(t.Context(), model, handle) })
-			if called || reply.StopReason != ai.StopReasonError || !strings.Contains(reply.ErrorMessage, "provider is not configured: ext-deferred") {
+			if called || reply.StopReason != ai.StopReasonError || !strings.Contains(reply.ErrorMessage, "Provider is not configured: ext-deferred") {
 				t.Errorf("called=%v reply=%+v", called, reply)
 			}
 		})
@@ -158,15 +158,15 @@ func TestModelRuntimeDeferredOperationsOfAnExtensionRegisteredProvider(t *testin
 		}
 		called := false
 		runtime, model = register(t, func(p *extension.NativeProvider) {
-			p.ResolveAuth = func(context.Context, *ai.Credential, ai.AuthResolutionOverrides) (*ai.AuthResult, *ai.Credential, error) {
-				return nil, nil, nil
+			p.ResolveAuth = func(context.Context, ai.CredentialStore, ai.AuthResolutionOverrides) (*ai.AuthResult, error) {
+				return nil, nil
 			}
 			p.CancelDeferred = func(context.Context, *ai.Model, ai.DeferredHandle, ai.DeferredCancelOptions) error {
 				called = true
 				return nil
 			}
 		})
-		if err := runtime.CancelDeferred(t.Context(), model, handle); err == nil || !strings.Contains(err.Error(), "provider is not configured: ext-deferred") || called {
+		if err := runtime.CancelDeferred(t.Context(), model, handle); err == nil || !strings.Contains(err.Error(), "Provider is not configured: ext-deferred") || called {
 			t.Errorf("unconfigured provider: err=%v called=%v", err, called)
 		}
 	})

@@ -11,7 +11,8 @@ const root = process.env.PI_PACKAGE_ROOT ?? realpathSync("extensions/sdk-ts/node
 assert.equal(JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version, PI_PACKAGE_VERSION);
 assert.equal(JSON.parse(readFileSync(join(root, "node_modules/marked/package.json"), "utf8")).version, "18.0.11");
 const dist = join(root, "node_modules/@earendil-works/pi-tui/dist");
-const { Markdown } = await import(pathToFileURL(join(dist, "components/markdown.js")).href);
+const { Markdown: pinnedMarkdown } = await import(pathToFileURL(join(dist, "components/markdown.js")).href);
+const Markdown = pinnedMarkdown;
 const { setCapabilities } = await import(pathToFileURL(join(dist, "terminal-image.js")).href);
 const { Chalk } = await import(pathToFileURL(join(root, "node_modules/chalk/source/index.js")).href);
 const chalk = new Chalk({ level: 3 });

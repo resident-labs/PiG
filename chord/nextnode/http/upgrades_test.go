@@ -1,6 +1,6 @@
 package http
 
-// pi: packages/chord/src/next-node/http/upgrades.ts
+// pi: packages/chord/src/node/http/upgrades.ts
 
 import (
 	"context"
@@ -32,7 +32,7 @@ import (
 // cap), plugin sockets (handed to their handler, an oversized frame closing only that socket, a throwing handler),
 // connections terminated at once when their socket handler or host leaves (a raw peer can act no more), an upgrade checked
 // again after authenticating, the heartbeat, close bounded for a peer that never answers, and nothing kept of a closed
-// socket. Ports packages/chord/test/next-node/http/upgrades.test.ts.
+// socket. Ports packages/chord/test/node/http/upgrades.test.ts.
 //
 // The revocation tests drive the router with `host.Reload` as Pi's do. A router change reaches the connections on a task of its own
 // (the router change is applied on the connection's own task), where Pi's watch listener runs before `reload` resolves: after a reload the tests wait for
@@ -83,7 +83,7 @@ var echoSocket = &HttpSocket{Handle: func(socket *WebSocketHandle, request HttpR
 
 // echo is the plugin contributing echoSocket under `/echo/:room`, frames of at most 64 bytes.
 func echo() plugin {
-	return plugin{"@app/echo", contributing(HttpContribution{Sockets: []HttpSocketEntry{{Pattern: "/echo/:room", Handler: echoSocket}}, MaxPayload: 64})}
+	return plugin{"@app/echo", contributing(HttpContribution{Sockets: []HttpSocketEntry{SocketFunc("/echo/:room", echoSocket)}, MaxPayload: 64})}
 }
 
 var owner = map[string]string{"x-principal": "owner"}
@@ -162,7 +162,7 @@ func TestTheLinksEndpointRefusesASocketWithoutAPrincipalFromAnotherOriginOrHostF
 		}},
 	})
 	port := server.port
-	mustRefused(t, port, "/chord", nil, 403)
+	mustRefused(t, port, "/chord", nil, 401)
 	mustRefused(t, port, "/chord", withHeaders(owner, map[string]string{"origin": "http://evil.com"}), 403)
 	mustRefused(t, port, "/chord", withHeaders(owner, map[string]string{"origin": "null"}), 403)
 	mustRefused(t, port, "/chord", withHeaders(owner, map[string]string{"origin": "HTTP://127.0.0.1:" + strconv.Itoa(port)}), 403)
@@ -230,7 +230,7 @@ func TestTheLinksEndpointCutsOffAClientThatStoppedReadingPast4MiBUnsentBeyondThe
 
 func TestPluginSocketsHandTheSocketAndItsRequestToTheHandlerInAScopeWithItsPrincipalNoPrincipalIsRefused(t *testing.T) {
 	server := serving(t, []plugin{echo()}, servedOptions{})
-	mustRefused(t, server.port, "/echo/lobby", nil, 403)
+	mustRefused(t, server.port, "/echo/lobby", nil, 401)
 	mustRefused(t, server.port, "/nope", owner, 404)
 	socket := mustSocketTo(t, server.port, "/echo/lobby", owner)
 	if got := nextMessage(t, socket); got != "lobby as owner" {
@@ -260,9 +260,37 @@ func TestPluginSocketsAnOversizedFrameClosesOnlyThatSocket1009NeverTheServer(t *
 	other.Close(0, "")
 }
 
+// Pi 7e713da2: ws already sends the protocol close code (1009) when a frame is oversized; terminating the socket then can discard
+// that frame, so the socket stays CLOSING while its error listeners run. The peer sees 1009; the server's own `close` event
+// reports 1006 (ws never reads the peer's close frame after a receiver error: Pi's ws 8.21 gives server 1006, client 1009).
+func TestPluginSocketsAnOversizedFrameLeavesTheSocketClosingTheServerReports1006AndThePeer1009(t *testing.T) {
+	stateAtError := make(chan int, 1)
+	serverClose := make(chan CloseEvent, 1)
+	watched := &HttpSocket{Handle: func(socket *WebSocketHandle, _ HttpRequest, _ host.Ctx) error {
+		socket.OnError(func(error) {
+			// Pi's listener runs after `ws` sent its close frame: the socket is CLOSING, which `keep` leaves alone.
+			stateAtError <- socket.ReadyState()
+		})
+		socket.OnceClose(func(event CloseEvent) { serverClose <- event })
+		return nil
+	}}
+	server := serving(t, []plugin{{"@app/watched", contributing(HttpContribution{Sockets: []HttpSocketEntry{SocketFunc("/watched", watched)}, MaxPayload: 64})}}, servedOptions{})
+	socket := mustSocketTo(t, server.port, "/watched", owner)
+	socket.Send([]byte(strings.Repeat("x", 100)), false, nil)
+	if event := receive(t, socket.closed, "the client's close"); event.Code != 1009 {
+		t.Fatalf("client close code = %d, want 1009", event.Code)
+	}
+	if state := receive(t, stateAtError, "the error"); state != WebSocketClosing {
+		t.Fatalf("ready state at the error = %d, want %d (closing)", state, WebSocketClosing)
+	}
+	if event := receive(t, serverClose, "the server's close"); event.Code != 1006 {
+		t.Fatalf("server close code = %d, want 1006", event.Code)
+	}
+}
+
 func TestPluginSocketsAThrowingHandlerIsReportedSocketFailedAndClosesItsSocket1011(t *testing.T) {
 	server := serving(t, []plugin{{"@app/bad", contributing(HttpContribution{Sockets: []HttpSocketEntry{{
-		Pattern: "/bad", Handler: &HttpSocket{Handle: func(*WebSocketHandle, HttpRequest, host.Ctx) error { return errors.New("handler") }},
+		Pattern: "/bad", Socket: HttpSocketOptions{Handler: &HttpSocket{Handle: func(*WebSocketHandle, HttpRequest, host.Ctx) error { return errors.New("handler") }}},
 	}}})}}, servedOptions{})
 	socket := mustSocketTo(t, server.port, "/bad", owner)
 	if event := receive(t, socket.closed, "the close"); event.Code != 1011 {
@@ -331,7 +359,7 @@ func hostsTunnel(name string, sockets []HttpSocketEntry) tunnel {
 // Q6.
 func TestRevocationKeepsAWritableContributionsOwnSocketsWhenOnlyItsHostsChange(t *testing.T) {
 	handler := noopSocket()
-	tn := hostsTunnel("app.tunnel", []HttpSocketEntry{{Pattern: "/own", Handler: handler}})
+	tn := hostsTunnel("app.tunnel", []HttpSocketEntry{SocketFunc("/own", handler)})
 	server := serving(t, []plugin{{"@app/tunnel", tn.facet}}, servedOptions{})
 	socket := mustSocketTo(t, server.port, "/own", owner)
 	tn.name(t, server, "t.example.com")
@@ -344,11 +372,11 @@ func TestRevocationKeepsAWritableContributionsOwnSocketsWhenOnlyItsHostsChange(t
 
 func TestRevocationTerminatesAPluginsSocketsAtOnceWhenAReloadRemovesItsContributionSealingTheirScopesOthersStayQ6(t *testing.T) {
 	scope := make(chan host.Ctx, 1)
-	removed := contributing(HttpContribution{Sockets: []HttpSocketEntry{{Pattern: "/removed", Handler: &HttpSocket{Handle: func(_ *WebSocketHandle, _ HttpRequest, ctx host.Ctx) error {
+	removed := contributing(HttpContribution{Sockets: []HttpSocketEntry{{Pattern: "/removed", Socket: HttpSocketOptions{Handler: &HttpSocket{Handle: func(_ *WebSocketHandle, _ HttpRequest, ctx host.Ctx) error {
 		scope <- ctx
 		return nil
-	}}}}})
-	other := contributing(HttpContribution{Sockets: []HttpSocketEntry{{Pattern: "/other", Handler: noopSocket()}}})
+	}}}}}})
+	other := contributing(HttpContribution{Sockets: []HttpSocketEntry{SocketFunc("/other", noopSocket())}})
 	server := serving(t, []plugin{{"@app/removed", removed}, {"@app/other", other}}, servedOptions{})
 	doomed := mustSocketTo(t, server.port, "/removed", owner)
 	kept := mustSocketTo(t, server.port, "/other", owner)
@@ -437,10 +465,10 @@ func frame(text string) []byte {
 func TestRevocationARawPeerWhoseHostOrContributionLeftCanSendNothingMoreToTheHandler(t *testing.T) {
 	var calls collector[string]
 	sockets := plugin{"@app/sockets", contributing(HttpContribution{Sockets: []HttpSocketEntry{{
-		Pattern: "/echo", Handler: &HttpSocket{Handle: func(socket *WebSocketHandle, _ HttpRequest, _ host.Ctx) error {
+		Pattern: "/echo", Socket: HttpSocketOptions{Handler: &HttpSocket{Handle: func(socket *WebSocketHandle, _ HttpRequest, _ host.Ctx) error {
 			socket.OnMessage(func(message Message) { calls.add(message.Text()) })
 			return nil
-		}},
+		}}},
 	}}})}
 	tunnel := plugin{"@app/tunnel", contributing(HttpContribution{Hosts: []string{"t.example"}})}
 	server := serving(t, []plugin{sockets, tunnel}, servedOptions{})
@@ -467,9 +495,9 @@ func TestRevocationARawPeerWhoseHostOrContributionLeftCanSendNothingMoreToTheHan
 func TestRevocationChecksAnUpgradeAgainAfterAuthenticatingOneWhoseHostLeftMeanwhileIsRefused(t *testing.T) {
 	gate := newGate()
 	started := newGate()
-	sockets := plugin{"@app/sockets", contributing(HttpContribution{Sockets: []HttpSocketEntry{{Pattern: "/echo", Handler: noopSocket()}}})}
+	sockets := plugin{"@app/sockets", contributing(HttpContribution{Sockets: []HttpSocketEntry{SocketFunc("/echo", noopSocket())}})}
 	server := serving(t, []plugin{sockets, {"@app/tunnel", contributing(HttpContribution{Hosts: []string{"t.example"}})}}, servedOptions{
-		authenticate: func(_ HttpRequest, ctx context.Context) (data.Principal, error) {
+		authenticate: func(ctx context.Context, _ HttpRequest) (data.Principal, error) {
 			started.resolve()
 			if err := gate.wait(ctx); err != nil {
 				return nil, err
@@ -496,8 +524,8 @@ func TestCancellationAbortsAnUpgradesAuthenticationWhenItsClient(t *testing.T) {
 	for _, how := range []string{"ends its connection", "resets its connection"} {
 		t.Run(how, func(t *testing.T) {
 			entered := make(chan context.Context, 1)
-			server := serving(t, []plugin{{"@app/s", contributing(HttpContribution{Sockets: []HttpSocketEntry{{Pattern: "/s", Handler: noopSocket()}}})}}, servedOptions{
-				authenticate: func(_ HttpRequest, ctx context.Context) (data.Principal, error) {
+			server := serving(t, []plugin{{"@app/s", contributing(HttpContribution{Sockets: []HttpSocketEntry{SocketFunc("/s", noopSocket())}})}}, servedOptions{
+				authenticate: func(ctx context.Context, _ HttpRequest) (data.Principal, error) {
 					entered <- ctx
 					<-ctx.Done()
 					return nil, nil
@@ -527,10 +555,10 @@ func TestCancellationAbortsAnUpgradesAuthenticationWhenItsClient(t *testing.T) {
 func TestHeartbeatPingsAPluginSocketAfter15sOfSilenceAndTerminatesIt15sLaterWithoutAnAnswer(t *testing.T) {
 	clock := newFakeClock()
 	server := serving(t, []plugin{{"@app/quiet", contributing(HttpContribution{Sockets: []HttpSocketEntry{{
-		Pattern: "/quiet", Handler: &HttpSocket{Handle: func(socket *WebSocketHandle, _ HttpRequest, _ host.Ctx) error {
+		Pattern: "/quiet", Socket: HttpSocketOptions{Handler: &HttpSocket{Handle: func(socket *WebSocketHandle, _ HttpRequest, _ host.Ctx) error {
 			socket.OnMessage(func(message Message) { socket.Send(message.Data, false, nil) })
 			return nil
-		}},
+		}}},
 	}}})}}, servedOptions{after: clock.afterFunc})
 	// The silent client never answers a ping (`autoPong: false`).
 	silent, err := dialSocket(server.port, "/quiet", owner, 0)
@@ -577,7 +605,7 @@ func TestHeartbeatPingsAPluginSocketAfter15sOfSilenceAndTerminatesIt15sLaterWith
 
 // Sol's build review: close waited on a peer that never acknowledged its close frame.
 func TestCloseTerminatesASocketThatNeverAcknowledgesItsCloseAtCloseTimeout(t *testing.T) {
-	server := serving(t, []plugin{{"@app/s", contributing(HttpContribution{Sockets: []HttpSocketEntry{{Pattern: "/s", Handler: noopSocket()}}})}}, servedOptions{closeTimeout: 20 * time.Millisecond})
+	server := serving(t, []plugin{{"@app/s", contributing(HttpContribution{Sockets: []HttpSocketEntry{SocketFunc("/s", noopSocket())}})}}, servedOptions{closeTimeout: 20 * time.Millisecond})
 	raw := rawSocket(t, server.port, "127.0.0.1:"+strconv.Itoa(server.port), "/s")
 	defer func() { _ = raw.Close() }()
 	started := time.Now()
@@ -650,12 +678,12 @@ func TestGCKeepsNothingOfAClosedPluginSocket(t *testing.T) {
 	var mu sync.Mutex
 	var refs []weak.Pointer[byte]
 	server := serving(t, []plugin{{"@app/kept", contributing(HttpContribution{Sockets: []HttpSocketEntry{{
-		Pattern: "/kept", Handler: &HttpSocket{Handle: func(socket *WebSocketHandle, request HttpRequest, ctx host.Ctx) error {
+		Pattern: "/kept", Socket: HttpSocketOptions{Handler: &HttpSocket{Handle: func(socket *WebSocketHandle, request HttpRequest, ctx host.Ctx) error {
 			mu.Lock()
 			refs = append(refs, weakOf(socket), weakOf(request), weakOf(ctx))
 			mu.Unlock()
 			return nil
-		}},
+		}}},
 	}}})}}, servedOptions{})
 	func() {
 		socket := mustSocketTo(t, server.port, "/kept", owner)
@@ -682,4 +710,215 @@ func TestGCKeepsNothingOfAClosedPluginSocket(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("the socket, its request or its scope is still kept")
+}
+
+func TestAPublicSocketIsAcceptedWithoutAPrincipalAndRunsAnonymousAnotherIsRefused401(t *testing.T) {
+	seen := make(chan string, 1)
+	handler := &HttpSocket{Handle: func(_ *WebSocketHandle, _ HttpRequest, ctx host.Ctx) error {
+		seen <- httpKindOf(ctx.Principal())
+		return nil
+	}}
+	server := serving(t, []plugin{{"@app/sockets", contributing(HttpContribution{Sockets: []HttpSocketEntry{
+		{Pattern: "/open", Socket: HttpSocketOptions{Handler: handler, Public: true}},
+		SocketFunc("/closed", noopSocket()),
+	}})}}, servedOptions{})
+	mustRefused(t, server.port, "/closed", nil, 401)
+	socket := mustSocketTo(t, server.port, "/open", nil)
+	socket.Start()
+	select {
+	case kind := <-seen:
+		if kind != "anonymous" {
+			t.Fatalf("kind = %q", kind)
+		}
+	case <-time.After(within):
+		t.Fatal("the public socket's handler did not run")
+	}
+	server.close()
+}
+
+// Ports packages/chord/src/node/http/http.ts `links.opened` (Pi main c23b9ec1, `close` added by Pi 5f89cc0a7df6): the hook runs once
+// the link is accepted, with the request, the principal and what terminates that link; what it returns runs when the socket
+// closes; a hook that fails is reported `hook_failed` and the link stays.
+func TestTheLinksEndpointCallsOpenedOnceTheLinkIsAcceptedAndItsResultWhenTheSocketCloses(t *testing.T) {
+	opened := make(chan [2]string, 1)
+	closed := make(chan struct{}, 1)
+	server := serving(t, nil, servedOptions{links: &LinksOptions{Path: "/chord", Opened: func(request HttpRequest, principal data.Principal, _ func()) (func(), error) {
+		opened <- [2]string{request.Path(), kindOf(principal)}
+		return func() { closed <- struct{}{} }, nil
+	}}})
+	socket := mustSocketTo(t, server.port, "/chord", owner)
+	if got := <-opened; got != [2]string{"/chord", "owner"} {
+		t.Fatalf("opened = %v", got)
+	}
+	select {
+	case <-closed:
+		t.Fatal("closed ran before the socket closed")
+	default:
+	}
+	socket.Close(1000, "")
+	<-closed
+}
+
+func TestTheLinksEndpointReportsAFailingOpenedAsHookFailedAndKeepsTheLink(t *testing.T) {
+	server := serving(t, nil, servedOptions{links: &LinksOptions{Path: "/chord", Opened: func(HttpRequest, data.Principal, func()) (func(), error) {
+		return nil, errors.New("opened")
+	}}})
+	socket := mustSocketTo(t, server.port, "/chord", owner)
+	socket.Close(1000, "")
+	// The hook runs after the handshake, on the upgrade's own goroutine: its failure is reported a moment later.
+	eventually(t, "the failed hook reported", func() bool { return len(server.errors.all()) > 0 })
+	errs := server.errors.all()
+	if len(errs) != 1 || errs[0].Kind != ErrHookFailed || errs[0].Hook != HookLinksOpened || errs[0].Error == nil || errs[0].Error.Error() != "opened" {
+		t.Fatalf("errors = %+v", errs)
+	}
+}
+
+// Ports packages/chord/test/node/http/upgrades.test.ts "gives links.opened what terminates that link at once: the others stay
+// open" (Pi 5f89cc0a7df6): the close given to the hook terminates that link only, no close handshake (the peer sees 1006), the
+// hook's own result runs once for it, and a second call after the link is gone does nothing.
+func TestTheLinksEndpointGivesOpenedWhatTerminatesThatLinkAtOnceTheOthersStayOpen(t *testing.T) {
+	var mu sync.Mutex
+	var closes []func()
+	opened := make(chan struct{}, 2)
+	closed := make(chan int, 4)
+	server := serving(t, nil, servedOptions{links: &LinksOptions{Path: "/chord", Opened: func(_ HttpRequest, _ data.Principal, closeLink func()) (func(), error) {
+		mu.Lock()
+		index := len(closes)
+		closes = append(closes, closeLink)
+		mu.Unlock()
+		opened <- struct{}{}
+		return func() { closed <- index }, nil
+	}}})
+	// Each link is dialled once the hook of the one before it ran: closes[0] is the first link's.
+	first := mustSocketTo(t, server.port, "/chord", owner)
+	receive(t, opened, "the first link's hook")
+	second := mustSocketTo(t, server.port, "/chord", owner)
+	receive(t, opened, "the second link's hook")
+	closes[0]()
+	// Terminated, not closed with a handshake: the peer sees an abnormal close.
+	if event := receive(t, first.closed, "the first link's close"); event.Code != 1006 {
+		t.Fatalf("close code = %d, want 1006", event.Code)
+	}
+	if got := receive(t, closed, "the first link's closed"); got != 0 {
+		t.Fatalf("closed ran for link %d, want 0", got)
+	}
+	if second.ReadyState() != WebSocketOpenState {
+		t.Fatalf("the other link is %d, want open", second.ReadyState())
+	}
+	// A second call, after the link is gone, does nothing.
+	closes[0]()
+	second.Close(1000, "")
+	if got := receive(t, closed, "the second link's closed"); got != 1 {
+		t.Fatalf("closed ran for link %d, want 1", got)
+	}
+	select {
+	case got := <-closed:
+		t.Fatalf("closed ran again for link %d", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// A hook may end its link before it returns (an app that finds the credential already revoked): Node emits a terminated socket's
+// `close` on a later turn, after the hook returned its function, so that function still runs, once. A goroutine's terminate can
+// finish before the hook returned: the function must run then too.
+func TestTheLinksEndpointRunsWhatOpenedReturnedWhenItEndedTheLinkBeforeReturning(t *testing.T) {
+	closed := make(chan struct{}, 2)
+	server := serving(t, nil, servedOptions{links: &LinksOptions{Path: "/chord", Opened: func(_ HttpRequest, _ data.Principal, closeLink func()) (func(), error) {
+		closeLink()
+		// The terminated socket's close event is emitted on another goroutine: let it come first.
+		time.Sleep(20 * time.Millisecond)
+		return func() { closed <- struct{}{} }, nil
+	}}})
+	socket := mustSocketTo(t, server.port, "/chord", owner)
+	if event := receive(t, socket.closed, "the link's close"); event.Code != 1006 {
+		t.Fatalf("close code = %d, want 1006", event.Code)
+	}
+	receive(t, closed, "what the hook returned")
+	select {
+	case <-closed:
+		t.Fatal("what the hook returned ran twice")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// close after the peer closed the link does nothing: what the hook returned ran once, for the peer's close.
+func TestTheLinksEndpointsCloseAfterThePeerClosedTheLinkDoesNothingAndClosedRanOnce(t *testing.T) {
+	got := make(chan func(), 1)
+	closed := make(chan struct{}, 4)
+	server := serving(t, nil, servedOptions{links: &LinksOptions{Path: "/chord", Opened: func(_ HttpRequest, _ data.Principal, closeLink func()) (func(), error) {
+		got <- closeLink
+		return func() { closed <- struct{}{} }, nil
+	}}})
+	socket := mustSocketTo(t, server.port, "/chord", owner)
+	closeLink := receive(t, got, "the hook")
+	socket.Close(1000, "")
+	receive(t, socket.closed, "the peer's close")
+	receive(t, closed, "what the hook returned")
+	closeLink()
+	closeLink()
+	select {
+	case <-closed:
+		t.Fatal("what the hook returned ran again")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// close from other goroutines racing the peer's close: what the hook returned runs once, whoever ends the link first.
+func TestTheLinksEndpointsCloseRacingThePeersCloseRunsClosedOnce(t *testing.T) {
+	const links = 20
+	got := make(chan func(), links)
+	count := make(chan struct{}, 4*links)
+	server := serving(t, nil, servedOptions{links: &LinksOptions{Path: "/chord", Opened: func(_ HttpRequest, _ data.Principal, closeLink func()) (func(), error) {
+		got <- closeLink
+		return func() { count <- struct{}{} }, nil
+	}}})
+	sockets := make([]*clientSocket, links)
+	closes := make([]func(), links)
+	for i := range sockets {
+		sockets[i] = mustSocketTo(t, server.port, "/chord", owner)
+		closes[i] = receive(t, got, "the hook")
+	}
+	var start sync.WaitGroup
+	start.Add(1)
+	var done sync.WaitGroup
+	for i := range sockets {
+		done.Add(2)
+		go func() { defer done.Done(); start.Wait(); closes[i]() }()
+		go func() { defer done.Done(); start.Wait(); sockets[i].Close(1000, "") }()
+	}
+	start.Done()
+	done.Wait()
+	for range links {
+		receive(t, count, "what a hook returned")
+	}
+	select {
+	case <-count:
+		t.Fatal("what a hook returned ran twice")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// A request carrying Connection: Upgrade with a non-websocket Upgrade token reaches the upgrade handler (as Node emits
+// `upgrade` for any Upgrade header), and Pi's `ws` refuses it with 400 Bad Request rather than gorilla/websocket's 426.
+func TestNonWebSocketUpgradeHeaderAnswers400(t *testing.T) {
+	server := serving(t, []plugin{{"@app/s", contributing(HttpContribution{Sockets: []HttpSocketEntry{SocketFunc("/s", noopSocket())}})}}, servedOptions{})
+	conn, err := net.Dial("tcp", "127.0.0.1:"+strconv.Itoa(server.port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_, err = io.WriteString(conn, "GET /s HTTP/1.1\r\nHost: 127.0.0.1:"+strconv.Itoa(server.port)+"\r\nConnection: Upgrade\r\nUpgrade: h2c\r\nx-principal: owner\r\n\r\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(within))
+	answer := make([]byte, 4096)
+	n, err := conn.Read(answer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstLine, _, _ := strings.Cut(string(answer[:n]), "\r\n")
+	if firstLine != "HTTP/1.1 400 Bad Request" {
+		t.Fatalf("status line = %q, want HTTP/1.1 400 Bad Request (full response: %q)", firstLine, string(answer[:n]))
+	}
 }

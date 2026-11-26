@@ -14,7 +14,7 @@ import (
 
 var toolCardSeq atomic.Uint64
 
-// applyToolPresentation binds definition renderers and their retained call arguments. Core read/write cards use the same built-in definitions as extension overrides, so presentation never depends on private tool-result metadata.
+// applyToolPresentation binds definition renderers and their retained call arguments. Every built-in tool's card uses its built-in definition, as an extension override of it does, so presentation never depends on private tool-result metadata.
 func (m *InteractiveMode) applyToolPresentation(comp *tui.ToolExecutionComponent, toolCallID, name string, args json.RawMessage) {
 	if comp == nil {
 		return
@@ -60,13 +60,18 @@ func (m *InteractiveMode) presentToolCard(comp *tui.ToolExecutionComponent, tool
 // resolveToolRenderers returns the renderers that draw calls of the named tool, or nil when the tool has none.
 func (m *InteractiveMode) resolveToolRenderers(name string) *extension.ToolRenderers {
 	// upstream: interactive-mode.ts getRegisteredToolDefinition: extension resolvers in load order, then the registered tool.
+	// pig additive (D625): the resolution also notes whether an extension draws the card (toolRenderersOfAnExtension); Pi's keeps no such note.
+	var fromBase *extension.ToolRenderers
+	var plain extension.ToolRenderers
+	registered := false
 	base := func() *extension.ToolRenderers {
 		var definition extension.ToolDefinition
 		var ok bool
 		if m.newRunner != nil {
 			definition, ok = m.newRunner.GetToolDefinition(name)
+			registered = ok && (definition.RenderCall != nil || definition.RenderResult != nil)
 		}
-		if !ok && (name == "read" || name == "write" || name == "edit") {
+		if !ok && tui.HasBuiltInToolRenderers(name) {
 			definition, ok = extension.ToolDefinition{Name: name}, true
 			if name == "edit" {
 				// upstream: core/tools/edit.ts renderShell: "self"
@@ -81,12 +86,19 @@ func (m *InteractiveMode) resolveToolRenderers(name string) *extension.ToolRende
 			builtIn = definition.BuiltInRenderers
 		}
 		definition = withBuiltInRenderers(builtIn, definition)
-		return &extension.ToolRenderers{RenderShell: definition.RenderShell, RenderCall: definition.RenderCall, RenderResult: definition.RenderResult}
+		plain = extension.ToolRenderers{RenderShell: definition.RenderShell, RenderCall: definition.RenderCall, RenderResult: definition.RenderResult}
+		handed := plain
+		fromBase = &handed
+		return fromBase
 	}
-	if m.newRunner != nil {
-		return m.newRunner.ResolveToolRenderers(name, base)
+	if m.newRunner == nil {
+		return base()
 	}
-	return base()
+	resolved := m.newRunner.ResolveToolRenderers(name, base)
+	if toolRenderersOfAnExtension(resolved, fromBase, plain, registered) {
+		m.extensionRenderersMounted()
+	}
+	return resolved
 }
 
 // toolCardDefinition is the registered tool's renderers bound to the card they draw: the ToolDefinition arm of upstream's
@@ -174,6 +186,10 @@ const toolCardSweepMin = 256
 // invalidate that runs both renderers again.
 func (m *InteractiveMode) toolDefinitionRenderers(definition extension.ToolRenderers, card func() *tui.ToolExecutionComponent, toolCallID string) *tui.ToolDefinitionRenderers {
 	state := map[string]any{}
+	if m.backgroundCtx != nil {
+		// The card's highlight warm-up (warmWholeHighlight) runs in the session's background group, which ends with its context.
+		state[builtInRenderStateKey] = &builtInRenderState{lifetime: m.backgroundCtx, spawn: m.backgroundTasks.Go}
+	}
 	cardID := "card-" + strconv.FormatUint(toolCardSeq.Add(1), 10)
 	cwd := m.opts.CWD
 	invalidate := func() {
@@ -208,6 +224,11 @@ func (m *InteractiveMode) toolDefinitionRenderers(definition extension.ToolRende
 		}
 	}
 	renderers := &tui.ToolDefinitionRenderers{Self: definition.RenderShell == extension.ToolRenderShellSelf, CallReadsFields: readsCallFields(definition.RenderCall)}
+	if unchanged := callShowsNoChange(definition.RenderCall); unchanged != nil {
+		renderers.CallUnchanged = func(input tui.ToolRenderInput) bool {
+			return input.Fields != nil && unchanged(input.Fields, context(input, nil))
+		}
+	}
 	if definition.RenderCall != nil {
 		var last extension.Component
 		renderers.Call = func(input tui.ToolRenderInput) (tui.Component, bool) {
@@ -221,7 +242,7 @@ func (m *InteractiveMode) toolDefinitionRenderers(definition extension.ToolRende
 	if definition.RenderResult != nil {
 		var last extension.Component
 		renderers.Result = func(input tui.ToolRenderInput) (tui.Component, bool) {
-			result, ok := toolResultOf(card().ResultValue())
+			result, ok := toolResultForRenderer(card().ResultValue(), definition.RenderResult)
 			if !ok {
 				result = agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: card().Output}}, IsError: input.IsError}
 			}

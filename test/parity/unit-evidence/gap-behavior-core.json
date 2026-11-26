@@ -241,7 +241,7 @@
       "TestUpstreamCodemodeOptionsAndStore",
       "TestCodemodeTimeoutCancelsARunningNestedCall"
     ],
-    "upstream_reference": "packages/coding-agent/test/suite/agent-session-codemode.test.ts (ported in coding/codemode_session_upstream_test.go: script header, nested calls, options, store, output truncation); packages/coding-agent/src/extensions/codemode/execute.ts:46-66 (ARGS_PREVIEW_CHARS 200, ERROR_PREVIEW_CHARS 500, truncateText slice(0, max - 3) + \"...\") and :231-233 (DEFAULT_MAX_OUTPUT_TOKENS 10_000, CHARS_PER_TOKEN 4), which Pi's tests do not assert",
+    "upstream_reference": "packages/coding-agent/test/suite/agent-session-codemode.test.ts (ported in coding/codemode_session_upstream_test.go and coding/codemode_session_upstream_node_test.go: script header, nested calls, options, store, output truncation); packages/coding-agent/src/extensions/codemode/execute.ts:46-66 (ARGS_PREVIEW_CHARS 200, ERROR_PREVIEW_CHARS 500, truncateText slice(0, max - 3) + \"...\") and :231-233 (DEFAULT_MAX_OUTPUT_TOKENS 10_000, CHARS_PER_TOKEN 4), which Pi's tests do not assert",
     "mutation": "coding/extension/builtin/codemode/execute.go: `argsPreviewChars  = 200` -> `argsPreviewChars  = 201` (TestCodemodeNestedCallPreviewsAndTheDefaultOutputBudget FAIL); coding/extension/builtin/codemode/execute.go: `errorPreviewChars = 500` -> `errorPreviewChars = 501` (TestCodemodeNestedCallPreviewsAndTheDefaultOutputBudget FAIL); coding/extension/builtin/codemode/execute.go: `defaultMaxOutputTokens = 10_000` -> `defaultMaxOutputTokens = 10_001` (TestCodemodeNestedCallPreviewsAndTheDefaultOutputBudget FAIL); coding/extension/builtin/codemode/execute.go: `if count+width > maxChars-3 {` -> `if count+width > maxChars-2 {` (TestCodemodeNestedCallPreviewsAndTheDefaultOutputBudget FAIL); coding/extension/builtin/codemode/execute.go: `title := \"Script failed\"` -> `title := \"Script failure\"` (TestCodemodeTimeoutCancelsARunningNestedCall, TestUpstreamAgentSessionCodemodeTool, TestUpstreamCodemodeOptionsAndStore FAIL); coding/extension/builtin/codemode/execute.go: `IsError: !result.OK,` -> `IsError: false,` (TestCodemodeTimeoutCancelsARunningNestedCall, TestUpstreamAgentSessionCodemodeTool, TestUpstreamCodemodeOptionsAndStore FAIL); compiled test FAIL (go test -overlay without -cover), baseline PASS"
   },
   {
@@ -400,11 +400,19 @@
     "upstream": "packages/coding-agent/src/extensions/mcp/oauth.ts",
     "package": "./coding/mcpext",
     "tests": [
-      "TestResponseFromRedirectURLMessagesAndOrder",
-      "TestResponseFromRedirectURLTrimsLikeJavaScript",
       "TestMCPOAuthCIMDUsesPisDocumentWhenAuthorizationResponsesNameTheirIssuer",
       "TestMCPOAuthCIMDUsesADocumentAndCallbackPathSpecificToTheMCPServerWithoutTheIssParameter",
       "TestMCPOAuthCIMDReplacesARegisteredClientWhenSwitchingToTheDocument"
+    ],
+    "upstream_reference": "packages/coding-agent/test/mcp-oauth-refresh.test.ts; packages/coding-agent/test/mcp-oauth-store.test.ts; packages/coding-agent/src/extensions/mcp/oauth.ts (REFRESH_SKEW_MS 30s, REFRESH_REQUEST_TIMEOUT_MS, REFRESH_LOCK_STALE_MS 20s, REFRESH_LOCK_WAIT_MS 25s, REFRESH_LOCK_RETRY_MS, redirect URL validation messages, client metadata URL)",
+    "mutation": "TestResponseFromRedirectURLMessagesAndOrder/empty_code: `errors.New(\"The redirect URL does not contain an authorization code\")` -> `errors.New(\"The redirect URL has no authorization code\")` (TestResponseFromRedirectURLMessagesAndOrder, TestResponseFromRedirectURLMessagesAndOrder/missing_code, TestResponseFromRedirectURLMessagesAndOrder/empty_code FAIL); TestResponseFromRedirectURLMessagesAndOrder/not_a_URL: `errors.New(\"Expected the full redirect URL from the browser address bar\")` -> `errors.New(\"Expected the redirect URL\")` (TestResponseFromRedirectURLTrimsLikeJavaScript, TestResponseFromRedirectURLMessagesAndOrder, TestResponseFromRedirectURLMessagesAndOrder/not_a_URL FAIL); TestResponseFromRedirectURLMessagesAndOrder/state_wins_over_a_missing_code: `errors.New(\"The redirect URL belongs to a different sign-in\")` -> `errors.New(\"The redirect URL is for a different sign-in\")` (TestResponseFromRedirectURLMessagesAndOrder, TestResponseFromRedirectURLMessagesAndOrder/wrong_state, TestResponseFromRedirectURLMessagesAndOrder/missing_state FAIL); TestMCPOAuthCIMDReplacesARegisteredClientWhenSwitchingToTheDocument: `clientMetadataBaseURL = \"https://pi.dev/oauth\"` -> `clientMetadataBaseURL = \"https://pi.dev/oauth2\"` (TestMCPOAuthCIMDUsesPisDocumentWhenAuthorizationResponsesNameTheirIssuer, TestMCPOAuthCIMDUsesADocumentAndCallbackPathSpecificToTheMCPServerWithoutTheIssParameter, TestMCPOAuthCIMDReplacesARegisteredClientWhenSwitchingToTheDocument FAIL); compiled test FAIL (go test -overlay without -cover), baseline PASS"
+  },
+  {
+    "upstream": "packages/coding-agent/src/extensions/mcp/oauth.ts",
+    "package": "./mcp/oauth",
+    "tests": [
+      "TestResponseFromRedirectURLMessagesAndOrder",
+      "TestResponseFromRedirectURLTrimsLikeJavaScript"
     ],
     "upstream_reference": "packages/coding-agent/test/mcp-oauth-refresh.test.ts; packages/coding-agent/test/mcp-oauth-store.test.ts; packages/coding-agent/src/extensions/mcp/oauth.ts (REFRESH_SKEW_MS 30s, REFRESH_REQUEST_TIMEOUT_MS, REFRESH_LOCK_STALE_MS 20s, REFRESH_LOCK_WAIT_MS 25s, REFRESH_LOCK_RETRY_MS, redirect URL validation messages, client metadata URL)",
     "mutation": "TestResponseFromRedirectURLMessagesAndOrder/empty_code: `errors.New(\"The redirect URL does not contain an authorization code\")` -> `errors.New(\"The redirect URL has no authorization code\")` (TestResponseFromRedirectURLMessagesAndOrder, TestResponseFromRedirectURLMessagesAndOrder/missing_code, TestResponseFromRedirectURLMessagesAndOrder/empty_code FAIL); TestResponseFromRedirectURLMessagesAndOrder/not_a_URL: `errors.New(\"Expected the full redirect URL from the browser address bar\")` -> `errors.New(\"Expected the redirect URL\")` (TestResponseFromRedirectURLTrimsLikeJavaScript, TestResponseFromRedirectURLMessagesAndOrder, TestResponseFromRedirectURLMessagesAndOrder/not_a_URL FAIL); TestResponseFromRedirectURLMessagesAndOrder/state_wins_over_a_missing_code: `errors.New(\"The redirect URL belongs to a different sign-in\")` -> `errors.New(\"The redirect URL is for a different sign-in\")` (TestResponseFromRedirectURLMessagesAndOrder, TestResponseFromRedirectURLMessagesAndOrder/wrong_state, TestResponseFromRedirectURLMessagesAndOrder/missing_state FAIL); TestMCPOAuthCIMDReplacesARegisteredClientWhenSwitchingToTheDocument: `clientMetadataBaseURL = \"https://pi.dev/oauth\"` -> `clientMetadataBaseURL = \"https://pi.dev/oauth2\"` (TestMCPOAuthCIMDUsesPisDocumentWhenAuthorizationResponsesNameTheirIssuer, TestMCPOAuthCIMDUsesADocumentAndCallbackPathSpecificToTheMCPServerWithoutTheIssParameter, TestMCPOAuthCIMDReplacesARegisteredClientWhenSwitchingToTheDocument FAIL); compiled test FAIL (go test -overlay without -cover), baseline PASS"
@@ -448,18 +456,18 @@
     "upstream": "packages/coding-agent/src/core/tools/renderers/edit.ts",
     "package": "./internal/codingagent",
     "tests": [
-      "TestBuiltInRenderersMatchPi104"
+      "TestBuiltInRenderersMatchPi"
     ],
-    "upstream_reference": "packages/coding-agent/src/core/tools/renderers/edit.ts renderCall and renderResult rows for every committed probe case (internal/codingagent/testdata/pi104-render-probe, recorded from Pi 1.0.4's built renderers)",
+    "upstream_reference": "packages/coding-agent/src/core/tools/renderers/edit.ts renderCall and renderResult rows for every committed probe case (internal/codingagent/testdata/pi-render-probe, recorded from Pi 1.0.4's built renderers)",
     "mutation": "internal/codingagent/tool_builtin_renderers.go: token = \"toolSuccessBg\" -> \"toolPendingBg\" in editRenderCall; compiled test FAIL, baseline PASS"
   },
   {
     "upstream": "packages/coding-agent/src/core/tools/renderers/write.ts",
     "package": "./internal/codingagent",
     "tests": [
-      "TestBuiltInRenderersMatchPi104"
+      "TestBuiltInRenderersMatchPi"
     ],
-    "upstream_reference": "packages/coding-agent/src/core/tools/renderers/write.ts renderCall and renderResult rows for every committed probe case (internal/codingagent/testdata/pi104-render-probe, recorded from Pi 1.0.4's built renderers)",
+    "upstream_reference": "packages/coding-agent/src/core/tools/renderers/write.ts renderCall and renderResult rows for every committed probe case (internal/codingagent/testdata/pi-render-probe, recorded from Pi 1.0.4's built renderers)",
     "mutation": "internal/codingagent/tool_builtin_renderers.go: \"[invalid content arg - expected string]\" -> \"[invalid content arg]\" in writeRenderCall; compiled test FAIL, baseline PASS"
   },
   {

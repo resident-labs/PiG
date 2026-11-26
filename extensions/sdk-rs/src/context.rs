@@ -9,7 +9,6 @@ use crate::theme::{Theme, UiState};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
@@ -73,6 +72,12 @@ pub trait RemoteComponent: Send {
     /// Raw input preserves lone UTF-16 units just like terminal listeners.
     fn handle_input(&mut self, data: &crate::JsString) -> Result<RemoteComponentResult, String>;
     fn set_invalidate(&mut self, _invalidate: Option<RemoteComponentInvalidate>) {}
+    /// Pi's optional `Component.invalidate()`: the host's TUI was invalidated (a theme change, a cell-size report, a change
+    /// of image support; Pi's `TUI.invalidate`, tui.ts:951-954), so the component drops what it kept from the state before.
+    /// A theme change is applied first, and a frame is rendered after it. It runs on the worker
+    /// [`Self::handle_input`] runs on, in order with the input. The default does nothing, and the component is rendered again
+    /// all the same.
+    fn invalidate(&mut self) {}
     fn dispose(&mut self) {}
     /// Whether the component captures viewport input, as an upstream component with
     /// `capturesViewportInput` does: the host's fullscreen viewport keys (scroll, page) go to it instead
@@ -122,6 +127,12 @@ pub trait ViewComponent: Send {
         Ok(RemoteComponentResult::pending())
     }
     fn set_invalidate(&mut self, _invalidate: Option<RemoteComponentInvalidate>) {}
+    /// Pi's optional `Component.invalidate()`: the host's TUI was invalidated (a theme change, a cell-size report, a change
+    /// of image support; Pi's `TUI.invalidate`, tui.ts:951-954), so the component drops what it kept from the state before.
+    /// A theme change is applied first, and a frame is rendered after it. It runs on the worker
+    /// [`Self::handle_input`] runs on, in order with the input. The default does nothing, and the component is rendered again
+    /// all the same.
+    fn invalidate(&mut self) {}
     fn dispose(&mut self) {}
     /// Whether the component captures viewport input; see
     /// [`RemoteComponent::captures_viewport_input`]. The default is false.
@@ -149,6 +160,12 @@ pub(crate) enum OverlayComponent {
 }
 
 impl OverlayComponent {
+    fn invalidate(&mut self) {
+        match self {
+            OverlayComponent::Lines(component) => component.invalidate(),
+            OverlayComponent::View(component) => component.invalidate(),
+        }
+    }
     fn handle_input(&mut self, data: &crate::JsString) -> Result<RemoteComponentResult, String> {
         match self {
             OverlayComponent::Lines(component) => component.handle_input(data),
@@ -292,6 +309,8 @@ enum RemoteComponentEvent {
     Opened(OverlayState),
     /// The host's `ui.custom.focus`: the component lost (false) or regained (true) TUI focus.
     Focus(bool),
+    /// The host's `ui.custom.invalidate`: its TUI was invalidated this many times.
+    Invalidate(u64),
     Stop,
 }
 
@@ -493,6 +512,11 @@ impl RemoteOverlay {
         self.send(RemoteComponentEvent::Focus(focused))
     }
 
+    /// Queues the host's `ui.custom.invalidate` behind the input already queued.
+    pub(crate) fn send_invalidate(&self, count: u64) -> Result<(), String> {
+        self.send(RemoteComponentEvent::Invalidate(count))
+    }
+
     /// Queues a `ui.view.event` behind the input already queued.
     pub(crate) fn send_view_event(&self, event: crate::kit::Event) -> Result<(), String> {
         self.send(RemoteComponentEvent::ViewEvent(Box::new(event)))
@@ -549,12 +573,12 @@ fn render_remote_component_frame(
         .as_ref()
         .map_or(width, |layout| resolve_overlay_width(layout, width));
     let frame = match &state.component {
-        OverlayComponent::Lines(component) => catch_unwind(AssertUnwindSafe(|| {
+        OverlayComponent::Lines(component) => crate::diagnostic::recover(|| {
             crate::kit::Rendered::Lines(component.render(render_width))
-        })),
-        OverlayComponent::View(component) => catch_unwind(AssertUnwindSafe(|| {
-            crate::kit::Rendered::view(component.view(width))
-        })),
+        }),
+        OverlayComponent::View(component) => {
+            crate::diagnostic::recover(|| crate::kit::Rendered::view(component.view(width)))
+        }
     }
     .map_err(|_| io::Error::other("focused render panicked"))?;
     state.last_render = Some(Instant::now());
@@ -659,18 +683,18 @@ fn run_remote_component_worker(worker: RemoteComponentWorker) {
                     let mut state = overlay.state.lock().unwrap();
                     match (&mut state.component, event) {
                         (component, RemoteComponentEvent::Input(data)) => Some(
-                            catch_unwind(AssertUnwindSafe(|| component.handle_input(&data)))
+                            crate::diagnostic::recover(|| component.handle_input(&data))
                                 .map_err(|_| "focused input panicked".to_string()),
                         ),
                         (
                             OverlayComponent::View(component),
                             RemoteComponentEvent::ViewEvent(event),
                         ) => Some(
-                            catch_unwind(AssertUnwindSafe(|| component.handle_view_event(*event)))
+                            crate::diagnostic::recover(|| component.handle_view_event(*event))
                                 .map_err(|_| "focused view event panicked".to_string()),
                         ),
                         (component, RemoteComponentEvent::Mouse(event)) => Some(
-                            catch_unwind(AssertUnwindSafe(|| component.handle_mouse(&event)))
+                            crate::diagnostic::recover(|| component.handle_mouse(&event))
                                 .map_err(|_| "focused mouse panicked".to_string()),
                         ),
                         // A line component has no view, so it ignores view events.
@@ -709,7 +733,7 @@ fn run_remote_component_worker(worker: RemoteComponentWorker) {
                         request_parent: request_parent.clone(),
                         request_id: request_id.clone(),
                     };
-                    catch_unwind(AssertUnwindSafe(|| on_handle(handle)))
+                    crate::diagnostic::recover(|| on_handle(handle))
                         .map_err(|_| io::Error::other("onHandle panicked"))
                 } else {
                     Ok(())
@@ -720,6 +744,27 @@ fn run_remote_component_worker(worker: RemoteComponentWorker) {
                 // handle's is_focused reads, and the component renders again.
                 overlay.handle_state.lock().unwrap().focused = focused;
                 render_remote_component_frame(&conn, &key, &overlay, width.load(Ordering::Relaxed))
+            }
+            RemoteComponentEvent::Invalidate(count) => {
+                // Pi's TUI.invalidate reached the component (tui.ts:951-954): the theme_change that preceded this on the connection
+                // is applied, the component drops what it kept, and the frame it builds now goes out.
+                let outcome = {
+                    let mut state = overlay.state.lock().unwrap();
+                    crate::diagnostic::recover(|| {
+                        for _ in 0..count {
+                            state.component.invalidate();
+                        }
+                    })
+                };
+                match outcome {
+                    Ok(()) => render_remote_component_frame(
+                        &conn,
+                        &key,
+                        &overlay,
+                        width.load(Ordering::Relaxed),
+                    ),
+                    Err(_) => Err(io::Error::other("focused invalidate panicked")),
+                }
             }
             RemoteComponentEvent::Stop => break,
         };
@@ -740,8 +785,8 @@ fn dispose_remote_component(overlay: &RemoteOverlay) {
         .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = catch_unwind(AssertUnwindSafe(|| state.component.set_invalidate(None)));
-    let _ = catch_unwind(AssertUnwindSafe(|| state.component.dispose()));
+    let _ = crate::diagnostic::recover(|| state.component.set_invalidate(None));
+    let _ = crate::diagnostic::recover(|| state.component.dispose());
 }
 
 /// A raw terminal-input handler's verdict on one chunk, mirroring upstream's
@@ -1995,10 +2040,10 @@ impl ModelRegistry {
     ) -> Arc<ModelEventStream> {
         self.stream_with_method(model, request, options, true, callbacks, None)
     }
-    /// A stream on the session graph `ModelRuntime` the handle names.
+    /// A stream on the session graph `ModelRuntime` whose object is given.
     pub(crate) fn stream_on_runtime(
         &self,
-        runtime: &str,
+        runtime: Arc<crate::graph::GraphObject>,
         model: serde_json::Value,
         request: serde_json::Value,
         options: serde_json::Value,
@@ -2010,7 +2055,7 @@ impl ModelRegistry {
             options,
             simple,
             ModelStreamCallbacks::default(),
-            Some(runtime.to_string()),
+            Some(runtime),
         )
     }
     fn stream_with_method(
@@ -2020,13 +2065,10 @@ impl ModelRegistry {
         options: serde_json::Value,
         simple: bool,
         callbacks: ModelStreamCallbacks,
-        runtime: Option<String>,
+        runtime: Option<Arc<crate::graph::GraphObject>>,
     ) -> Arc<ModelEventStream> {
-        let runtime = runtime.or_else(|| {
-            self.runtime
-                .as_ref()
-                .map(|runtime| runtime.handle().to_string())
-        });
+        // The thread below owns the runtime's object until the host's stream call is answered: the object's release names the handle.
+        let runtime = runtime.or_else(|| self.runtime.as_ref().map(|runtime| runtime.object()));
         let id = format!(
             "model-stream-{}",
             self.sequence.fetch_add(1, Ordering::Relaxed) + 1
@@ -2065,7 +2107,7 @@ impl ModelRegistry {
                 {
                     let mut call = serde_json::json!({"streamId": id, "model": model, "request": merged, "simple":simple});
                     if let Some(runtime) = &runtime {
-                        call["runtime"] = serde_json::Value::String(runtime.clone());
+                        call["runtime"] = serde_json::Value::String(runtime.handle().to_string());
                     }
                     for (set, name) in [(flags.0, "onPayload"), (flags.1, "onResponse"), (flags.2, "transformHeaders"), (flags.3, "fetch")] {
                         if set {
@@ -2115,27 +2157,47 @@ impl ModelRegistry {
     }
 }
 
-/// The Session's identity as the host's state snapshots replicate it: Pi's `ctx.model.id`, `ctx.model.provider` and
-/// `ctx.sessionManager.getSessionName()`. The ready state and every `state_update` pass through [`SessionIdentity::apply_state`].
+/// The Session's identity as the host's state snapshots replicate it: Pi's `ctx.model` (the id and provider every read of the model takes, and the
+/// model object `get_model_info` decodes per call) and `ctx.sessionManager`'s `getSessionId()`, `getSessionName()` and `getSessionFile()`. The ready state and every
+/// `state_update` pass through [`SessionIdentity::apply_state`].
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SessionIdentity {
     pub(crate) model: String,
     pub(crate) model_provider: String,
+    /// The session object's members, `""` for none. They are known once `session_id` is.
     pub(crate) session_name: String,
+    pub(crate) session_file: String,
+    /// The snapshot's model object, `null` for a Session without a model; `None` until a snapshot carried the `model` key.
+    pub(crate) model_wire: Option<serde_json::Value>,
+    /// `model_wire` decoded once when it changes (the error is the decode error of the host reply, as its message), so a read clones it instead of decoding under the lock the reader thread needs to apply a push.
+    pub(crate) model_info: Option<Result<Option<ModelInfo>, String>>,
+    /// The snapshot's session id, `""` for none; `None` until a snapshot carried the `session` object.
+    pub(crate) session_id: Option<String>,
 }
 
 impl SessionIdentity {
-    /// Applies a state snapshot. An absent `model` keeps the replica and an explicit null clears it (the Session holds no model). Every session snapshot carries the name, `""` for a session with no name.
+    /// Applies a state snapshot. An absent `model` keeps the replica and an explicit null clears it (the Session holds no model); the model object is copied and its
+    /// identity derived only when it differs from the held one. Every session object replaces the name, the file (`""` for a session with no name or no file, an in-memory
+    /// session) and the id (omitted when empty).
     pub(crate) fn apply_state(&mut self, state: &serde_json::Map<String, serde_json::Value>) {
-        if let Some(model) = state.get("model") {
+        if let Some(model) = state.get("model")
+            && self.model_wire.as_ref() != Some(model)
+        {
             (self.model, self.model_provider) = model_identity(model);
+            self.model_info = Some(ModelInfo::from_wire(model).map_err(|error| error.to_string()));
+            self.model_wire = Some(model.clone());
         }
         if let Some(session) = state.get("session").and_then(serde_json::Value::as_object) {
-            self.session_name = session
-                .get("sessionName")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string();
+            let member = |key: &str| {
+                session
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            self.session_name = member("sessionName");
+            self.session_file = member("sessionFile");
+            self.session_id = Some(member("sessionId"));
         }
     }
 }
@@ -2163,6 +2225,9 @@ pub(crate) fn model_identity(model: &serde_json::Value) -> (String, String) {
 }
 
 /// Context provides access to the host's UI and session state.
+/// It has no method that continues a turn or appends a compaction at a turn's end: a `turn_end` or `agent_before_settle` handler does both with its result,
+/// `entries` (custom, custom_message, context_edit and compaction drafts) and `continue` (one more provider request, no new user message). See "Own compaction
+/// and continue after an overflow" in the extensions guide.
 /// Passed to every handler function. Clones share the connection, cancellation and live session state, so retained callbacks can own a context without copying that state.
 #[derive(Clone)]
 pub struct Context {
@@ -2553,6 +2618,46 @@ const RPC_SYNCHRONOUS_UI_EFFECTS: &[&str] = &[
     "ui.setHeader",
 ];
 
+/// The model [`Context::set_model`] takes: a Pi model object, or the `provider/id` name of one. Both convert into it, so
+/// `ctx.set_model(&object)` and `ctx.set_model("provider/id")` compile.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetModelArg {
+    /// A Pi model object.
+    Object(serde_json::Value),
+    /// A `provider/id` name.
+    Named(String),
+}
+
+impl From<serde_json::Value> for SetModelArg {
+    fn from(object: serde_json::Value) -> Self {
+        SetModelArg::Object(object)
+    }
+}
+
+impl From<&serde_json::Value> for SetModelArg {
+    fn from(object: &serde_json::Value) -> Self {
+        SetModelArg::Object(object.clone())
+    }
+}
+
+impl From<&str> for SetModelArg {
+    fn from(spec: &str) -> Self {
+        SetModelArg::Named(spec.to_string())
+    }
+}
+
+impl From<String> for SetModelArg {
+    fn from(spec: String) -> Self {
+        SetModelArg::Named(spec)
+    }
+}
+
+impl From<&String> for SetModelArg {
+    fn from(spec: &String) -> Self {
+        SetModelArg::Named(spec.clone())
+    }
+}
+
 impl Context {
     pub fn model_registry(&self) -> ModelRegistry {
         ModelRegistry {
@@ -2579,6 +2684,19 @@ impl Context {
         }
     }
 
+    /// The stale message as an error once the session was replaced or reloaded: what a call that has an error result returns where a getter panics (see [`Self::assert_active`]). A replacement context is not stale.
+    fn stale_error(&self) -> io::Result<()> {
+        if self.replacement {
+            return Ok(());
+        }
+        // Copy the message out so the lock is not held while the error is built.
+        let message = self.conn.stale_message.lock().unwrap().clone();
+        match message {
+            Some(message) => Err(io::Error::other(message)),
+            None => Ok(()),
+        }
+    }
+
     /// Returns the working directory. Panics with the stale message after the session was replaced or reloaded.
     pub fn cwd(&self) -> &str {
         self.assert_active();
@@ -2596,14 +2714,21 @@ impl Context {
         }
     }
 
-    /// Returns the terminal width.
+    /// Returns the terminal width. Panics with the stale message after the session was replaced or reloaded.
     pub fn width(&self) -> u32 {
+        self.assert_active();
+        self.terminal_width()
+    }
+
+    /// The width the host last reported, without the stale check: the SDK's own renders and pushes read it, and a push from a stale context fails with the host's error, never with a panic on a thread of the SDK.
+    pub(crate) fn terminal_width(&self) -> u32 {
         self.shared_width.load(Ordering::Relaxed)
     }
 
     /// Returns the terminal height in rows, or 0 when the host has not
-    /// reported one. Updated by `height_change` notifications.
+    /// reported one. Updated by `height_change` notifications. Panics with the stale message after the session was replaced or reloaded.
     pub fn height(&self) -> u32 {
+        self.assert_active();
         self.shared_height.load(Ordering::Relaxed)
     }
 
@@ -2659,6 +2784,7 @@ impl Context {
     /// Streams a partial result of the running tool, as upstream's `onUpdate`
     /// does. The host shows updates in order, before the tool's final result.
     pub fn on_update(&self, partial: crate::ToolResult) -> io::Result<()> {
+        self.stale_error()?;
         if self.tool_call_id.is_none() || self.request_id.is_empty() {
             return Err(io::Error::other(
                 "on_update is only available while a tool runs",
@@ -3062,6 +3188,17 @@ impl Context {
         crate::host_helpers::decode_resized(self.call_host(method, Some(args))?)
     }
 
+    /// Pi's `withFileMutationQueue` for a handler that has its context: run `f` in the host's file mutation queue for `file_path` and return its result. A tool
+    /// that takes the queue through its context registers in the order Pi's one thread runs the batch's tools (D187); the free
+    /// [`crate::with_file_mutation_queue`] registers in the order the calls reach the host. See `file_mutation_queue::with_context`.
+    pub fn with_file_mutation_queue<T>(
+        &self,
+        file_path: impl AsRef<std::path::Path>,
+        f: impl FnOnce() -> T,
+    ) -> io::Result<T> {
+        crate::file_mutation_queue::with_context(self, file_path.as_ref(), f)
+    }
+
     /// Low-level host call escape hatch. Prefer typed methods when available.
     pub fn call_host(
         &self,
@@ -3242,6 +3379,28 @@ impl Context {
         trigger_turn: Option<bool>,
         deliver_as: Option<&str>,
     ) -> io::Result<()> {
+        self.send_message_with_details(
+            custom_type,
+            content,
+            display,
+            trigger_turn,
+            deliver_as,
+            None,
+        )
+    }
+
+    /// [`Context::send_message`] with upstream's message `details`, extension data kept with the
+    /// message and not sent to the model: `None` leaves the member out and `Some(Value::Null)`
+    /// writes it as null.
+    pub fn send_message_with_details(
+        &self,
+        custom_type: &str,
+        content: &str,
+        display: bool,
+        trigger_turn: Option<bool>,
+        deliver_as: Option<&str>,
+        details: Option<serde_json::Value>,
+    ) -> io::Result<()> {
         // Both options are optional upstream: None is sent as unset and the
         // host applies upstream's default for the session's state.
         let mut options = serde_json::Map::new();
@@ -3254,30 +3413,53 @@ impl Context {
                 serde_json::Value::String(deliver_as.to_string()),
             );
         }
+        let mut message = serde_json::json!({
+            "customType": custom_type,
+            "content": content,
+            "display": display,
+        });
+        if let Some(details) = details {
+            message["details"] = details;
+        }
         call_result_to_io(self.call_wire(
             "sendMessage",
-            Some(serde_json::json!({
-                "message": {
-                    "customType": custom_type,
-                    "content": content,
-                    "display": display,
-                },
-                "options": options,
-            })),
+            Some(serde_json::json!({"message": message, "options": options})),
         )?)
     }
 
-    /// Send a user message containing a string or text/image content blocks.
+    /// Send a user message containing a string or text/image content blocks. `deliver_as` is `"steer"` or `"followUp"`; the empty
+    /// string sends no `deliverAs`, as `pi.sendUserMessage(content)` does: an idle agent runs the message at once and a streaming
+    /// agent refuses it with Pi's error (`Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue
+    /// the message.`, an extension error event `send_user_message`; the call itself returns).
     pub fn send_user_message(
         &self,
         content: impl serde::Serialize,
         deliver_as: &str,
     ) -> io::Result<()> {
+        self.send_user_message_with(content, deliver_as, None)
+    }
+
+    /// `send_user_message` with Pi's `expandPromptTemplates` option (types.ts:1792): `Some(true)` dispatches an extension
+    /// command and expands a skill command or prompt template in the text as typed input would; `None` is Pi's default,
+    /// false. On a withSession context the call runs on the replacement Session and returns after it.
+    pub fn send_user_message_with(
+        &self,
+        content: impl serde::Serialize,
+        deliver_as: &str,
+        expand_prompt_templates: Option<bool>,
+    ) -> io::Result<()> {
+        let mut options = serde_json::json!({});
+        if !deliver_as.is_empty() {
+            options["deliverAs"] = serde_json::json!(deliver_as);
+        }
+        if let Some(expand) = expand_prompt_templates {
+            options["expandPromptTemplates"] = serde_json::json!(expand);
+        }
         call_result_to_io(self.call_wire(
             "sendUserMessage",
             Some(serde_json::json!({
                 "content": content,
-                "options": {"deliverAs": deliver_as},
+                "options": options,
             })),
         )?)
     }
@@ -3291,12 +3473,30 @@ impl Context {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
-    /// Append a custom persistent entry to the session.
+    /// Append a custom persistent entry to the session. `Value::Null` leaves the entry without a
+    /// `data` member, as Pi's `appendEntry(customType)` does; [`Context::append_entry_opt`] writes
+    /// an explicit null.
     pub fn append_entry(&self, custom_type: &str, data: serde_json::Value) -> io::Result<()> {
-        call_result_to_io(self.call_wire(
-            "appendEntry",
-            Some(serde_json::json!({"customType": custom_type, "data": data})),
-        )?)
+        self.append_entry_opt(custom_type, if data.is_null() { None } else { Some(data) })
+    }
+
+    /// Append a custom persistent entry whose `data` member is left out (`None`, Pi's
+    /// `appendEntry(customType)`), written as null (`Some(Value::Null)`, Pi's
+    /// `appendEntry(customType, null)`) or a value.
+    pub fn append_entry_opt(
+        &self,
+        custom_type: &str,
+        data: Option<serde_json::Value>,
+    ) -> io::Result<()> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "customType".into(),
+            serde_json::Value::String(custom_type.to_string()),
+        );
+        if let Some(data) = data {
+            args.insert("data".into(), data);
+        }
+        call_result_to_io(self.call_wire("appendEntry", Some(serde_json::Value::Object(args)))?)
     }
 
     // ─── Editor access ───────────────────────────────────────────────────
@@ -3338,8 +3538,12 @@ impl Context {
 
     // ─── Session state ───────────────────────────────────────────────────
 
-    /// Get the session name, fetched live from the host. Pi's `getSessionName` is `string | undefined`: `None` means the session has no name.
+    /// Get the session name. Pi's `getSessionName` is `string | undefined`: `None` means the session has no name. The state snapshots replicate it, so the read
+    /// costs no host call once one arrived; a replacement context asks the host.
     pub fn get_session_name(&self) -> io::Result<Option<String>> {
+        if let Some(name) = self.replicated_session(|identity| &identity.session_name)? {
+            return Ok(Some(name).filter(|name| !name.is_empty()));
+        }
         self.optional_string_field("getSessionName", "name")
     }
 
@@ -3350,14 +3554,31 @@ impl Context {
         )
     }
 
-    /// Set or clear a label for a session entry.
-    /// Sets or clears an entry label. The host's failure is returned, as
-    /// upstream's setLabel throws when the session cannot record the label.
+    /// Sets or clears an entry label. The label is written as given: an empty one clears the label
+    /// and its entry holds `"label":""`, as Pi's `setLabel(entryId, "")` writes it. The host's
+    /// failure is returned, as upstream's setLabel throws when the session cannot record the label.
     pub fn set_label(&self, entry_id: &str, label: &str) -> io::Result<()> {
-        call_result_to_io(self.call_wire(
-            "setLabel",
-            Some(serde_json::json!({"entryId": entry_id, "label": label})),
-        )?)
+        self.set_label_opt(entry_id, Some(serde_json::Value::String(label.to_string())))
+    }
+
+    /// Sets or clears an entry label in every form Pi's `setLabel(entryId, label?)` takes: `None`
+    /// is the call without a label, whose entry has no `label` member; `Some(Value::Null)` is a
+    /// null label, written as null; a string is written as given. All but a string that is not
+    /// empty clear the label.
+    pub fn set_label_opt(
+        &self,
+        entry_id: &str,
+        label: Option<serde_json::Value>,
+    ) -> io::Result<()> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "entryId".into(),
+            serde_json::Value::String(entry_id.to_string()),
+        );
+        if let Some(label) = label {
+            args.insert("label".into(), label);
+        }
+        call_result_to_io(self.call_wire("setLabel", Some(serde_json::Value::Object(args)))?)
     }
 
     /// Return the host flag value or its first registered default; false and empty strings remain values. `None` is Pi's undefined; a host failure is an error, not the default.
@@ -3382,10 +3603,44 @@ impl Context {
         );
     }
 
-    /// Set the model. Returns (success, error_message).
-    pub fn set_model(&self, model: &str) -> (bool, String) {
+    /// Pi's `pi.setModel(model)`: make `model`, a Pi model object, the Session's model. Returns (switched, error_message).
+    ///
+    /// `switched` is false, and nothing changes, when the model's provider has no configured auth. The Session uses the object as given, with
+    /// the members the caller left on it (its context window, limits, base URL, compat): a model taken from the model registry and edited, or
+    /// one built by hand for a provider the host knows. The `model_select` handlers have run when it returns.
+    ///
+    /// A `provider/id` string stands for the registry's model of that name. An id no catalog lists names no model: the error is
+    /// `Model not found: provider/id`, as for Pi's RPC set_model, and nothing is set; a name with no slash is an openai model. The string form asks the host for the model object and then sets it, two
+    /// calls: the object the first call returned is the one set, whatever the registry became in between, and an error of the first call is
+    /// returned without setting.
+    pub fn set_model(&self, model: impl Into<SetModelArg>) -> (bool, String) {
+        let model = match model.into() {
+            SetModelArg::Object(object) => object,
+            SetModelArg::Named(spec) => {
+                match self.call_wire("resolveModel", Some(serde_json::json!({"spec": spec}))) {
+                    Ok(result) => {
+                        if let Some(error) = result.error {
+                            return (false, error.message);
+                        }
+                        let mut v = result.result.unwrap_or_default();
+                        let err = v.get("error").and_then(|s| s.as_str()).unwrap_or("");
+                        if !err.is_empty() {
+                            return (false, err.to_string());
+                        }
+                        v.get_mut("model")
+                            .map(serde_json::Value::take)
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                    Err(e) => return (false, e.to_string()),
+                }
+            }
+        };
         match self.call_wire("setModel", Some(serde_json::json!({"model": model}))) {
             Ok(result) => {
+                // The host rejects a value that is not a chat model object; Pi's Promise rejects.
+                if let Some(error) = result.error {
+                    return (false, error.message);
+                }
                 let v = result.result.unwrap_or_default();
                 let ok = v
                     .get("success")
@@ -3484,6 +3739,7 @@ impl Context {
     /// list waits for the host like [`Self::set_widget_value`]: an unanswered
     /// frame has no place in that order.
     pub fn set_widget(&self, key: &str, lines: Vec<String>) -> io::Result<()> {
+        self.stale_error()?;
         if self.mode == "rpc" {
             return self.set_widget_value(key, serde_json::json!(lines), None);
         }
@@ -3504,6 +3760,7 @@ impl Context {
         view: crate::kit::View,
         options: Option<serde_json::Value>,
     ) -> io::Result<()> {
+        self.stale_error()?;
         let encoded = self.conn.views.encode(&view).map_err(io::Error::other)?;
         self.replace_surface_id(widget_renderer_id(key), None);
         // Held across the send, so an eviction's resend and this frame keep their order.
@@ -3552,6 +3809,7 @@ impl Context {
     where
         F: Fn(u32) -> Vec<String> + Send + Sync + 'static,
     {
+        self.stale_error()?;
         let Some(render) = render else {
             return self.set_widget_value(key, serde_json::Value::Null, options);
         };
@@ -3760,7 +4018,7 @@ impl Context {
             args.insert("hasHandle".to_string(), serde_json::Value::Bool(true));
         }
         let weak_overlay = Arc::downgrade(&overlay);
-        let attach_result = catch_unwind(AssertUnwindSafe(|| {
+        let attach_result = crate::diagnostic::recover(|| {
             overlay
                 .state
                 .lock()
@@ -3771,7 +4029,7 @@ impl Context {
                         overlay.request_render();
                     }
                 })));
-        }));
+        });
         if attach_result.is_err() {
             overlay.active.store(false, Ordering::Release);
             dispose_remote_component(&overlay);
@@ -3938,6 +4196,7 @@ impl Context {
     ///
     /// Fails until the host has sent settings, as upstream's getter throws before the runtime is bound (`loader.ts:157-177`).
     pub fn get_settings(&self) -> io::Result<serde_json::Value> {
+        self.stale_error()?;
         self.conn
             .api_state
             .lock()
@@ -3977,6 +4236,7 @@ impl Context {
         + Sync
         + 'static,
     ) -> io::Result<()> {
+        self.stale_error()?;
         let late = &self.conn.late_tool_renderers;
         let mut resolvers = late.resolvers.lock().unwrap();
         resolvers.push(Arc::new(resolver));
@@ -4080,10 +4340,9 @@ impl Context {
             let callback = callback.clone();
             std::thread::spawn(move || {
                 for (update, answer) in receiver {
-                    let failure =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(update)))
-                            .err()
-                            .map(|payload| panic_message(payload.as_ref()));
+                    let failure = crate::diagnostic::recover(|| callback(update))
+                        .err()
+                        .map(|payload| panic_message(payload.as_ref()));
                     let _ = answer.send(failure);
                 }
             })
@@ -4223,8 +4482,16 @@ impl Context {
         self.host_reply("getSystemPromptOptions", None)
     }
 
-    /// Get structured metadata about the active model. Pi's model is `Model | undefined`: `None` means no model is set.
+    /// Get structured metadata about the active model. Pi's model is `Model | undefined`: `None` means no model is set. The state snapshots replicate the model, so
+    /// the read costs no host call once one arrived and decodes the model per call; a replacement context asks the host.
     pub fn get_model_info(&self) -> io::Result<Option<ModelInfo>> {
+        if let Some(identity) = self.replica()?
+            && let Some(info) = &identity.model_info
+        {
+            return info
+                .clone()
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message));
+        }
         let Some(v) = self.call_host("getModelInfo", None)? else {
             return Ok(None);
         };
@@ -4447,13 +4714,50 @@ impl Context {
 
     // ─── Session identity ────────────────────────────────────────────────
 
-    /// The current session's id, including for in-memory sessions.
+    /// The current session's id, including for in-memory sessions. The state snapshots replicate it, so the read costs no host call once one arrived; a replacement
+    /// context asks the host.
     pub fn get_session_id(&self) -> io::Result<String> {
+        if let Some(id) = self.replicated_session_id()? {
+            return Ok(id);
+        }
         self.required_field("getSessionID", None, "sessionId")
     }
 
-    /// The current session file path. Pi's `getSessionFile` is `string | undefined`: `None` means an in-memory session.
+    /// The replicated session id, or `None` when the host must answer: a replacement context (this process replicates only the requesting Session) or before the
+    /// first snapshot carried the session.
+    pub(crate) fn replicated_session_id(&self) -> io::Result<Option<String>> {
+        self.replicated_session(|identity| identity.session_id.as_deref().unwrap_or_default())
+    }
+
+    /// One member of the replicated session object (`""` for none), or `None` when the host must answer, as for [`Context::replicated_session_id`].
+    pub(crate) fn replicated_session(
+        &self,
+        member: impl FnOnce(&SessionIdentity) -> &str,
+    ) -> io::Result<Option<String>> {
+        Ok(self
+            .replica()?
+            .filter(|identity| identity.session_id.is_some())
+            .map(|identity| member(&identity).to_string()))
+    }
+
+    /// The replicated state, or `None` for a replacement context. A stale context fails as the host answers every call of a replaced runtime.
+    fn replica(&self) -> io::Result<Option<std::sync::MutexGuard<'_, SessionIdentity>>> {
+        if self.replacement {
+            return Ok(None);
+        }
+        // Copy the message out so the guard is not held while the error is built.
+        let message = self.conn.stale_message.lock().unwrap().clone();
+        if let Some(message) = message {
+            return Err(io::Error::other(message));
+        }
+        Ok(Some(self.shared_identity.lock().unwrap()))
+    }
+
+    /// The current session file path. Pi's `getSessionFile` is `string | undefined`: `None` means an in-memory session. Replicated like [`Context::get_session_name`].
     pub fn get_session_file(&self) -> io::Result<Option<String>> {
+        if let Some(file) = self.replicated_session(|identity| &identity.session_file)? {
+            return Ok(Some(file).filter(|file| !file.is_empty()));
+        }
         self.optional_string_field("getSessionFile", "sessionFile")
     }
 
@@ -4477,7 +4781,7 @@ impl Context {
     ///
     /// When `options.signal` is cancelled the host terminates the command, as Pi does: the command alone receives SIGTERM (the
     /// process is killed on Windows), no descendant is signalled, and the call returns the output written so far with `killed`
-    /// set and `exit_code` 0, which is what a command that a signal ended reports. A signal that is cancelled before the call
+    /// set and `exit_code` 143 (128 + SIGTERM), which is what a command that a signal ended reports. A signal that is cancelled before the call
     /// starts the command and ends it at once. SIGKILL follows the SIGTERM five seconds later if the command has not exited, for a
     /// timeout and a `max_buffer` overflow too. Without a signal the command ends when the calling request is cancelled; a signal replaces that
     /// cancellation, so cancelling the request then leaves the command running and the call waits for its result.
@@ -4920,6 +5224,7 @@ impl Context {
     /// Upstream `ctx.ui.theme`: a snapshot of the host's active theme, kept
     /// current by the host's state and `theme_change` notifies.
     pub fn theme(&self) -> Theme {
+        self.assert_active();
         self.shared_ui.lock().unwrap().theme.clone()
     }
 
@@ -5731,8 +6036,8 @@ impl SurfaceRenderer {
         if *stopped {
             return Ok(());
         }
-        let width = ctx.width();
-        let lines = match catch_unwind(AssertUnwindSafe(|| (self.render)(width))) {
+        let width = ctx.terminal_width();
+        let lines = match crate::diagnostic::recover(|| (self.render)(width)) {
             Ok(lines) => lines,
             Err(payload) => {
                 ctx.notify(
@@ -5807,7 +6112,7 @@ impl Context {
     fn set_surface(&self, method: &'static str, lines: Option<Vec<String>>) -> io::Result<()> {
         self.replace_surface(method, None);
         let args = match lines {
-            Some(lines) => surface_args(lines, self.width()),
+            Some(lines) => surface_args(lines, self.terminal_width()),
             None => serde_json::json!({"clear": true}),
         };
         call_result_to_io(self.call_wire(method, Some(args))?)
@@ -6378,6 +6683,112 @@ mod login_call_tests {
         assert_eq!(replacement.cwd(), "/new");
     }
 
+    // Pi guards every context member (runner.ts:883-1037). After the session was replaced the members that have no error result panic with the stale
+    // message, the calls that have one return it, and a call that fails changes nothing: the installed widget renderer is still there.
+    #[test]
+    fn a_stale_context_fails_the_theme_size_widget_update_settings_and_renderer_members_with_the_stale_message()
+     {
+        const STALE: &str = "This extension ctx is stale after session replacement or reload.";
+        let (extension_stream, _host_stream) = UnixStream::pair().unwrap();
+        let mut ctx = Arc::try_unwrap(context(extension_stream)).ok().unwrap();
+        ctx.tool_call_id = Some("tool".into());
+        ctx.request_id = "request".into();
+        ctx.shared_width.store(90, Ordering::Relaxed);
+        ctx.shared_height.store(30, Ordering::Relaxed);
+        assert_eq!((ctx.width(), ctx.height()), (90, 30));
+        let _ = ctx.theme();
+        ctx.replace_surface_id(
+            widget_renderer_id("kept"),
+            Some(Arc::new(SurfaceRenderer {
+                method: "ui.setWidget",
+                widget: Some(("kept".into(), None)),
+                render: Box::new(|_| vec!["row".into()]),
+                stopped: Mutex::new(false),
+                refresh: Mutex::new((false, false)),
+            })),
+        );
+        ctx.conn
+            .apply_invalidate(&serde_json::json!({ "message": STALE }));
+        type Read<'a> = Box<dyn Fn() + 'a>;
+        let reads: [(&str, Read<'_>); 3] = [
+            ("theme", Box::new(|| drop(ctx.theme()))),
+            ("width", Box::new(|| assert_ne!(ctx.width(), u32::MAX))),
+            ("height", Box::new(|| assert_ne!(ctx.height(), u32::MAX))),
+        ];
+        for (name, read) in reads {
+            let panic =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).expect_err(name);
+            let message = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()));
+            assert_eq!(message.as_deref(), Some(STALE), "{name}");
+        }
+        let view = || crate::kit::View::new(crate::kit::Text::new("x", 0, 0));
+        let calls: Vec<(&str, io::Result<()>)> = vec![
+            ("set_widget", ctx.set_widget("kept", vec!["x".into()])),
+            ("set_widget_view", ctx.set_widget_view("kept", view(), None)),
+            (
+                "set_widget_renderer",
+                ctx.set_widget_renderer("kept", Some(|_: u32| vec!["y".to_string()]), None),
+            ),
+            (
+                "set_widget_renderer clear",
+                ctx.set_widget_renderer("kept", None::<fn(u32) -> Vec<String>>, None),
+            ),
+            ("on_update", ctx.on_update(crate::ToolResult::text("x"))),
+            ("get_settings", ctx.get_settings().map(|_| ())),
+            (
+                "register_tool_renderer",
+                ctx.register_tool_renderer(|_, _| None),
+            ),
+        ];
+        for (name, result) in calls {
+            let error = result.expect_err(name);
+            assert_eq!(error.to_string(), STALE, "{name}");
+        }
+        assert!(
+            ctx.surfaces
+                .lock()
+                .unwrap()
+                .contains_key(&widget_renderer_id("kept")),
+            "a failed widget call retired the installed renderer"
+        );
+    }
+
+    // The SDK renders a footer, header or widget again on a thread of its own after a width change. That read of the width is not the context's
+    // `width()`: a context the session replaced would panic there. The refresh still renders at the reported width and the push fails with the
+    // host's error.
+    #[test]
+    fn a_stale_surface_refresh_reads_the_width_without_panicking() {
+        const STALE: &str = "This extension ctx is stale after session replacement or reload.";
+        let (extension_stream, host_stream) = UnixStream::pair().unwrap();
+        drop(host_stream);
+        let ctx = context(extension_stream);
+        ctx.shared_width.store(77, Ordering::Relaxed);
+        let (widths, seen) = std::sync::mpsc::channel();
+        let renderer = Arc::new(SurfaceRenderer {
+            method: "ui.setFooter",
+            widget: None,
+            render: Box::new(move |width| {
+                let _ = widths.send(width);
+                vec!["row".into()]
+            }),
+            stopped: Mutex::new(false),
+            refresh: Mutex::new((false, false)),
+        });
+        ctx.replace_surface("ui.setFooter", Some(renderer.clone()));
+        ctx.conn
+            .apply_invalidate(&serde_json::json!({ "message": STALE }));
+        ctx.refresh_surfaces();
+        assert_eq!(
+            seen.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(77)
+        );
+        assert!(renderer.push(&ctx).is_err());
+        assert!(ctx.set_footer(vec!["x".into()]).is_err());
+    }
+
     // Pi's loader appends a resolver registered after loading; the host learns the extension's new resolver count
     // and asks the late resolver after the loaded ones.
     #[test]
@@ -6492,6 +6903,7 @@ mod login_call_tests {
                         code: Some("invalid_sprite".to_string()),
                         message: "invalid sprite definition mascot: must contain exactly 14 rows"
                             .to_string(),
+                        shell_exit: None,
                     }),
                 }),
                 ..Default::default()
@@ -6729,6 +7141,7 @@ mod sdk_surface_call_tests {
                 error: Some(ErrorInfo {
                     code: None,
                     message: "yield failed".to_string(),
+                    shell_exit: None,
                 }),
             },
         );
@@ -6771,6 +7184,7 @@ mod sdk_surface_call_tests {
                 error: Some(ErrorInfo {
                     code: None,
                     message: "yield failed".to_string(),
+                    shell_exit: None,
                 }),
             },
         );
@@ -7013,6 +7427,7 @@ mod sdk_surface_call_tests {
             error: Some(ErrorInfo {
                 code: None,
                 message: "Nothing to compact".to_string(),
+                shell_exit: None,
             }),
         });
         assert_eq!(call.parent_request_id, None);
@@ -7030,6 +7445,7 @@ mod sdk_surface_call_tests {
                 error: Some(ErrorInfo {
                     code: None,
                     message: "spawn EINVAL".to_string(),
+                    shell_exit: None,
                 }),
             }
         }
@@ -7056,6 +7472,7 @@ mod sdk_surface_call_tests {
             error: Some(ErrorInfo {
                 code: Some("host_failed".to_string()),
                 message: "boom".to_string(),
+                shell_exit: None,
             }),
         }
     }
@@ -7236,6 +7653,523 @@ mod sdk_surface_call_tests {
             branch.unwrap_err().to_string().contains("boom"),
             "the second read must report the same failure without a second call"
         );
+    }
+
+    // ─── Replicated model and session id reads ───────────────────────────
+
+    fn model_object() -> serde_json::Value {
+        json!({
+            "id": "m-1", "name": "Model One", "provider": "prov-1", "contextWindow": 200000,
+            "maxTokens": 8192, "reasoning": true,
+            "cost": {"input": 1.5, "output": 2.5, "cacheRead": 0.5, "cacheWrite": 3.0},
+            "inputLimits": {"maxImageBytes": 9}
+        })
+    }
+
+    fn snapshot(ctx: &Context, state: serde_json::Value) {
+        ctx.shared_identity
+            .lock()
+            .unwrap()
+            .apply_state(state.as_object().unwrap());
+    }
+
+    fn bench() -> (Arc<Context>, UnixStream) {
+        let (ext_stream, host_stream) = UnixStream::pair().unwrap();
+        (context(ext_stream, "req-1"), host_stream)
+    }
+
+    /// A context of the replacement Session: it never answers from this process's replica.
+    fn replacement_of(ctx: &Arc<Context>) -> Arc<Context> {
+        let mut replacement = (**ctx).clone();
+        replacement.replacement = true;
+        Arc::new(replacement)
+    }
+
+    /// Runs `reads` on a thread; a host call it sends fails the test, naming the method, instead of blocking it.
+    fn without_a_host_call<T: Send + 'static>(
+        ctx: &Arc<Context>,
+        host_stream: &UnixStream,
+        reads: impl FnOnce(&Context) -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = mpsc::channel();
+        let caller = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(reads(&caller));
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(value) => value,
+            Err(_) => {
+                let host = Connection::new(host_stream.try_clone().unwrap());
+                let (_, call) = next_call(&host);
+                panic!("a replicated read sent the host call {}", call.method);
+            }
+        }
+    }
+
+    /// Runs `f` on `ctx`, whose host answers its one call with `answer`.
+    fn one_call<T: Send + 'static>(
+        ctx: &Arc<Context>,
+        host_stream: UnixStream,
+        f: impl FnOnce(&Context) -> T + Send + 'static,
+        answer: CallResultMsg,
+    ) -> (CallMsg, T) {
+        let caller = {
+            let ctx = ctx.clone();
+            std::thread::spawn(move || f(&ctx))
+        };
+        let host = Connection::new(host_stream);
+        let (id, call) = next_call(&host);
+        reply(ctx, id, answer);
+        (call, caller.join().unwrap())
+    }
+
+    type Reads = (
+        io::Result<Option<ModelInfo>>,
+        io::Result<String>,
+        io::Result<serde_json::Value>,
+    );
+
+    fn all_three(ctx: &Context) -> Reads {
+        (
+            ctx.get_model_info(),
+            ctx.get_session_id(),
+            ctx.session_manager().get_session_id(),
+        )
+    }
+
+    #[test]
+    fn replicated_reads_answer_from_the_state_snapshot_without_a_host_call() {
+        let (ctx, host) = bench();
+        snapshot(
+            &ctx,
+            json!({"model": model_object(), "session": {"sessionId": "sess-1"}}),
+        );
+        let (info, session_id, manager_id) = without_a_host_call(&ctx, &host, all_three);
+        let info = info.unwrap().unwrap();
+        assert_eq!(
+            (info.id.as_str(), info.name.as_str(), info.provider.as_str()),
+            ("m-1", "Model One", "prov-1")
+        );
+        assert_eq!(
+            (info.context_window, info.max_output_tokens),
+            (200000, 8192)
+        );
+        assert!(info.reasoning);
+        assert_eq!(
+            (
+                info.input_cost_per_1m,
+                info.output_cost_per_1m,
+                info.cache_read_cost_per_1m,
+                info.cache_write_cost_per_1m
+            ),
+            (1.5, 2.5, 0.5, 3.0)
+        );
+        assert_eq!(info.input_limits, Some(json!({"maxImageBytes": 9})));
+        assert_eq!(session_id.unwrap(), "sess-1");
+        assert_eq!(manager_id.unwrap(), json!("sess-1"));
+    }
+
+    #[test]
+    fn later_snapshots_replace_the_replica_and_an_absent_key_keeps_it() {
+        let (ctx, host) = bench();
+        snapshot(
+            &ctx,
+            json!({"model": model_object(), "session": {"sessionId": "sess-1"}}),
+        );
+        snapshot(&ctx, json!({"isIdle": true}));
+        let (info, session_id, _) = without_a_host_call(&ctx, &host, all_three);
+        assert_eq!(info.unwrap().unwrap().id, "m-1");
+        assert_eq!(session_id.unwrap(), "sess-1");
+
+        // The same model again, a different model, and a different session.
+        snapshot(&ctx, json!({"model": model_object()}));
+        snapshot(
+            &ctx,
+            json!({"model": {"id": "m-2", "name": "Model Two", "provider": {"id": "prov-2"}}, "session": {"sessionId": "sess-2"}}),
+        );
+        let (info, session_id, manager_id) = without_a_host_call(&ctx, &host, all_three);
+        let info = info.unwrap().unwrap();
+        assert_eq!(
+            (info.id.as_str(), info.name.as_str(), info.provider.as_str()),
+            ("m-2", "Model Two", "prov-2")
+        );
+        assert_eq!(session_id.unwrap(), "sess-2");
+        assert_eq!(manager_id.unwrap(), json!("sess-2"));
+
+        // A null model clears the model only; a session object without sessionId carries the empty id.
+        snapshot(&ctx, json!({"model": null}));
+        let (info, session_id, _) = without_a_host_call(&ctx, &host, all_three);
+        assert!(info.unwrap().is_none());
+        assert_eq!(session_id.unwrap(), "sess-2");
+        snapshot(&ctx, json!({"session": {"sessionName": "named"}}));
+        let (info, session_id, manager_id) = without_a_host_call(&ctx, &host, all_three);
+        assert!(info.unwrap().is_none());
+        assert_eq!(session_id.unwrap(), "");
+        assert_eq!(manager_id.unwrap(), json!(""));
+
+        // A model object with an empty id names no model.
+        snapshot(&ctx, json!({"model": {"id": "", "name": "only a name"}}));
+        assert!(
+            without_a_host_call(&ctx, &host, |c| c.get_model_info())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reads_ask_the_host_until_a_snapshot_carried_them() {
+        let answer = || ok(Some(model_object()));
+        let (ctx, host) = bench();
+        let (call, info) = one_call(&ctx, host, |c| c.get_model_info(), answer());
+        assert_eq!(call.method, "getModelInfo");
+        assert_eq!(info.unwrap().unwrap().id, "m-1");
+        let (ctx, host) = bench();
+        let (call, id) = one_call(
+            &ctx,
+            host,
+            |c| c.get_session_id(),
+            ok(Some(json!({"sessionId": "host-id"}))),
+        );
+        assert_eq!(call.method, "getSessionID");
+        assert_eq!(id.unwrap(), "host-id");
+        let (ctx, host) = bench();
+        let (call, id) = one_call(
+            &ctx,
+            host,
+            |c| c.session_manager().get_session_id(),
+            ok(Some(json!("host-id"))),
+        );
+        assert_eq!(call.method, "sessionRead");
+        assert_eq!(call.args.unwrap()["method"], "getSessionId");
+        assert_eq!(id.unwrap(), json!("host-id"));
+
+        // The model and the session id are known independently: a snapshot without the other member leaves it to the host.
+        let (ctx, host) = bench();
+        snapshot(&ctx, json!({"model": model_object()}));
+        let (call, id) = one_call(
+            &ctx,
+            host,
+            |c| c.get_session_id(),
+            ok(Some(json!({"sessionId": "host-id"}))),
+        );
+        assert_eq!(
+            (call.method.as_str(), id.unwrap().as_str()),
+            ("getSessionID", "host-id")
+        );
+        let (ctx, host) = bench();
+        snapshot(&ctx, json!({"session": {"sessionId": "sess-1"}}));
+        let (call, _) = one_call(&ctx, host, |c| c.get_model_info(), ok(Some(json!(null))));
+        assert_eq!(call.method, "getModelInfo");
+    }
+
+    #[test]
+    fn a_replacement_context_keeps_asking_the_host() {
+        let (ctx, host) = bench();
+        snapshot(
+            &ctx,
+            json!({"model": model_object(), "session": {"sessionId": "sess-1"}}),
+        );
+        let replacement = replacement_of(&ctx);
+        let (call, info) = one_call(
+            &replacement,
+            host.try_clone().unwrap(),
+            |c| c.get_model_info(),
+            ok(Some(json!({"id": "other", "provider": "p"}))),
+        );
+        assert_eq!(call.method, "getModelInfo");
+        assert_eq!(info.unwrap().unwrap().id, "other");
+        let (call, id) = one_call(
+            &replacement,
+            host.try_clone().unwrap(),
+            |c| c.get_session_id(),
+            ok(Some(json!({"sessionId": "other-id"}))),
+        );
+        assert_eq!(call.method, "getSessionID");
+        assert_eq!(id.unwrap(), "other-id");
+        let (call, id) = one_call(
+            &replacement,
+            host,
+            |c| c.session_manager().get_session_id(),
+            ok(Some(json!("other-id"))),
+        );
+        assert_eq!(call.method, "sessionRead");
+        assert_eq!(id.unwrap(), json!("other-id"));
+    }
+
+    // The host answers every call of a replaced runtime with the stale error; the local read fails the same way.
+    #[test]
+    fn a_stale_context_fails_the_replicated_reads_with_the_stale_message() {
+        const STALE: &str = "This extension ctx is stale after session replacement or reload.";
+        for snapshotted in [true, false] {
+            let (ctx, host) = bench();
+            if snapshotted {
+                snapshot(
+                    &ctx,
+                    json!({"model": model_object(), "session": {"sessionId": "sess-1"}}),
+                );
+            }
+            ctx.conn.apply_invalidate(&json!({"message": STALE}));
+            let (info, session_id, manager_id) = without_a_host_call(&ctx, &host, all_three);
+            for message in [
+                info.unwrap_err().to_string(),
+                session_id.unwrap_err().to_string(),
+                manager_id.unwrap_err().to_string(),
+            ] {
+                assert_eq!(message, STALE, "snapshotted: {snapshotted}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_returned_model_is_not_an_alias_of_the_replica() {
+        let (ctx, host) = bench();
+        snapshot(&ctx, json!({"model": model_object()}));
+        let mut first = without_a_host_call(&ctx, &host, |c| c.get_model_info())
+            .unwrap()
+            .unwrap();
+        first.name.push_str(" mutated");
+        first.context_window = 1;
+        first.input_limits.as_mut().unwrap()["maxImageBytes"] = json!(1);
+        let second = without_a_host_call(&ctx, &host, |c| c.get_model_info())
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.name, "Model One");
+        assert_eq!(second.context_window, 200000);
+        assert_eq!(second.input_limits, Some(json!({"maxImageBytes": 9})));
+    }
+
+    // A model the typed decode rejects fails with the message the host reply's decode gave.
+    #[test]
+    fn an_undecodable_replicated_model_fails_like_the_host_reply_did() {
+        for model in [
+            json!({"id": "m", "contextWindow": "big"}),
+            json!({"id": "m", "reasoning": "yes"}),
+            json!("not an object"),
+        ] {
+            let (ctx, host) = bench();
+            snapshot(&ctx, json!({"model": model.clone()}));
+            let local = without_a_host_call(&ctx, &host, |c| c.get_model_info());
+            let (ask, host) = bench();
+            let (_, reply) = one_call(&ask, host, |c| c.get_model_info(), ok(Some(model.clone())));
+            let (local, reply) = (local.unwrap_err(), reply.unwrap_err());
+            assert_eq!(local.to_string(), reply.to_string(), "{model}");
+            assert_eq!(local.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    // ─── Replicated session name and file reads ──────────────────────────
+
+    type NameAndFile = (
+        io::Result<Option<String>>,
+        io::Result<Option<String>>,
+        io::Result<serde_json::Value>,
+        io::Result<serde_json::Value>,
+    );
+
+    fn name_and_file(ctx: &Context) -> NameAndFile {
+        (
+            ctx.get_session_name(),
+            ctx.get_session_file(),
+            ctx.session_manager().get_session_name(),
+            ctx.session_manager().get_session_file(),
+        )
+    }
+
+    #[test]
+    fn session_name_and_file_answer_from_the_state_snapshot_without_a_host_call() {
+        let (ctx, host) = bench();
+        snapshot(
+            &ctx,
+            json!({"session": {"sessionId": "s", "sessionName": "named", "sessionFile": "/s/f.jsonl"}}),
+        );
+        let (name, file, manager_name, manager_file) =
+            without_a_host_call(&ctx, &host, name_and_file);
+        assert_eq!(name.unwrap().as_deref(), Some("named"));
+        assert_eq!(file.unwrap().as_deref(), Some("/s/f.jsonl"));
+        assert_eq!(manager_name.unwrap(), json!("named"));
+        assert_eq!(manager_file.unwrap(), json!("/s/f.jsonl"));
+    }
+
+    // Both members of a session object replace the held ones: "" is none and clears, as the host's own "" reply read as none.
+    #[test]
+    fn later_snapshots_replace_the_name_and_the_file_and_empty_clears_them() {
+        let (ctx, host) = bench();
+        snapshot(
+            &ctx,
+            json!({"session": {"sessionId": "s", "sessionName": "named", "sessionFile": "/s/f.jsonl"}}),
+        );
+        snapshot(&ctx, json!({"isIdle": true}));
+        let (name, file, _, _) = without_a_host_call(&ctx, &host, name_and_file);
+        assert_eq!(name.unwrap().as_deref(), Some("named"));
+        assert_eq!(file.unwrap().as_deref(), Some("/s/f.jsonl"));
+
+        snapshot(
+            &ctx,
+            json!({"session": {"sessionId": "s", "sessionName": "renamed", "sessionFile": "/s/g.jsonl"}}),
+        );
+        let (name, file, manager_name, manager_file) =
+            without_a_host_call(&ctx, &host, name_and_file);
+        assert_eq!(name.unwrap().as_deref(), Some("renamed"));
+        assert_eq!(file.unwrap().as_deref(), Some("/s/g.jsonl"));
+        assert_eq!(manager_name.unwrap(), json!("renamed"));
+        assert_eq!(manager_file.unwrap(), json!("/s/g.jsonl"));
+
+        // The name cleared, the file kept by the snapshot that names it.
+        snapshot(
+            &ctx,
+            json!({"session": {"sessionId": "s", "sessionName": "", "sessionFile": "/s/g.jsonl"}}),
+        );
+        let (name, file, manager_name, manager_file) =
+            without_a_host_call(&ctx, &host, name_and_file);
+        assert_eq!(name.unwrap(), None);
+        assert_eq!(file.unwrap().as_deref(), Some("/s/g.jsonl"));
+        assert_eq!(manager_name.unwrap(), serde_json::Value::Null);
+        assert_eq!(manager_file.unwrap(), json!("/s/g.jsonl"));
+
+        // An in-memory session: the empty file clears the held one and a missing key is the empty value.
+        snapshot(
+            &ctx,
+            json!({"session": {"sessionId": "s", "sessionName": "again", "sessionFile": ""}}),
+        );
+        let (name, file, manager_name, manager_file) =
+            without_a_host_call(&ctx, &host, name_and_file);
+        assert_eq!(name.unwrap().as_deref(), Some("again"));
+        assert_eq!(file.unwrap(), None);
+        assert_eq!(manager_name.unwrap(), json!("again"));
+        assert_eq!(manager_file.unwrap(), serde_json::Value::Null);
+        snapshot(&ctx, json!({"session": {"sessionId": "s"}}));
+        let (name, file, manager_name, manager_file) =
+            without_a_host_call(&ctx, &host, name_and_file);
+        assert_eq!((name.unwrap(), file.unwrap()), (None, None));
+        assert_eq!(
+            (manager_name.unwrap(), manager_file.unwrap()),
+            (serde_json::Value::Null, serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn session_name_and_file_ask_the_host_until_a_snapshot_carried_the_session() {
+        // A snapshot without a session object leaves every session read to the host.
+        type Read = (
+            &'static str,
+            fn(&Context) -> io::Result<serde_json::Value>,
+            &'static str,
+            serde_json::Value,
+        );
+        let reads: [Read; 4] = [
+            (
+                "getSessionName",
+                |c| Ok(json!(c.get_session_name()?)),
+                "getSessionName",
+                json!({"name": "host-name"}),
+            ),
+            (
+                "getSessionFile",
+                |c| Ok(json!(c.get_session_file()?)),
+                "getSessionFile",
+                json!({"sessionFile": "/host/f"}),
+            ),
+            (
+                "sessionRead",
+                |c| c.session_manager().get_session_name(),
+                "getSessionName",
+                json!("host-name"),
+            ),
+            (
+                "sessionRead",
+                |c| c.session_manager().get_session_file(),
+                "getSessionFile",
+                json!("/host/f"),
+            ),
+        ];
+        for (method, read, manager_method, answer) in reads {
+            let (ctx, host) = bench();
+            snapshot(&ctx, json!({"model": model_object()}));
+            let (call, value) = one_call(&ctx, host, read, ok(Some(answer)));
+            assert_eq!(call.method, method);
+            if method == "sessionRead" {
+                assert_eq!(call.args.unwrap()["method"], manager_method);
+            }
+            assert!(value.unwrap().is_string());
+        }
+        // The host's empty reply reads as none.
+        let (ctx, host) = bench();
+        let (_, name) = one_call(
+            &ctx,
+            host,
+            |c| c.get_session_name(),
+            ok(Some(json!({"name": ""}))),
+        );
+        assert_eq!(name.unwrap(), None);
+    }
+
+    #[test]
+    fn a_replacement_context_asks_the_host_for_the_session_name_and_file() {
+        let (ctx, host) = bench();
+        snapshot(
+            &ctx,
+            json!({"session": {"sessionId": "s", "sessionName": "named", "sessionFile": "/s/f.jsonl"}}),
+        );
+        let replacement = replacement_of(&ctx);
+        let (call, name) = one_call(
+            &replacement,
+            host.try_clone().unwrap(),
+            |c| c.get_session_name(),
+            ok(Some(json!({"name": "other"}))),
+        );
+        assert_eq!(call.method, "getSessionName");
+        assert_eq!(name.unwrap().as_deref(), Some("other"));
+        let (call, file) = one_call(
+            &replacement,
+            host.try_clone().unwrap(),
+            |c| c.get_session_file(),
+            ok(Some(json!({"sessionFile": "/other"}))),
+        );
+        assert_eq!(call.method, "getSessionFile");
+        assert_eq!(file.unwrap().as_deref(), Some("/other"));
+        let (call, name) = one_call(
+            &replacement,
+            host.try_clone().unwrap(),
+            |c| c.session_manager().get_session_name(),
+            ok(Some(json!("other"))),
+        );
+        assert_eq!(call.method, "sessionRead");
+        assert_eq!(call.args.unwrap()["method"], "getSessionName");
+        assert_eq!(name.unwrap(), json!("other"));
+        let (call, file) = one_call(
+            &replacement,
+            host,
+            |c| c.session_manager().get_session_file(),
+            ok(Some(json!("/other"))),
+        );
+        assert_eq!(call.method, "sessionRead");
+        assert_eq!(call.args.unwrap()["method"], "getSessionFile");
+        assert_eq!(file.unwrap(), json!("/other"));
+    }
+
+    #[test]
+    fn a_stale_context_fails_the_session_name_and_file_reads_with_the_stale_message() {
+        const STALE: &str = "This extension ctx is stale after session replacement or reload.";
+        for snapshotted in [true, false] {
+            let (ctx, host) = bench();
+            if snapshotted {
+                snapshot(
+                    &ctx,
+                    json!({"session": {"sessionId": "s", "sessionName": "named", "sessionFile": "/s/f.jsonl"}}),
+                );
+            }
+            ctx.conn.apply_invalidate(&json!({"message": STALE}));
+            let (name, file, manager_name, manager_file) =
+                without_a_host_call(&ctx, &host, name_and_file);
+            for message in [
+                name.unwrap_err().to_string(),
+                file.unwrap_err().to_string(),
+                manager_name.unwrap_err().to_string(),
+                manager_file.unwrap_err().to_string(),
+            ] {
+                assert_eq!(message, STALE, "snapshotted: {snapshotted}");
+            }
+        }
     }
 }
 
@@ -7660,5 +8594,99 @@ mod dialog_value_tests {
             (Value::Null, false)
         );
         assert_eq!(dialog_value(&json!({}), "text"), (Value::Null, false));
+    }
+}
+
+// Uses UnixStream::pair as a socket transport double; Windows transport is connect-only.
+#[cfg(all(test, unix))]
+mod overlay_invalidate_tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicUsize;
+
+    struct Probe {
+        invalidations: Arc<AtomicUsize>,
+        renders: Arc<AtomicUsize>,
+    }
+
+    impl RemoteComponent for Probe {
+        fn render(&self, _width: u32) -> Vec<String> {
+            self.renders.fetch_add(1, Ordering::SeqCst);
+            vec!["row".to_string()]
+        }
+        fn handle_input(
+            &mut self,
+            _data: &crate::JsString,
+        ) -> Result<RemoteComponentResult, String> {
+            Ok(RemoteComponentResult::pending())
+        }
+        fn invalidate(&mut self) {
+            self.invalidations.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The host's `ui.custom.invalidate` is one event of the component's serial queue. A component that closed while the event
+    /// was queued is not invalidated and not rendered, and nothing is sent: the event is dropped without an error.
+    #[test]
+    fn an_invalidate_queued_for_a_closed_component_is_dropped() {
+        let invalidations = Arc::new(AtomicUsize::new(0));
+        let renders = Arc::new(AtomicUsize::new(0));
+        let (events_tx, events_rx) = sync_channel(64);
+        let overlay: RemoteComponentRef = Arc::new(RemoteOverlay {
+            state: Mutex::new(RemoteComponentState {
+                component: OverlayComponent::Lines(Box::new(Probe {
+                    invalidations: invalidations.clone(),
+                    renders: renders.clone(),
+                })),
+                last_lines: Vec::new(),
+                last_captures: false,
+                last_view: None,
+                seq: 0,
+                last_render: None,
+                layout: None,
+            }),
+            events: events_tx,
+            active: AtomicBool::new(true),
+            render_pending: AtomicBool::new(false),
+            view_refs: Mutex::new(Vec::new()),
+            force_view: AtomicBool::new(false),
+            on_handle: Mutex::new(None),
+            handle_state: Mutex::new(OverlayState::default()),
+        });
+        overlay
+            .send_invalidate(2)
+            .expect("queued while the component is mounted");
+        // The component closed before its worker took the event.
+        overlay.stop();
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        run_remote_component_worker(RemoteComponentWorker {
+            conn: Arc::new(Connection::new(stream)),
+            key: "custom-1".to_string(),
+            overlay: overlay.clone(),
+            width: Arc::new(AtomicU32::new(80)),
+            events: events_rx,
+            done: done_tx,
+            request_parent: None,
+            request_id: String::new(),
+        });
+        done_rx.recv().expect("the worker ended");
+        assert_eq!(
+            invalidations.load(Ordering::SeqCst),
+            0,
+            "no invalidate after the close"
+        );
+        assert_eq!(
+            renders.load(Ordering::SeqCst),
+            0,
+            "no render after the close"
+        );
+        let mut byte = [0u8; 1];
+        assert!(
+            !matches!(peer.read(&mut byte), Ok(read) if read > 0),
+            "nothing is sent for the dropped event"
+        );
     }
 }

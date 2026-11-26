@@ -76,8 +76,8 @@ func processIdentity(me *managedExt) any {
 	if me.packedProcess != nil {
 		return me.packedProcess.spawner()
 	}
-	if me.procOwner != nil {
-		return me.procOwner
+	if owner := me.processOwner(); owner != nil {
+		return owner
 	}
 	return me
 }
@@ -317,6 +317,14 @@ func (x *xrefHub) expect(conn *Conn, id string) {
 	defer x.mu.Unlock()
 	x.initLocked()
 	x.expected[xrefFrame{conn, id}] = struct{}{}
+}
+
+// expects reports whether the response frame of request id on conn is one inbound must read: the response of a request expect named, until inbound has read it.
+func (x *xrefHub) expects(conn *Conn, id string) bool {
+	x.mu.Lock()
+	_, ok := x.expected[xrefFrame{conn, id}]
+	x.mu.Unlock()
+	return ok
 }
 
 func (x *xrefHub) forget(conn *Conn, id string) {

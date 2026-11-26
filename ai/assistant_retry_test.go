@@ -62,6 +62,14 @@ func TestIsRetryableAssistantErrorClassification(t *testing.T) {
 		{"matches Azure peak-load capacity errors", "The system is currently experiencing high demand and cannot process your request. Your request exceeds the maximum usage size allowed during peak load. For improved capacity reliability, consider switching to Provisioned Throughput."},
 		// .upstream/v1.0.1/packages/ai/src/utils/retry.ts:34 (#10278): "Selected model is at capacity" ends the turn without this pattern.
 		{"matches provider model capacity errors", "Selected model is at capacity. Please try a different model."},
+		// Pi 9b88b94e2 packages/ai/test/retry.test.ts:106 (#12064): a gateway ends the stream with an Anthropic-style api_error event.
+		{"matches gateway wording for a closed connection", `{"type":"error","error":{"type":"api_error","message":"Connection closed."}}`},
+		// Pi 9b88b94e2 (#12064): packages/agent/src/proxy.ts's own message for a proxy stream that hit EOF before a done or error event matches too.
+		{"matches the agent proxy closed-connection message", "Connection closed by proxy server before the response completed"},
+		// Pi 9b88b94e2 (#12064): the plain text of the same event, and the separators `.?` accepts.
+		{"matches bare closed-connection text", "Connection closed."},
+		{"matches closed-connection text with an underscore", "connection_closed"},
+		{"matches closed-connection text without a separator", "ConnectionClosed"},
 		// .upstream/v1.2.0/packages/ai/src/utils/retry.ts:51-53 (#10842): gateway wording "The upstream provider returned an error".
 		{"matches gateway provider-returned-an-error wording", "The upstream provider returned an error"},
 		{"matches provider-returned-error wording", "Provider returned error"},
@@ -74,6 +82,8 @@ func TestIsRetryableAssistantErrorClassification(t *testing.T) {
 		{"retries temporary ChatGPT subscription errors/user_unavailable", "subscription_sharing_user_unavailable: User cannot be loaded."},
 		// Pi 29057ece (#11057): the Codex CLI mid-stream disconnect, relayed by a proxy.
 		{"matches Codex CLI stream disconnects relayed by proxies", "stream disconnected before completion: stream closed before response.completed"},
+		// .upstream/current/packages/ai/test/retry.test.ts:100 (#11879)
+		{"matches gateway wording for a stream cut short mid-reply", "Claude Code's stream from Anthropic was cut short after the reply had begun"},
 		// Pi 6e491cfa: a status code stays retryable next to punctuation, whitespace and at either end.
 		{"matches standalone status codes/prefix", "429"},
 		{"matches standalone status codes/in parentheses", "OpenAI API error (503): upstream"},
@@ -97,6 +107,14 @@ func TestIsRetryableAssistantErrorClassification(t *testing.T) {
 	// Pi cedefc5326 retry.test.ts: the ChatGPT Business workspace usage limit is not retried.
 	if IsRetryableAssistantError(errorFaux(`OpenAI API error (429): {"code":"subscription_sharing_workplace_individual_usage_limit_exceeded","message":"Usage limit reached."}`)) {
 		t.Error("the ChatGPT Business workspace usage limit must stay non-retryable")
+	}
+	// Pi 9b88b94e2 (#12064): the quota/limit pattern is still checked first, so a closed connection that carries quota wording stays non-retryable.
+	if IsRetryableAssistantError(errorFaux(`{"type":"error","error":{"type":"api_error","message":"Connection closed. insufficient_quota"}}`)) {
+		t.Error("a closed connection with quota exhaustion wording must stay non-retryable")
+	}
+	// Pi's pattern is connection.?closed, not every wording of a closed connection.
+	if IsRetryableAssistantError(errorFaux("The connection was closed by the user")) {
+		t.Error("\"connection was closed\" is not Pi's closed-connection pattern")
 	}
 	// Pi c719d5b0 (#11572, #11537): Zhipu/Z.ai usage limit code 1308 arrives as HTTP 429 and resets after hours.
 	for _, message := range []string{
@@ -429,12 +447,48 @@ func TestRetryDelayMsUsesSafeIntegerMagnitude(t *testing.T) {
 	}
 }
 
-// Upstream RETRYABLE_PROVIDER_ERROR_PATTERN (packages/ai/src/utils/retry.ts)
-// has no ECONNRESET or connection-reset entry, so a message carrying only Go's
-// "connection reset by peer" text is not retried, as in pi-ai.
-func TestConnectionResetTextIsNotRetryable(t *testing.T) {
+// Upstream RETRYABLE_PROVIDER_ERROR_PATTERN (packages/ai/src/utils/retry.ts) lists
+// "connection reset by peer" since Pi 4699b5b26 (#12128), so a message carrying only
+// Go's text of a reset is retried, as in pi-ai. Before that commit neither retried it.
+func TestConnectionResetTextIsRetryable(t *testing.T) {
 	message := "github-copilot: request: read tcp 100.64.0.1:50817->140.82.112.22:443: read: connection reset by peer"
-	if IsRetryableAssistantError(errorFaux(message)) {
-		t.Fatalf("IsRetryableAssistantError(%q) = true; pi-ai's pattern list does not retry it", message)
+	if !IsRetryableAssistantError(errorFaux(message)) {
+		t.Fatalf("IsRetryableAssistantError(%q) = false; pi-ai's pattern list retries it", message)
+	}
+}
+
+func TestRetryAssistantCallCustomDeciderAndFailureResponse(t *testing.T) {
+	recorder := &retryRecorder{}
+	calls := 0
+	policy := &RetryPolicy{
+		Enabled:    true,
+		MaxRetries: 5,
+		Decide: func(attempt, maxAttempts int, response AssistantMessage) RetryDecision {
+			if maxAttempts != 5 {
+				t.Errorf("maxAttempts = %d, want 5", maxAttempts)
+			}
+			if response.FailureResponse != nil && response.FailureResponse.Status == 401 {
+				if attempt <= 2 {
+					return RetryDecision{Retry: true, DelayMs: 1}
+				}
+				return RetryDecision{Retry: false}
+			}
+			return RetryDecision{Retry: false}
+		},
+	}
+	response, err := RetryAssistantCall(context.Background(), func() (AssistantMessage, error) {
+		calls++
+		msg := errorFaux("401 unauthorized")
+		msg.FailureResponse = &FailureResponse{Status: 401, Headers: map[string]string{"retry-after": "2"}}
+		return msg, nil
+	}, policy, recorder.callbacks())
+	if err != nil || response.StopReason != StopReasonError || calls != 3 {
+		t.Fatalf("response=%#v err=%v calls=%d, want 3 calls", response, err, calls)
+	}
+	if len(recorder.scheduled) != 2 || recorder.scheduled[0][2] != 1 || recorder.scheduled[1][2] != 1 {
+		t.Fatalf("scheduled = %v, want two 1ms retries", recorder.scheduled)
+	}
+	if !reflect.DeepEqual(recorder.finished, [][3]any{{false, 2, "401 unauthorized"}}) {
+		t.Fatalf("finished = %v", recorder.finished)
 	}
 }

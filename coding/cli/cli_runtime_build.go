@@ -9,7 +9,6 @@ import (
 	"maps"
 	"os"
 	"slices"
-	"strings"
 	"sync"
 
 	"github.com/MichaelKinsy/PiG/agent"
@@ -63,7 +62,9 @@ func (b *cliRuntimeBuilder) ambientScopes(projectTrusted bool) (extensions, skil
 
 // cliRuntimeBuilder holds the process-fixed inputs of Pi's createRuntime closure and builds the cwd-bound state of one Session runtime: services, resources, extension host, model, tools and system prompt.
 type cliRuntimeBuilder struct {
-	mode              appMode
+	mode appMode
+	// packages is how this process's package installs run (main.ts packageCommandOutput, onPackageProgress); nil outside interactive mode.
+	packages          *packageRun
 	flags             Args
 	agentDir          string
 	launchCWD         string
@@ -76,13 +77,18 @@ type cliRuntimeBuilder struct {
 	settingsDiagnostics []codingagent.AgentSessionRuntimeDiagnostic
 	startupUIOptions    codingagent.StartupUIOptions
 	trustStore          *codingagent.ProjectTrustStore
-	trustByCWD          map[string]bool
+	// trustMu guards trustByCWD: a --listen server's concurrent builds read and write it (pig additive (D232)).
+	trustMu    sync.Mutex
+	trustByCWD map[string]bool
 	// stageExtensionSDKs stages the embedded extension SDKs and returns the failure to report (stageExtensionSDKsFor). stageSDKs runs it once per
 	// process, before the first extension load that starts an extension: a run that loads none stages nothing.
 	stageExtensionSDKs func() error
 	stageSDKs          sync.Once
 	// extensionFactories are MainOptions.ExtensionFactories, the compiled-in extensions the program's main adds after the built-in ones (main.ts:575).
 	extensionFactories []extension.InlineExtension
+	// buildMu and cellRegistry are set only by a --listen server started with --listen-share-extensions (pig additive (D232)): the mutex that serializes its builds, and the registry its Hosts share cell processes through. A default --listen server builds its sessions concurrently.
+	cellRegistry *subprocess.CellRegistry
+	buildMu      *sync.Mutex
 }
 
 // cliBuildInput selects one build.
@@ -117,6 +123,8 @@ type cliBuild struct {
 	StartupDiagnostics           []codingagent.AgentSessionRuntimeDiagnostic
 	PreTrustExtensionDiagnostics []codingagent.AgentSessionRuntimeDiagnostic
 	ExtensionDiagnostics         []codingagent.AgentSessionRuntimeDiagnostic
+	// ExtensionWarnings are the package and replacement warnings of the load, which the loaded-resources listing shows under [Extension issues] (resource-loader.ts getExtensions().warnings).
+	ExtensionWarnings []codingagent.ExtensionWarning
 
 	PromptPaths     []string
 	ThemePaths      []string
@@ -180,6 +188,7 @@ func (b *cliRuntimeBuilder) buildResources(ctx context.Context, in cliBuildInput
 	flags := b.flags
 	cwd := in.CWD
 	resourceFlags, err := resolveCLIResourceFlags(flags, b.launchCWD)
+	resourceFlags.packages = b.packages
 	if err != nil {
 		return nil, cliCLIError("%v", err)
 	}
@@ -197,7 +206,9 @@ func (b *cliRuntimeBuilder) buildResources(ctx context.Context, in cliBuildInput
 		}
 		projectTrusted = saved == nil || *saved
 	}
+	b.trustMu.Lock()
 	cached, hasCached := b.trustByCWD[cwd]
+	b.trustMu.Unlock()
 	if flags.ProjectTrustOverride == nil && hasTrustResources && hasCached {
 		projectTrusted = cached
 	}
@@ -256,6 +267,8 @@ func (b *cliRuntimeBuilder) buildResources(ctx context.Context, in cliBuildInput
 	if startupExtensions == nil {
 		startupExtensions = &startupExtensionSet{}
 	}
+	// pig additive (D232): with --listen-share-extensions every build of a --listen server creates its extension Host on the server's cell registry; without it the registry is nil and the Host keeps its own processes.
+	startupExtensions.cells = b.cellRegistry
 	build.SourceResolver = newStartupExtensionSourceResolver(nil)
 	resolver := build.SourceResolver
 	failed := true
@@ -302,7 +315,7 @@ func (b *cliRuntimeBuilder) buildResources(ctx context.Context, in cliBuildInput
 		if extensionset.HasInline(b.extensionFactories) {
 			if startupExtensions.host == nil {
 				// The inline extensions register against the runtime of the host the final pass adopts.
-				startupExtensions.host, startupExtensions.bridge = newSubprocessExtensionHost(cwd, b.mode.extensionMode(), services.Registry().ModelRegistry)
+				startupExtensions.host, startupExtensions.bridge = newSubprocessExtensionHost(cwd, b.mode.extensionMode(), services.Registry().ModelRegistry, startupExtensions.cells)
 			}
 			preTrustInline, inlineErrs = (&extensionSetLoader{CWD: cwd, Settings: services.SettingsManager(), Flags: resourceFlags, Inline: b.extensionFactories, Runtime: startupExtensions.host.Runtime(), EventBus: inlineBus}).loadInlineExtensions()
 			// Non-nil even when every factory failed: the final pass runs no factory again (resource-loader.ts:772-773).
@@ -349,7 +362,9 @@ func (b *cliRuntimeBuilder) buildResources(ctx context.Context, in cliBuildInput
 		if err != nil {
 			return nil, cliCLIError("resolve project trust: %v", err)
 		}
+		b.trustMu.Lock()
 		b.trustByCWD[cwd] = projectTrusted
+		b.trustMu.Unlock()
 		services.SettingsManager().SetProjectTrusted(projectTrusted)
 		settings = services.Settings()
 		trace.Mark("trust-resolved")
@@ -372,14 +387,10 @@ func (b *cliRuntimeBuilder) buildResources(ctx context.Context, in cliBuildInput
 	}
 	// pig additive (D216): a configured local Package whose directory does not exist warns in the session with its resolved path; Pi skips it silently.
 	missingLocal := packagemanager.MissingLocalPackages(cwd, services.SettingsManager().AgentDir(), services.SettingsManager())
-	if reinstalled, missingPkgs := packagemanager.EnsureConfiguredPackagesInstalled(cwd, services.SettingsManager().AgentDir(), services.SettingsManager()); len(reinstalled)+len(missingPkgs) > 0 {
-		if len(reinstalled) > 0 {
-			fmt.Fprintf(os.Stderr, "[pig] Reinstalled missing packages: %s\n", strings.Join(reinstalled, ", "))
-		}
-		missingPkgs = slices.DeleteFunc(missingPkgs, func(source string) bool { return packagemanager.DetectSourceKind(source) == "local" })
-		if len(missingPkgs) > 0 {
-			fmt.Fprintf(os.Stderr, "[pig] Could not install: %s (run `pig update` when online)\n", strings.Join(missingPkgs, ", "))
-		}
+	// resource-loader.ts reload: resolve() installs each missing configured Package and the -e sources refresh, on every load: startup, /new, /resume and /fork. A Package that fails to install is skipped and warns below.
+	installFailures, err := installPackagesForLoad(b.packages, cwd, services.SettingsManager().AgentDir(), services.SettingsManager())
+	if err != nil {
+		return nil, cliCLIError("%v", err)
 	}
 	trace.Mark("packages-reinstall-done")
 
@@ -405,7 +416,7 @@ func (b *cliRuntimeBuilder) buildResources(ctx context.Context, in cliBuildInput
 	skillScan := codingagent.NewAgentsSkillScan(cwd)
 	build.SkillInputs = collectSkillInputsIn(skillScan, cwd, b.agentDir, services.SettingsManager(), resourceFlags, skillScopes, resolver.Resolve)
 	trace.Mark("extension-discovery-start")
-	cliExtensions := collectCLIExtensionConfigs(cwd, b.agentDir, services.SettingsManager(), resourceFlags.Extensions, resolver.Resolve)
+	cliExtensions := collectCLIExtensionConfigs(cwd, b.agentDir, services.SettingsManager(), b.packages, resourceFlags.Extensions, resolver.Resolve)
 	extraExtConfigs := collectExtensionConfigsWith(cliExtensions, cwd, b.agentDir, services.SettingsManager(), resourceFlags, extensionScopes, resolver.Resolve)
 	trace.Mark("extension-discovery-done")
 	if err := cliPackageSourceError(extraExtConfigs); err != nil {
@@ -438,8 +449,8 @@ func (b *cliRuntimeBuilder) buildResources(ctx context.Context, in cliBuildInput
 	if err != nil {
 		return nil, cliCLIError("%v", err)
 	}
-	// An -e source that could not be installed warns before the package warnings and the load goes on (resource-loader.ts [...installWarnings, ...packageWarnings], Pi 6dfb54678).
-	packageWarnings = mergeExtensionWarnings(fromCodingAgentWarnings(packagemanager.PackageInstallWarnings(cliExtensions.installFailures, missingLocal)), packageWarnings)
+	// A Package or -e source that could not be installed warns before the package warnings and the load goes on (resource-loader.ts [...installWarnings, ...packageWarnings], Pi 6dfb54678).
+	packageWarnings = mergeExtensionWarnings(fromCodingAgentWarnings(packagemanager.PackageInstallWarnings(installFailures, missingLocal, cliExtensions.installFailures)), packageWarnings)
 
 	var embeddedCells []subprocess.EmbeddedCell
 	if b.activePigletBaked {
@@ -459,7 +470,11 @@ func (b *cliRuntimeBuilder) buildResources(ctx context.Context, in cliBuildInput
 	if b.mode == appModeRPC {
 		// get_commands reports the provenance of extension commands, so each config carries its resolved source before the load.
 		build.RPCSourceInfo = maps.Clone(build.SourceInfo)
-		finalExtConfigs, reloadFinalExtConfigs = rpcExtensionConfigs(extraExtConfigs, cwd, b.agentDir, build.RPCSourceInfo), nil
+		finalExtConfigs = rpcExtensionConfigs(extraExtConfigs, cwd, b.agentDir, build.RPCSourceInfo)
+		// A reload rediscovers the extensions as Pi's resource loader does, and stamps what it found from the source info the reload's resource pass recorded just before.
+		reloadFinalExtConfigs = func() []subprocess.ExtConfig {
+			return rpcExtensionConfigs(build.ReloadExtensionConfigs(), cwd, b.agentDir, build.RPCSourceInfo)
+		}
 	}
 	var extensionLoadErrs []error
 	// pig divergence (D70): every build, including a session replacement's, starts its own extension host and processes.
@@ -561,13 +576,33 @@ func (b *cliRuntimeBuilder) buildResources(ctx context.Context, in cliBuildInput
 	var flagDiagnostics []codingagent.AgentSessionRuntimeDiagnostic
 	build.ExtensionFlagValues, flagDiagnostics = services.ApplyExtensionFlagValues(build.Extensions)
 	conflicts := codingagent.DetectExtensionConflicts(build.Extensions)
-	build.ExtensionDiagnostics = slices.Concat(sdkDiagnostics, build.PreTrustExtensionDiagnostics, registrationDiagnostics, flagDiagnostics, extensionLoadDiagnostics(withUpgradeHints(extensionLoadErrs, build.SDKDrift)), extensionErrorDiagnostics(builtinErrs), extensionConflictDiagnostics(conflicts), staleCopyDiagnostics(codingagent.DetectToolConflicts(build.Extensions), finalExtConfigs), extensionWarningDiagnostics(mergeExtensionWarnings(packageWarnings, replacementWarnings)))
+	extensionWarnings := mergeExtensionWarnings(packageWarnings, replacementWarnings)
+	build.ExtensionWarnings = toCodingAgentWarnings(extensionWarnings)
+	build.ExtensionDiagnostics = slices.Concat(sdkDiagnostics, build.PreTrustExtensionDiagnostics, registrationDiagnostics, flagDiagnostics, extensionLoadDiagnostics(withUpgradeHints(extensionLoadErrs, build.SDKDrift)), extensionErrorDiagnostics(builtinErrs), extensionConflictDiagnostics(conflicts), staleCopyDiagnostics(codingagent.DetectToolConflicts(build.Extensions), finalExtConfigs), extensionWarningDiagnostics(extensionWarnings))
 	trace.Mark("extensions-loaded")
 
 	build.Flags = flags
 	build.Settings = settings
 	failed = false
 	return build, nil
+}
+
+// runtimeDiagnostics are the diagnostics of the construction this build serves, as Pi's createRuntime returns them (main.ts, #11973, c8c456c85c6e): the settings and extension diagnostics, then the model scope warnings, then the session option warnings and errors, then the model fallback message as one more warning (main.ts:917-918: it is the login guidance when no model is available and "Could not restore model x/y. Using a/b" otherwise; Pi's `session.model` condition always holds because the agent holds a placeholder model). The startup build and every replacement's build return them through the Runtime, which reports each once (TakeUnreportedDiagnostics); the error exit of startup and --help / --list-models list the same diagnostics. Call it after buildSession.
+func (build *cliBuild) runtimeDiagnostics() []codingagent.AgentSessionRuntimeDiagnostic {
+	diagnostics := slices.Concat(build.StartupDiagnostics, build.ExtensionDiagnostics)
+	for _, warning := range build.Selected.ScopeWarnings {
+		diagnostics = append(diagnostics, codingagent.AgentSessionRuntimeDiagnostic{Type: "warning", Message: warning})
+	}
+	for _, warning := range build.Selected.Warnings {
+		diagnostics = append(diagnostics, codingagent.AgentSessionRuntimeDiagnostic{Type: "warning", Message: warning})
+	}
+	for _, diagnosticErr := range build.Selected.Errors {
+		diagnostics = append(diagnostics, codingagent.AgentSessionRuntimeDiagnostic{Type: "error", Message: diagnosticErr.Error()})
+	}
+	if build.ModelFallbackMessage != "" {
+		diagnostics = append(diagnostics, codingagent.AgentSessionRuntimeDiagnostic{Type: "warning", Message: build.ModelFallbackMessage})
+	}
+	return codingagent.DeduplicateDiagnostics(diagnostics)
 }
 
 // buildSession resolves the model, skills, tools and system prompt against the build's resources, as Pi's createRuntime does before createAgentSessionFromServices.
@@ -659,8 +694,9 @@ func (b *cliRuntimeBuilder) loadPromptResources(build *cliBuild, agentToolNames 
 	}
 	promptOptions.AppendSystemPrompt = resolvedPrompts.append
 
+	// The prompt text is rendered from the sections, whose values then lie inside it: one copy of a prompt that holds the project context files, not two.
 	build.SystemPromptSections = prompts.BuildSystemPromptSections(promptOptions)
-	build.SystemPrompt = prompts.BuildDefaultPrompt(promptOptions)
+	build.SystemPrompt = prompts.RenderSharingSections(build.SystemPromptSections)
 
 	extContextFiles := make([]extension.SystemPromptContextFile, 0, len(promptCtxFiles))
 	for _, cf := range promptCtxFiles {

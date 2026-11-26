@@ -159,7 +159,7 @@ func opencodeModels(ctx *ProviderContext) ([]ChatModel, error) {
 
 // opencodeCompletionsCompat is the OpenAI Completions compat shared by OpenCode Zen and Go.
 func opencodeCompletionsCompat() *Obj {
-	return O("supportsStore", false, "supportsDeveloperRole", false, "supportsStrictMode", true)
+	return O("supportsStore", false, "supportsStrictMode", true)
 }
 
 // finalizeOpencodeModel is the behavior shared by OpenCode Zen and Go.
@@ -182,7 +182,7 @@ func finalizeOpencodeModel(model ChatModel) {
 		if provider == "opencode" && SupportsClaudeMidConvoSystemMessages(id) {
 			MergeCompat(model, O("supportsMidConvoSystemMessages", true))
 		}
-		// Zen and Go forward per-message effort and `thinking.block_binding`. Without
+		// Pi 9ee7586a9: Zen and Go forward per-message effort and `thinking.block_binding`. Without
 		// `drop_block`, Go rejects replayed thinking after the system prompt or tools change.
 		if SupportsClaudeMidConvoEffort(id) {
 			EnableClaudeMidConvoEffort(model)

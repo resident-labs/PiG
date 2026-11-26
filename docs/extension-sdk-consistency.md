@@ -14,15 +14,15 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`.
 
 ## Summary
 
-225 surfaces.
+229 surfaces.
 
 | Runtime | implemented | exercised by a conformance fixture | holes |
 |---|---|---|---|
-| Node runtime | 222 | 222 | 0 |
-| Go | 224 | 224 | 0 |
-| Rust | 224 | 224 | 0 |
-| Python | 224 | 224 | 0 |
-| Lisp | 224 | 224 | 0 |
+| Node runtime | 227 | 227 | 0 |
+| Go | 229 | 229 | 0 |
+| Rust | 229 | 229 | 0 |
+| Python | 229 | 229 | 0 |
+| Lisp | 229 | 229 | 0 |
 
 ## pi (ExtensionAPI)
 
@@ -266,7 +266,7 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`.
 |---|---|---|---|---|
 | `ctx.ui.theme.name` | exercised | exercised | exercised | exercised | exercised |
 | `ctx.ui.theme.sourcePath` | exercised | exercised | exercised | exercised | exercised |
-| `ctx.ui.theme.sourceInfo` | - | - | - | - | - |
+| `ctx.ui.theme.sourceInfo` | exercised | exercised | exercised | exercised | exercised |
 | `ctx.ui.theme.appearance` | exercised | exercised | exercised | exercised | exercised |
 | `ctx.ui.theme.colors` | exercised | exercised | exercised | exercised | exercised |
 | `ctx.ui.theme.style` | exercised | exercised | exercised | exercised | exercised |
@@ -327,6 +327,10 @@ Regenerate with `go run ./test/parity/cmd/sdksurface`.
 | `kit tool renderResult(view)` | exercised | exercised | exercised | exercised | exercised |
 | `kit message renderer(view)` | exercised | exercised | exercised | exercised | exercised |
 | `kit entry renderer(view)` | exercised | exercised | exercised | exercised | exercised |
+| `kit message renderer view event` | exercised | exercised | exercised | exercised | exercised |
+| `kit entry renderer view event` | exercised | exercised | exercised | exercised | exercised |
+| `kit message renderer state` | exercised | exercised | exercised | exercised | exercised |
+| `kit entry renderer state` | exercised | exercised | exercised | exercised | exercised |
 | `kit lines list annotation` | exercised | exercised | exercised | exercised | exercised |
 
 ## Holes

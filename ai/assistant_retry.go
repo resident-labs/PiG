@@ -69,11 +69,20 @@ var retryableProviderErrorPattern = buildProviderErrorPattern([]string{
 	"connection.?error",
 	"connection.?refused",
 	"connection.?lost",
+	// Gateway mid-stream drop relayed as an Anthropic-style api_error event, e.g. {"type":"error","error":{"type":"api_error","message":"Connection closed."}}; also the agent proxy's "Connection closed by proxy server before the response completed" (#12064, Pi 9b88b94e2).
+	// upstream: packages/ai/src/utils/retry.ts:RETRYABLE_PROVIDER_ERROR_PATTERN
+	"connection.?closed",
 	"other side closed",
 	"fetch failed",
 	// node-fetch system errors, e.g. the Google ADC OAuth token refresh used by google-vertex; the reason is often empty (#10996, Pi 0fbdbd3f).
 	"request to \\S+ failed, reason:",
 	"getaddrinfo",
+	// Bare Node socket error codes, e.g. "read ECONNRESET", "write EPIPE", or "connect ETIMEDOUT 1.2.3.4:443" when a transport reports only the code (#12128, Pi 4699b5b26). The codes must not be part of a longer identifier.
+	// Pi spells it (?<![a-z0-9_])(?:ECONNRESET|ECONNABORTED|ECONNREFUSED|ETIMEDOUT|EPIPE)(?![a-z0-9_]); RE2 has no lookaround, so the neighbours are matched, as for the status codes above.
+	// upstream: packages/ai/src/utils/retry.ts:RETRYABLE_PROVIDER_ERROR_PATTERN
+	"(?:^|[^a-z0-9_])(?:ECONNRESET|ECONNABORTED|ECONNREFUSED|ETIMEDOUT|EPIPE)(?:[^a-z0-9_]|$)",
+	// upstream: packages/ai/src/utils/retry.ts:RETRYABLE_PROVIDER_ERROR_PATTERN
+	"connection reset by peer",
 	"ENOTFOUND",
 	"EAI_AGAIN",
 	"upstream.?connect",
@@ -86,6 +95,9 @@ var retryableProviderErrorPattern = buildProviderErrorPattern([]string{
 	// WebSocket transports can report close/error text.
 	"websocket.?closed",
 	"websocket.?error",
+	// Codex 60-minute WebSocket lifetime limit, as code `websocket_connection_limit_reached` or as text "Responses websocket connection limit reached". A retry opens a fresh connection (#12124, Pi bb1a2b3542b5).
+	// upstream: packages/ai/src/utils/retry.ts:RETRYABLE_PROVIDER_ERROR_PATTERN
+	"websocket.?connection.?limit.?reached",
 	// Premature stream endings from SDKs and transports.
 	"ended without",
 	"stream ended before message_stop",
@@ -93,6 +105,8 @@ var retryableProviderErrorPattern = buildProviderErrorPattern([]string{
 	"http2 request did not get a response",
 	// Codex CLI mid-stream disconnect, relayed by proxies that wrap the Codex CLI, e.g. "stream disconnected before completion: stream closed before response.completed" (#11057, Pi 29057ece).
 	"stream disconnected before completion",
+	// Magpie gateway relaying a dropped upstream Anthropic stream, for example "Claude Code's stream from Anthropic was cut short after the reply had begun" (#11879, Pi 566344046).
+	"cut short after the reply had begun",
 	// Node ERR_HTTP2_STREAM_CANCEL: the HTTP/2 session died before the request was sent, for example after the Bedrock SDK's 5-minute session timeout (utils/retry.ts, #10379).
 	"pending stream has been canceled",
 	// Provider-requested retry delay cap failures flow through the outer policy.
@@ -108,15 +122,26 @@ var retryableProviderErrorPattern = buildProviderErrorPattern([]string{
 	"subscription_sharing_user_unavailable",
 })
 
+// RetryDecision is what a custom RetryDecider chooses for one failed assistant call.
+type RetryDecision struct {
+	Retry   bool
+	DelayMs int
+}
+
+// RetryDecider classifies a failed assistant response and chooses the backoff delay before attempt (1-based).
+type RetryDecider func(attempt, maxAttempts int, response AssistantMessage) RetryDecision
+
 // RetryPolicy bounds attempts with exponential backoff
 // (baseDelayMs * 2^(attempt-1)). MaxAgentDelayMs caps each computed delay and
-// defaults to DefaultMaxAgentRetryDelayMs when nil.
+// defaults to DefaultMaxAgentRetryDelayMs when nil. Decide, when non-nil,
+// replaces IsRetryableAssistantError and RetryDelayMs.
 type RetryPolicy struct {
 	Enabled bool `json:"enabled"`
 	// MaxRetries is the retry budget; the initial call never counts as a retry.
-	MaxRetries      int  `json:"maxRetries"`
-	BaseDelayMs     int  `json:"baseDelayMs"`
-	MaxAgentDelayMs *int `json:"maxAgentDelayMs,omitempty"`
+	MaxRetries      int          `json:"maxRetries"`
+	BaseDelayMs     int          `json:"baseDelayMs"`
+	MaxAgentDelayMs *int         `json:"maxAgentDelayMs,omitempty"`
+	Decide          RetryDecider `json:"-"`
 }
 
 // DefaultMaxAgentRetryDelayMs is the default cap for one agent retry delay.
@@ -187,13 +212,29 @@ func RetryAssistantCall(ctx context.Context, produce func() (AssistantMessage, e
 			}
 			return response, nil
 		}
-		if attempt >= maxAttempts || !IsRetryableAssistantError(response) {
-			if lastRetryAttempt > 0 {
-				if err := callFinished(callbacks, false, lastRetryAttempt, response.ErrorMessage); err != nil {
-					return AssistantMessage{}, err
+		var delayMs int
+		// pig additive (D654): a decider replaces isRetryableAssistantError and retryDelayMs (retry.ts:238, :149).
+		if policy != nil && policy.Decide != nil {
+			decision := policy.Decide(attempt+1, maxAttempts, response)
+			if attempt >= maxAttempts || !decision.Retry {
+				if lastRetryAttempt > 0 {
+					if err := callFinished(callbacks, false, lastRetryAttempt, response.ErrorMessage); err != nil {
+						return AssistantMessage{}, err
+					}
 				}
+				return response, nil
 			}
-			return response, nil
+			delayMs = decision.DelayMs
+		} else {
+			if attempt >= maxAttempts || !IsRetryableAssistantError(response) {
+				if lastRetryAttempt > 0 {
+					if err := callFinished(callbacks, false, lastRetryAttempt, response.ErrorMessage); err != nil {
+						return AssistantMessage{}, err
+					}
+				}
+				return response, nil
+			}
+			delayMs = RetryDelayMs(*policy, attempt+1)
 		}
 
 		attempt++
@@ -202,7 +243,6 @@ func RetryAssistantCall(ctx context.Context, produce func() (AssistantMessage, e
 		if lastRetryMessage == "" {
 			lastRetryMessage = "Unknown error"
 		}
-		delayMs := RetryDelayMs(*policy, attempt)
 		if callbacks.OnRetryScheduled != nil {
 			if err := callbacks.OnRetryScheduled(attempt, maxAttempts, delayMs, lastRetryMessage); err != nil {
 				return AssistantMessage{}, err
@@ -259,6 +299,7 @@ func sleepContext(ctx context.Context, delay time.Duration) error {
 // IsRetryableAssistantError classifies whether a failed assistant message looks
 // like a transient provider or transport error. It does not implement retry
 // policy; callers handle context overflow first.
+// The socket error codes of the pattern are Node's text; a Go transport error (a syscall.Errno in a *net.OpError) reaches this text form through nodeNetErrorMessage, nodeConnectionFailure and WithCauseDetail, which name it with the same code, so there is no typed match here.
 func IsRetryableAssistantError(message AssistantMessage) bool {
 	if message.StopReason != StopReasonError || message.ErrorMessage == "" {
 		return false

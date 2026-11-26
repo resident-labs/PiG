@@ -5,12 +5,13 @@ import (
 	"fmt"
 
 	"github.com/MichaelKinsy/PiG/chord/delta"
+	"github.com/MichaelKinsy/PiG/chord/next/contracts"
 	"github.com/MichaelKinsy/PiG/chord/next/data"
 	"github.com/MichaelKinsy/PiG/chord/next/state"
 	"github.com/MichaelKinsy/PiG/chord/next/store"
 )
 
-// Ports packages/chord/src/next/documents/slot.ts
+// Ports packages/chord/src/documents/slot.ts
 //
 // Document slots (slice 6a §1.2): one per declared document name on its object, across the object's attempts. A slot
 // holds the documents' trackers, the version and definition its values are of, what is stored of persisted ones, and
@@ -63,6 +64,8 @@ type PersistedSlot interface {
 type SlotDefinition struct {
 	current  AnyDefinition
 	hydrated bool
+	// beforeHydrate is a test-only seam run right before Hydrate writes current; nil in production.
+	beforeHydrate func()
 }
 
 // NewSlotDefinition is the slot definition of a slot first declared with definition.
@@ -81,9 +84,9 @@ func (slot *SlotDefinition) Hydrated() AnyDefinition {
 	return slot.current
 }
 
-// Check checks a declaration of this name by a new attempt: a flipped `keyed` or `persist`, a version older than the
-// values (old code) or the same version with another fingerprint (a schema changed without a bump) fail (the attempt
-// fails broken).
+// Check checks a declaration of this name by a new attempt: a flipped `keyed` or `persist`, another key kind (strings
+// or a host kind), a version older than the values (old code) or the same version with another fingerprint (a schema
+// changed without a bump) fail (the attempt fails broken).
 func (slot *SlotDefinition) Check(definition AnyDefinition) error {
 	current := slot.current
 	name := current.Name
@@ -93,6 +96,15 @@ func (slot *SlotDefinition) Check(definition AnyDefinition) error {
 			kind = "keyed"
 		}
 		return fmt.Errorf("%s: declared %s, its documents are not", name, kind)
+	}
+	if hostKindName(definition.Host) != hostKindName(current.Host) {
+		keys := func(kind *contracts.HostKind) string {
+			if kind == nil {
+				return "string keys"
+			}
+			return "addresses of " + kind.Kind
+		}
+		return fmt.Errorf("%s: declared with %s, its documents have %s", name, keys(definition.Host), keys(current.Host))
 	}
 	if definition.Persist != current.Persist {
 		kind := "in memory"
@@ -110,8 +122,19 @@ func (slot *SlotDefinition) Check(definition AnyDefinition) error {
 	return nil
 }
 
+// hostKindName is a host kind's name, "" for none (string keys and singletons): kinds compare by name.
+func hostKindName(kind *contracts.HostKind) string {
+	if kind == nil {
+		return ""
+	}
+	return kind.Kind
+}
+
 // Hydrate records the hydration with definition.
 func (slot *SlotDefinition) Hydrate(definition AnyDefinition) {
+	if slot.beforeHydrate != nil {
+		slot.beforeHydrate()
+	}
 	slot.current = definition
 	slot.hydrated = true
 }
@@ -269,6 +292,9 @@ func (slot *SingletonSlot) LoadDeclared(ctx context.Context) error { return slot
 
 // Key is a singleton has one document: its key is always "".
 func (slot *SingletonSlot) Key(string) (string, error) { return "", nil }
+
+// KeyOf is as Key: a singleton takes no key from a handle.
+func (slot *SingletonSlot) KeyOf(any) (string, error) { return "", nil }
 
 // Cold is false: a singleton loads at activation.
 func (slot *SingletonSlot) Cold(string) bool { return false }

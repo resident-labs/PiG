@@ -15,6 +15,7 @@ import (
 	"weak"
 
 	"github.com/MichaelKinsy/PiG/chord"
+	chordctx "github.com/MichaelKinsy/PiG/chord/context"
 	"github.com/MichaelKinsy/PiG/chord/delta"
 	"github.com/MichaelKinsy/PiG/chord/next/contracts"
 	"github.com/MichaelKinsy/PiG/chord/next/data"
@@ -24,9 +25,9 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/state"
 )
 
-// pi: packages/chord/src/next/remote/hold.ts
+// pi: packages/chord/src/remote/hold.ts
 
-// Ports packages/chord/test/next/remote/hold.test.ts.
+// Ports packages/chord/test/remote/hold.test.ts.
 //
 // Go forms (rows of the lane): `instancesOf(Hold, "start")`, `instancesOf(ChordObject, ...)` and the mocked Delta
 // `encoder` are designed out: a Go test reaches the holds, their members' encoders and the objects through the host's
@@ -850,8 +851,8 @@ func rhServeTally(closing <-chan struct{}) func(FacetHost) error {
 			return err
 		}
 		return host.Serve(rhFresh, func(_ *delta.JsonObject, _ data.Principal, self Self) (contracts.Implementation, error) {
-			self.Open(func(context.Context) (any, error) { return nil, nil }, func(any, NativeCloseReason, context.Context) error {
-				<-closing
+			self.Open(func(context.Context) (any, error) { return nil, nil }, func(_ any, _ NativeCloseReason, ctx context.Context) error {
+				_, _ = chordctx.Receive(context.WithoutCancel(ctx), closing)
 				return nil
 			})
 			return serve(self), nil
@@ -930,9 +931,9 @@ var rhRetiring = rhRemote("app.retiring",
 
 type rhRetiringRig struct {
 	*RawPeer
-	t     testing.TB
-	names wireIndexes
-	calls int
+	t      testing.TB
+	names  wireIndexes
+	server Host
 }
 
 // rhRetiringPeer is a server serving rhRetiring to a raw peer that acks only when told.
@@ -965,7 +966,7 @@ func rhRetiringPeer(t testing.TB) *rhRetiringRig {
 	})}}, background))
 	peer := rhSecondPeerWith(t, server, rawPeerOptions{NoAck: true})
 	rhSync(t, peer)
-	rig := &rhRetiringRig{RawPeer: peer, t: t, names: wireNames(t, rhRetiring, "v")}
+	rig := &rhRetiringRig{RawPeer: peer, t: t, names: wireNames(t, rhRetiring, "v"), server: server}
 	rhHold(peer, 0, rhRetiring)
 	peer.Next("bound")
 	peer.Ack(link.Optional[int]{})
@@ -979,21 +980,22 @@ func rhSecondPeerWith(t testing.TB, server Host, options rawPeerOptions) *RawPee
 	return newRawPeer(t, b, options)
 }
 
-// call calls a method of hold 0 and waits for its result.
+// call calls a method of the object hold 0 holds, from the server itself as the hold's principal (an answer over the link
+// would send the waiting state before it), and waits for its result.
 func (r *rhRetiringRig) call(method string, args ...int) {
 	r.t.Helper()
-	id := r.calls
-	r.calls++
-	message := &link.CallMessage{Call: id, Hold: 0, Method: r.names.Methods[method]}
-	if len(args) > 0 {
-		part, err := link.JsonPart(float64(args[0]))
-		must(r.t, err)
-		message.Args = part
-	}
-	r.Send(message)
-	if got := r.Next("result").(*link.ResultMessage).Call; got != id {
-		r.t.Fatalf("result for call %d, want %d", got, id)
-	}
+	_, err := r.server.Root(func(ctx Ctx) (any, error) {
+		object, err := ctx.Get(rhRetiring, jsonObject(), GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		var argument delta.JsonValue
+		if len(args) > 0 {
+			argument = float64(args[0])
+		}
+		return object.Call(method, argument, ctx)
+	}, background, RootOptions{Principal: ownerPrincipal()})
+	must(r.t, err)
 }
 
 func (r *rhRetiringRig) nextState() link.StateEntry {

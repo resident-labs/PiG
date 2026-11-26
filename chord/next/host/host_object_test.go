@@ -21,8 +21,8 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/internal/nexttest"
 )
 
-// pi: packages/chord/src/next/host/object.ts
-// Ports packages/chord/test/next/host/object.test.ts: objects (§6): identity and lifetime, retries, attempts parked on
+// pi: packages/chord/src/host/object.ts
+// Ports packages/chord/test/host/object.test.ts: objects (§6): identity and lifetime, retries, attempts parked on
 // dependencies, cycle checks, collection, `ref.retry()`, linger, cycles across hosts, a failed activation's cleanup and a
 // live object failing. Every case runs a real host; the cases Pi runs under `fakeTimers()` run on the scopeLoop and move the
 // clock with advanceHost. What Pi awaits in a handler or an opener is a blocking Go function on its task.
@@ -221,6 +221,7 @@ func TestObjectRetriesRetryATransientFailureAfter1sDoublingUpTo60sAndStartOverAf
 		got <- ref
 	}()
 	until(t, "the first attempt", func() bool { return len(flaky.all()) == 1 })
+	until(t, "the first attempt's backoff window", func() bool { return hasTimerAt(loop, 1_000) })
 	advanceSettled(loop, host, 183_000)
 	receive(t, got).Release()
 	want := []int64{0, 1000, 3000, 7000, 15000, 31000, 63000, 123000, 183000}
@@ -231,6 +232,7 @@ func TestObjectRetriesRetryATransientFailureAfter1sDoublingUpTo60sAndStartOverAf
 	again := make(chan *Reference, 1)
 	go func() { again <- mustGet(t, host, objSvc, jsonObject("id", 1.0)) }()
 	until(t, "the next attempt", func() bool { return len(flaky.all()) == 10 })
+	until(t, "the tenth attempt's backoff window", func() bool { return hasTimerAt(loop, 184_000) })
 	advanceSettled(loop, host, 1000)
 	ref := receive(t, again)
 	if v, _ := ref.Member("n").Value(); v != 11.0 {
@@ -303,6 +305,7 @@ func TestObjectRetriesEndAFailedObjectWithItsLastReferenceItsBackoffEntryExpires
 	}
 	first := get(500 * time.Millisecond)
 	until(t, "the first attempt", func() bool { return len(flaky.all()) == 1 })
+	until(t, "the first attempt's backoff window", func() bool { return hasTimerAt(loop, 1_000) })
 	advanceSettled(loop, host, 500)
 	wantChordError(t, receive(t, first), data.CodeUnavailable, "", "app.svc(1): offline")
 	advanceSettled(loop, host, 4500)
@@ -312,6 +315,7 @@ func TestObjectRetriesEndAFailedObjectWithItsLastReferenceItsBackoffEntryExpires
 	// The entry expired: a new object tries at once and its window starts over at 1 s.
 	second := get(1500 * time.Millisecond)
 	until(t, "the second attempt", func() bool { return len(flaky.all()) == 2 })
+	until(t, "the second attempt's backoff window", func() bool { return hasTimerAt(loop, 6_000) })
 	advanceSettled(loop, host, 1500)
 	_ = receive(t, second)
 	if got := flaky.all(); !reflect.DeepEqual(got, []int64{0, 5000, 6000}) {
@@ -332,6 +336,7 @@ func TestObjectRetriesMakeAGetRightAfterAFailureWaitForTheScheduledRetry(t *test
 		first <- err
 	}()
 	until(t, "the first attempt", func() bool { return len(flaky.all()) == 1 })
+	until(t, "the first attempt's backoff window", func() bool { return hasTimerAt(loop, 1_000) })
 	advanceSettled(loop, host, 500)
 	_ = receive(t, first)
 	second := make(chan *Reference, 1)
@@ -354,7 +359,7 @@ func TestObjectRetriesStartANewInstanceOnlyAfterThePreviousOneClosed(t *testing.
 		return h.Serve(objSvc, func(_ *delta.JsonObject, self Self) (contracts.Implementation, error) {
 			// The instance's native closes only when the test lets it.
 			self.Open(func(context.Context) (any, error) { return nil, nil },
-				func(any, NativeCloseReason, context.Context) error { closing.wait(t); return nil })
+				func(_ any, _ NativeCloseReason, ctx context.Context) error { closing.await(t, ctx); return nil })
 			n := factory.Add(1)
 			return contracts.Implementation{Members: contracts.VariantImplementation{State: map[string]chord.Watchable[delta.JsonValue]{"n": constant(float64(n))}}}, nil
 		}, ServeOptions{})
@@ -442,6 +447,7 @@ func TestObjectParkedKeepsItsReferencesWhileParkedAGetterRejectsWithTheWaitingCa
 		got <- err
 	}()
 	until(t, "the dependency's first attempt", func() bool { return len(svc.all()) == 1 })
+	until(t, "the dependency's backoff window", func() bool { return hasTimerAt(loop, 1_000) })
 	advanceSettled(loop, host, 1500)
 	wantChordError(t, receive(t, got), data.CodeUnavailable, "", "waiting for app.svc(1): app.svc(1): offline")
 	advanceSettled(loop, host, 10_000)
@@ -671,6 +677,7 @@ func TestObjectGCOfFailedObjectsCollectsOneAfterItsLastReferenceWhileItsBackoffE
 		got <- err
 	}()
 	until(t, "the attempt", func() bool { mu.Lock(); defer mu.Unlock(); return len(attempts) == 1 })
+	until(t, "the failed attempt's backoff window", func() bool { return hasTimerAt(loop, 1_000) })
 	advanceSettled(loop, host, 100)
 	_ = receive(t, got)
 	if got := loop.TimerCount(); got != 1 {
@@ -1131,4 +1138,52 @@ func TestObjectALiveObjectFailingIsRecoveredByRefRetryANewAttemptTheDocumentsAsT
 	if !reflect.DeepEqual(value, jsonObject("items", []any{"a"})) {
 		t.Fatalf("list = %v, want {items: [a]}", value)
 	}
+}
+
+// --- calls for a reference (decision "References share one wire hold") ----------------------------------------------
+
+var objWho = mustContract(contracts.Local("app.who", contracts.LocalDeclaration{Params: contracts.Params{},
+	Version: 1, Members: []contracts.LocalEntry{contracts.Mem("who", contracts.NewMethod(contracts.Str(), contracts.Str()))},
+}))
+
+// object.test.ts: calls for a reference › run as the reference's binding's caller; a local object keeps no replica counts
+// (Pi main 47e9d74f9)
+func TestObjectCallsForAReferenceRunAsTheReferencesBindingsCallerALocalObjectKeepsNoReplicaCounts(t *testing.T) {
+	host := newHost(t, HostOptions{Principal: ownerPrincipal(), OnError: noopOnError})
+	_, err := host.Load([]HostFacet{{Name: "@test/who", Facet: DefineFacet(func(h FacetHost, _ FacetSelf) error {
+		return h.Serve(objWho, func(*delta.JsonObject, Self) (contracts.Implementation, error) {
+			return contracts.Implementation{Members: contracts.VariantImplementation{
+				Methods: map[string]contracts.MethodFunction{"who": func(_ delta.JsonValue, ctx context.Context) (delta.JsonValue, error) {
+					principal := exCtx(ctx).Principal()
+					if principal == nil {
+						return "none", nil
+					}
+					return principalKind(principal), nil
+				}},
+			}}, nil
+		}, ServeOptions{})
+	})}}, background)
+	must(t, err)
+	who := mustGet(t, host, objWho, jsonObject())
+	got, err := who.Call("who", "?", background)
+	must(t, err)
+	if got != "owner" {
+		t.Fatalf("who = %v, want owner", got)
+	}
+	h := host.(*chordHost)
+	var object *chordObject
+	h.enter(func() {
+		for _, each := range h.objects {
+			if each.label() == "app.who" {
+				object = each
+			}
+		}
+	})
+	if object == nil {
+		t.Fatal("no object app.who")
+	}
+	if generation, counted := object.generationOf("who"); counted {
+		t.Fatalf("generationOf = %d, want none", generation)
+	}
+	must(t, host.Close(background))
 }

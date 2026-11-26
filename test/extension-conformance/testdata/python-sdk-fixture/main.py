@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import dataclasses
+import io
 import json
+import os
 import pathlib
 import re
+import socket
 import struct
 import sys
 import threading
@@ -20,6 +23,39 @@ sys.path.insert(0, str(ROOT / "extensions" / "sdk-py"))
 
 import pig_sdk  # noqa: E402
 from pig_sdk import kit  # noqa: E402
+
+
+def dumps_deep(value: Any, separators: tuple[str, str] = (", ", ": ")) -> str:
+    """json.dumps of a payload, written with a stack of its own when its nesting passes what the interpreter's JSON writer takes (its recursion limit: about 990 levels on 3.11, and a lower C limit than Linux's on Windows)."""
+    try:
+        return json.dumps(value, separators=separators)
+    except RecursionError:
+        pass
+    comma, colon = separators
+    out: list[str] = []
+    stack: list[Any] = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, tuple):  # a literal to write: a bracket, a comma, or an object key and its colon
+            out.append(item[0])
+        elif isinstance(item, dict):
+            out.append("{")
+            stack.append(("}",))
+            for index, (key, member) in enumerate(reversed(list(item.items()))):
+                stack.append(member)
+                stack.append((json.dumps(key) + colon,))
+                if index < len(item) - 1:
+                    stack.append((comma,))
+        elif isinstance(item, list):
+            out.append("[")
+            stack.append(("]",))
+            for index in range(len(item) - 1, -1, -1):
+                stack.append(item[index])
+                if index:
+                    stack.append((comma,))
+        else:
+            out.append(json.dumps(item))
+    return "".join(out)
 
 
 def kit_probe_view() -> kit.View:
@@ -514,6 +550,15 @@ def dialog_text(value) -> str:
     return value if isinstance(value, str) else ""
 
 
+def io_wait(addr: str) -> None:
+    """Dial addr ("host:port"), write "waiting\n" and return when the peer writes a line."""
+    host, port = addr.rsplit(":", 1)
+    with socket.create_connection((host, int(port))) as peer:
+        peer.sendall(b"waiting\n")
+        with peer.makefile("rb") as lines:
+            lines.readline()
+
+
 def new_extension() -> pig_sdk.Extension:
     # factory_agent_dir is get_agent_dir() while the factory runs, where Pi's extensions call it (TestConformance_HostConfigurationAgreesAcrossSDKs).
     try:
@@ -634,10 +679,35 @@ def new_extension() -> pig_sdk.Extension:
         ctx.notify("refine_log:" + json.dumps(calls) + ":end", "info")
 
     ext.command("refine_log", "Report and clear the refinement call log", refine_log_probe)
+
+    def refine_value_probe(ctx, args):
+        # refine_value (TestConformance_RefinedValueRunsRefinements): Value.check / Value.errors on the probe schema; the notice carries the result (or the message a refinement raised) and the log of the refinement calls made.
+        request = json.loads(args)
+        report: dict = {}
+        try:
+            if request["mode"] == "check":
+                report["result"] = pig_sdk.Value.check(probe, request["value"])
+            elif request["mode"] == "cycle":
+                # a schema that refers to itself: the host answers TypeBox's RangeError, which is the call's failure
+                report["result"] = pig_sdk.Value.check(pig_sdk.Type.unsafe({"$ref": "#"}), 1)
+            else:
+                report["result"] = [
+                    {"keyword": e.keyword, "schemaPath": e.schema_path, "instancePath": e.instance_path, "params": e.params, "message": e.message}
+                    for e in pig_sdk.Value.errors(probe, request["value"])
+                ]
+        except Exception as exc:  # noqa: BLE001 - a refinement's own exception is what the probe reports
+            report = {"thrown": str(exc)}
+        report["calls"] = list(refine_log)
+        refine_log.clear()
+        ctx.notify("refine_value:" + json.dumps(report, separators=(",", ":"), ensure_ascii=False) + ":end", "info")
+
+    ext.command("refine_value", "Run Value.check or Value.errors on the refinement probe schema", refine_value_probe)
     class ConformanceEditor(pig_sdk.EditorComponent):
         """Swallows "q", rewrites "a" to "A", upper-cases the host's setText, and frames super.render."""
 
         def handle_input(self, data):
+            if data == "!":
+                raise RuntimeError("bad key")
             if data == "q":
                 return
             if data == "L":
@@ -841,6 +911,18 @@ def new_extension() -> pig_sdk.Extension:
                 def access(path):
                     log.append("access:" + path)
                 ops = pig_sdk.ReadOperations(read_file=read_file, access=access)
+            if case.get("ops") == "stream":
+                def read_file(path):
+                    log.append("readFile:" + path)
+                    return ("OPS:" + path).encode()
+
+                def access(path):
+                    log.append("access:" + path)
+
+                def create_read_stream(path):
+                    log.append("createReadStream:" + path)
+                    return io.BytesIO(("STREAM:" + path + "\n").encode())
+                ops = pig_sdk.ReadOperations(read_file=read_file, access=access, create_read_stream=create_read_stream)
             return pig_sdk.ReadToolOptions(auto_resize_images=case.get("autoResizeImages"), operations=ops)
         if tool == "write":
             ops = None
@@ -878,9 +960,26 @@ def new_extension() -> pig_sdk.Extension:
                     log.append("isDirectory:" + path)
                     raise RuntimeError("no such path for the probe")
                 ops = pig_sdk.GrepOperations(is_directory=is_directory)
+            if case.get("ops") == "grepdir":
+                def listed_directory(path):
+                    log.append("isDirectory:" + path)
+                    return True
+                def ignored_read_file(path):
+                    log.append("readFile:" + path)
+                    return ""
+                ops = pig_sdk.GrepOperations(is_directory=listed_directory, read_file=ignored_read_file)
             return pig_sdk.GrepToolOptions(operations=ops)
         if tool == "find":
             ops = None
+            if case.get("ops") == "globlimit":
+                def limit_exists(path):
+                    log.append("exists:" + path)
+                    return True
+
+                def limit_glob(pattern, cwd, options):
+                    log.append("glob:%s:limit=%d" % (pattern, options["limit"]))
+                    return ["a.txt", "b.txt", "c.txt"][: int(options["limit"])]
+                ops = pig_sdk.FindOperations(exists=limit_exists, glob=limit_glob)
             if custom:
                 def find_exists(path):
                     log.append("exists:" + path)
@@ -899,6 +998,39 @@ def new_extension() -> pig_sdk.Extension:
                 log.append("spawnHook:" + spawn["command"])
                 return {"command": "printf '%s|%s' \"$HOOK_VAR\" \"$PI_SESSION_ID\"", "cwd": spawn["cwd"], "env": {**spawn["env"], "HOOK_VAR": "hook-env"}}
         ops = None
+        if case.get("ops") == "localThread":
+            # The local operations run on another thread and their error comes back unchanged.
+            local = pig_sdk.create_local_bash_operations()
+
+            def local_thread_exec(command, cwd, options):
+                outcome = {}
+
+                def run():
+                    try:
+                        outcome["result"] = local.exec(command, cwd, options)
+                    except BaseException as error:  # noqa: BLE001
+                        outcome["error"] = error
+
+                worker = threading.Thread(target=run)
+                worker.start()
+                worker.join()
+                if "error" in outcome:
+                    raise outcome["error"]
+                return outcome["result"]
+            ops = pig_sdk.BashOperations(exec=local_thread_exec)
+        if case.get("ops") in ("local", "localWrapped"):
+            # The bash tool runs on the local operations. "local" raises their error unchanged; "localWrapped" raises a new one with the same message, which is not the
+            # backend's error and keeps nothing of it (Pi matches the backend's class, bash.ts).
+            local = pig_sdk.create_local_bash_operations()
+
+            def local_exec(command, cwd, options):
+                try:
+                    return local.exec(command, cwd, options)
+                except Exception as error:  # noqa: BLE001
+                    if case["ops"] == "localWrapped":
+                        raise RuntimeError(str(error)) from None
+                    raise
+            ops = pig_sdk.BashOperations(exec=local_exec)
         if custom:
             def exec_(command, cwd, options):
                 log.append("exec:%s|cwd=%s" % (command, cwd))
@@ -1271,6 +1403,21 @@ def new_extension() -> pig_sdk.Extension:
 
     ext.command("ui_forward_probe", "Call the working, paste, editor-text and tools-expanded UI members", ui_forward_probe)
 
+    # conformance-click-message / conformance-click-entry: a card whose mouse region counts clicks in the renderer state the SDK keeps per displayed message. The handler runs for each event the host's view took, before the render.
+    def click_state(options, event):
+        if event.type == kit.MOUSE and event.node == "card":
+            options.state["clicks"] = options.state.get("clicks", 0) + 1
+            options.state["last"] = f"{int(event.mouse['x'])},{int(event.mouse['y'])}"
+
+    def click_view(prefix, subject_text, options):
+        text = f"{prefix}:{subject_text}:clicks={options.state.get('clicks', 0)}:last={options.state.get('last', 'none')}:expanded={'true' if options.get('expanded') else 'false'}"
+        return kit.View(kit.MouseRegion("card", kit.Text(text, 0, 0), types=["click"]))
+
+    ext.message_view_renderer("conformance-click-message", lambda ctx, message, options, width: click_view("clickcard", message.get("content", ""), options))
+    ext.message_view_event("conformance-click-message", lambda ctx, message, options, event: click_state(options, event))
+    ext.entry_view_renderer("conformance-click-entry", lambda ctx, entry, options, width: click_view("clickentry", entry.get("data", ""), options))
+    ext.entry_view_event("conformance-click-entry", lambda ctx, entry, options, event: click_state(options, event))
+
     # The extension owns the thinking runs from load; thinking_runs_off/on flip the flag through the runtime entry point (the conformance row reads the host's aggregated flag).
     ext.own_thinking_runs(True)
     ext.command("thinking_runs_off", "Clear the owns-thinking-runs flag", lambda ctx, _args: ctx.own_thinking_runs(False))
@@ -1566,6 +1713,14 @@ def new_extension() -> pig_sdk.Extension:
         ctx.notify(json.dumps(out), "info")
     ext.command("replicated-accessors", "Read the replicated accessors after each write", replicated_accessors)
     ext.command("active_tools_set", "Set the active tools to the comma-separated names", lambda ctx, args: ctx.set_active_tools(args.strip().split(",")))
+    def host_error_probe(ctx, _args):
+        text, code = "no error", "-"
+        try:
+            ctx.navigate_tree("entry")
+        except Exception as error:
+            text, code = str(error), getattr(error, "code", None) or "-"
+        ctx.notify("host_error:%s|%s" % (text, code), "info")
+    ext.command("host_error_probe", "Report what a host error on navigateTree looks like to the extension", host_error_probe)
     def session_actions_unbound(ctx, _args):
         parts = []
         for name, call in (("new", lambda: ctx.new_session()), ("fork", lambda: ctx.fork("entry")), ("navigate", lambda: ctx.navigate_tree("entry")), ("switch", lambda: ctx.switch_session("/s.jsonl"))):
@@ -1580,10 +1735,91 @@ def new_extension() -> pig_sdk.Extension:
             parts.append("reload=error:%s" % error)
         ctx.notify("unbound:" + ",".join(parts), "info")
 
+    # event_session_actions_on keeps the handler's context; event_session_actions_stored calls the actions through it after the handler's request ended.
+    kept_event_ctx = []
+
+    def report_session_actions(hctx):
+        parts = []
+        for name, call in (("wait", lambda: hctx.wait_for_idle()), ("new", lambda: hctx.new_session()), ("fork", lambda: hctx.fork("entry")), ("navigate", lambda: hctx.navigate_tree("entry")), ("switch", lambda: hctx.switch_session("/s.jsonl")), ("reload", lambda: hctx.reload())):
+            try:
+                call()
+                parts.append("%s=allowed" % name)
+            except Exception as error:
+                parts.append("%s=rejected" % name if "is not a function" in str(error) else "%s=error:%s" % (name, error))
+        return ",".join(parts)
+
+    def event_session_actions_on(ctx, args):
+        def handler(hctx, _data):
+            kept_event_ctx.append(hctx)
+            hctx.notify("event_actions:" + report_session_actions(hctx), "info")
+
+        ext.on_event(args.strip(), handler)
+
+    def event_session_actions_stored(ctx, _args):
+        ctx.notify("stored_actions:" + report_session_actions(kept_event_ctx[-1]), "info")
+
+    ext.command("event_session_actions_on", "Subscribe to the event named by the argument with a handler that calls the session actions", event_session_actions_on)
+    ext.command("event_session_actions_stored", "Call the session actions through the context an event handler kept", event_session_actions_stored)
+
+    # tool_call_cancel_on subscribes to tool_call with a handler that waits for the cancel signal and then answers (D650 claim 6).
+    def tool_call_cancel_on(ctx, _args):
+        def handler(hctx, _data):
+            hctx.notify("cancel_wait", "info")
+            while not hctx.is_cancelled():
+                time.sleep(0.005)
+            hctx.notify("cancel_seen", "info")
+            return {"block": True, "reason": "answered after the abort"}
+
+        ext.on_event("tool_call", handler)
+
+    ext.command("tool_call_cancel_on", "Subscribe to tool_call with a handler that waits for the cancel signal", tool_call_cancel_on)
+    # session_actions_tool makes the same calls, and the wait, through the context of a tool's execute: Pi's createContext() object, so every one is refused.
+    ext.tool("session_actions_tool", "Call the session actions through the tool's context", {"type": "object", "properties": {}}, lambda tctx, _args: {"content": "tool_actions:" + report_session_actions(tctx)})
+
+    # wait_idle_command waits for the run from a command context (runner.ts createCommandContext); wait_idle_with_session from a withSession callback's context.
+    def wait_idle_command(ctx, _args):
+        text = "done"
+        try:
+            ctx.wait_for_idle()
+        except Exception as error:
+            text = "error:%s" % error
+        ctx.notify("wait_idle:" + text, "info")
+
+    def wait_idle_with_session(ctx, _args):
+        # The callback runs while this command's switch_session call is in flight, so the notice is sent once the call returned.
+        text = ["never ran"]
+
+        def with_session(replaced):
+            text[0] = "done"
+            try:
+                replaced.wait_for_idle()
+            except Exception as error:
+                text[0] = "error:%s" % error
+
+        ctx.switch_session("/s.jsonl", {"withSession": with_session})
+        ctx.notify("with_session_wait:" + text[0], "info")
+
+    ext.command("wait_idle_command", "Wait for the run from a command", wait_idle_command)
+    ext.command("wait_idle_with_session", "Wait for the run from a withSession callback", wait_idle_with_session)
     ext.command("session_actions_unbound", "Report what unbound session actions answer", session_actions_unbound)
     ext.command("active_tools_get", "Report the active tools", lambda ctx, _args: ctx.notify("active_tools:%s" % ",".join(ctx.get_active_tools()), "info"))
+    # mcp_register_run registers two MCP servers in one synchronous run and reads the active tools after each call (TestConformance_McpServerRegisteredAtRunTimeIsHandledInsideTheCall).
+    def mcp_register_run(ctx, _args):
+        reads = []
+        for name in ("conformance-run-a", "conformance-run-b"):
+            ctx.register_mcp_server(name, {"url": "https://%s.invalid/mcp" % name})
+            reads.append(",".join(ctx.get_active_tools()))
+        ctx.notify("mcp_register_run:%s" % "|".join(reads), "info")
+
+    ext.command("mcp_register_run", "Register two MCP servers and report the active tools after each", mcp_register_run)
     # provider_probe_register and provider_probe_unregister register and unregister a plain provider after the extension connected.
-    ext.command("provider_probe_register", "Register a provider with one model", lambda ctx, _args: ext.register_provider("conformance-probe", json.loads(r'''{"baseUrl":"https://probe.invalid/v1","api":"openai-completions","apiKey":"probe-key","models":[{"id":"probe-model","name":"Probe Model","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1000,"maxTokens":100}]}''')))
+    # registry-model-probe registers the provider of the active model again with the argument as the model's name, then reads the model (TestARegistryWriteIsVisibleToTheNextModelReadAcrossSDKs).
+    def registry_model_probe(ctx, name):
+        ext.register_provider("replica-reg", {"baseUrl": "https://probe.invalid/v1", "api": "openai-completions", "apiKey": "probe-key", "models": [{"id": "m", "name": name, "reasoning": False, "input": ["text"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 1000, "maxTokens": 100}]})
+        ctx.notify("regname=" + ((ctx.get_model_info() or {}).get("name") or ""), "info")
+
+    ext.command("registry-model-probe", "Register the active model's provider with a new name, then read the model", registry_model_probe)
+    ext.command("provider_probe_register", "Register a provider with one model", lambda ctx, _args: ext.register_provider("conformance-probe", json.loads(r'''{"baseUrl":"https://probe.invalid/v1","api":"openai-completions","apiKey":"probe-key","models":[{"id":"probe-model","name":"Probe Model","reasoning":true,"input":["text","image"],"cost":{"input":3.5,"output":4.5,"cacheRead":0.35,"cacheWrite":0.45},"contextWindow":54321,"maxTokens":4321}]}''')))
     ext.command("provider_probe_unregister", "Unregister the provider", lambda ctx, _args: ext.unregister_provider("conformance-probe"))
     ext.command("commands-probe", "Read the host's slash commands", lambda ctx, _args: ctx.notify(json.dumps([[c["name"], c["source"], c.get("description", "")] for c in ctx.get_commands() if c["name"] == "conformance-listed"], separators=(",", ":")), "info"))
     ext.command("session-identity", "Read context identity accessors", lambda ctx, _args: ctx.notify(json.dumps([ctx.get_session_id(), ctx.get_session_file(), ctx.get_leaf_id(), ctx.get_session_name()]), "info"))
@@ -1638,7 +1874,7 @@ def new_extension() -> pig_sdk.Extension:
                     trace.write("returned first\n")
         return "md:%s:%s:streaming=%s:width=%d" % (markdown, context.get("messageType", ""), str(bool(context.get("isStreaming"))).lower(), int(context.get("availableWidth") or 0))
 
-    ext.markdown_transformer(transform_markdown)
+    ext.markdown_transformer(transform_markdown, message_types=["user", "assistant", "assistant-thinking", "custom", "summary", "changelog"])
     def resolved_line(prefix: str, tool: str):
         return lambda _ctx, args, _render, _width: ["%s:%s:%s" % (prefix, tool, args.get("q"))]
 
@@ -1650,6 +1886,16 @@ def new_extension() -> pig_sdk.Extension:
             renderers = pig_sdk.ToolRenderers()
             renderers.call_view = lambda _ctx, _args, _render, _width: kit_probe_view()
             renderers.result_view = lambda _ctx, _result, _options, _render, _width: kit_probe_view()
+            return renderers
+        if tool == "last_view_probe":
+            # A view renderer that reads the view form of ToolRenderContext.last_component: the kind of what its previous run returned, and the run's own n.
+            def last_view_call(_ctx, args, render, _width):
+                last = render.last_component
+                kind = "none" if last is None else ("view" if isinstance(last, kit.View) else "lines")
+                return kit.View(kit.Container([kit.Text("lastview:%s:n=%s" % (kind, args.get("n")), 0, 0)]))
+
+            renderers = pig_sdk.ToolRenderers()
+            renderers.call_view = last_view_call
             return renderers
         if tool == "conformance_keyhints":
             return pig_sdk.ToolRenderers(render_call=lambda _ctx, args, render, _width: [hints_of(render, args.get("q", ""))])
@@ -1701,16 +1947,31 @@ def new_extension() -> pig_sdk.Extension:
         return {"content": "soft tool error", "is_error": True}
 
     ext.tool("echo", "Echo input text", {"type": "object", "required": ["text"], "properties": {"text": {"type": "string", "description": "Text to echo"}, "offset": {"type": "number"}}}, echo)
+    # D232 shared-cells rows: instance-local state, the process's event bus, and what this instance heard (the same three tools in every SDK fixture).
+    shared = {"calls": 0, "heard": []}
+    ext.events.on("shared-cells", lambda _ctx, data: shared["heard"].append(data["from"]))
+
+    def shared_counter(_ctx, _params):
+        shared["calls"] += 1
+        return str(shared["calls"])
+
+    def shared_ping(ctx, params):
+        ctx.events.emit("shared-cells", {"from": params["name"]})
+        return "pinged"
+
+    ext.tool("counter", "This instance's call count", {"type": "object", "properties": {}}, shared_counter)
+    ext.tool("ping", "Emit on the shared-cells channel", {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}, shared_ping)
+    ext.tool("received", "What this instance heard on shared-cells", {"type": "object", "properties": {}}, lambda _ctx, _params: "received=" + ",".join(shared["heard"]))
     ext.tool("render_probe", "Render its own tool card", {"type": "object", "properties": {}}, lambda _ctx, _params: "render ok")
 
     def render_probe_call(_ctx, args, render, width):
         render.state["calls"] = render.state.get("calls", 0) + 1
-        return ["toolrender:call:%s:partial=%s:calls=%d:width=%d" % (args.get("topic"), str(render.is_partial).lower(), render.state["calls"], width)]
+        return ["toolrender:call:%s:partial=%s:calls=%d:width=%d:last=%s" % (args.get("topic"), str(render.is_partial).lower(), render.state["calls"], width, (render.last_component or ["none"])[0])]
 
     def render_probe_result(_ctx, result, options, render, width):
         return [
-            "toolrender:result:%s:%s:expanded=%s:calls=%s:width=%d:duration=%s"
-            % (result["content"][0]["text"], result["details"]["k"], str(bool(options.get("expanded"))).lower(), render.state.get("calls"), width, "none" if render.duration_ms is None else render.duration_ms)
+            "toolrender:result:%s:%s:expanded=%s:calls=%s:width=%d:duration=%s:last=%s"
+            % (result["content"][0]["text"], result["details"]["k"], str(bool(options.get("expanded"))).lower(), render.state.get("calls"), width, "none" if render.duration_ms is None else render.duration_ms, (render.last_component or ["none"])[0])
         ]
 
     ext.tool_renderers("render_probe", render_call=render_probe_call, render_result=render_probe_result, render_shell="self")
@@ -1744,7 +2005,40 @@ def new_extension() -> pig_sdk.Extension:
         time.sleep(8)
         return {"content": "late"}
 
+    # signal_host_probe shows that the host keeps answering a tool's host calls after its abort, as Pi's in-process calls are.
+    def signal_host_probe(ctx, _params):
+        def ask(title):
+            try:
+                return ctx.input(title, "p")[0]
+            except Exception as error:
+                return "failed: %s" % error
+
+        first = ask("tool_signal:first")
+        aborted = str(ctx.is_cancelled()).lower()
+        second = ask("tool_signal:later")
+        return {"content": "tool_signal:%s:%s:%s" % (aborted, first, second)}
+
+    # aborted_entry_probe is called with its run already aborted: it echoes the nonce, reports whether its signal was aborted on its first line, and makes a host call after that, which the host answers (TestConformance_ToolCalledAbortedEntersWithItsSignalAborted).
+    def aborted_entry_probe(ctx, params):
+        aborted = str(ctx.is_cancelled()).lower()
+        try:
+            answer = ctx.input("aborted_entry:%s" % params["nonce"], "p")[0]
+        except Exception as error:
+            answer = "failed: %s" % error
+        return {"content": "aborted_entry:%s:%s:%s" % (params["nonce"], aborted, answer)}
+
+    # signal_nested_probe shows that the host keeps answering a nested tool call's host calls after the abort, as Pi's in-process calls are.
+    def signal_nested_probe(ctx, _params):
+        try:
+            result = ctx.execute_tool("abort_tool", {})["result"]
+            text = "".join(block.get("text", "") for block in result["content"]) if isinstance(result["content"], list) else result["content"]
+        except Exception as error:
+            text = "failed: %s" % error
+        return {"content": "tool_signal_nested:" + text}
+
     ext.tool("big_out", "Return text of the size in the argument", {"type": "object", "properties": {}}, lambda ctx, params: {"content": [{"type": "text", "text": "a" * int(params["n"])}]})
+    # lone_decl: a description, a parameter name and a parameter's text hold a lone UTF-16 surrogate (TestConformance_ToolDeclarationLoneSurrogatesAgreeAcrossSDKs).
+    ext.tool("lone_decl", "D[\ud83d]", {"type": "object", "properties": {"K[\ude00\ud83d]": {"type": "string", "description": "PD[\ud83d]", "enum": ["E[\ude00]"], "default": "DF[\ud83d]"}}}, lambda ctx, params: {"content": [{"type": "text", "text": "lone"}]})
     ext.tool("echo_params", "Return the arguments as the result details", {"type": "object", "properties": {}}, lambda ctx, params: {"content": [{"type": "text", "text": "echoed"}], "details": params})
     ext.tool("nan_out", "Return details holding NaN and Infinity", {"type": "object", "properties": {}}, lambda ctx, params: {"content": [{"type": "text", "text": "nan"}], "details": {"n": float("nan"), "i": float("-inf"), "l": [float("nan"), 2, {"d": float("inf")}], "ok": 1}})
     ext.tool("update_tool", "Stream two partial results", {"type": "object", "properties": {}}, update_tool)
@@ -1752,6 +2046,9 @@ def new_extension() -> pig_sdk.Extension:
     ext.tool("ordered_result", "Return a result whose members are not in the declared order", {"type": "object", "properties": {}}, ordered_result)
     ext.tool("abort_tool", "Wait for the abort signal", {"type": "object", "properties": {}}, abort_tool)
     ext.tool("hang_tool", "Ignore the abort signal", {"type": "object", "properties": {}}, hang_tool)
+    ext.tool("signal_host_probe", "Await host dialogs across the abort", {"type": "object", "properties": {}}, signal_host_probe)
+    ext.tool("aborted_entry_probe", "Report the signal a tool starts with", {"type": "object", "properties": {}}, aborted_entry_probe)
+    ext.tool("signal_nested_probe", "Run abort_tool as a nested tool call", {"type": "object", "properties": {}}, signal_nested_probe)
     ext.command(
         "abort_probe",
         "Report whether abort_tool saw its abort signal",
@@ -1836,6 +2133,20 @@ def new_extension() -> pig_sdk.Extension:
         return {"content": "mutated " + params["tag"]}
 
     ext.tool("mutation_order_probe", "Take the file mutation queue and append a tag to the file", {"type": "object", "properties": {"file": {"type": "string"}, "tag": {"type": "string"}}}, mutation_order_probe)
+    # mutation_order_ctx_probe makes `calls` getter calls, then takes the queue through its context (TestFileMutationOrderOfTheContextFormAcrossSDKs).
+    def mutation_order_ctx_probe(ctx, params):
+        for _ in range(int(params.get("calls", 0))):
+            ctx.get_context_usage()
+
+        def body():
+            path = pathlib.Path(params["file"])
+            before = path.read_bytes() if path.exists() else b""
+            path.write_bytes(before + (params["tag"] + "\n").encode())
+
+        ctx.with_file_mutation_queue(params["file"], body)
+        return {"content": "mutated " + params["tag"]}
+
+    ext.tool("mutation_order_ctx_probe", "Make getter calls, take the queue through the context and append a tag", {"type": "object", "properties": {"file": {"type": "string"}, "tag": {"type": "string"}, "calls": {"type": "number"}}}, mutation_order_ctx_probe)
     ext.tool("start_order", "Report the order in which calls start", {"type": "object", "properties": {"n": {"type": "number"}}}, start_order)
 
     def dialog_order(ctx, params):
@@ -2020,6 +2331,49 @@ def new_extension() -> pig_sdk.Extension:
 
     ext.command("overlay-handle-probe", "Exercise the overlay handle ui.custom hands to on_handle", overlay_handle_probe)
 
+    def theme_probe_row(ctx: pig_sdk.Context) -> str:
+        theme = ctx.theme
+        return f"{theme.name}|{theme.fg('accent', 'x')}"
+
+    class InvalidateProbeComponent:
+        def __init__(self, ctx: pig_sdk.Context) -> None:
+            self.ctx = ctx
+            self.invalidations = 0
+            self.kept = theme_probe_row(ctx)
+
+        def render(self, width: int) -> list[str]:
+            return [f"inv={self.invalidations} kept={self.kept} live={self.ctx.theme.name}"]
+
+        def invalidate(self) -> None:
+            self.invalidations += 1
+            self.kept = theme_probe_row(self.ctx)
+
+        def handle_input(self, data: str) -> pig_sdk.RemoteComponentResult:
+            return pig_sdk.RemoteComponentResult(done=data == "q", value="closed" if data == "q" else None)
+
+    class PlainThemeProbeComponent:
+        # No invalidate: the host's invalidation renders it again all the same.
+        def __init__(self, ctx: pig_sdk.Context) -> None:
+            self.ctx = ctx
+
+        def render(self, width: int) -> list[str]:
+            return [f"plain live={theme_probe_row(self.ctx)}"]
+
+        def handle_input(self, data: str) -> pig_sdk.RemoteComponentResult:
+            return pig_sdk.RemoteComponentResult(done=data == "q", value="closed" if data == "q" else None)
+
+    def overlay_invalidate_probe(ctx: pig_sdk.Context, args: str) -> None:
+        component = PlainThemeProbeComponent(ctx) if str(args or "").strip() == "plain" else InvalidateProbeComponent(ctx)
+        ctx.custom(component, {"overlay": True})
+        ctx.notify("overlay-invalidate=ok", "info")
+
+    ext.command("overlay-invalidate-probe", "Count the host's invalidations of a mounted overlay and draw the theme", overlay_invalidate_probe)
+
+    def theme_read_probe(ctx: pig_sdk.Context, _args: str) -> None:
+        ctx.notify("theme-read=" + theme_probe_row(ctx), "info")
+
+    ext.command("theme-read-probe", "Report the theme the extension holds, with no component mounted", theme_read_probe)
+
     class FocusProbeComponent:
         def __init__(self) -> None:
             self.handle: pig_sdk.OverlayHandle | None = None
@@ -2073,6 +2427,31 @@ def new_extension() -> pig_sdk.Extension:
     ext.command("liveness_user_call", "Exercise an interactive host call", lambda ctx, args: ctx.input("Question", "Answer"))
     ext.command("liveness_fire_call", "Exercise a no-result UI host call", lambda ctx, args: ctx.set_title("Conformance title"))
 
+    # io_wait and io_wait_settled wait on a plain TCP read: they dial the address they get, announce themselves with a "waiting" line and return when the peer writes a line.
+    ext.command("io_wait", "Wait on a socket read", lambda ctx, args: io_wait(args))
+
+    def io_wait_settled(ctx: pig_sdk.Context, args: str) -> None:
+        ext.on_event("agent_settled", lambda hctx, data: io_wait(args))
+
+    ext.command("io_wait_settled", "Make agent_settled wait on a socket read", io_wait_settled)
+
+    name_wait_addr: list[str] = []
+    ext.command("io_wait_name", "Make the session_info_changed handler wait on a socket read", lambda ctx, args: name_wait_addr.append(args))
+
+    # io_wait_input and io_wait_start subscribe an input / before_agent_start handler that waits on a socket read first and then notifies "<event>:<text or prompt>".
+    def io_wait_event(event: str, member: str):
+        def arm(ctx: pig_sdk.Context, args: str) -> None:
+            def handler(hctx, data):
+                io_wait(args)
+                hctx.notify("%s:%s" % (event, data.get(member, "")), "info")
+
+            ext.on_event(event, handler)
+
+        return arm
+
+    ext.command("io_wait_input", "Make an input handler wait on a socket read", io_wait_event("input", "text"))
+    ext.command("io_wait_start", "Make a before_agent_start handler wait on a socket read", io_wait_event("before_agent_start", "prompt"))
+
     ext.command("command_error", "Return a command error", command_error)
 
     def command_awaited_error(ctx: pig_sdk.Context, args: str) -> None:
@@ -2100,6 +2479,443 @@ def new_extension() -> pig_sdk.Extension:
 
     ext.command("event_probe_subscribe", "Subscribe to turn_end after connecting", event_probe_subscribe)
     ext.command("event_probe_unsubscribe", "Remove the turn_end handler registered after connecting", event_probe_unsubscribe)
+    # D614 plugin UI mounts: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewMounts).
+    def view_text(ctx, suffix):
+        ab = ctx.view_abilities()
+        n = ab.limits.intent_arg_bytes if ab else 0
+        return kit.View(kit.Text(f"fixture-view-{n}{suffix}"))
+
+    def view_abilities_probe(ctx, _args):
+        ab = ctx.view_abilities()
+        if ab is None:
+            ctx.notify("view-abilities:none", "info")
+            return
+        ctx.notify(f"view-abilities:mounts={ab.limits.mounts},argbytes={ab.limits.intent_arg_bytes},slots={'+'.join(ab.slots)},nodes={'+'.join(ab.nodes)},markdown={str(ab.markdown).lower()}", "info")
+
+    def view_probe(ctx, _args):
+        st = ctx.mount_view("probe", "panel", view_text(ctx, ""))
+        ctx.notify(f"view-mounted:epoch={st.mount.epoch},rev={st.mount.rev},state={st.state}", "info")
+        first = st.mount
+        st = ctx.update_view(first, view_text(ctx, "-2"))
+        ctx.notify(f"view-updated:rev={st.mount.rev}", "info")
+        try:
+            ctx.update_view(first, view_text(ctx, "-stale"))
+            code = "none"
+        except pig_sdk.ViewError as err:
+            code = err.code
+        ctx.notify(f"view-stale:{code}", "info")
+        cur = st.mount
+        ctx.notify(f"view-hidden:{ctx.hide_view(cur).state}", "info")
+        ctx.notify(f"view-shown:{ctx.show_view(cur).state}", "info")
+        ctx.notify(f"view-finished:{ctx.finish_view(cur).state}", "info")
+        try:
+            ctx.remove_view(cur)
+            code = "none"
+        except pig_sdk.ViewError as err:
+            code = err.code
+        ctx.notify(f"view-terminal:{code}", "info")
+        ctx.notify(f"view-final:{ctx.view_state('probe').state}", "info")
+        obj = pig_sdk.ViewShape
+        intents = [
+            pig_sdk.ViewIntent("fx.add", obj("object", properties={"n": obj("integer")}, required=("n",)), answer=obj("object", properties={"sum": obj("integer")}, required=("sum",))),
+            pig_sdk.ViewIntent("fx.wait", obj("object", properties={"tag": obj("string")}, required=("tag",)), cancellable=True, timeout_ms=5000),
+        ]
+        st = ctx.mount_view("probe2", "panel", view_text(ctx, "-live"), intents=intents)
+        ctx.notify(f"view-second:epoch={st.mount.epoch},rev={st.mount.rev}", "info")
+
+    view_cancelled: list = []
+
+    def view_cancelled_probe(ctx, _args):
+        ctx.notify("intent-cancelled:" + (view_cancelled[-1] if view_cancelled else ""), "info")
+
+    def view_state_probe(ctx, _args):
+        st = ctx.view_state("probe2")
+        ctx.notify(f"view-state:{st.state}:{st.reason}", "info")
+
+    # D614: the redraw panel and the abilities watcher, the same way in every SDK fixture (conformance TestConformance_UIViewAnswerRedraw and
+    # TestConformance_UIViewAbilitiesEvent).
+    def redraw_intents():
+        shape = pig_sdk.ViewShape
+        n = shape("object", properties={"n": shape("integer")}, required=("n",))
+        rev = shape("object", properties={"rev": shape("integer")}, required=("rev",))
+        return [pig_sdk.ViewIntent("fx.redraw", n, answer=rev), pig_sdk.ViewIntent("fx.foreign", n, answer=rev)]
+
+    # The context of the command that mounted the redraw panel: an update made through it is the extension's, not an intent handler's.
+    redraw_command: list = []
+
+    def view_redraw_probe(ctx, _args):
+        st = ctx.mount_view("redraw", "panel", kit.View(kit.Text("fixture-redraw-0")), intents=redraw_intents())
+        redraw_command.append(ctx)
+        ctx.notify(f"view-redraw:rev={st.mount.rev}", "info")
+
+    def view_redraw_intent(inv):
+        own = inv.intent == "fx.redraw"
+        ab = inv.context.view_abilities()
+        text = f"fixture-{'redraw' if own else 'foreign'}-{inv.arg['n'] + (ab.limits.intent_arg_bytes if ab else 0)}"
+        ctx = inv.context if own else redraw_command[-1]
+        try:
+            st = ctx.update_view(pig_sdk.ViewRef(inv.mount.key, inv.mount.epoch, inv.rev), kit.View(kit.Text(text)), intents=redraw_intents())
+        except pig_sdk.ViewError as err:
+            return pig_sdk.ViewIntentResult("failed", error=str(err))
+        return pig_sdk.ViewIntentResult("done", {"rev": st.mount.rev})
+
+    view_watch = {"armed": False, "block": False, "events": 0}
+    view_watch_release = threading.Event()
+
+    def describe_abilities(ab):
+        return f"slots={'+'.join(ab.slots)},mounts={ab.limits.mounts}" if ab else "none"
+
+    def view_abilities_changed(ab, ctx):
+        view_watch["events"] += 1
+        if not view_watch["armed"]:
+            return
+        if view_watch["block"]:
+            view_watch["block"] = False
+            ctx.notify("view-event-blocked", "info")
+            view_watch_release.wait()
+            view_watch_release.clear()
+            ctx.notify("view-event-released", "info")
+        if ab is None:
+            ctx.notify("view-event:none", "info")
+            return
+        same = describe_abilities(ab) == describe_abilities(ctx.view_abilities())
+        ctx.notify(f"view-event:{describe_abilities(ab)},same={'true' if same else 'false'}", "info")
+        try:
+            st = ctx.mount_view("arrived", "panel", kit.View(kit.Text(f"fixture-arrived-{ab.limits.mounts}")))
+            ctx.notify(f"view-arrived:{st.state}", "info")
+        except pig_sdk.ViewError as err:
+            ctx.notify(f"view-arrived:{err.code}", "info")
+
+    def view_watch_probe(ctx, _args):
+        view_watch["armed"] = True
+        ctx.notify("view-watch:armed", "info")
+
+    def view_block_probe(ctx, _args):
+        view_watch["block"] = True
+        ctx.notify("view-block:set", "info")
+
+    def view_release_probe(ctx, _args):
+        view_watch_release.set()
+        ctx.notify("view-release:done", "info")
+
+    def view_events_probe(ctx, _args):
+        ctx.notify(f"view-events:{view_watch['events']}", "info")
+
+    def view_intent(inv):
+        if inv.intent.startswith("fx.close-"):
+            # The user dismissed the dialog: the client raised the intent with {}, and its handler removes the mount.
+            if inv.arg != {}:
+                return pig_sdk.ViewIntentResult("refused", error="dismiss takes {}")
+            inv.context.remove_view(pig_sdk.ViewRef(inv.mount.key, inv.mount.epoch, inv.rev))
+            return pig_sdk.ViewIntentResult("done")
+        if inv.intent in ("fx.redraw", "fx.foreign"):
+            return view_redraw_intent(inv)
+        if inv.intent == "fx.reopen":
+            # The user opened the hidden view: its handler shows it.
+            inv.context.show_view(pig_sdk.ViewRef(inv.mount.key, inv.mount.epoch, inv.rev))
+            return pig_sdk.ViewIntentResult("done")
+        if inv.intent == "fx.pick":
+            return pig_sdk.ViewIntentResult("done", {"node": inv.node_key, "picked": inv.arg["value"]})
+        if inv.intent == "fx.add":
+            ab = inv.context.view_abilities()
+            total = inv.arg["n"] * 2 + (ab.limits.intent_arg_bytes if ab else 0)
+            return pig_sdk.ViewIntentResult("done", {"sum": total})
+        if inv.intent == "fx.wait":
+            inv.context.notify("intent-started:" + inv.arg["tag"], "info")
+            while not inv.context.is_cancelled():
+                time.sleep(0.01)
+            # A call made after the cancel is cancelled with its request, so the tag is kept for ui_view_cancelled.
+            view_cancelled.append(inv.arg["tag"])
+            return pig_sdk.ViewIntentResult("done", {})
+        return pig_sdk.ViewIntentResult("refused", error="unknown intent")
+
+    # D614 amendment: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewExtras).
+    def x_claim(claims, name):
+        return next((c.value for c in claims if c.name == name), None)
+
+    def x_picked(ab):
+        return next((x_claim(sc.claims, "display.colors") for sc in ab.slot_claims if sc.slot == "panel"), None)
+
+    def x_list(node_id, label):
+        return kit.View(kit.SelectList(node_id, [kit.SelectItem(node_id, label)]))
+
+    def x_rects(n):
+        return [{"kind": "rect", "width": 1, "height": 1} for _ in range(n)]
+
+    def x_code(call):
+        try:
+            call()
+            return "none"
+        except pig_sdk.ViewError as err:
+            return err.code
+
+    def view_extras_probe(ctx, _args):
+        ab = ctx.view_abilities()
+        picked = x_picked(ab)
+        ctx.notify(
+            f"view-x-claims:colors={x_claim(ab.claims, 'display.colors')},kind={x_claim(ab.claims, 'display.kind')},"
+            f"gestures={'+'.join(x_claim(ab.claims, 'input.gestures'))},hover={str(x_claim(ab.claims, 'display.hover')).lower()},"
+            f"panel.colors={picked},profiles={'+'.join(ab.drawing.profiles)},shapes={ab.drawing.shapes},pixels={ab.drawing.pixels}",
+            "info",
+        )
+        when = {"any": [{"all": [{"claim": "display.colors", "op": "equals", "value": picked}]}]}
+        region = {"key": "r", "shape": {"kind": "rect", "width": 4, "height": 4}, "gestures": ["activate"], "intent": "fx.tap", "name": "Tap"}
+        st = ctx.mount_view(
+            "extras",
+            "panel",
+            x_list("base", "fixture-x-base"),
+            intents=[pig_sdk.ViewIntent(name="fx.tap", arg=pig_sdk.ViewShape("object"))],
+            alternatives=[{"when": when, "view": x_list("alt", f"fixture-x-alt-{picked}"), "drawing": {"profile": "scene", "shapes": x_rects(ab.drawing.shapes - 1), "regions": [region]}}],
+            a11y=[
+                {"node": "alt", "name": f"Extras {picked}", "role": "button", "checked": True, "relations": [{"kind": "describedBy", "target": "base"}]},
+                {"node": "base", "name": "Base"},
+            ],
+            focus=[{"node": "alt", "request": "mount", "restore": "previous"}],
+        )
+        ctx.notify(f"view-x-mounted:{st.state}", "info")
+
+        def attempt(label, **content):
+            ctx.notify(f"view-x-{label}:{x_code(lambda: ctx.update_view(st.mount, x_list('base', 'fixture-x-base'), **content))}", "info")
+
+        def scene(shapes):
+            return {"profile": "scene", "shapes": shapes}
+
+        present = {"any": [{"all": [{"claim": "display.hover", "op": "present"}]}]}
+        nested = {"kind": "rect", "width": 1, "height": 1}
+        for _ in range(8):
+            nested = {"kind": "group", "children": [nested]}
+        attempt("alts", alternatives=[{"when": present, "view": x_list("base", "fixture-x-base")} for _ in range(9)])
+        attempt("nest", drawing=scene([nested]))
+        attempt("points", drawing=scene([{"kind": "polyline", "points": [{"x": i, "y": i} for i in range(1025)]}]))
+        attempt("shapes", drawing=scene(x_rects(4097)))
+        attempt("a11y", a11y=[{"node": f"n{i}"} for i in range(257)])
+        attempt("over", drawing=scene(x_rects(ab.drawing.shapes + 1)))
+        attempt(
+            "pixels",
+            drawing={"profile": "pixels", "pixels": {"width": 2, "height": 2, "asset": "img", "scaling": "nearest"}},
+            assets=[pig_sdk.ViewAsset(id="img", mime="image/png", size=4, sha256="a" * 64, delivery="inline")],
+        )
+        old = pig_sdk.ViewRef(st.mount.key, st.mount.epoch, st.mount.rev + 50)
+        stale = "none"
+        for _ in range(3):
+            stale = x_code(lambda: ctx.update_view(old, x_list("base", "fixture-x-base")))
+        ctx.notify(f"view-x-stale:{stale}", "info")
+        notices = ctx.view_diagnostics("extras")
+
+        def count(code):
+            return sum(n.count for n in notices if n.code == code and n.path == "update")
+
+        ctx.notify(f"view-x-diag:invalid={count('invalid')},limit={count('limit')},unsupported={count('unsupported')},stale={count('stale')}", "info")
+        ctx.notify(f"view-x-bigresult:{x_code(lambda: ctx.finish_view(st.mount, result='r' * 65536))}", "info")
+
+    def view_extras_end_probe(ctx, _args):
+        picked = x_picked(ctx.view_abilities())
+        st = ctx.view_state("extras")
+        notices = ctx.view_diagnostics("extras")
+        ctx.notify(f"view-x-diag2:n={len(notices)},last={notices[-1].path if notices else ''}", "info")
+        done = ctx.finish_view(st.mount, result={"picked": picked})
+        ctx.notify(f"view-x-finished:{done.state},picked={done.result['picked']}", "info")
+        cur = ctx.view_state("extras")
+        ctx.notify(f"view-x-state:{cur.state},picked={cur.result['picked']}", "info")
+
+    # D614: a view an agent's tool shows. The command registers the tool; the tool mounts a titled panel, hides it, shows it and
+    # updates it with a focus request, the same way in every SDK fixture (conformance TestConformance_UIViewToolShowsAndFocuses).
+    def view_show(ctx, params):
+        if params.get("op") == "hide":
+            return f"view-tool:{ctx.hide_view(ctx.view_state('shown').mount).state}"
+        title, node = params["title"], params["node"]
+
+        def content(title, request):
+            return {
+                "title": title,
+                "intents": [
+                    pig_sdk.ViewIntent("fx.reopen", pig_sdk.ViewShape("object"), when_hidden=True),
+                    pig_sdk.ViewIntent("fx.tap", pig_sdk.ViewShape("object")),
+                ],
+                "focus": [{"node": node, "request": request} if request else {"node": node}],
+            }
+
+        st = ctx.mount_view("shown", "panel", x_list(node, "fixture-shown"), **content(title, ""))
+        st = ctx.hide_view(st.mount)
+        st = ctx.show_view(st.mount)
+        st = ctx.update_view(st.mount, x_list(node, "fixture-shown"), **content(title + "/2", "update"))
+        return f"view-tool:{st.state},rev={st.mount.rev}"
+
+    def view_tool_probe(ctx, _args):
+        ctx.register_tool(pig_sdk.ToolDefinition(
+            name="view_show",
+            label="view_show",
+            description="Mount, show and focus a titled view",
+            parameters={"type": "object"},
+            execute=view_show,
+        ))
+
+    # D521: bigint_tool registers a tool whose schema declares a bigint parameter and answers the kind of value it receives for it and the value.
+    def bigint_tool_probe(ctx, _args):
+        def bigint_arg(_ctx, params):
+            value = params["n"]
+            return {"content": ("string" if isinstance(value, str) else "other") + ":" + str(value)}
+
+        ctx.register_tool(pig_sdk.ToolDefinition(
+            name="bigint_arg",
+            label="bigint_arg",
+            description="Report the kind and value of n",
+            parameters={"type": "object", "required": ["n"], "properties": {"n": {"type": "bigint"}}},
+            execute=bigint_arg,
+        ))
+
+    ext.command("bigint_tool", "Register the tool that reports what a bigint argument arrives as", bigint_tool_probe)
+    ext.command("ui_view_tool", "Register the tool that shows a titled view", view_tool_probe)
+
+    # D614 grid node: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewGrid). The argument is
+    # the row's token: the cell values, the selection and one chip text are built from it.
+    def view_grid_probe(ctx, args):
+        tok = args.strip()
+        cells = [kit.GridCell(label="30", dim=True), kit.GridCell(label="31", dim=True)]
+        for d in range(1, 29):
+            cell = kit.GridCell(value=f"{tok}-{d}", label=str(d))
+            if d == 1:
+                cell.chips = [kit.GridChip(f"{tok} standup", "#3366cc"), kit.GridChip("lunch", "accent")]
+                cell.more = 2
+            elif d == 2:
+                cell.mark, cell.color = "current", "#ff000080"
+            elif d == 3:
+                cell.chips = [kit.GridChip("plain")]
+            elif d == 28:
+                cell.label = None
+            cells.append(cell)
+
+        def content(grid):
+            return {
+                "view": kit.View(kit.Container([kit.Text(f"Month {tok}", 0, 0), grid])),
+                "intents": [pig_sdk.ViewIntent("fx.pick", pig_sdk.ViewShape("object", properties={"value": pig_sdk.ViewShape("string")}, required=("value",)), node_key="month")],
+                "fallback": kit.Text(f"grid-fallback {tok}", 0, 0),
+            }
+
+        month = kit.Grid("month", 7, cells, head=["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"], chip_rows=2, selected=f"{tok}-2")
+        st = ctx.mount_view("grid", "panel", **content(month))
+        ctx.notify(f"view-g-mounted:{st.state}", "info")
+
+        def attempt(label, columns, cells):
+            ctx.notify(f"view-g-{label}:{x_code(lambda: ctx.update_view(st.mount, **content(kit.Grid('month', columns, cells))))}", "info")
+
+        attempt("cells", 7, [kit.GridCell(label="x") for _ in range(129)])
+        attempt("chips", 7, [kit.GridCell(value="a", chips=[kit.GridChip("c") for _ in range(9)])])
+        attempt("columns", 17, [kit.GridCell(value="a")])
+        attempt("mark", 7, [kit.GridCell(value="a", mark=tok)])
+        cur = ctx.view_state("grid")
+        ctx.notify(f"view-g-state:{cur.state},rev={cur.mount.rev}", "info")
+
+    ext.command("ui_view_grid", "Mount a month as a grid and probe the bounds of the grid", view_grid_probe)
+
+    # D614 node ids: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewNodeIds). The argument is
+    # the row's token: the ids of the container, the text and the box are built from it.
+    def view_node_ids_probe(ctx, args):
+        tok = args.strip()
+        root = kit.Container(
+            [
+                kit.Text(f"Label {tok}", 0, 0, bg="selectedBg", id=f"{tok}-label"),
+                kit.Box(1, 0, bg="toolPendingBg", children=[kit.Text("inside", 0, 0)], id=f"{tok}-frame"),
+            ],
+            id=f"{tok}-root",
+        )
+        st = ctx.mount_view("ids", "panel", view=kit.View(root), a11y=[{"node": f"{tok}-label", "name": f"Label {tok}"}])
+        ctx.notify(f"view-i-mounted:{st.state}", "info")
+
+    ext.command("ui_view_node_ids", "Mount a view whose container, text and box carry an id", view_node_ids_probe)
+
+    # D614 image id: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewImageID). The argument is the row's token and a Kitty image id only that row uses: the image node carries both, its bytes are the token's.
+    def view_image_id_probe(ctx, args):
+        tok, number = args.split()
+        image = kit.Image(f"pig-image-{tok}".encode(), "image/png", image_id=int(number), filename=f"{tok}.png", id=f"{tok}-photo")
+        st = ctx.mount_view("image-id", "panel", view=kit.View(image))
+        ctx.notify(f"view-m-mounted:{st.state}", "info")
+
+    ext.command("ui_view_image_id", "Mount a view whose image node carries a Kitty image id", view_image_id_probe)
+
+    # D614 bindings: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewBindings).
+    def view_bindings_probe(ctx, args):
+        key, number = args.split(" ")
+        n = int(number)
+
+        def content(bindings):
+            intents = [
+                pig_sdk.ViewIntent("fx.go", pig_sdk.ViewShape("object", properties={"n": pig_sdk.ViewShape("integer")}, required=("n",))),
+                pig_sdk.ViewIntent("fx.tap", pig_sdk.ViewShape("object")),
+            ]
+            return {"intents": intents, "bindings": bindings}
+
+        def go_to(key, n):
+            return {"key": key, "intent": "fx.go", "arg": {"n": n}}
+
+        def tap(key):
+            return {"key": key, "intent": "fx.tap"}
+
+        first = {**go_to(key, n), "name": f"Go {n}"}
+        st = ctx.mount_view("bind", "panel", view_text(ctx, "-bind"), **content([first, go_to("w", n + 1), {"gesture": "swipe-left", "intent": "fx.tap"}]))
+        ctx.notify(f"view-b-mounted:{st.state}", "info")
+
+        def attempt(label, bindings):
+            ctx.notify(f"view-b-{label}:{x_code(lambda: ctx.update_view(st.mount, view_text(ctx, '-bind'), **content(bindings)))}", "info")
+
+        attempt("many", [tap(c) for c in "abcdefghijklmnopqrstuvwxyz0123456"])
+        attempt("reserved", [tap("shift+tab")])
+        attempt("order", [tap("ctrl+shift+p"), tap("shift+ctrl+p")])
+        attempt("gesture", [{"gesture": "pinch", "intent": "fx.tap"}])
+        attempt("arg", [go_to("a", "x")])
+        attempt("ok", [go_to("ctrl+shift+p", n), go_to("shift+ctrl+q", n + 1)])
+
+    # D614 slot dialog: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewDialog).
+    def view_dialog_probe(ctx, args):
+        key, number = args.split(" ")
+        n = int(number)
+        obj = pig_sdk.ViewShape
+        add = pig_sdk.ViewIntent("fx.add", obj("object", properties={"n": obj("integer")}, required=("n",)), answer=obj("object", properties={"sum": obj("integer")}, required=("sum",)))
+        try:
+            st = ctx.mount_view("dlg", "dialog", view_text(ctx, "-dlg"), title=f"Chart {n}", intents=[add], bindings=[{"key": key, "intent": "fx.add", "arg": {"n": n}}])
+        except pig_sdk.ViewError as err:
+            ctx.notify(f"view-d-mounted:{err.code}", "info")
+            return
+        ctx.notify(f"view-d-mounted:{st.state}", "info")
+        ctx.notify(f"view-d-hidden:{ctx.hide_view(st.mount).state}", "info")
+        ctx.notify(f"view-d-shown:{ctx.show_view(st.mount).state}", "info")
+
+    ext.command("ui_view_dialog", "Mount a titled view with a bound key in the dialog slot, hide it and show it", view_dialog_probe)
+    ext.command("ui_view_bindings", "Mount a view with bindings and probe what the host refuses", view_bindings_probe)
+
+    # D614 dismiss: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewDismiss).
+    def view_dismiss_probe(ctx, args):
+        obj = pig_sdk.ViewShape("object")
+        tap = pig_sdk.ViewIntent("fx.tap", obj)
+
+        def closing(name, **members):
+            return pig_sdk.ViewIntent(name, members.pop("arg", obj), dismiss=True, **members)
+
+        st = ctx.mount_view("dismiss", "dialog", view_text(ctx, "-dismiss"), intents=[tap, closing(args)])
+        ctx.notify(f"view-d-mounted:{st.state}", "info")
+
+        def attempt(label, intents):
+            ctx.notify(f"view-d-{label}:{x_code(lambda: ctx.update_view(st.mount, view_text(ctx, '-dismiss'), intents=intents))}", "info")
+
+        attempt("two", [tap, closing(args), closing(args + "2")])
+        attempt("node", [tap, closing(args, node_key="n")])
+        attempt("arg", [tap, closing(args, arg=pig_sdk.ViewShape("object", properties={"value": pig_sdk.ViewShape("string")}, required=("value",)))])
+        attempt("ok", [closing(args), tap])
+
+    ext.command("ui_view_dismiss", "Mount a dialog with a dismiss intent and probe what the host refuses", view_dismiss_probe)
+    ext.command("ui_view_extras", "Mount a view with alternatives, a drawing, a11y and focus, and probe the bounds", view_extras_probe)
+    ext.command("ui_view_extras_end", "Read the notices of the extras mount and finish it with a result", view_extras_end_probe)
+    ext.command("ui_view_abilities", "Report the replicated client abilities", view_abilities_probe)
+    ext.command("ui_view_probe", "Mount, update, hide, show, finish and remove a view", view_probe)
+    ext.command("ui_view_cancelled", "Report the intent whose handler was cancelled", view_cancelled_probe)
+    ext.command("ui_view_state", "Report the state of the second mount", view_state_probe)
+    ext.on_view_intent(view_intent)
+    ext.command("ui_view_redraw", "Mount the panel whose intents redraw it", view_redraw_probe)
+    ext.command("ui_view_watch", "Arm the abilities watcher", view_watch_probe)
+    ext.command("ui_view_block", "Block the abilities watcher on its next event", view_block_probe)
+    ext.command("ui_view_release", "Release the blocked abilities watcher", view_release_probe)
+    ext.command("ui_view_events", "Report how often the abilities watcher ran", view_events_probe)
+    ext.on_view_abilities(view_abilities_changed)
     ext.command(
         "report_geometry",
         "Report observed terminal geometry",
@@ -2152,6 +2968,42 @@ def new_extension() -> pig_sdk.Extension:
     ext.command("send_message_default", "Send a custom message with default options", lambda ctx, args: ctx.send_message("notice", "default"))
     ext.command("send_message_no_turn", "Send a custom message that never starts a turn", lambda ctx, args: ctx.send_message("notice", "no-turn", trigger_turn=False))
     ext.command("send_user_message", "Send a user message", lambda ctx, args: ctx.send_user_message(json.loads(args) if args else "hello-user", "followUp"))
+    ext.command("send_user_message_delivery", "Send a user message with the delivery named by the argument", lambda ctx, args: ctx.send_user_message("delivery-" + args) if args == "absent" else ctx.send_user_message("delivery-" + args, args))
+    def send_refusal_order(ctx, args):
+        def first():
+            ctx.send_user_message("order-absent")
+            ctx.send_user_message("order-steer", "steer")
+            ctx.send_user_message("order-followUp", "followUp")
+
+        def after_return(send):
+            def run():
+                time.sleep(0.1)
+                send()
+            threading.Thread(target=run, daemon=True).start()
+
+        if args == "first":
+            first()
+        elif args == "between":
+            ctx.send_user_message("order-absent")
+            ctx.send_user_message("order-steer", "steer")
+            ctx.send_user_message("order-absent-2")
+        elif args == "yielded":
+            ctx.yield_now()
+            first()
+        elif args == "throws":
+            first()
+            raise RuntimeError("order-throws")
+        elif args == "blocked":
+            first()
+            time.sleep(30)
+        elif args == "detached":
+            after_return(first)
+        elif args == "detached_alone":
+            after_return(lambda: ctx.send_user_message("order-absent"))
+        else:
+            raise RuntimeError("send_refusal_order: unknown case " + args)
+    ext.command("send_refusal_order", "Send a refused user message and others in one run, as the argument names", send_refusal_order)
+    ext.command("send_user_message_expand", "Send a user message with expandPromptTemplates set to the argument", lambda ctx, args: ctx.send_user_message("expand-user", "followUp", expand_prompt_templates=(args == "true")))
     ext.command("settings_probe", "Report the effective settings", lambda ctx, args: ctx.notify("settings_probe:" + json.dumps(ctx.get_settings(), separators=(",", ":")), "info"))
 
     def model_set(ctx, args):
@@ -2295,7 +3147,58 @@ def new_extension() -> pig_sdk.Extension:
         ctx.notify(f"setModel={'true' if ok else 'false'}", "info")
 
     ext.command("set_model", "Switch to the model in the arguments", set_model)
+
+    def set_model_object(ctx: pig_sdk.Context, args: str) -> None:
+        try:
+            ok, error = ctx.set_model(json.loads(args))
+        except Exception as exc:  # the host's rejection of the call
+            ok, error = False, str(exc)
+        ctx.notify(f"setModelObject=error:{error}" if error else f"setModelObject={'true' if ok else 'false'}", "info")
+
+    ext.command("set_model_object", "Switch to the model object in the arguments", set_model_object)
+
+    def set_model_object_before_agent_start(ctx: pig_sdk.Context, args: str) -> None:
+        model = json.loads(args)
+
+        def before_agent_start(hctx, _data):
+            ok, error = hctx.set_model(model)
+            if error:
+                raise RuntimeError(error)
+            hctx.notify(f"beforeAgentSetModel={'true' if ok else 'false'}", "info")
+
+        ext.on_event("before_agent_start", before_agent_start)
+
+    ext.command("set_model_object_before_agent_start", "Switch to the model object in the arguments before each agent start", set_model_object_before_agent_start)
     ext.command("append_entry", "Append a custom entry", lambda ctx, args: ctx.append_entry("conformance-entry", "hello-entry"))
+
+    def entry_null_members(ctx: pig_sdk.Context, args: str) -> None:
+        # An entry and a message with the optional member left out, then with it written as null: None is Pi's omitted argument and pig_sdk.NULL is its null.
+        ctx.append_entry("conformance-null-omitted", None)
+        ctx.append_entry("conformance-null-explicit", pig_sdk.NULL)
+        ctx.send_message("conformance-null-omitted", "x", False)
+        ctx.send_message("conformance-null-explicit", "x", False, details=pig_sdk.NULL)
+
+    ext.command("entry_null_members", "Append entries and send messages with an omitted and a null member", entry_null_members)
+
+    def label_members(ctx: pig_sdk.Context, args: str) -> None:
+        # setLabel on the entry in the arguments without a label, with a null one and with an empty one: Pi writes a different entry for each.
+        ctx.set_label(args)
+        ctx.set_label(args, pig_sdk.NULL)
+        ctx.set_label(args, "")
+
+    def setup_null_members(ctx: pig_sdk.Context, args: str) -> None:
+        # The setup callback's SessionManager: an entry and a message with the optional member left out, then with it written as null.
+        def setup(manager: pig_sdk.SetupSessionManager) -> None:
+            manager.append_custom_entry("api-custom")
+            manager.append_custom_entry("api-custom", pig_sdk.NULL)
+            manager.append_custom_message_entry("api-message", "x", False)
+            manager.append_custom_message_entry("api-message", "x", True, pig_sdk.NULL)
+
+        ctx.new_session({"setup": setup})
+
+    ext.command("setup_null_members", "Seed a new session with an omitted and a null member", setup_null_members)
+
+    ext.command("label_members", "Set a label that is omitted, null and empty", label_members)
 
     def append_entries_probe(ctx: pig_sdk.Context, args: str) -> None:
         # Pi's appendEntry returns nothing and never fails, so a refusal the SDK reports is dropped here; the row reads the session afterwards.
@@ -2312,6 +3215,51 @@ def new_extension() -> pig_sdk.Extension:
         ext.on_event(name, lambda hctx, data: hctx.notify("event_field:%s.%s=%s" % (name, field, json.dumps(data[field], separators=(",", ":")) if field in data else "absent"), "info"))
 
     ext.command("event_field_probe", "Report a field of the events named by the argument `<event> <field>`", event_field_probe)
+
+    def event_level_edit_probe(ctx, args):
+        # `<event> <top|deep>`: subscribe to the event with a handler that edits it in place and returns nothing. `top` assigns a member of the event itself (probeTop); `deep` edits inside the message the event carries (the first user message of a `messages` list): the text of its first text block, else a string content, else a `probe` member. Every edit writes `other-event-edit`.
+        name, level = args.split()
+        edited = "other-event-edit"
+
+        def make(hctx, data):
+            if level == "top":
+                data["probeTop"] = edited
+                return
+            target = data.get("message")
+            if target is None and isinstance(data.get("messages"), list) and data["messages"]:
+                target = next((m for m in data["messages"] if isinstance(m, dict) and m.get("role") == "user"), data["messages"][0])
+            if not isinstance(target, dict):
+                return
+            content = target.get("content")
+            first = content[0] if isinstance(content, list) and content else None
+            if isinstance(first, dict) and first.get("type") == "text":
+                first["text"] = edited
+            elif isinstance(content, str):
+                target["content"] = edited
+            else:
+                target["probe"] = edited
+
+        ext.on_event(name, make)
+
+    ext.command("event_level_edit_probe", "Subscribe to the event named by the argument `<event> <top|deep>` with a handler that edits the event itself or the message inside it in place", event_level_edit_probe)
+    def event_member_probe(ctx, args):
+        # `<event> <set|delete|once> <member> [json]`: a handler that assigns the member the JSON, deletes it, or (once) assigns it in its first call only and reports `member_probe_stale:<event>:<bool>` whether a later call found it already there.
+        name, op, member, *rest = args.split(None, 3)
+        value = json.loads(rest[0]) if rest else None
+        calls = [0]
+
+        def make(hctx, data):
+            calls[0] += 1
+            if op == "delete":
+                data.pop(member, None)
+            elif op == "once" and calls[0] > 1:
+                hctx.notify("member_probe_stale:%s:%s" % (name, "true" if member in data and data[member] == value else "false"), "info")
+            else:
+                data[member] = value
+
+        ext.on_event(name, make)
+
+    ext.command("event_member_probe", "Subscribe to the event named by the argument `<event> <set|delete|once> <member> [json]` with a handler that assigns, deletes or once assigns a member of the event", event_member_probe)
     event_probe_on_offs: dict = {}
 
     event_probe_results: dict = {}
@@ -2325,14 +3273,20 @@ def new_extension() -> pig_sdk.Extension:
 
         def probe(hctx, data):
             hctx.notify("event_probe_on:%s" % name, "info")
-            hctx.notify("event_payload:%s:%s" % (name, json.dumps(data)), "info")
+            hctx.notify("event_payload:%s:%s" % (name, dumps_deep(data)), "info")
             # The event as the host sent it, for the tests that compare a payload field with the Go reference's.
             hctx.notify("event_probe_data:%s:%s" % (name, json.dumps(data, separators=(",", ":"))), "info")
             # mcp_servers_change carries every registered server (types.ts:699-709): report their names, which only the host's registry knows.
             if isinstance(data, dict) and isinstance(data.get("servers"), list):
                 hctx.notify("event_probe_servers:%s" % ",".join(str(s.get("name")) for s in data["servers"]), "info")
             queued = event_probe_results.get(name)
-            return queued.pop(0) if queued else None
+            value = queued.pop(0) if queued else None
+            # Pi ignores what a before_provider_headers handler returns and sends the headers object the handlers edited (runner.ts emitBeforeProviderHeaders), so the queued result becomes the headers by editing event.headers in place, as the Node fixture does.
+            if name == "before_provider_headers" and isinstance(value, dict):
+                data["headers"].clear()
+                data["headers"].update(value)
+                return None
+            return value
 
         off = ext.on_event(name, probe)
         event_probe_on_offs.setdefault(name, []).append(off)
@@ -2341,8 +3295,67 @@ def new_extension() -> pig_sdk.Extension:
         for off in event_probe_on_offs.pop(args.strip(), []):
             off()
 
+    # event_probe_fail subscribes to the event named by the argument with a handler that reads the active tools from the host, reports the servers of the event and then fails (TestConformance_McpServersChangeFirstHandlerInAnotherProcessIsSentAndItsFailureReported).
+    def event_probe_fail(ctx, args):
+        name = args.strip()
+
+        def failing(hctx, data):
+            servers = data.get("servers") if isinstance(data, dict) else None
+            # The read is the handler's first host call: nothing of the handler reaches the host before it.
+            hctx.get_active_tools()
+            hctx.notify("event_probe_fail:%s:%s" % (name, ",".join(str(s.get("name")) for s in servers or [])), "info")
+            raise RuntimeError("event_probe_fail: %s handler failed" % name)
+
+        ext.on_event(name, failing)
+
+    ext.command("event_probe_fail", "Subscribe to the event named by the argument with a handler that fails", event_probe_fail)
     ext.command("event_probe_result", "Queue the JSON result the next event_probe_on handler call of an event returns", event_probe_result)
     ext.command("event_probe_on", "Subscribe to the event named by the argument", event_probe_on)
+
+    # lone_passthrough subscribes to the event named by the argument with a handler that returns the value it received, and lone_send sends the
+    # argument's text back through sendUserMessage, sendMessage or registerProvider (TestConformance_LoneSurrogatePassThroughAcrossSDKs).
+    def lone_units(text):
+        return ".".join("%x" % ord(ch) for ch in text) if isinstance(text, str) else "none"
+
+    def lone_member(data, key):
+        try:
+            return data[key]
+        except (KeyError, TypeError, IndexError):
+            return None
+
+    def lone_passthrough(ctx, args):
+        name = args.strip()
+
+        def handler(hctx, data):
+            if name == "input":
+                seen, result = lone_member(data, "text"), {"action": "transform", "text": lone_member(data, "text")}
+            elif name == "before_agent_start":
+                seen, result = lone_member(data, "systemPrompt"), {"systemPrompt": lone_member(data, "systemPrompt")}
+            elif name == "tool_result":
+                seen, result = lone_member(lone_member(lone_member(data, "content"), 0), "text"), {"content": lone_member(data, "content")}
+            else:
+                content = lone_member(lone_member(lone_member(data, "messages"), 0), "content")
+                seen = content if isinstance(content, str) else lone_member(lone_member(content, 0), "text")
+                result = {"messages": lone_member(data, "messages")}
+                if name == "context_edit":
+                    result = {"messages": [lone_member(lone_member(data, "messages"), 0), {"role": "user", "content": "edited", "timestamp": 2}]}
+            hctx.notify("lone_seen:%s:%s" % (name, lone_units(seen)), "info")
+            return result
+
+        ext.on_event("context" if name == "context_edit" else name, handler)
+
+    def lone_send(ctx, args):
+        kind, _, value = args.partition(" ")
+        ctx.notify("lone_seen:%s:%s" % (kind, lone_units(value)), "info")
+        if kind == "user":
+            ctx.send_user_message(value, "followUp")
+        elif kind == "custom":
+            ctx.send_message("lone", value, True)
+        else:
+            ext.register_provider("lone-compat", {"baseUrl": "https://probe.invalid/v1", "api": "openai-completions", "apiKey": "probe-key", "models": [{"id": "m", "name": value, "reasoning": False, "input": ["text"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 1000, "maxTokens": 100, "compat": {"openRouterRouting": {"sort": value}}}]})
+
+    ext.command("lone_passthrough", "Subscribe to the event named by the argument with a handler that returns the value it received", lone_passthrough)
+    ext.command("lone_send", "Send the argument's text back through sendUserMessage, sendMessage or registerProvider", lone_send)
 
     def event_result_probe(ctx, args):
         # Subscribe to the event named first with a handler that returns the JSON that follows: the result an SDK extension gives the host.
@@ -2351,29 +3364,231 @@ def new_extension() -> pig_sdk.Extension:
         ext.on_event(name, lambda hctx, data: result)
 
     ext.command("event_result_probe", "Subscribe to an event with a handler that returns the given JSON", event_result_probe)
+
+    def event_signal_probe(ctx, args):
+        # Subscribe to session_before_compact or session_before_tree with a handler that returns the state of its event signal (the request's cancellation) on its first line and after a dialog it opened was answered, and the dialog's answer: the signal aborts while the dialog is pending (mode "wait") or before the handler runs (mode "first"), and Pi's in-process host call still returns its answer.
+        name = args.strip()
+
+        def handler(hctx, data):
+            source = data.get("preparation", {}) if name == "session_before_tree" else data
+            mode = source.get("customInstructions", "")
+            before = hctx.is_cancelled()
+            try:
+                answer = hctx.input("event_signal:%s:%s:pending" % (name, mode), "p")[0]
+            except Exception as error:
+                answer = "failed: %s" % error
+            state = "event_signal:%s:%s:%s:%s" % (mode, str(before).lower(), str(hctx.is_cancelled()).lower(), answer)
+            if name == "session_before_compact":
+                return {"compaction": {"summary": state, "firstKeptEntryId": "k", "tokensBefore": 1}}
+            return {"label": state}
+
+        ext.on_event(name, handler)
+
+    ext.command("event_signal_probe", "Subscribe to session_before_compact or session_before_tree with a handler that returns the state of its event signal", event_signal_probe)
+
+    def tool_call_abort_probe(ctx, args):
+        # Subscribe to tool_call with a handler that answers from a dialog it opened (TestConformance_ToolCallHandlerIsAwaitedThroughTheAbort).
+        def handler(hctx, data):
+            mode = (data.get("input") or {}).get("mode", "")
+            try:
+                answer = hctx.input("tool_call_abort:%s:pending" % mode, "p")[0]
+            except Exception as error:
+                answer = "failed: %s" % error
+            return {"block": True, "reason": "tool_call_abort:%s:%s" % (mode, answer)}
+
+        ext.on_event("tool_call", handler)
+
+    ext.command("tool_call_abort_probe", "Subscribe to tool_call with a handler that answers from a dialog it opened", tool_call_abort_probe)
+
+    def event_ordered_result_probe(ctx, args):
+        # A Python dict keeps its members in the order they were written, so this is event_result_probe.
+        name, _, raw = args.strip().partition(" ")
+        result = json.loads(raw)
+        ext.on_event(name, lambda hctx, data: result)
+
+    ext.command("event_ordered_result_probe", "Subscribe to an event with a handler that returns the given JSON, members in written order", event_ordered_result_probe)
+
+    def event_keys_probe(ctx, args):
+        # Subscribe to the event named by the argument with a handler that reports the key order of its payload (dict keeps the order the host wrote).
+        name = args.strip()
+        ext.on_event(name, lambda hctx, data: hctx.notify("event_keys:%s:%s" % (name, json.dumps([list(data["payload"]), list(data["payload"]["zeta"])], separators=(",", ":"))), "info"))
+
+    ext.command("event_keys_probe", "Subscribe to the event named by the argument with a handler that reports the key order of its payload", event_keys_probe)
+
+    def event_echo_probe(ctx, args):
+        # Subscribe to the event named by the argument with a handler that hands back, unchanged, the objects it was sent.
+        name = args.strip()
+
+        def echo(hctx, data):
+            if name == "turn_end":
+                return {"entries": data["entries"]}
+            if name == "context":
+                return {"messages": data["messages"][1:]}
+            if name == "before_provider_request":
+                return data["payload"]
+            if name == "tool_result":
+                return {"content": data["content"], "details": data["details"]}
+            if name == "message_end":
+                return {"message": data["message"]}
+            raise RuntimeError("event_echo_probe has no echo for " + name)
+
+        ext.on_event(name, echo)
+
+    ext.command("event_echo_probe", "Subscribe to the event named by the argument with a handler that hands back the objects it was sent", event_echo_probe)
+
+    def event_mutate_probe(ctx, args):
+        # Subscribe to the event named by the argument `<event> [mode]` with a handler that works on the event's payload (before_provider_request) or headers (before_provider_headers) as the mode says: no mode edits it in place and returns nothing, fail edits it and raises, replace edits nothing and returns a replacement, both edits it in place under a key of its own and returns the replacement, delete (headers) sets the header the first edit wrote to None.
+        name, _, mode = args.strip().partition(" ")
+        mode = mode.strip()
+
+        def mutate(hctx, data):
+            key = {"fail": "inPlaceBeforeError", "both": "inPlaceAlongside"}.get(mode, "inPlace")
+            headers = name == "before_provider_headers"
+            if headers:
+                if mode == "delete":
+                    data["headers"]["x-pig-inPlace"] = None
+                elif mode != "replace":
+                    data["headers"]["x-pig-" + key] = "in-place-edit"
+            elif mode != "replace":
+                data["payload"][key] = "in-place-edit"
+                if "zeta" in data["payload"]:
+                    data["payload"]["zeta"][key] = "in-place-edit"
+            if mode == "fail":
+                raise RuntimeError("failed after the edit")
+            if mode in ("replace", "both"):
+                return {"x-pig-replaced": "returned"} if headers else {"replaced": "returned"}
+            return None
+
+        ext.on_event(name, mutate)
+
+    ext.command("event_mutate_probe", "Subscribe to the event named by the argument with a handler that edits its payload or headers in place and returns nothing", event_mutate_probe)
+
+    def event_edit_probe(ctx, args):
+        # Subscribe to the event named by the argument `<event> <edit> [fail]` with a handler that makes one edit of the event's content, details, isError, message or messages (tool_result, message_end, context), returns nothing and, with fail, raises after the edit. Every edit writes the value `other-event-edit`, which no other test uses.
+        words = args.split()
+        name, edit, failing = words[0], words[1], len(words) > 2 and words[2] == "fail"
+        edited = "other-event-edit"
+
+        def text():
+            return [{"type": "text", "text": edited}]
+
+        def make(hctx, data):
+            which = name + "/" + edit
+            if which == "tool_result/content-assign":
+                data["content"] = text()
+            elif which == "tool_result/details-assign":
+                data["details"] = {"k": edited}
+            elif which == "tool_result/iserror-assign":
+                data["isError"] = True
+            elif which == "tool_result/content-deep":
+                data["content"][0]["text"] = edited
+            elif which == "tool_result/details-deep":
+                data["details"]["k"] = edited
+            elif which == "message_end/deep":
+                data["message"]["content"][0]["text"] = edited
+            elif which == "message_end/content-assign":
+                data["message"]["content"] = text()
+            elif which == "message_end/message-assign":
+                data["message"] = {"role": "user", "content": text(), "timestamp": 1}
+            elif which == "context/deep":
+                data["messages"][0]["content"][0]["text"] = edited
+            else:
+                raise RuntimeError("event_edit_probe has no edit " + which)
+            if failing:
+                raise RuntimeError("failed after the edit")
+
+        ext.on_event(name, make)
+
+    ext.command("event_edit_probe", "Subscribe to the event named by the argument with a handler that edits the event in place and returns nothing", event_edit_probe)
+
+    def event_assign_probe(ctx, args):
+        # Subscribe to the event named by the argument with a handler that ASSIGNS a new value to the event's input (tool_call), messages (context) or entries (turn_end) instead of editing the old value in place, and returns nothing.
+        name, _, variant = args.strip().partition(" ")
+        edited = "other-event-edit"
+
+        def assign(hctx, data):
+            if name == "tool_call":
+                data["input"] = {"command": edited}
+            elif name == "context":
+                if variant == "bad":
+                    data["messages"] = "oops"
+                elif variant == "badmsg":
+                    data["messages"] = [42]
+                else:
+                    data["messages"] = [{"role": "user", "content": [{"type": "text", "text": edited}], "timestamp": 1}]
+            elif name == "turn_end":
+                data["entries"] = [{"type": "custom", "customType": edited}]
+            else:
+                raise RuntimeError("event_assign_probe has no event " + name)
+
+        ext.on_event(name, assign)
+
+    ext.command("event_assign_probe", "Subscribe to the event named by the argument with a handler that assigns a new value to the event's input, messages or entries", event_assign_probe)
     ext.command("event_probe_off", "Unsubscribe the event_probe_on handlers of the event named by the argument", event_probe_on_off)
     def event_payload_probe(ctx, args):
         name = args.strip()
-        ext.on_event(name, lambda hctx, data: hctx.notify("event_payload:%s:%s" % (name, json.dumps(data)), "info"))
+        ext.on_event(name, lambda hctx, data: hctx.notify("event_payload:%s:%s" % (name, dumps_deep(data)), "info"))
 
     ext.command("event_payload_probe", "Subscribe and report the payload of the event named by the argument", event_payload_probe)
     def event_isolation_probe(ctx, args):
-        # Two handlers: the first reports the nested marker it received, writes a sentinel into it and changes it again from a timer thread after returning; the
-        # second reports what it received (TestConformance_EventHandlersDoNotShareTheirPayload).
+        # Two handlers: the first reports the marker it received, writes a sentinel into its container and changes it again from a timer thread after returning; the
+        # second reports what it received (TestConformance_EventHandlersDoNotShareTheirPayload). For a boundary event the marker is the first context entry's
+        # sourceEntry id and the container that source entry; for a context or context_with_system event it is the length of data["messages"] and the container
+        # that list.
         name = args.strip()
+        conversation = name in ("context", "context_with_system")
 
         def source(data):
             entries = (data.get("context") or {}).get("contextEntries") or []
             return entries[0]["sourceEntry"] if entries else None
 
+        def marker(data):
+            return len(data.get("messages") or []) if conversation else source(data)["id"]
+
+        def scribble(data, value):
+            if conversation:
+                data["messages"].append({"role": "user", "content": value, "timestamp": 0})
+            else:
+                source(data)["id"] = value
+
+        def messages(data):
+            # A boundary event: the first context message, the first llm message and the first message of the first context entry: one text in three places of the
+            # payload. A conversation event: its first three messages.
+            if conversation:
+                lst = data.get("messages") or []
+                return [lst[i] if i < len(lst) else None for i in range(3)]
+            context = data.get("context") or {}
+            found = []
+            for lst in (context.get("contextMessages"), context.get("llmMessages")):
+                found.append(lst[0] if lst else None)
+            entries = context.get("contextEntries") or []
+            inner = (entries[0].get("messages") if entries else None) or []
+            found.append(inner[0] if inner else None)
+            return found
+
         def first(hctx, data):
-            container = source(data)
-            hctx.notify("event_isolation:A:%s:end" % container["id"], "info")
-            container["id"] = "SENTINEL-HANDLER-A"
-            threading.Timer(0.1, lambda: container.__setitem__("id", "SENTINEL-LATE-WRITER")).start()
+            hctx.notify("event_isolation:A:%s:end" % marker(data), "info")
+            scribble(data, "SENTINEL-HANDLER-A")
+            found = messages(data)
+            hctx.notify("event_isolation_msgs:A:%s" % "|".join(str(m["content"]) if m else "None" for m in found), "info")
+            for m in found:
+                if m is not None:
+                    m["content"] = "SENTINEL-HANDLER-A"
+
+            def late():
+                scribble(data, "SENTINEL-LATE-WRITER")
+                for m in found:
+                    if m is not None:
+                        m["content"] = "SENTINEL-LATE-WRITER"
+
+            threading.Timer(0.1, late).start()
+
+        def second(hctx, data):
+            hctx.notify("event_isolation:B:%s:end" % marker(data), "info")
+            hctx.notify("event_isolation_msgs:B:%s" % "|".join(str(m["content"]) if m else "None" for m in messages(data)), "info")
 
         ext.on_event(name, first)
-        ext.on_event(name, lambda hctx, data: hctx.notify("event_isolation:B:%s:end" % source(data)["id"], "info"))
+        ext.on_event(name, second)
 
     ext.command("event_isolation_probe", "Subscribe two handlers that report the nested marker they received and then write sentinels into it", event_isolation_probe)
 
@@ -2507,8 +3722,79 @@ def new_extension() -> pig_sdk.Extension:
             pass
 
     ext.command("stale-probe", "Report cwd, mode, hasUI and model", stale_probe)
+
+    def stale_members(ctx: pig_sdk.Context, args: str = "") -> None:
+        """Call the members that fail with the stale message: each outcome is one line, and the command fails with every line when one carries the message."""
+        lines: list[str] = []
+        stale = False
+
+        def member(name, call) -> None:
+            nonlocal stale
+            try:
+                outcome = "ok:%s" % (call(),)
+            except Exception as error:  # noqa: BLE001 - the outcome is the report
+                outcome = "raises:%s:%s" % (type(error).__name__, error)
+            stale = stale or "This extension ctx is stale" in outcome
+            lines.append("%s=%s" % (name, outcome))
+
+        member("theme", lambda: type(ctx.theme).__name__)
+        member("width", lambda: ctx.width)
+        member("height", lambda: ctx.height)
+        member("sessionName", lambda: ctx.session_name)
+        member("setWidgetLines", lambda: ctx.set_widget("stale-members", ["x"]))
+        member("setWidgetView", lambda: ctx.set_widget("stale-members-view", kit.View(kit.Text("x", 0, 0))))
+        member("setWidgetRenderer", lambda: ctx.set_widget_renderer("stale-members-renderer", lambda width: ["x"]))
+        member("onUpdate", lambda: ctx.on_update("x"))
+        member("getSettings", lambda: type(ctx.get_settings()).__name__)
+        if stale:
+            raise RuntimeError("stale-members\n" + "\n".join(lines))
+        ctx.notify("members\n" + "\n".join(lines), "info")
+
+    ext.command("stale-members", "Call the members that fail with the stale message", stale_members)
     ext.command("signal-wait", "Wait for ctx.signal to abort", signal_wait)
     ext.command("usage-probe", "Report context usage", lambda ctx, args: ctx.notify(json.dumps(ctx.get_context_usage()), "info"))
+
+    def replica_model(info):
+        """The model info as Go's ModelInfo.UnmarshalJSON normalizes the wire model object."""
+        if info is None:
+            return None
+        provider = info.get("provider")
+        if isinstance(provider, dict):
+            provider = provider.get("id")
+        cost = info.get("cost") if isinstance(info.get("cost"), dict) else {}
+
+        def per_million(flat, nested):
+            return float(info.get(flat) or cost.get(nested) or 0)
+
+        return {
+            "id": info.get("id") or info.get("modelId") or "",
+            "name": info.get("name") or info.get("displayName") or "",
+            "provider": provider if isinstance(provider, str) else "",
+            "contextWindow": int(info.get("contextWindow") or 0),
+            "maxOutputTokens": int(info.get("maxOutputTokens") or info.get("maxTokens") or 0),
+            "reasoning": info.get("reasoning") is True,
+            "inputCostPer1M": per_million("inputCostPer1M", "input"),
+            "outputCostPer1M": per_million("outputCostPer1M", "output"),
+            "cacheReadCostPer1M": per_million("cacheReadCostPer1M", "cacheRead"),
+            "cacheWriteCostPer1M": per_million("cacheWriteCostPer1M", "cacheWrite"),
+        }
+
+    def replica_probe(ctx: pig_sdk.Context, args: str) -> None:
+        if args.startswith("set-model:"):
+            ctx.set_model(args[len("set-model:"):])
+        report = {
+            "model": replica_model(ctx.get_model_info()),
+            "sessionId": ctx.get_session_id(),
+            "managerSessionId": ctx.session_manager.get_session_id(),
+            "sessionName": ctx.get_session_name(),
+            "sessionFile": ctx.get_session_file(),
+            "managerSessionName": ctx.session_manager.get_session_name(),
+            "managerSessionFile": ctx.session_manager.get_session_file(),
+            "usage": ctx.get_context_usage(),
+        }
+        ctx.notify(json.dumps(report, separators=(",", ":")), "info")
+
+    ext.command("replica-probe", "Report the model info, the session id read both ways and the context usage", replica_probe)
 
     def context_probe(ctx: pig_sdk.Context, args: str) -> None:
         opts = ctx.get_system_prompt_options()
@@ -2570,6 +3856,27 @@ def new_extension() -> pig_sdk.Extension:
     ext.command("sprite-probe", "Exercise sprite registration and host errors", sprite_probe)
     ext.command("scoped-models-probe", "Report the model scope", lambda ctx, _args: ctx.notify(json.dumps(ctx.scoped_models()), "info"))
     ext.command("context-probe", "Report ctx.mode + ctx.getSystemPromptOptions()", context_probe)
+
+    def console_probe(ctx: pig_sdk.Context, args: str) -> None:
+        for n in (1, 2):
+            if args != "stderr":
+                print(f"probe-out-{n}", flush=True)
+            print(f"probe-err-{n}", file=sys.stderr, flush=True)
+
+    ext.command("console-probe", "Write console lines to stdout and stderr", console_probe)
+
+    # panic-probe and the on_loaded handler fail after a deliberate stderr line the extension itself writes (TestConformance_SDKDiagnosticsReachOnlyTheExtensionLog).
+    def loaded_panic_probe(ctx: pig_sdk.Context) -> None:
+        if os.environ.get("PIG_FIXTURE_PANIC_PROBE"):
+            print("probe-err-loaded", file=sys.stderr, flush=True)
+            raise RuntimeError("probe-panic-boom")
+
+    def panic_probe(ctx: pig_sdk.Context, args: str) -> None:
+        print("probe-err-command", file=sys.stderr, flush=True)
+        raise RuntimeError("probe-panic-boom")
+
+    ext.on_loaded(loaded_panic_probe)
+    ext.command("panic-probe", "Fail after an stderr line of the extension's own", panic_probe)
 
     def dialog_probe(ctx: pig_sdk.Context, args: str) -> None:
         selected = dialog_text(ctx.select("Pick", ["first", "second"])[0])
@@ -2841,7 +4148,7 @@ def new_extension() -> pig_sdk.Extension:
             return
         ctx.notify(
             "tool-update=%s:%s:%s:%s"
-            % (data.get("toolName"), json.dumps(data.get("args"), separators=(",", ":")), data.get("partialResult", {}).get("content", [{}])[0].get("text"), data.get("partialResult", {}).get("details", {}).get("progress")),
+            % (data.get("toolName"), dumps_deep(data.get("args"), (",", ":")), data.get("partialResult", {}).get("content", [{}])[0].get("text"), data.get("partialResult", {}).get("details", {}).get("progress")),
             "info",
         )
 
@@ -2984,11 +4291,61 @@ def new_extension() -> pig_sdk.Extension:
     def boundary_result(_ctx: pig_sdk.Context, data: dict[str, Any]) -> dict[str, Any]:
         assert [entry["customType"] for entry in data["entries"]] == ["kept", "before-error"]
         assert len(data["context"]["contextEntries"]) == 2
-        return {"entries": [{"type": "custom", "customType": "conformance-boundary"}], "continue": True}
+        # One draft with a null replacement, one without the member, and a compaction that keeps nothing.
+        return {
+            "entries": [
+                {"type": "custom", "customType": "conformance-boundary"},
+                {"type": "context_edit", "targetId": "conformance-failed-attempt", "replacement": None},
+                {"type": "context_edit", "targetId": "conformance-omitted-member"},
+                {
+                    "type": "compaction",
+                    "summary": "conformance-summary",
+                    "firstKeptEntryId": None,
+                    "details": {"format": "conformance-checkpoint"},
+                    "usage": None,
+                },
+                # A data, a details and (above) a usage member written as null: Pi's file holds each as null.
+                {"type": "custom", "customType": "conformance-null-data", "data": None},
+                {
+                    "type": "custom_message",
+                    "customType": "conformance-null-details",
+                    "content": "x",
+                    "display": False,
+                    "details": pig_sdk.NULL,
+                },
+            ],
+            "continue": True,
+        }
+
+    def boundary_drafts(ctx: pig_sdk.Context, data: dict[str, Any]) -> None:
+        entries = data["entries"]
+        assert len(entries) == 6, "boundary result reached the next handler as %d entries" % len(entries)
+
+        def member(index: int, key: str) -> str:
+            if key not in entries[index]:
+                return "absent"
+            return "null" if entries[index][key] is None else "value"
+
+        ctx.notify(
+            "agent_before_settle_drafts:%d:%s:%s:%s:%s:%s:%s:%s:%s"
+            % (
+                len(entries),
+                member(1, "replacement"),
+                member(2, "replacement"),
+                member(3, "firstKeptEntryId"),
+                (entries[3].get("details") or {}).get("format"),
+                member(0, "data"),
+                member(3, "usage"),
+                member(4, "data"),
+                member(5, "details"),
+            ),
+            "info",
+        )
 
     ext.on_event("agent_before_settle", agent_before_settle)
     ext.on_event("agent_before_settle", boundary_error)
     ext.on_event("agent_before_settle", boundary_result)
+    ext.on_event("agent_before_settle", boundary_drafts)
     def session_start(ctx, data):
         ctx.notify("session_start:" + str(data.get("reason", "")), "info")
         if data.get("previousSessionFile"):
@@ -2996,12 +4353,21 @@ def new_extension() -> pig_sdk.Extension:
 
     def session_shutdown(ctx, data):
         ctx.notify("session_shutdown:" + str(data.get("reason", "")), "info")
+        # The handler's own context is still active (Pi invalidates after the handlers ran): the stale-members test reads every member from here.
+        if data.get("reason") == "stale-members-test":
+            stale_members(ctx)
         if data.get("targetSessionFile"):
             ctx.notify("target:" + data["targetSessionFile"], "info")
 
     ext.on_event("session_start", session_start)
     ext.on_event("session_shutdown", session_shutdown)
-    ext.on_event("session_info_changed", lambda ctx, data: ctx.notify("session_info_changed:" + str(data.get("name", "")), "info"))
+    def session_info_changed(ctx, data):
+        # io_wait_name arms the handler to wait on a socket read first, as a handler that awaits does in Pi.
+        if name_wait_addr:
+            io_wait(name_wait_addr[0])
+        ctx.notify("session_info_changed:" + str(data.get("name", "")), "info")
+
+    ext.on_event("session_info_changed", session_info_changed)
     for name in ("ui_prompt_start", "ui_prompt_end"):
         ext.on_event(name, ui_prompt_event)
     ext.on_event(
@@ -3162,12 +4528,38 @@ def _register_conformance_oauth(ext: pig_sdk.Extension) -> None:
 STATE_PUSH_WINDOW = 5.0
 
 
+def _context_usage_report(usage):
+    """"none" for no usage, else "tokens=<n>" with "" for null tokens."""
+    if usage is None:
+        return "none"
+    tokens = usage.get("tokens")
+    return "tokens=" + ("" if tokens is None else str(tokens))
+
+
+def _usage_then_id(ctx):
+    """A host call, then the replicated id: the id must not be older than the host's answer."""
+    usage = ctx.get_context_usage()
+    if usage is None or usage.get("tokens") is None:
+        return "none"
+    if usage["tokens"] != 250:
+        return "tokens=%d" % usage["tokens"]
+    return "tokens=250,id=" + ctx.get_session_id()
+
+
 def _state_push_reader(ctx, kind):
     """The read of one replicated accessor, as a string that fails soft: a read that raises reports its error."""
     if kind == "model":
         read = lambda: ctx.model
+    elif kind == "model-name":
+        read = lambda: (ctx.get_model_info() or {}).get("name") or ""
+    elif kind == "usage-then-id":
+        read = lambda: _usage_then_id(ctx)
+    elif kind == "context-usage":
+        read = lambda: _context_usage_report(ctx.get_context_usage())
     elif kind == "session-name":
         read = lambda: ctx.session_name
+    elif kind == "session-id":
+        read = lambda: ctx.get_session_id()
     elif kind == "theme":
         read = lambda: ctx.theme.name or ""
     elif kind.startswith("settings:"):
@@ -3188,7 +4580,7 @@ def _state_push_reader(ctx, kind):
 
 
 def _register_state_push_probe(ext: pig_sdk.Extension) -> None:
-    """Register the state-push-probe command (TestHostStateChangeReachesABackgroundReaderAcrossSDKs). The command arms a thread that reads one replicated accessor from outside every request, as an extension's timer does, and returns: the host then changes its own state with no call and no event to this extension, and the thread reports the first value that differs from the one it armed on, or the value it still holds after STATE_PUSH_WINDOW, to a file in the directory the arguments name. The arguments are {"kind": "model" | "session-name" | "theme" | "settings:<key>" | "mcp", "dir": <directory>}; the report is "<armed>=><read>"."""
+    """Register the state-push-probe command (TestHostStateChangeReachesABackgroundReaderAcrossSDKs). The command arms a thread that reads one replicated accessor from outside every request, as an extension's timer does, and returns: the host then changes its own state with no call and no event to this extension, and the thread reports the first value that differs from the one it armed on, or the value it still holds after STATE_PUSH_WINDOW, to a file in the directory the arguments name. The arguments are {"kind": "model" | "model-name" | "session-name" | "session-id" | "context-usage" | "theme" | "settings:<key>" | "mcp", "dir": <directory>}; the report is "<armed>=><read>"."""
 
     def probe(ctx, args):
         request = json.loads(args)
@@ -3473,7 +4865,7 @@ def _register_tui_alt_frame_probe(ext: pig_sdk.Extension) -> None:
         hide_two = screen.show_overlay(over, {"width": 8})
         doc.invalidated = over.invalidated = 0
         screen.invalidate()
-        facts.append(f"invalidate={b(doc.invalidated > 0)}/{b(over.invalidated > 0)}")
+        facts.append(f"invalidate={doc.invalidated}/{over.invalidated}")
         hide_two.hide()
         mut_log: list[str] = []
         armed = False
@@ -3515,7 +4907,7 @@ def _register_tui_alt_frame_probe(ext: pig_sdk.Extension) -> None:
             r.append(f"scroll={screen.viewport_top}/{b(screen.is_following_output)}")
             mut.invalidated = 0
             screen.invalidate()
-            r.append(f"invalidate={b(mut.invalidated > 0)}")
+            r.append(f"invalidate={mut.invalidated}")
             r.append(f"lines={len(screen.get_screen_lines())}")
             mut_log.append(",".join(r))
             return ["MUT"]

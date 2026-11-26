@@ -14,10 +14,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 
+	"github.com/MichaelKinsy/PiG/internal/codexwsobserve"
 	"github.com/MichaelKinsy/PiG/internal/coding/pigidentity"
 	"github.com/MichaelKinsy/PiG/internal/nodeurl"
 	"github.com/MichaelKinsy/PiG/internal/tlsdistrust"
@@ -27,7 +29,8 @@ const (
 	codexWebSocketBeta           = "responses_websockets=2026-02-06"
 	codexWebSocketConnectTimeout = 15 * time.Second
 	codexWebSocketCacheTTL       = 5 * time.Minute
-	codexWebSocketMaxAge         = 55 * time.Minute
+	// The server closes a socket after 60 minutes, even mid-response, and the in-flight response is lost. New requests open a fresh socket after 45 minutes, leaving 15 minutes for long responses (Pi bb1a2b3542b5).
+	codexWebSocketMaxAge = 45 * time.Minute // upstream: packages/ai/src/api/openai-codex-responses.ts:SESSION_WEBSOCKET_MAX_AGE_MS
 )
 
 // codexWebSocketError is a WebSocket transport failure as Node's WebSocket reports it to openai-codex-responses.ts: extractWebSocketError's "WebSocket error" for a failed handshake or a dropped connection, and extractWebSocketCloseError's WebSocketCloseError, with the close code, for a close frame (openai-codex-responses.ts:1250-1288).
@@ -205,14 +208,17 @@ func GetOpenAICodexWebSocketDebugStats(sessionID string) *OpenAICodexWebSocketDe
 // counters when no session id is supplied.
 func ResetOpenAICodexWebSocketDebugStats(sessionID ...string) {
 	codexWebSocketSessions.mu.Lock()
-	defer codexWebSocketSessions.mu.Unlock()
+	var notified string
 	if len(sessionID) > 0 && sessionID[0] != "" {
-		delete(codexWebSocketSessions.stats, sessionID[0])
-		delete(codexWebSocketSessions.fallback, sessionID[0])
-		return
+		notified = sessionID[0]
+		delete(codexWebSocketSessions.stats, notified)
+		delete(codexWebSocketSessions.fallback, notified)
+	} else {
+		clear(codexWebSocketSessions.stats)
+		clear(codexWebSocketSessions.fallback)
 	}
-	clear(codexWebSocketSessions.stats)
-	clear(codexWebSocketSessions.fallback)
+	codexWebSocketSessions.mu.Unlock()
+	codexwsobserve.Notify(notified)
 }
 
 // CloseOpenAICodexWebSocketSessions closes one session's cached connections,
@@ -258,12 +264,13 @@ func recordCodexWebSocketFailure(sessionID string, failure error) {
 		return
 	}
 	codexWebSocketSessions.mu.Lock()
-	defer codexWebSocketSessions.mu.Unlock()
 	stats := codexDebugStatsLocked(sessionID)
 	codexWebSocketSessions.fallback[sessionID] = true
 	stats.WebSocketFailures++
 	stats.WebSocketFallbackActive = true
 	stats.LastWebSocketError = failure.Error()
+	codexWebSocketSessions.mu.Unlock()
+	codexwsobserve.Notify(sessionID)
 }
 
 func recordCodexWebSocketSSEFallback(sessionID string) {
@@ -271,10 +278,11 @@ func recordCodexWebSocketSSEFallback(sessionID string) {
 		return
 	}
 	codexWebSocketSessions.mu.Lock()
-	defer codexWebSocketSessions.mu.Unlock()
 	stats := codexDebugStatsLocked(sessionID)
 	stats.SSEFallbacks++
 	stats.WebSocketFallbackActive = codexWebSocketSessions.fallback[sessionID]
+	codexWebSocketSessions.mu.Unlock()
+	codexwsobserve.Notify(sessionID)
 }
 
 func codexWebSocketFallbackActive(sessionID string) bool {
@@ -711,12 +719,19 @@ func joinJSONArray(items []json.RawMessage) json.RawMessage {
 	return append(out, ']')
 }
 
-// startCodexWebSocket streams the request over the Codex WebSocket. A nil stream with a nil error falls back to SSE; fallback is the transport failure that caused it, or nil when the session's WebSocket is already disabled.
-func (p *openAIResponsesProvider) startCodexWebSocket(ctx context.Context, endpoint string, body []byte, apiKey, accountID, cacheSessionID string, grammarProps map[string]string, opts StreamOptions) (stream *AssistantMessageEventStream, fallback, err error) {
-	return p.startCodexWebSocketAttempt(ctx, endpoint, body, apiKey, accountID, cacheSessionID, grammarProps, opts, true, true)
+// codexUsesCachedContext is `options?.transport === "websocket-cached" || options?.transport === "auto"` (openai-codex-responses.ts:1539): it reads the option as the caller passed it. Pi's default `options?.transport || "auto"`
+// (:313) has one use, choosing the WebSocket path (and the transport the failure diagnostic names, :378); it does not make an unset transport "auto" here, so a request with no transport, or one that names neither, sends the full
+// context. The path rule is the `transport != TransportSSE` test of the caller.
+func codexUsesCachedContext(transport Transport) bool {
+	return transport == TransportWebSocketCached || transport == TransportAuto
 }
 
-func (p *openAIResponsesProvider) startCodexWebSocketAttempt(ctx context.Context, endpoint string, body []byte, apiKey, accountID, cacheSessionID string, grammarProps map[string]string, opts StreamOptions, retryConnectionLimit, retryMissingContinuation bool) (stream *AssistantMessageEventStream, fallback, err error) {
+// startCodexWebSocket streams the request over the Codex WebSocket. A nil stream with a nil error falls back to SSE; fallback is the transport failure that caused it, or nil when the session's WebSocket is already disabled.
+func (p *openAIResponsesProvider) startCodexWebSocket(ctx context.Context, endpoint string, body []byte, apiKey, accountID, cacheSessionID string, grammarProps map[string]string, configurationUpdateEffort string, opts StreamOptions) (stream *AssistantMessageEventStream, fallback, err error) {
+	return p.startCodexWebSocketAttempt(ctx, endpoint, body, apiKey, accountID, cacheSessionID, grammarProps, configurationUpdateEffort, opts, true, true)
+}
+
+func (p *openAIResponsesProvider) startCodexWebSocketAttempt(ctx context.Context, endpoint string, body []byte, apiKey, accountID, cacheSessionID string, grammarProps map[string]string, configurationUpdateEffort string, opts StreamOptions, retryConnectionLimit, retryMissingContinuation bool) (stream *AssistantMessageEventStream, fallback, err error) {
 	if codexWebSocketFallbackActive(cacheSessionID) {
 		recordCodexWebSocketSSEFallback(cacheSessionID)
 		return nil, nil, nil
@@ -750,9 +765,7 @@ func (p *openAIResponsesProvider) startCodexWebSocketAttempt(ctx context.Context
 		recordCodexWebSocketSSEFallback(cacheSessionID)
 		return nil, err, nil
 	}
-	// Empty transport has upstream's default "auto" behavior, including cached
-	// continuation when a cache session id is available.
-	useCachedContext := opts.Transport == TransportWebSocketCached || opts.Transport == TransportAuto || opts.Transport == ""
+	useCachedContext := codexUsesCachedContext(opts.Transport)
 	var delta *codexDelta
 	if useCachedContext {
 		delta = cachedCodexDelta(acquired.entry, request)
@@ -770,7 +783,7 @@ func (p *openAIResponsesProvider) startCodexWebSocketAttempt(ctx context.Context
 			return nil, nil, errCodexAborted
 		}
 		if wasReused {
-			return p.startCodexWebSocketAttempt(ctx, endpoint, body, apiKey, accountID, cacheSessionID, grammarProps, opts, retryConnectionLimit, retryMissingContinuation)
+			return p.startCodexWebSocketAttempt(ctx, endpoint, body, apiKey, accountID, cacheSessionID, grammarProps, configurationUpdateEffort, opts, retryConnectionLimit, retryMissingContinuation)
 		}
 		recordCodexWebSocketFailure(cacheSessionID, err)
 		recordCodexWebSocketSSEFallback(cacheSessionID)
@@ -810,14 +823,20 @@ func (p *openAIResponsesProvider) startCodexWebSocketAttempt(ctx context.Context
 			stats.LastPreviousResponseId = ""
 		}
 		codexWebSocketSessions.mu.Unlock()
+		codexwsobserve.Notify(cacheSessionID)
 	}
 
 	builder := newAssistantStreamBuilder(ctx, APIOpenAICodexResponses, p.cfg.ProviderID, p.cfg.Model)
 	builder.modelCost = opts.ModelCost
 	builder.requestServiceTier = requestServiceTierOf(opts)
+	builder.setResponseMetadata("", "", "", configurationUpdateEffort, nil)
 	builder.setProviderEventObserver(opts, providerEventModel(p.cfg.ModelMetadata, APIOpenAICodexResponses, p.cfg.ProviderID, p.cfg.Model))
 	var messageType int
 	var first []byte
+	// websocketStarted (openai-codex-responses.ts:321-336) becomes true at the first event mapCodexEvents yields, a leading codex.rate_limits
+	// event included. Every decision below reads that one flag: a started stream is not reconnected for the connection limit and is not retried or
+	// moved to SSE after a read error; it ends in an error message, which the caller's retry handles.
+	websocketStarted := false
 	for {
 		messageType, first, err = readCodexWebSocket(ctx, acquired.connection, optionTimeout(opts.TimeoutMs))
 		if err != nil {
@@ -838,6 +857,14 @@ func (p *openAIResponsesProvider) startCodexWebSocketAttempt(ctx context.Context
 		if json.Unmarshal(first, &event) != nil || event.Type != "codex.rate_limits" {
 			break
 		}
+		websocketStarted = true
+		// onStart pushes the start event at the first event the mapper yields (openai-codex-responses.ts:333-338).
+		builder.start()
+	}
+	if err != nil && websocketStarted {
+		// An aborted request ends the same way (consumeCodexWebSocket does not call a cancelled context a transport failure).
+		go p.consumeCodexWebSocket(ctx, acquired, nil, err, request, len(body), grammarProps, useCachedContext, builder, opts)
+		return builder.stream, nil, nil
 	}
 	if err != nil {
 		wasReused := acquired.reused
@@ -846,7 +873,7 @@ func (p *openAIResponsesProvider) startCodexWebSocketAttempt(ctx context.Context
 			return nil, nil, errCodexAborted
 		}
 		if wasReused {
-			return p.startCodexWebSocketAttempt(ctx, endpoint, body, apiKey, accountID, cacheSessionID, grammarProps, opts, retryConnectionLimit, retryMissingContinuation)
+			return p.startCodexWebSocketAttempt(ctx, endpoint, body, apiKey, accountID, cacheSessionID, grammarProps, configurationUpdateEffort, opts, retryConnectionLimit, retryMissingContinuation)
 		}
 		recordCodexWebSocketFailure(cacheSessionID, err)
 		recordCodexWebSocketSSEFallback(cacheSessionID)
@@ -865,12 +892,13 @@ func (p *openAIResponsesProvider) startCodexWebSocketAttempt(ctx context.Context
 			acquired.entry.continuation = nil
 		}
 		acquired.release(false)
-		return p.startCodexWebSocketAttempt(ctx, endpoint, body, apiKey, accountID, cacheSessionID, grammarProps, opts, retryConnectionLimit, false)
+		return p.startCodexWebSocketAttempt(ctx, endpoint, body, apiKey, accountID, cacheSessionID, grammarProps, configurationUpdateEffort, opts, retryConnectionLimit, false)
 	}
-	if code == "websocket_connection_limit_reached" {
+	// connectionLimitBeforeStart := !websocketStarted && isWebSocketConnectionLimitReachedError(error) (openai-codex-responses.ts:362): a started stream keeps its error.
+	if code == "websocket_connection_limit_reached" && !websocketStarted {
 		acquired.release(false)
 		if retryConnectionLimit {
-			return p.startCodexWebSocketAttempt(ctx, endpoint, body, apiKey, accountID, cacheSessionID, grammarProps, opts, false, retryMissingContinuation)
+			return p.startCodexWebSocketAttempt(ctx, endpoint, body, apiKey, accountID, cacheSessionID, grammarProps, configurationUpdateEffort, opts, false, retryMissingContinuation)
 		}
 		message := "Codex error: websocket_connection_limit_reached"
 		if _, mapped := mapCodexWebSocketEventFrame(first); mapped != nil {
@@ -882,9 +910,13 @@ func (p *openAIResponsesProvider) startCodexWebSocketAttempt(ctx context.Context
 		return nil, eventErr, nil
 	}
 
-	go p.consumeCodexWebSocket(ctx, acquired, first, request, len(body), grammarProps, useCachedContext, builder, opts)
+	go p.consumeCodexWebSocket(ctx, acquired, first, nil, request, len(body), grammarProps, useCachedContext, builder, opts)
 	return builder.stream, nil, nil
 }
+
+// codexWebSocketTerminalSeam is a test seam, nil outside tests. The feeder calls it with the stream's session id once it holds a terminal frame and before it stops the abort close: the window in which a
+// cancel that lands concurrently has already closed the connection, which a test cannot hit by timing.
+var codexWebSocketTerminalSeam atomic.Pointer[func(sessionID string)]
 
 func markCodexWebSocketFinishing(entry *codexWebSocketEntry) {
 	if entry == nil {
@@ -895,7 +927,9 @@ func markCodexWebSocketFinishing(entry *codexWebSocketEntry) {
 	codexWebSocketSessions.mu.Unlock()
 }
 
-func (p *openAIResponsesProvider) consumeCodexWebSocket(ctx context.Context, acquired *acquiredCodexWebSocket, first []byte, request codexRequest, requestBytes int, grammarProps map[string]string, useCachedContext bool, builder *assistantStreamBuilder, opts StreamOptions) {
+// consumeCodexWebSocket feeds the stream from first and the frames after it. A non-nil readErr is the read error of a stream that has started (a leading
+// codex.rate_limits event was yielded): it replaces first, as the error of the next read.
+func (p *openAIResponsesProvider) consumeCodexWebSocket(ctx context.Context, acquired *acquiredCodexWebSocket, first []byte, readErr error, request codexRequest, requestBytes int, grammarProps map[string]string, useCachedContext bool, builder *assistantStreamBuilder, opts StreamOptions) {
 	reader, writer := io.Pipe()
 	feedDone := make(chan struct{})
 	parseDone := make(chan struct{})
@@ -922,6 +956,15 @@ func (p *openAIResponsesProvider) consumeCodexWebSocket(ctx context.Context, acq
 					return
 				}
 			}
+			if readErr != nil {
+				err := readErr
+				if ctx.Err() == nil {
+					recordCodexWebSocketFailure(acquired.sessionID, err)
+					err = &codexWebSocketTransportFailure{err: err}
+				}
+				_ = writer.CloseWithError(err)
+				return
+			}
 			if !observed {
 				if err := builder.observeCodexFrame(message); err != nil {
 					_ = writer.CloseWithError(err)
@@ -936,7 +979,12 @@ func (p *openAIResponsesProvider) consumeCodexWebSocket(ctx context.Context, acq
 			}
 			if !mapped.skip {
 				if mapped.terminal {
+					if seam := codexWebSocketTerminalSeam.Load(); seam != nil {
+						(*seam)(acquired.sessionID)
+					}
 					markCodexWebSocketFinishing(acquired.entry)
+					// The terminal frame ends the request: from here a cancelled context must not close the connection, which release keeps for the session's next request.
+					stopCancel()
 				}
 				if _, err := fmt.Fprintf(writer, "data: %s\n\n", mapped.data); err != nil {
 					return

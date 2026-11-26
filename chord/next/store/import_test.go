@@ -19,7 +19,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/sqlite/node"
 )
 
-// Ports packages/chord/test/next/store/import.test.ts: tests of `ImportStore` (slice 6a §13, rules 12, 24, 25): round
+// Ports packages/chord/test/store/import.test.ts: tests of `ImportStore` (slice 6a §13, rules 12, 24, 25): round
 // trips (old row versions, a migrating table, uncheckpointed deltas), the store it returns, every refusal of the
 // archive's order and content, the rollback, and an input that stalls cancelled by `ctx`.
 
@@ -248,7 +248,7 @@ func TestImportJSONCellsHoldingNull(t *testing.T) {
 		if _, err := source.Commit(staged, openFence, ctx); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
-		v2, err := EvolveTable(v1, func(t *TableEditor) *TableEditor {
+		v2, err := EvolveTable(v1, func(t *TableEditor) TableTailEditor {
 			return t.Json("data", Json(contracts.Obj(contracts.Prop("was", contracts.Nul())), JsonColumnOptions{
 				Version: 2,
 				Migrate: func(value delta.JsonValue, _ int) (any, error) {
@@ -294,6 +294,14 @@ func TestImportRefusals(t *testing.T) {
 			"not an archive part",
 		},
 		{"no manifest first", func(parts []any) []any { return parts[1:] }, "the manifest comes first"},
+		{
+			"a host's data archive",
+			func(parts []any) []any {
+				importAt(parts, 0).Set("host", "session|S1")
+				return parts
+			},
+			"a host's data archive (session|S1); import it with importHostData",
+		},
 		{"a second manifest", func(parts []any) []any { return append([]any{parts[0]}, parts...) }, "the manifest comes first, once"},
 		{
 			"another format",
@@ -634,6 +642,62 @@ func TestImportRefusals(t *testing.T) {
 		}
 	})
 
+	t.Run("cancelling ctx while DecodeJsonl Next is in flight does not race with background Close", func(t *testing.T) {
+		parts := importArchive(t)
+		enc := EncodeJsonl(&jsonlParts{parts: parts[:1]})
+		firstChunk, ok, err := enc.Next(chordctx.Background())
+		if err != nil || !ok {
+			t.Fatalf("encode first: %v, %v", ok, err)
+		}
+		_ = enc.Close()
+
+		const maxAttempts = 20
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			src := &blockingByteSource{
+				first:   append([]byte(nil), firstChunk...),
+				entered: make(chan struct{}),
+				release: make(chan struct{}),
+				closed:  make(chan struct{}),
+			}
+
+			cancellable, cancel := chordctx.WithCancel(chordctx.Background())
+			db, err := node.OpenNodeSqliteDatabase(":memory:", node.NodeSqliteDatabaseOptions{})
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+
+			wrapped := &observingParts{PartSource: DecodeJsonl(src), nextDone: make(chan struct{})}
+			done := make(chan error, 1)
+			go func() {
+				_, err := ImportStore(SqliteBackend(db), wrapped, cancellable, StoreOptions{})
+				done <- err
+			}()
+
+			<-src.entered
+			// Release Next right after cancel so both writes to jsonlDecoder.finished land close together
+			// without sleeping; if importEach selected the settled EOF instead of ctx.Done, retry cleanly.
+			cancel(errors.New("stop"))
+			close(src.release)
+			err = <-done
+			select {
+			case <-wrapped.nextDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the in-flight Next did not finish")
+			}
+			if !archiveIsCode(err, data.CodeAborted) {
+				continue
+			}
+			select {
+			case <-src.closed:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the background close did not run")
+			}
+			t.Logf("aborted path exercised on attempt %d", attempt)
+			return
+		}
+		t.Fatalf("ImportStore did not take the aborted path in %d attempts", maxAttempts)
+	})
+
 	t.Run("an input whose Next panics fails the import with the panic as its error", func(t *testing.T) {
 		parts := importArchive(t)
 		db, err := node.OpenNodeSqliteDatabase(":memory:", node.NodeSqliteDatabaseOptions{})
@@ -663,6 +727,10 @@ func (source *panickingSource) Next(ctx context.Context) (any, bool, error) {
 
 func (source *panickingSource) Close() error { return nil }
 
+// stalledForever is what a stalledSource waits on: nothing sends on it; TestMain closes it once the tests ended, so the
+// goroutine that modelled a never-settling promise is not reported as a leak.
+var stalledForever = make(chan struct{})
+
 // stalledSource yields `values`, then waits for ever: a Close wakes nothing, as Pi's never-settling promise.
 type stalledSource struct {
 	values []ArchivePart
@@ -675,7 +743,7 @@ func (source *stalledSource) Next(ctx context.Context) (any, bool, error) {
 		source.index++
 		return source.values[source.index-1], true, nil
 	}
-	<-make(chan struct{})
+	<-stalledForever
 	return nil, false, nil
 }
 
@@ -708,4 +776,68 @@ func withMember(object *delta.JsonObject, key string, value any) *delta.JsonObje
 	copied := object.Clone()
 	copied.Set(key, value)
 	return copied
+}
+
+func TestImportOfAnArchiveWrittenBeforeSchema3(t *testing.T) {
+	t.Run("takes an old archive (no host in manifest, records or columns) and exports it again as it was, its manifest at schema 3", func(t *testing.T) {
+		// Pi's stored/archive.jsonl: exported by the code before schema 3 (manifest schema 2).
+		raw, err := os.ReadFile(filepath.Join("..", "host", "testdata", "schema-switch", "stored", "archive.jsonl"))
+		noError(t, err)
+		lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+		values := make([]any, len(lines))
+		for index, line := range lines {
+			values[index], err = delta.DecodeJson([]byte(line))
+			noError(t, err)
+		}
+		if !strings.Contains(lines[0], `"schema":2`) || strings.Contains(string(raw), `"host"`) {
+			t.Fatalf("the fixture is no archive of schema 2 without hosts: %s", lines[0])
+		}
+		imported := importedStore(t, SlicePartSource(values), false)
+		got := partTexts(t, exported(t, imported, chordctx.Background()))
+		want := append([]string{strings.Replace(lines[0], `"schema":2`, `"schema":3`, 1)}, lines[1:]...)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("exported parts differ from the archive:\n got %v\nwant %v", got, want)
+		}
+	})
+}
+
+// blockingByteSource yields `first`, then blocks on `release` after closing `entered`. Close signals `closed`
+// without synchronizing with Next, so the test can wait for importEach's background Close without sleeping while
+// Next and Close still execute concurrently on jsonlDecoder under the race detector.
+type blockingByteSource struct {
+	first   []byte
+	sent    bool
+	entered chan struct{}
+	release chan struct{}
+	closed  chan struct{}
+}
+
+func (b *blockingByteSource) Next(ctx context.Context) ([]byte, bool, error) {
+	if !b.sent {
+		b.sent = true
+		return b.first, true, nil
+	}
+	close(b.entered)
+	<-b.release
+	return nil, false, nil
+}
+
+func (b *blockingByteSource) Close() error {
+	close(b.closed)
+	return nil
+}
+
+// observingParts wraps a PartSource to signal nextDone once Next returns ok=false or an error,
+// so the test waits for the in-flight Next goroutine to finish without synchronizing it with Close.
+type observingParts struct {
+	PartSource
+	nextDone chan struct{}
+}
+
+func (p *observingParts) Next(ctx context.Context) (any, bool, error) {
+	v, ok, err := p.PartSource.Next(ctx)
+	if !ok || err != nil {
+		close(p.nextDone)
+	}
+	return v, ok, err
 }

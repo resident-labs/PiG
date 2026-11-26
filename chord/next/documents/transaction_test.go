@@ -23,8 +23,8 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/sqlite"
 )
 
-// Ports packages/chord/test/next/documents/transaction.test.ts
-// pi: packages/chord/src/next/documents/transaction.ts
+// Ports packages/chord/test/documents/transaction.test.ts
+// pi: packages/chord/src/documents/transaction.ts
 //
 // Pi runs these on a `createHost` host: objects served with `h.serve`, reached through `host.get` references, and
 // `self.tx`. The Go form runs them on the harness object of support_test.go (a DocumentsOwner with its attempts): an
@@ -257,6 +257,7 @@ func txObject(t *testing.T, label string, options objectOptions, meter *nexttest
 	}
 	if meter != nil {
 		o.batch = state.NewBatch(report, meter.Telemetry.Metrics())
+		o.telemetry = meter.Telemetry
 	} else {
 		o.batch = state.NewBatch(report, nil)
 	}
@@ -518,8 +519,8 @@ func TestTransactionsCommitTheObjectsDocumentsInOneBatchOneComputeOneFrame(t *te
 }
 
 // TestTransactionsCommitTheirOtherChangesWhenTheyRetireAnAbsentDocument runs `it("commit their other changes when
-// they retire an absent document (R13)")` of packages/chord/test/next/documents/transaction.test.ts:177;
-// `tx.retire(one.b)` is packages/chord/test/next/documents/transaction.test.ts:180, Tx.Retire.
+// they retire an absent document (R13)")` of packages/chord/test/documents/transaction.test.ts:177;
+// `tx.retire(one.b)` is packages/chord/test/documents/transaction.test.ts:180, Tx.Retire.
 func TestTransactionsCommitTheirOtherChangesWhenTheyRetireAnAbsentDocument(t *testing.T) {
 	one, _ := objects(t, nil)
 	_, err := one.attempt.Tx(func(tx Tx) (any, error) {
@@ -539,8 +540,8 @@ func TestTransactionsCommitTheirOtherChangesWhenTheyRetireAnAbsentDocument(t *te
 }
 
 // TestTransactionsDraftARetiredDocumentAnewWatchesGetARootReplacement runs `it("draft a retired document anew:
-// watches get a root replacement")` of packages/chord/test/next/documents/transaction.test.ts:186; `tx.retire(one.a)`
-// is packages/chord/test/next/documents/transaction.test.ts:193, Tx.Retire.
+// watches get a root replacement")` of packages/chord/test/documents/transaction.test.ts:186; `tx.retire(one.a)`
+// is packages/chord/test/documents/transaction.test.ts:193, Tx.Retire.
 func TestTransactionsDraftARetiredDocumentAnewWatchesGetARootReplacement(t *testing.T) {
 	one, _ := objects(t, nil)
 	_, err := one.a.Change(background, func(draft *delta.Object) (any, error) { return nil, draft.Set("n", float64(3)) })
@@ -781,6 +782,31 @@ func TestTheSealFenceDiscardsTheTransactionHoldingTheLineAtTheSealTheLineIsFreeI
 	txRequireValue(t, s.o, s.handles[1], obj("n", float64(2)))
 }
 
+// Pi's overlay proxy throws a TypeError once its change settled (tracker.ts "Cannot use a settled overlay"), and a throw inside
+// the callback rejects the transaction. A draft of a transaction cut at the seal panics here (delta.ErrRevoked): the
+// transaction returns that as its error, so a callback that runs on a task of the host (p2's keepMemento, a handler's blocking
+// work) fails its handler when its object ends under it and does not crash the process.
+func TestTheSealFenceRevokesTheCutTransactionsDraftsAWriteAfterItRejectsTheTransactionWithTheRevokedOverlayNotAPanic(t *testing.T) {
+	s := newSealable(t)
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+	first := goTx(s.attempts[0], func(tx Tx) (any, error) {
+		draft, err := tx.Draft(s.handles[0])
+		if err != nil {
+			return nil, err
+		}
+		close(entered)
+		<-gate
+		return nil, draft.Set("n", float64(1))
+	}, background)
+	<-entered
+	s.restart(t)
+	close(gate)
+	if err := awaitTx(t, first).err; !errors.Is(err, delta.ErrRevoked) {
+		t.Fatalf("error = %v, want the revoked overlay's (%v)", err, delta.ErrRevoked)
+	}
+}
+
 func TestTheSealFenceRefusesASealedAttemptsTransactionsWaitingForTheLineAndEveryNewOneItsHandlesStillRead(t *testing.T) {
 	s := newSealable(t)
 	gate := make(chan struct{})
@@ -820,7 +846,7 @@ func (owner *tableOwner) AssertLive() error {
 }
 func (owner *tableOwner) Fail(err *data.ChordError) { owner.o.Fail(err) }
 
-var openFence = store.CommitFence{Admit: func() bool { return true }, Adopt: func(int64, []int64) error { return nil }}
+var openFence = store.CommitFence{Admit: func() bool { return true }, Adopt: func(int64, []int64, int) error { return nil }}
 
 // storedObject is a restartable store object with `N` and `Edits` (and, persisted, `P` and the keyed `K`) on a store
 // with an outbox; its handles by attempt.
@@ -937,8 +963,8 @@ func holdBackend(t *testing.T, st *store.ChordStore) (release func()) {
 
 // TestTablesInATransactionCommitRowsAndDocumentsInOneStepTheDocumentsAdoptInsideItOneSeq runs `it("commit rows and
 // documents in one step: the documents adopt inside it, one seq")` of
-// packages/chord/test/next/documents/transaction.test.ts:336; `tx.put(edits, ...)` is
-// packages/chord/test/next/documents/transaction.test.ts:346, Tx.Put.
+// packages/chord/test/documents/transaction.test.ts:336; `tx.put(edits, ...)` is
+// packages/chord/test/documents/transaction.test.ts:346, Tx.Put.
 func TestTablesInATransactionCommitRowsAndDocumentsInOneStepTheDocumentsAdoptInsideItOneSeq(t *testing.T) {
 	s := storedOn(t, nil, false, nil)
 	watch := watchOf(t, s.o, s.n[0])
@@ -1000,11 +1026,12 @@ func TestTablesInATransactionInMemoryOnlyCommitsTakeNoStepAndNoSeq(t *testing.T)
 
 // TestTablesInATransactionReadCommittedRowsWithPageAndRowsOverlayOwnWritesWithGet runs `it("read committed rows with
 // tx.page and tx.rows, overlay own writes with tx.get")` of
-// packages/chord/test/next/documents/transaction.test.ts:373: `tx.put`
-// (packages/chord/test/next/documents/transaction.test.ts:377), `tx.page`
-// (packages/chord/test/next/documents/transaction.test.ts:378), `tx.rows`
-// (packages/chord/test/next/documents/transaction.test.ts:380) and `tx.get`
-// (packages/chord/test/next/documents/transaction.test.ts:382), Tx.Put, Page, Rows and Get.
+// packages/chord/test/documents/transaction.test.ts:373: `tx.put`
+// (packages/chord/test/documents/transaction.test.ts:377), `tx.page`
+// (packages/chord/test/documents/transaction.test.ts:378), `tx.rows`
+// (packages/chord/test/documents/transaction.test.ts:380) and `tx.get`
+// (packages/chord/test/documents/transaction.test.ts:382), Tx.Put, Page, Rows and Get.
+// Cites packages/chord/src/documents/transaction.ts:48 and :55 (Tx.page and Tx.rows of committed rows).
 func TestTablesInATransactionReadCommittedRowsWithPageAndRowsOverlayOwnWritesWithGet(t *testing.T) {
 	s := storedOn(t, nil, false, nil)
 	edits := s.edits[0]
@@ -1091,8 +1118,8 @@ func TestTablesInATransactionWriteNothingOnAThrowOrAnAbortAndRefuseACallbackThat
 }
 
 // TestTablesInATransactionRefuseAnotherObjectsTable runs `it("refuse another object's table")` of
-// packages/chord/test/next/documents/transaction.test.ts:416; `tx.put(other.edits, ...)` is
-// packages/chord/test/next/documents/transaction.test.ts:419, Tx.Put.
+// packages/chord/test/documents/transaction.test.ts:416; `tx.put(other.edits, ...)` is
+// packages/chord/test/documents/transaction.test.ts:419, Tx.Put.
 func TestTablesInATransactionRefuseAnotherObjectsTable(t *testing.T) {
 	s := storedOn(t, nil, false, nil)
 	other := storedOn(t, nil, false, nil)
@@ -1208,8 +1235,8 @@ func TestPersistedDocumentsInATransactionCommitPersistedAndInMemoryDocumentsInOn
 
 // TestPersistedDocumentsInATransactionAKeyedRetirementTakes6asStatementsTheCountedDeleteTheRevisionsLastSeq runs
 // `it("a keyed retirement takes 6a's statements: the counted DELETE, the revisions, lastSeq (cost guard)")` of
-// packages/chord/test/next/documents/transaction.test.ts:536; `tx.retire(k, "a")` is
-// packages/chord/test/next/documents/transaction.test.ts:544, Tx.Retire.
+// packages/chord/test/documents/transaction.test.ts:536; `tx.retire(k, "a")` is
+// packages/chord/test/documents/transaction.test.ts:544, Tx.Retire.
 func TestPersistedDocumentsInATransactionAKeyedRetirementTakes6asStatementsTheCountedDeleteTheRevisionsLastSeq(t *testing.T) {
 	meter := nexttest.Metered(t)
 	s := storedOn(t, nil, true, nil)
@@ -1234,8 +1261,8 @@ func TestPersistedDocumentsInATransactionAKeyedRetirementTakes6asStatementsTheCo
 
 // TestPersistedDocumentsInATransactionAssignTheCreatedDocumentsIdsByTheirOrderInTheCommitRetireAndRecreateInOneCommit
 // runs `it("assign the created documents' ids by their order in the commit; retire and recreate in one commit")` of
-// packages/chord/test/next/documents/transaction.test.ts:552; `tx.retire(k, "b")` is
-// packages/chord/test/next/documents/transaction.test.ts:559, Tx.Retire.
+// packages/chord/test/documents/transaction.test.ts:552; `tx.retire(k, "b")` is
+// packages/chord/test/documents/transaction.test.ts:559, Tx.Retire.
 func TestPersistedDocumentsInATransactionAssignTheCreatedDocumentsIdsByTheirOrderInTheCommitRetireAndRecreateInOneCommit(t *testing.T) {
 	s := storedOn(t, nil, true, nil)
 	k := s.k[0]
@@ -1448,3 +1475,28 @@ func TestPersistedDocumentsInATransactionAHostClosingWhileAnAdmittedCommitIsInTh
 // stays usable" needs the host's `serve` of a method handler, `closeTimeout` and its `drain_timeout` report
 // (`errors.map(kind)`), and the host's release of a handler's stuck call at the object's end. The documents'
 // half of it (an admitted commit holds the line past the seal and adopts) is the previous test.
+
+// Only the revoked overlay is the transaction's error: any other panic of the callback is the caller's own and goes on, an
+// error value or a runtime error among them, and the line is free after it.
+func TestATransactionReturnsOnlyTheRevokedOverlayPanicOfItsCallbackAnyOtherPanicGoesOn(t *testing.T) {
+	s := newSealable(t)
+	var nilMap map[string]int
+	for name, throw := range map[string]func(){
+		"an error":        func() { panic(errors.New("a bug")) },
+		"a runtime error": func() { nilMap["k"] = 1 },
+		"a string":        func() { panic("boom") },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("%s: the panic did not go on", name)
+				}
+			}()
+			_, err := s.attempts[0].Tx(func(Tx) (any, error) { throw(); return nil, nil }, background)
+			t.Errorf("%s: Tx returned %v", name, err)
+		}()
+		if _, err := s.attempts[0].Tx(func(Tx) (any, error) { return nil, nil }, background); err != nil {
+			t.Fatalf("%s: the line is not free after the panic: %v", name, err)
+		}
+	}
+}

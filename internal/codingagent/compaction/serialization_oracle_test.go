@@ -70,15 +70,16 @@ emit(mod.serializeConversation(input.map((m) => (m.role === "assistant" ? { ...m
 	}
 }
 
-// A tool result is cut at 2000 UTF-16 units, so a cut inside an emoji keeps the high surrogate as JavaScript's slice does.
-func TestSerializeConversationKeepsASurrogateHalfAtTheCut(t *testing.T) {
+// A tool result is cut at 2000 UTF-16 units, so a cut inside an emoji drops the whole pair.
+func TestSerializeConversationDropsASurrogatePairAtTheCut(t *testing.T) {
+	// Pi's sliceHead keeps the pair whole, so the cut after 2000 units drops the emoji that straddles it; the count still says 1.
 	text := "x" + strings.Repeat("😀", 1000) // 2001 units
 	units := jsstring.ToUTF16(SerializeConversation([]ai.Message{oracleToolResult(text)}))
 	prefix := len(jsstring.ToUTF16("[Tool result]: "))
-	if got := units[prefix+1999]; got != 0xD83D {
-		t.Fatalf("last kept unit = %#x, want the high surrogate 0xd83d", got)
+	if got := units[prefix+1998]; got != 0xDE00 {
+		t.Fatalf("last kept unit = %#x, want the low surrogate 0xde00 of a whole pair", got)
 	}
-	if tail := string(jsstring.FromUTF16(units[prefix+2000:])); tail != "\n\n[... 1 more characters truncated]" {
+	if tail := string(jsstring.FromUTF16(units[prefix+1999:])); tail != "\n\n[... 1 more characters truncated]" {
 		t.Fatalf("marker = %q", tail)
 	}
 }

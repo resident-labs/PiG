@@ -12,6 +12,13 @@ var azureContextWindowOverrides = map[string]float64{
 	"gpt-5.6-luna":  1050000,
 	"gpt-5.6-sol":   1050000,
 	"gpt-5.6-terra": 1050000,
+	"gpt-6-astra":   1050000,
+	"gpt-6-luna":    1050000,
+	"gpt-6-sol":     1050000,
+	"gpt-6.1-sol":   1050000,
+	"gpt-6.1-terra": 1050000,
+	"gpt-6.2-astra": 1050000,
+	"gpt-6.2-sol":   1050000,
 }
 
 // Azure resells DeepSeek at its own rates. US data zone, checked 2026-09-16.
@@ -20,14 +27,13 @@ func azureDeepseekV4ProCost() *Obj {
 	return O("input", 1.925, "output", 3.828, "cacheRead", 0.165, "cacheWrite", 0)
 }
 
-// azureOpenAIModels are OpenAI models as Azure deploys them. Azure bills without OpenAI's long-context tier.
+// azureOpenAIModels are OpenAI models as Azure deploys them, including OpenAI's long-context price tier above 272K input tokens.
 func azureOpenAIModels(models []ChatModel) []ChatModel {
 	out := []ChatModel{}
 	for _, model := range models {
 		if model.Str("api") != "openai-responses" {
 			continue
 		}
-		cost := model.Object("cost")
 		window, ok := azureContextWindowOverrides[model.Str("id")]
 		if !ok {
 			window = model.Num("contextWindow")
@@ -36,12 +42,6 @@ func azureOpenAIModels(models []ChatModel) []ChatModel {
 			Set("api", "azure-openai-responses").
 			Set("provider", "azure").
 			Set("baseUrl", "").
-			Set("cost", O(
-				"input", cost.Num("input"),
-				"output", cost.Num("output"),
-				"cacheRead", cost.Num("cacheRead"),
-				"cacheWrite", cost.Num("cacheWrite"),
-			)).
 			Set("contextWindow", window))
 	}
 	return out
@@ -75,10 +75,9 @@ func azure() ProviderDefinition {
 		Finalize: func(model ChatModel, _ *ProviderContext) {
 			EnableOpenAIGrammarTools(model)
 			if model.Str("api") == "openai-completions" {
-				// Azure 400s on DeepSeek's `thinking` field and on every prompt cache parameter, discards a
-				// `developer` system message unbilled once reasoning_effort is set, and honours mid-convo ones (#9645).
+				// Azure 400s on DeepSeek's `thinking` field and on every prompt cache parameter, and honours
+				// mid-convo system messages (#9645).
 				MergeCompat(model, O(
-					"supportsDeveloperRole", false,
 					"supportsMidConvoSystemMessages", true,
 					"thinkingFormat", "openai",
 					"supportsLongCacheRetention", false,

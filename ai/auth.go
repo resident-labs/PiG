@@ -206,7 +206,7 @@ type AuthStorage struct {
 	read *authReadState
 }
 
-// NewAuthStorage opens the credential store and materializes a missing auth.json as {} with mode 0600. The parent directory uses mode 0700. Existing bytes and permissions remain unchanged; a failed initial load preserves the last valid snapshot. Instances of the first auth path share that snapshot.
+// NewAuthStorage opens the credential store and materializes a missing auth.json as {} with mode 0600. The parent directory uses mode 0700. Existing bytes and permissions remain unchanged; a failed initial load preserves the last valid snapshot. Instances of the first auth path share that snapshot. A directory that cannot be made is not an error here: AuthStorage.create's constructor ends in reload(), which keeps the last snapshot for every error of the lock that makes the directory (auth-storage.ts:68,99,379-392), so the store opens empty and the first write, which makes the directory again, returns Node's mkdir error.
 func NewAuthStorage(path string) (*AuthStorage, error) {
 	if path == "" {
 		return nil, errors.New("auth: empty path")
@@ -214,10 +214,6 @@ func NewAuthStorage(path string) (*AuthStorage, error) {
 	// AuthStorage.create (auth-storage.ts:348) opens normalizePath(authPath): `~` and `~/x` expand to the home directory and a file:// URL becomes its path.
 	path, err := resolvepath.Normalize(path)
 	if err != nil {
-		return nil, err
-	}
-	dir := nodepath.Dirname(path)
-	if err := nodeerrno.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	store := &AuthStorage{path: path, read: authReadStateForPath(path)}
@@ -251,7 +247,16 @@ func cloneAuthCredentials(creds map[string]Credential) map[string]Credential {
 
 // credential returns one provider's stored credential from the latest snapshot.
 func (a *AuthStorage) credential(provider string) (Credential, bool, error) {
-	creds, err := a.readLatest(context.Background())
+	return a.credentialIn(context.Background(), provider)
+}
+
+// credentialIn is credential with its read made in ctx's operation. It does not end with ctx.
+func (a *AuthStorage) credentialIn(ctx context.Context, provider string) (Credential, bool, error) {
+	// A context with Done() == nil can never end, so the wrapper changes nothing for it: only one that can end needs it (an allocation, and a second on every Value lookup). A custom context with Done() == nil and a non-nil Err or a Deadline is not one the product makes.
+	if ctx.Done() != nil {
+		ctx = context.WithoutCancel(ctx)
+	}
+	creds, err := a.readLatest(ctx)
 	if err != nil {
 		return Credential{}, false, err
 	}
@@ -464,6 +469,7 @@ func (a *AuthStorage) writeLocked(creds *authStorageData, lock *pilock.Lock) err
 		return err
 	}
 	// Pi applies the mode only at creation and rewrites in place: the replacement keeps the mode, a symlink and, on Windows, the DACL, and never leaves a truncated file behind.
+	// pig divergence (D651): replaced through a private temporary file and a rename, in place where that is refused; Pi writes the file in place.
 	if err := writeAuthFile(a.path, data, 0o600); err != nil {
 		return nodeerrno.FromPathError(err)
 	}
@@ -487,8 +493,8 @@ func (a *AuthStorage) ensureFileExists() error {
 	if pathExists(a.path) {
 		return nil
 	}
-	// Exclusive creation preserves existing bytes, modes, ACLs and symlinks, including when another process creates the file concurrently.
-	file, err := ownerfile.CreateNew(a.path)
+	// Exclusive creation preserves existing bytes, modes, ACLs and symlinks, including when another process creates the file concurrently. A symlink whose target is missing gets its target created, as Pi's writeFileSync does, because the lock follows the link to the real file.
+	file, err := createNewFollowingLinks(a.path, ownerfile.CreateNew)
 	if errors.Is(err, fs.ErrExist) {
 		return nil
 	}
@@ -512,7 +518,8 @@ func pathExists(path string) bool {
 var (
 	acquireAuthFileLock = pilock.Acquire
 	releaseAuthFileLock = (*pilock.Lock).Release
-	writeAuthFile       = atomicfile.WriteFile
+	// pig divergence (D651): replaced through a private temporary file and a rename, in place where that is refused; Pi writes the file in place.
+	writeAuthFile = atomicfile.WriteFile
 )
 
 // withFileLock serializes reads and writes with Pi's synchronous or cancellable auth lock contract. A failure to release the lock is ignored on the cancellable path, as withLockAsync ignores unlock errors (auth-storage.ts:191-198); on the synchronous path it replaces the result, as withLock's finally block rethrows it (auth-storage.ts:109-113).

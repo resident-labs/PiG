@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/MichaelKinsy/PiG/internal/atomicfile"
 	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
 
 	"github.com/MichaelKinsy/PiG/coding/extension"
@@ -18,6 +19,7 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
 	"github.com/MichaelKinsy/PiG/internal/orderedjson"
 	"github.com/MichaelKinsy/PiG/internal/text"
+	"github.com/MichaelKinsy/PiG/mcp"
 )
 
 // Ports packages/coding-agent/src/extensions/mcp/config.ts.
@@ -97,12 +99,6 @@ func isJSONObject(raw json.RawMessage) bool { return len(raw) > 0 && raw[0] == '
 // upstream: packages/coding-agent/src/extensions/mcp/config.ts:OVERRIDE_KEYS
 var overrideKeys = []string{"enabled", "exposure", "toolExposure"}
 
-// isOverride reports whether an entry overrides a server defined elsewhere
-// instead of defining one: it has no `command`, `url`, or `type` member.
-func isOverride(value *orderedjson.Object) bool {
-	return !value.Has("command") && !value.Has("url") && !value.Has("type")
-}
-
 func (s *configState) readFile(path, scope string) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -150,7 +146,7 @@ func (s *configState) readFile(path, scope string) {
 	for _, name := range servers.Keys() {
 		raw, _ := servers.Get(name)
 		if scope == "project" && isJSONObject(raw) {
-			if value, err := orderedjson.Parse(raw); err == nil && isOverride(value) {
+			if value, err := orderedjson.Parse(raw); err == nil && mcp.IsMcpServerOverride(value) {
 				s.readOverride(path, name, value)
 				continue
 			}
@@ -162,7 +158,7 @@ func (s *configState) readFile(path, scope string) {
 		}
 		// Names that differ only in `-` and `_` would share a namespace.
 		if clash := slices.IndexFunc(s.names, func(other string) bool {
-			return other != name && extension.McpNamespace(other) == extension.McpNamespace(name)
+			return other != name && mcp.McpNamespace(other) == mcp.McpNamespace(name)
 		}); clash >= 0 {
 			s.errors = append(s.errors, fmt.Sprintf(`%s: server "%s" conflicts with "%s"`, path, name, s.names[clash]))
 			continue
@@ -292,7 +288,7 @@ func UpdateMcpServerConfig(path, name string, patch McpServerConfigPatch, option
 		if server == nil {
 			return false, fmt.Errorf(`%s does not define MCP server "%s"`, path, name)
 		}
-		keepDefaults := isOverride(server)
+		keepDefaults := mcp.IsMcpServerOverride(server)
 		if patch.Enabled != nil {
 			if *patch.Enabled && !keepDefaults {
 				server.Delete("enabled")
@@ -342,11 +338,9 @@ func AddMcpServerConfigJSON(path, name string, config json.RawMessage) (bool, er
 		if servers == nil {
 			servers = orderedjson.New()
 		}
-		replaced = plainObjectDefines(servers, name)
-		// Assigning "__proto__" on a plain object sets its prototype instead of adding a member, so the file gets no such server.
-		if name != "__proto__" || servers.Has(name) {
-			servers.Set(name, config)
-		}
+		// pig divergence (D645): the servers are own entries, so a server named like an Object.prototype member (constructor, toString, __proto__) is added, replaced and written like any other; Pi's `target[name] !== undefined` on a plain object reports it replaced the first time, and its `target[name] = config` writes no server named __proto__.
+		replaced = servers.Has(name)
+		servers.Set(name, config)
 		serversRaw, _ := servers.MarshalJSON()
 		parsed.Set("mcpServers", serversRaw)
 		return true, nil
@@ -362,26 +356,15 @@ func RemoveMcpServerConfig(path, name string) (bool, error) {
 	}
 	removed := false
 	err := editMcpServers(path, func(servers, _ *orderedjson.Object) (bool, error) {
-		if servers == nil || !plainObjectDefines(servers, name) {
+		// pig divergence (D645): only a server the file defines is removed; Pi's `target[name] !== undefined` on a plain object also finds the members it inherits and reports a server named like one (constructor, hasOwnProperty, __proto__) removed when the file has none.
+		if servers == nil || !servers.Has(name) {
 			return false, nil
 		}
-		servers.Delete(name) // a name that is only inherited deletes nothing, but Pi counts it as removed and rewrites the file
+		servers.Delete(name)
 		removed = true
 		return true, nil
 	})
 	return removed, err
-}
-
-// objectPrototypeNames are the properties a plain JavaScript object inherits from Object.prototype.
-var objectPrototypeNames = map[string]bool{
-	"constructor": true, "__defineGetter__": true, "__defineSetter__": true, "hasOwnProperty": true, "__lookupGetter__": true, "__lookupSetter__": true,
-	"isPrototypeOf": true, "propertyIsEnumerable": true, "toString": true, "valueOf": true, "__proto__": true, "toLocaleString": true,
-}
-
-// plainObjectDefines is `servers[name] !== undefined` on the plain object Pi parses mcp.json into: an own member, or one inherited from
-// Object.prototype (a server named "constructor" or "__proto__" reads as already defined).
-func plainObjectDefines(servers *orderedjson.Object, name string) bool {
-	return servers.Has(name) || objectPrototypeNames[name]
 }
 
 var indentPattern = lazyregexp.New(`(?m)^([ \t]+)\S`)
@@ -446,7 +429,8 @@ func editMcpServers(path string, edit func(servers, parsed *orderedjson.Object) 
 	if err := os.MkdirAll(filepath.Dir(path), 0o777); err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, out.Bytes(), 0o666); err != nil {
+	// pig divergence (D651): replaced through a private temporary file and a rename, in place where that is refused; Pi writes the file in place.
+	if err := atomicfile.WriteFile(path, out.Bytes(), 0o666); err != nil {
 		return errors.New(tools.NodeFSError(err, "open", path))
 	}
 	return nil

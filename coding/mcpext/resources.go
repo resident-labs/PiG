@@ -12,6 +12,7 @@ import (
 
 	"github.com/MichaelKinsy/PiG/internal/jsstring/localecompare"
 	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
 
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
@@ -163,7 +164,7 @@ func jsonResult(tool, server string, payload json.RawMessage) (agent.AgentToolRe
 	if err != nil {
 		return agent.AgentToolResult{}, err
 	}
-	content, fullOutputPath := LimitMcpContent([]ai.ToolResultMessageContent{ai.TextContent{Text: string(payload)}}, nil)
+	content, fullOutputPath := limitMcpContent([]ai.ToolResultMessageContent{ai.TextContent{Text: string(payload)}}, SaveToTempFile)
 	return agent.AgentToolResult{
 		Content:           content,
 		Details:           McpToolDetails{Server: server, Tool: tool, FullOutputPath: fullOutputPath},
@@ -250,7 +251,7 @@ func CreateMcpResourceToolDefinitions(options ResourceToolsOptions) []extension.
 			return nil, "", errors.New("cursor can only be used when a server is specified")
 		}
 		servers := slices.Clone(options.Servers())
-		slices.SortFunc(servers, func(a, b McpResourceServer) int { return localecompare.Compare(a.Name(), b.Name()) })
+		sortx.Func(servers, func(a, b McpResourceServer) int { return localecompare.Compare(a.Name(), b.Name()) })
 		type outcome struct {
 			items []any
 			err   error
@@ -415,7 +416,7 @@ func CreateMcpResourceToolDefinitions(options ResourceToolsOptions) []extension.
 			if len(converted) == 0 {
 				converted = []ai.ToolResultMessageContent{ai.TextContent{Text: fmt.Sprintf("Resource %s is empty.", uri)}}
 			}
-			content, fullOutputPath := LimitMcpContent(converted, nil)
+			content, fullOutputPath := limitMcpContent(converted, SaveToTempFile)
 			contents := make([]json.RawMessage, 0, len(result.Contents))
 			for _, c := range result.Contents {
 				data, err := contentsWithoutMeta(c)

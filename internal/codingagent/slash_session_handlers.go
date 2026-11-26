@@ -374,20 +374,32 @@ func treeNavigateWithSummarize(sc *SlashContext, entryID string) error {
 	// no summary through the same result handling as a chosen "No summary".
 	skipPrompt := sc.SettingsManager != nil && sc.SettingsManager.GetBranchSummarySettings().SkipPrompt
 
+	// pig divergence (D270): the frames of the prompt's close are held.
+	// The frames of a dialog's close are held when its choice leads to the navigation, so the first frame after the choice is the fork
+	// point (navigateTree). Cancelling a dialog, or choosing the custom prompt, shows the next dialog or the tree at once.
+	holdFor := func(holds func(choice string) bool) {
+		if sc.HoldFramesOnChoice != nil {
+			sc.HoldFramesOnChoice(holds)
+		}
+	}
+	defer holdFor(nil)
 	// Loop until user makes a complete choice or cancels (Esc) to re-open tree.
 	// Mirrors upstream while(true) loop (interactive-mode.ts:5591-5615).
 	for !skipPrompt {
+		holdFor(func(choice string) bool { return choice != optCustomSummarize })
 		choice, ok := sc.ShowExtensionSelector("Summarize branch?", []string{
 			optNoSummary, optSummarize, optCustomSummarize,
 		})
 		if !ok {
 			// Esc from selector: re-open tree at same row.
 			// Mirrors upstream interactive-mode.ts:5601.
+			holdFor(nil)
 			return treeHandlerWithInitial(sc, entryID)
 		}
 		wantsSummary = choice != optNoSummary
 
 		if choice == optCustomSummarize {
+			holdFor(func(string) bool { return true })
 			instructions, ok := sc.ShowExtensionEditor("Custom summarization instructions", "")
 			if !ok {
 				// Esc from editor: loop back to selector.
@@ -720,6 +732,7 @@ func settingsHandlerTUI(sc *SlashContext, config SettingsConfig) error {
 		// applied reports a failed save and shows the row's saved value again; otherwise it applies the change's live effect. value is the row's value as the live effect reads it.
 		applied := func(id, value string, err error) bool {
 			if err != nil {
+				// pig divergence (D633): a failed save is reported here and its live effect is not applied; Pi's callbacks apply the effect and the failure shows only in the settings diagnostics (interactive-mode.ts:5154-5173).
 				showStatusOrAppend(sc, fmt.Sprintf("Failed to save settings: %v", err))
 				if fresh, freshErr := settingsConfig(sc); freshErr == nil {
 					for _, item := range NewSettingsSelectorComponent(fresh, SettingsCallbacks{}).GetSettingsList().Items() {
@@ -1077,11 +1090,21 @@ func importHandler(sc *SlashContext) error {
 	}
 	cancelled, err := sc.ImportSession(inputPath, "")
 	if missing, ok := errors.AsType[*MissingSessionCwdError](err); ok {
-		if !confirmSlash(sc, "Session cwd not found", FormatMissingSessionCwdPrompt(missing.Issue)) {
+		switch promptForMissingSessionCwd(sc, missing.Issue) {
+		case MissingSessionCwdContinue:
+			cancelled, err = sc.ImportSession(inputPath, missing.Issue.FallbackCwd)
+		case MissingSessionCwdFork:
+			// Pi switchToForkedSession(inputPath, fallbackCwd): the fork replaces the import, and shows its own status.
+			var status string
+			status, cancelled, err = sc.ForkSession(inputPath, missing.Issue.FallbackCwd)
+			if err == nil && !cancelled {
+				showStatusOrAppend(sc, status)
+				return nil
+			}
+		default:
 			showStatusOrAppend(sc, "Import cancelled")
 			return nil
 		}
-		cancelled, err = sc.ImportSession(inputPath, missing.Issue.FallbackCwd)
 	}
 	if notFound, ok := errors.AsType[*SessionImportFileNotFoundError](err); ok {
 		return fmt.Errorf("Failed to import session: %w", notFound)
@@ -1098,6 +1121,25 @@ func importHandler(sc *SlashContext) error {
 	}
 	showStatusOrAppend(sc, "Session imported from: "+inputPath)
 	return nil
+}
+
+// promptForMissingSessionCwd is Pi's promptForMissingSessionCwd for a slash command: the choice, or "" when the selector was dismissed or Cancel was chosen.
+func promptForMissingSessionCwd(sc *SlashContext, issue SessionCwdIssue) MissingSessionCwdChoice {
+	options := GetMissingSessionCwdOptions(issue)
+	labels := make([]string, len(options))
+	for i, option := range options {
+		labels[i] = option.Label
+	}
+	label, ok := sc.ShowExtensionSelector(FormatMissingSessionCwdPrompt(issue), labels)
+	if !ok {
+		return ""
+	}
+	for _, option := range options {
+		if option.Label == label {
+			return option.Value
+		}
+	}
+	return ""
 }
 
 // confirmSlash asks a yes/no question as upstream showExtensionConfirm does:

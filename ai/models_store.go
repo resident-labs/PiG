@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -14,9 +15,11 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/MichaelKinsy/PiG/internal/atomicfile"
+	"github.com/MichaelKinsy/PiG/internal/jsonopts"
 	"github.com/MichaelKinsy/PiG/internal/jsonparse"
 	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
-
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/internal/nodeerrno"
 	"github.com/MichaelKinsy/PiG/internal/pilock"
 )
@@ -292,7 +295,10 @@ func (s *FileModelsStore) withLockRoot(ctx context.Context, fn func([]storedMode
 		}
 	}
 	if !pathExists(s.path) {
-		file, err := os.OpenFile(s.path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		// A symlink whose target is missing gets its target created, as Pi's writeFileSync does, because the lock follows the link to the real file.
+		file, err := createNewFollowingLinks(s.path, func(path string) (*os.File, error) {
+			return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		})
 		if err == nil {
 			_, writeErr := file.WriteString("{}")
 			closeErr := file.Close()
@@ -393,27 +399,27 @@ func parseStoredModels(data []byte) ([]storedModels, modelsRoot, error) {
 			return []storedModels{}, modelsRoot{kind: modelsRootScalar, scalar: string(canonical), scalarType: "number"}, nil
 		}
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+	decoder := jsontext.NewDecoder(bytes.NewReader(data), jsonopts.Parse)
+	if token, err := decoder.ReadToken(); err != nil || token.Kind() != '{' {
 		return nil, modelsRoot{}, fmt.Errorf("models store: parse: expected a JSON object")
 	}
 	var entries []storedModels
 	positions := make(map[string]int)
-	for decoder.More() {
-		key, err := decoder.Token()
+	for decoder.PeekKind() != '}' {
+		name, err := jsonopts.ReadName(decoder) // the JavaScript key: "\ud800" and "\ud801" stay two keys, as in JSON.parse
 		if err != nil {
 			return nil, modelsRoot{}, fmt.Errorf("models store: parse: %w", err)
 		}
-		var raw json.RawMessage
-		if err := decoder.Decode(&raw); err != nil {
+		rawValue, err := decoder.ReadValue()
+		if err != nil {
 			return nil, modelsRoot{}, fmt.Errorf("models store: parse: %w", err)
 		}
-		providerID := key.(string)
-		if index, exists := positions[providerID]; exists {
+		raw := json.RawMessage(bytes.Clone(rawValue))
+		if index, exists := positions[name]; exists {
 			entries[index].raw = raw
 		} else {
-			positions[providerID] = len(entries)
-			entries = append(entries, storedModels{providerID: providerID, raw: raw})
+			positions[name] = len(entries)
+			entries = append(entries, storedModels{providerID: jsonopts.ValidName(name), raw: raw})
 		}
 	}
 	return entries, modelsRoot{}, nil
@@ -460,7 +466,8 @@ func writeStoredModels(path string, entries []storedModels, root modelsRoot) err
 	if err := json.Indent(&indented, canonical, "", "  "); err != nil {
 		return fmt.Errorf("models store: encode: %w", err)
 	}
-	if err := os.WriteFile(path, indented.Bytes(), 0o600); err != nil {
+	// pig divergence (D651): replaced through a private temporary file and a rename, in place where that is refused; Pi writes the file in place.
+	if err := atomicfile.WriteFile(path, indented.Bytes(), 0o600); err != nil {
 		return nodeerrno.FromPathError(err)
 	}
 	return nil
@@ -514,7 +521,14 @@ func marshalStoreJSON(value any) ([]byte, error) {
 	if err := encoder.Encode(value); err != nil {
 		return nil, fmt.Errorf("models store: encode: %w", err)
 	}
-	return bytes.TrimSuffix(buffer.Bytes(), []byte("\n")), nil
+	encoded := bytes.TrimSuffix(buffer.Bytes(), []byte("\n"))
+	// encoding/json writes each byte of a lone UTF-16 surrogate as U+FFFD; JSON.stringify writes the unit as its escape.
+	if bytes.Contains(encoded, []byte("\xef\xbf\xbd")) {
+		if kept, err := jsstring.MarshalKeepingSurrogates(value); err == nil && jsstring.HasSurrogateEscape(kept) {
+			return kept, nil
+		}
+	}
+	return encoded, nil
 }
 
 // withSidecarLock holds the shared Pi directory lease, checks it once acquired as withLockAsync does (compromise, then abort), and hands fn the lease's compromise check, withLockAsync's throwIfCompromised. Like FileAuthStorageBackend.withLockAsync (auth-storage.ts:191-198), it ignores a failure to release the lease.

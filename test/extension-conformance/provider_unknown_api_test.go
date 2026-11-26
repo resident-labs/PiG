@@ -12,15 +12,9 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/extension/host/subprocess"
 )
 
-// providerUnknownAPICase is one SDK and load mode of the unregistered api row.
-type providerUnknownAPICase struct {
-	name, source  string
-	fused, packed bool
-}
-
 // providerUnknownAPIAnswer loads one fixture of a case, points the base URL of every provider it registers at a counting listener, and completes a request for the model of
 // provider. It returns the result and the number of requests the listener saw.
-func providerUnknownAPIAnswer(t *testing.T, tc providerUnknownAPICase, provider string) (*ai.AssistantMessage, int32) {
+func providerUnknownAPIAnswer(t *testing.T, tc providerCancelCase, provider string) (*ai.AssistantMessage, int32) {
 	t.Helper()
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -55,7 +49,7 @@ func providerUnknownAPIAnswer(t *testing.T, tc providerUnknownAPICase, provider 
 // text of Pi, "No API provider registered for api: <api>", and nothing is sent to its base URL (provider-composer.ts:605-606), whichever SDK registered it and however it is
 // loaded. A provider of the same extension that registers its own streamSimple for its api still runs its implementation.
 func TestExtensionProviderWithAnUnregisteredAPIIsRefusedAcrossSDKs(t *testing.T) {
-	cases := []providerUnknownAPICase{
+	cases := []providerCancelCase{
 		{name: "go-isolated", source: "testdata/provider-go"}, {name: "go-packed", source: "testdata/provider-go", packed: true},
 		{name: "python-isolated", source: "testdata/provider-python"}, {name: "python-packed", source: "testdata/provider-python", packed: true},
 		{name: "rust-isolated", source: "testdata/provider-rust"}, {name: "rust-packed", source: "testdata/provider-rust", packed: true},

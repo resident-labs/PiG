@@ -35,7 +35,7 @@ type RemoteOverlayOptions struct {
 	// component-framed with exactly upstream's showOverlay geometry.
 	Layout *OverlayLayout `json:"overlayOptions,omitempty"`
 	// Blocked mirrors upstream ui.custom()'s blocked option: while an inline component is visible the program status reports pi as
-	// blocked on it. An overlay ignores it.
+	// blocked on it; an overlay reports it until it ends, also while hidden.
 	Blocked *CustomBlocked `json:"blocked,omitempty"`
 }
 
@@ -164,6 +164,17 @@ type RemoteOverlayHandle interface {
 	Close(result any)
 }
 
+// RemoteOverlayRetirer is an optional [RemoteOverlayHandle] that can be taken off the screen without ending the call that opened it. Pi's reload removes the
+// extension overlays "the same way done() does, but leave the promises pending" (interactive-mode.ts:2592-2598 resetExtensionUI): the command that awaits ui.custom
+// stays awaiting. The host calls Retire on the overlays of a generation a reload replaced or removed while its process lives on; a handle that is not a retirer
+// stays as it is until the call ends or the extension's connection does. Safe to call from any goroutine, and more than once.
+//
+// pig-specific: no upstream equivalent.
+type RemoteOverlayRetirer interface {
+	RemoteOverlayHandle
+	Retire()
+}
+
 // RemoteOverlayHost is the callback surface the bridge provides so the
 // overlay can forward user input back to the remote producer.
 //
@@ -184,6 +195,20 @@ type RemoteOverlayFocusHost interface {
 	// OnFocus reports a change of the component's focus after it was mounted. Called from the goroutine that delivers its input,
 	// in order with it.
 	OnFocus(focused bool)
+}
+
+// RemoteOverlayInvalidateHost is an optional [RemoteOverlayHost] that tells the remote producer that the TUI was invalidated: Pi's
+// TUI.invalidate calls invalidate() on every mounted root and every overlay's component (tui.ts:951-954), so a component that keeps
+// rows until it is told builds them again after a theme change.
+//
+// pig-specific: Pi's component is in-process; a remote component learns of the invalidation through this callback.
+type RemoteOverlayInvalidateHost interface {
+	// OnInvalidate reports count invalidations (at least 1) the TUI made since the last report. Called from the goroutine that
+	// delivers the component's input, never from the TUI's owner loop, so a producer that does not read holds no frame. While a
+	// call waits for room on the producer's connection the owner loop keeps counting, and the next call carries that count: no
+	// invalidation is lost and at most one report per component is waiting. It returns when the report is queued, when ctx of the
+	// component ends, or when the connection closes.
+	OnInvalidate(count int)
 }
 
 // RemoteOverlayViewportHost is an optional [RemoteOverlayHost] that publishes the component's capturesViewportInput: Pi's optional

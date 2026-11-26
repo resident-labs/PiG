@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-// Pi 0.87.1 main.ts:782-826 collects extension, CLI-model, and API-key diagnostics before reporting them at 895-906. Scope warnings are printed during resolveModelScope (model-resolver.ts:372-381), even for metadata commands.
+// Pi main.ts createRuntime collects settings, extension, model scope, CLI-model and API-key diagnostics in that order, and main reports the initial runtime's diagnostics once, deduplicated. Pi bacd45b9c (#11973, #11264): the scope warnings are among them, after the extension diagnostics and before buildSessionOptions' diagnostics, where resolveModelScope used to print each one first, even for metadata commands; a repeated pattern is reported once.
 func TestStartupDiagnosticOrderMatchesPi(t *testing.T) {
 	clearAuthEnvForNoAuthTest(t)
 	binary := buildPigBinaryForSignalTest(t)
@@ -28,22 +28,30 @@ func TestStartupDiagnosticOrderMatchesPi(t *testing.T) {
 	apiError := "Error: --api-key requires a model to be specified via --model, --provider/--model, or --models\n"
 	for _, mode := range []string{"json", "rpc", "text"} {
 		for _, tc := range []struct {
-			name          string
-			args          []string
-			before, after string
+			name  string
+			args  []string
+			after string
+			// noModels says no model could be chosen, so the runtime's diagnostics end with the no-models warning (main.ts:917-918); a model chosen with a warning leaves none.
+			noModels bool
 		}{
-			{"extension only", nil, "", ""},
-			{"model error", []string{"--model", "missing-model-rv-rpc"}, "", modelError},
-			{"model warning", []string{"--model", "openai/unknown-rv-rpc"}, "", modelWarning},
-			{"api key error", []string{"--model", "missing-model-rv-rpc", "--api-key", "fixture"}, "", modelError + apiError},
-			{"scope and model", []string{"--models", "missing-scope-rv-rpc", "--model", "missing-model-rv-rpc"}, scopeWarning, modelError},
+			{"extension only", nil, "", true},
+			{"model error", []string{"--model", "missing-model-rv-rpc"}, modelError, true},
+			{"model warning", []string{"--model", "openai/unknown-rv-rpc"}, modelWarning, false},
+			{"api key error", []string{"--model", "missing-model-rv-rpc", "--api-key", "fixture"}, modelError + apiError, true},
+			{"scope and model", []string{"--models", "missing-scope-rv-rpc", "--model", "missing-model-rv-rpc"}, scopeWarning + modelError, true},
+			{"scope and model warning", []string{"--models", "missing-scope-rv-rpc", "--model", "openai/unknown-rv-rpc"}, scopeWarning + modelWarning, false},
+			{"repeated scope pattern", []string{"--models", "missing-scope-rv-rpc,missing-scope-rv-rpc"}, scopeWarning, true},
 		} {
 			t.Run(mode+"/"+tc.name, func(t *testing.T) {
 				args := append([]string{"--mode", mode, "-e", missing}, tc.args...)
 				run := runStartupDiagnosticProcess(t, binary, root, agentDir, args...)
-				want := tc.before + settingsWarning + extensionError + tc.after + "Hint: Start without extensions using \"pig -ne\".\n"
+				want := settingsWarning + extensionError + tc.after
+				if tc.noModels {
+					want += noModelsWarningCut
+				}
+				want += "Hint: Start without extensions using \"pig -ne\".\n"
 				var exit *exec.ExitError
-				if !errors.As(run.err, &exit) || exit.ExitCode() != 1 || run.stdout != "" || run.stderr != want {
+				if !errors.As(run.err, &exit) || exit.ExitCode() != 1 || run.stdout != "" || cutDocsRoot(run.stderr) != want {
 					t.Fatalf("exit=%v stdout=%q\nstderr=%q\nwant=%q", run.err, run.stdout, run.stderr, want)
 				}
 			})
@@ -61,8 +69,8 @@ func TestStartupDiagnosticOrderMatchesPi(t *testing.T) {
 	for _, metadata := range []string{"--help", "--list-models"} {
 		t.Run(metadata, func(t *testing.T) {
 			run := runStartupDiagnosticProcess(t, binary, root, agentDir, metadata, "--models", "missing-scope-rv-rpc", "--model", "missing-model-rv-rpc", "-e", missing)
-			// Pi 6dfb54678 main.ts reports startupDiagnostics, runtime diagnostics included, before the help text and the model listing.
-			if run.err != nil || run.stderr != scopeWarning+settingsWarning+extensionError+modelError || run.stdout == "" {
+			// Pi 6dfb54678 main.ts reports startupDiagnostics, runtime diagnostics included, before the help text and the model listing; c8c456c85c6e ends them with the no-models warning (main.ts:917-918, probed on Pi: --help and --list-models, exit 0).
+			if run.err != nil || cutDocsRoot(run.stderr) != settingsWarning+extensionError+scopeWarning+modelError+noModelsWarningCut || run.stdout == "" {
 				t.Fatalf("exit=%v stdout=%q stderr=%q", run.err, run.stdout, run.stderr)
 			}
 		})
@@ -83,14 +91,16 @@ func TestHeadlessNoModelOutputMatchesPi(t *testing.T) {
 					args = append(args, prompt)
 				}
 				run := runStartupDiagnosticProcess(t, binary, root, agentDir, args...)
-				wantError := ""
+				// Each PiG build stages its docs in its own bundle directory under docs (D22): the messages name that directory. A session also leaves the lease file beside it (bundle-<hash>.lease), which is no bundle.
+				bundles, globErr := filepath.Glob(filepath.Join(root, "pig", "docs", "bundle-????????????????"))
+				if globErr != nil || len(bundles) != 1 {
+					t.Fatalf("docs bundle directories = %v (%v), want exactly one", bundles, globErr)
+				}
+				guidance := "Use /login to log into a provider via OAuth or API key. See:\n  " + filepath.Join(bundles[0], "providers.md") + "\n  " + filepath.Join(bundles[0], "models.md") + "\n"
+				// Pi c8c456c85c6e (#12234): with no model main.ts:917-918 adds the "No models available" guidance to the runtime diagnostics as a warning (the agent keeps its placeholder model, agent.ts:57-97, so session.model is set), so every mode writes it to stderr once (measured on the oracle carrying the commit); a prompt then fails the key check as before.
+				wantError := "Warning: No models available. " + guidance
 				if prompt != "" {
-					// Each PiG build stages its docs in its own bundle directory under docs (D22): the message names that directory. A session also leaves the lease file beside it (bundle-<hash>.lease), which is no bundle.
-					bundles, globErr := filepath.Glob(filepath.Join(root, "pig", "docs", "bundle-????????????????"))
-					if globErr != nil || len(bundles) != 1 {
-						t.Fatalf("docs bundle directories = %v (%v), want exactly one", bundles, globErr)
-					}
-					wantError = "No API key found for the selected model.\n\nUse /login to log into a provider via OAuth or API key. See:\n  " + filepath.Join(bundles[0], "providers.md") + "\n  " + filepath.Join(bundles[0], "models.md") + "\n"
+					wantError += "No API key found for the selected model.\n\n" + guidance
 					var exit *exec.ExitError
 					if !errors.As(run.err, &exit) || exit.ExitCode() != 1 {
 						t.Fatalf("exit=%v, want 1", run.err)

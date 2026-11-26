@@ -10,6 +10,7 @@ import (
 	"github.com/MichaelKinsy/PiG/coding"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/testenv"
 )
 
 // benchReplacementBuilder returns the process-fixed builder print mode uses, configured with one Node extension, and the startup build.
@@ -58,6 +59,7 @@ func BenchmarkSessionReplacementCycle(b *testing.B) {
 	for _, extensions := range []int{1, 4} {
 		b.Run(map[int]string{1: "1ext", 4: "4ext"}[extensions], func(b *testing.B) {
 			builder, cwd, agentDir := benchReplacementBuilder(b, extensions)
+			testenv.PathOf(b, "node")
 			ctx := context.Background()
 			var rebuildTotal time.Duration
 			start := time.Now()
@@ -108,6 +110,7 @@ func BenchmarkSessionReplacementPhases(b *testing.B) {
 	for _, extensions := range []int{1, 4} {
 		b.Run(map[int]string{1: "1ext", 4: "4ext"}[extensions], func(b *testing.B) {
 			builder, cwd, _ := benchReplacementBuilder(b, extensions)
+			testenv.PathOf(b, "node")
 			ctx := context.Background()
 			manager, err := coding.NewInMemorySessionManager(cwd)
 			if err != nil {
@@ -143,10 +146,11 @@ func BenchmarkSessionReplacementPhases(b *testing.B) {
 	}
 }
 
-// The factory hands the build's diagnostics and model fallback message to the Runtime, which keeps them for the process as Pi's AgentSessionRuntime does (agent-session-runtime.ts apply).
-// Pi: packages/coding-agent/src/core/agent-session-runtime.ts:109 (Runtime.diagnostics); packages/coding-agent/src/core/agent-session-runtime.ts:113 (Runtime.modelFallbackMessage).
+// The factory hands the build's diagnostics to the Runtime, which keeps them for the process as Pi's AgentSessionRuntime does (agent-session-runtime.ts apply); a model fallback is one more warning in them (Pi c8c456c85c6e, main.ts createRuntime), and the option message stays only for the no-model guidance.
+// Pi: packages/coding-agent/src/main.ts:917-918 (the fallback warning pushed into the diagnostics); packages/coding-agent/src/core/agent-session-runtime.ts:109 (Runtime.diagnostics); packages/coding-agent/src/core/agent-session-runtime.ts:113 (Runtime.modelFallbackMessage).
 func TestSessionFactoryCarriesDiagnosticsAndModelFallbackToTheRuntime(t *testing.T) {
-	builder, cwd, agentDir := benchReplacementBuilder(t, 1)
+	// The subject, the diagnostics and the model fallback, needs no extension; one would add its own load diagnostic in a build that strips the Node extensions.
+	builder, cwd, agentDir := benchReplacementBuilder(t, 0)
 	ctx := context.Background()
 	build, err := builder.buildResources(ctx, cliBuildInput{CWD: cwd})
 	if err != nil {
@@ -159,9 +163,10 @@ func TestSessionFactoryCarriesDiagnosticsAndModelFallbackToTheRuntime(t *testing
 	if err := builder.buildSession(ctx, build, cliBuildInput{CWD: cwd, Manager: manager}); err != nil {
 		t.Fatal(err)
 	}
+	// The build holds a startup warning and the message of a fallback to another model; its host's inputs carry both as the diagnostics.
+	build.StartupDiagnostics = []codingagent.AgentSessionRuntimeDiagnostic{{Type: "warning", Message: "startup warning"}}
+	build.ModelFallbackMessage = "Could not restore model a/b. Using c/d"
 	inputs := builder.printHost(ctx, build, &printStartup{Manager: manager}).inputs()
-	inputs.Diagnostics = []codingagent.AgentSessionRuntimeDiagnostic{{Type: "warning", Message: "startup warning"}}
-	inputs.ModelFallbackMessage = "Could not restore model a/b. Using c/d"
 	factory := newCLISessionFactory(ctx, inputs, struct{}{}, nil)
 	defer factory.Close()
 	rt, err := coding.CreateAgentSessionRuntime(ctx, factory.Factory(), coding.CreateAgentSessionRuntimeOptions{CWD: cwd, AgentDir: agentDir, SessionManager: manager})
@@ -169,7 +174,7 @@ func TestSessionFactoryCarriesDiagnosticsAndModelFallbackToTheRuntime(t *testing
 		t.Fatal(err)
 	}
 	defer func() { _ = rt.Close() }()
-	if got := rt.Diagnostics(); len(got) != 1 || got[0].Message != "startup warning" {
+	if got := rt.Diagnostics(); len(got) != 2 || got[0].Message != "startup warning" || got[1].Type != "warning" || got[1].Message != "Could not restore model a/b. Using c/d" {
 		t.Fatalf("diagnostics=%v", got)
 	}
 	if got := rt.ModelFallbackMessage(); got != "Could not restore model a/b. Using c/d" {

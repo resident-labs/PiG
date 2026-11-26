@@ -46,6 +46,17 @@ func Allowed(h []AgentMessage) []AgentMessage {
 	return slices.Clone(h)
 }
 
+func Sorts(s []AgentMessage) {
+	slices.SortFunc(s, func(a, b AgentMessage) int { return a.A - b.A })
+	slices.SortStableFunc(s, func(a, b AgentMessage) int { return a.A - b.A })
+	_ = slices.SortedFunc(slices.Values(s), func(a, b AgentMessage) int { return a.A - b.A })
+	_ = slices.SortedStableFunc(slices.Values(s), func(a, b AgentMessage) int { return a.A - b.A })
+	_ = slices.Sorted(slices.Values([]int{2, 1}))
+	slices.Sort([]int{2, 1})
+	//perf:ok a timed listing, n up to thousands
+	slices.SortFunc(s, func(a, b AgentMessage) int { return a.A - b.A })
+}
+
 func Env() (string, error) {
 	_, err := os.Stat("x")
 	return os.Getenv("X"), err

@@ -18,6 +18,7 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/extension/installresolver"
 	sourceref "github.com/MichaelKinsy/PiG/coding/source"
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/noderealpath"
 	"github.com/MichaelKinsy/PiG/internal/nodeurl"
 	"github.com/MichaelKinsy/PiG/internal/resolvepath"
 )
@@ -78,8 +79,7 @@ func InstallPackageArtifacts(cwd, agentDir string, sm *codingagent.SettingsManag
 		case "npm":
 			return InstallManagedNPM(cwd, agentDir, sm, pkg.Source, local, opts...)
 		case "git":
-			gitOpts := append([]InstallOption{WithProgressReporter(progress)}, opts...)
-			return InstallManagedGit(cwd, agentDir, sm, pkg.Source, local, gitOpts...)
+			return InstallManagedGit(cwd, agentDir, sm, pkg.Source, local, append([]InstallOption{WithProgressReporter(progress)}, opts...)...)
 		default:
 			return fmt.Errorf("unsupported package source: %s", pkg.Source)
 		}
@@ -390,7 +390,7 @@ func InstallManagedNPM(cwd, agentDir string, sm *codingagent.SettingsManager, so
 		return err
 	}
 	args = append(args, NpmInstallArgs(manager, ref.Locator, realRoot, ref.NPMRegistry, opts...)...)
-	return RunPackageProcessContext(resolveInstallOptions(opts).ctx, "", command[0], args...)
+	return runInstallProcess(opts, "", command[0], args...)
 }
 
 // RealInstallRoot is the install root npm gets as --prefix: its real path when it exists, itself otherwise (package-manager.ts
@@ -400,7 +400,7 @@ func RealInstallRoot(root string) (string, error) {
 	if _, err := os.Stat(root); err != nil {
 		return root, nil
 	}
-	return codingagent.RealPathSync(root)
+	return noderealpath.Sync(root)
 }
 
 func NpmInstallArgs(manager, spec, installRoot, registry string, opts ...InstallOption) []string {
@@ -487,7 +487,7 @@ func InstallGitCheckout(sm *codingagent.SettingsManager, ref sourceref.Ref, chec
 		}
 		target := GitUpdateTarget{ref: "FETCH_HEAD", fetchArgs: []string{"fetch", "origin", ref.GitRef}}
 		if ref.GitRef == "" {
-			target, err = GetLocalGitUpdateTarget(checkout)
+			target, err = GetLocalGitUpdateTarget(checkout, opts...)
 			if err != nil {
 				return err
 			}
@@ -516,11 +516,11 @@ func InstallGitCheckout(sm *codingagent.SettingsManager, ref sourceref.Ref, chec
 	if !strings.Contains(repo, "://") && !strings.HasPrefix(repo, "git@") {
 		repo = "https://" + repo
 	}
-	if err := RunPackageProcessContext(resolveInstallOptions(opts).ctx, "", "git", "clone", GitCloneRepo(runtime.GOOS, repo), checkout); err != nil {
+	if err := runInstallProcess(opts, "", "git", "clone", GitCloneRepo(runtime.GOOS, repo), checkout); err != nil {
 		return err
 	}
 	if ref.GitRef != "" {
-		if err := RunPackageProcessContext(resolveInstallOptions(opts).ctx, checkout, "git", "checkout", ref.GitRef); err != nil {
+		if err := runInstallProcess(opts, checkout, "git", "checkout", ref.GitRef); err != nil {
 			return err
 		}
 	}

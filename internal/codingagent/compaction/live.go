@@ -3,6 +3,7 @@ package compaction
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"time"
 
@@ -92,8 +93,9 @@ func CompactLive(ctx context.Context, prep CompactionPreparation, request LiveRe
 	}, nil
 }
 
-func summarizeLive(ctx context.Context, request LiveRequest, prompt string, retry *ai.RetryPolicy, callbacks ai.RetryCallbacks) (string, *ai.Usage, error) {
+func summarizeLive(ctx context.Context, request LiveRequest, basePrompt string, retry *ai.RetryPolicy, callbacks ai.RetryCallbacks) (string, *ai.Usage, error) {
 	messages := request.Messages
+	prompt := basePrompt
 	nudged := false
 	for {
 		text, usage, err := completeSimpleWithRetries(ctx, retry, callbacks, func() (string, *ai.Usage, error) {
@@ -102,7 +104,7 @@ func summarizeLive(ctx context.Context, request LiveRequest, prompt string, retr
 		switch {
 		case errors.Is(err, ErrSummarizationToolCall) && !nudged:
 			nudged = true
-			prompt += liveToolCallNudge
+			prompt = basePrompt + liveToolCallNudge
 		case err != nil && isOverflow(err):
 			trimmed := dropOldest(messages)
 			if len(trimmed) == len(messages) {
@@ -121,8 +123,9 @@ func isOverflow(err error) bool {
 
 func sendLive(ctx context.Context, request LiveRequest, messages []ai.Message, prompt string) (string, *ai.Usage, error) {
 	ask := ai.UserMessage{Content: ai.UserContentBlocks{ai.TextContent{Text: prompt}}, Timestamp: time.Now().UnixMilli()}
-	full := append(messages[:len(messages):len(messages)], ask)
-	message := request.Stream(ctx, request.Model, ai.Context{Messages: full}, request.Options).Result()
+	messages = slices.Clip(messages)
+	messages = append(messages, ask)
+	message := resultWithProgress(ctx, request.Stream(ctx, request.Model, ai.Context{Messages: messages}, request.Options))
 	if ctx.Err() != nil {
 		return "", nil, ctx.Err()
 	}

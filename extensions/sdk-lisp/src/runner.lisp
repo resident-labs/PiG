@@ -54,7 +54,7 @@ The standalone entry point: (pig:run-extension (new-extension)) in an executable
         (if previous (sb-posix:setenv "PIG_EXT_SOCKET" previous 1) (sb-posix:unsetenv "PIG_EXT_SOCKET"))))))
 
 (defun report-member-failure (member condition socket)
-  (format *error-output* "~A: ~A~%" (car member) (condition-message condition))
+  (format *error-output* "extension \"~A\" load failed: ~A~%" (car member) (condition-message condition))
   (finish-output *error-output*)
   (when (and socket (plusp (length socket)))
     (unless (helper-drop-conn socket) (ignore-errors (conn-close (connect-unix socket))))))
@@ -80,6 +80,7 @@ generations on the host's control lines, and exit once none is live (unless the 
                                (unless (and socket (plusp (length socket)))
                                  (error "~A not set for ~A" (socket-env-name (car member)) (car member)))
                                (let ((ext (build-member member socket)))
+                                 (unless ext (error "factory returned nil"))
                                  (latch-set built)
                                  (unless (serve ext (helper-take-conn socket))
                                    (setf failed t)
@@ -123,13 +124,20 @@ generations on the host's control lines, and exit once none is live (unless the 
       (finish-output *error-output*)
       (sb-ext:exit :code (if failed 1 0) :abort t))))
 
+(defun load-standalone (file)
+  "Load the standalone FILE as `sbcl --script` would: an executable script's #! line is skipped, which LOAD alone cannot read."
+  (with-open-file (in file :external-format :utf-8)
+    (let ((first (read-line in nil "")))
+      (unless (and (>= (length first) 2) (string= "#!" first :end2 2)) (file-position in 0)))
+    (load in)))
+
 (defun image-main ()
   "The toplevel of every generated image: baked members when there are any, else the standalone loader
 (`image main.lisp`, which loads the file and exits when the extension stops)."
   (cond (*members* (runner-main))
         (t (let ((file (second sb-ext:*posix-argv*)))
              (unless file (format *error-output* "pig image: no extension file given~%") (sb-ext:exit :code 2 :abort t))
-             (handler-case (progn (load file) (finish-output) (sb-ext:exit :code 0 :abort t))
+             (handler-case (progn (load-standalone file) (finish-output) (sb-ext:exit :code 0 :abort t))
                (serious-condition (c)
                  (format *error-output* "~A: ~A~%" file (condition-message c))
                  (finish-output *error-output*)

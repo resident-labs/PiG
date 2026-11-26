@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/MichaelKinsy/PiG/ai"
@@ -74,7 +75,7 @@ func TestModelsProviderIsDormantUntilConfigured(t *testing.T) {
 	clearLlamaEnv(t)
 	models, _, _ := newTestModels(t, t.TempDir())
 	provider := models.GetProvider(LlamaProviderID)
-	if provider == nil || provider.Name != "llama.cpp" || provider.BaseURL != "http://127.0.0.1:8080/v1" || provider.Auth.APIKey == nil {
+	if provider == nil || provider.Name != "llama.cpp" || provider.BaseURL != "http://127.0.0.1:9931/v1" || provider.Auth.APIKey == nil {
 		t.Fatalf("provider = %+v", provider)
 	}
 	if result, err := models.GetAuth(context.Background(), LlamaProviderID); err != nil || result != nil {
@@ -131,8 +132,8 @@ func TestModelsProviderRefreshReportsNetworkErrorsAndAbortedCallers(t *testing.T
 	models, _, _ := newTestModels(t, t.TempDir())
 	allow := true
 	result := models.Refresh(context.Background(), ai.ModelsRefreshOptions{Providers: []string{LlamaProviderID}, AllowNetwork: &allow})
-	if err := result.Errors[LlamaProviderID]; err == nil || err.Error() != "fetch failed" {
-		t.Fatalf("refresh = %+v, want fetch failed", result)
+	if err := result.Errors[LlamaProviderID]; err == nil || !strings.HasPrefix(err.Error(), "Could not reach llama.cpp server at "+closedURL+": ") {
+		t.Fatalf("refresh = %+v, want the server named (Pi ea0f49a36)", result)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

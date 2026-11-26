@@ -21,11 +21,18 @@ type repaintRecorder struct {
 func (r *repaintRecorder) Invalidate()           { r.calls = append(r.calls, "invalidate") }
 func (r *repaintRecorder) RequestRender(...bool) { r.calls = append(r.calls, "requestRender") }
 
-// Pi's init loads the remaining grammars off the event loop after the startup frame; its continuation, back on the loop, invalidates and requests a render unless the mode has stopped (interactive-mode.ts:init).
+// Pi's init loads the remaining grammars off the event loop after the startup frame; its continuation, back on the loop, returns if the mode is not initialized, then calls ui.invalidate() and ui.requestRender(), in that order (interactive-mode.ts:1163-1167, `loadAllHighlightLanguages().then(...)`). Both calls are asserted: a load that drops either one fails. The grammar load runs once per process, so each test runs in a process of its own.
 func TestLoadRemainingHighlightLanguagesRepaintsOnTheOwnerLoop(t *testing.T) {
+	if !testenv.InOwnProcess(t) {
+		return
+	}
 	ctx := t.Context()
 	renderer := &repaintRecorder{}
 	m := &InteractiveMode{tuiInst: renderer, uiTaskCh: make(chan func(), 1), backgroundCtx: ctx}
+	// A code block drawn before the load asked for a language only the load registers.
+	if tui.SupportsLanguage("ada") {
+		t.Fatal("ada is registered before the load; the test needs a language only the load adds")
+	}
 	m.loadRemainingHighlightLanguages()
 
 	var task func()
@@ -48,10 +55,14 @@ func TestLoadRemainingHighlightLanguagesRepaintsOnTheOwnerLoop(t *testing.T) {
 }
 
 func TestLoadRemainingHighlightLanguagesSkipsTheRepaintAfterStop(t *testing.T) {
+	if !testenv.InOwnProcess(t) {
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	renderer := &repaintRecorder{}
 	m := &InteractiveMode{tuiInst: renderer, uiTaskCh: make(chan func()), backgroundCtx: ctx}
+	tui.SupportsLanguage("ada") // an earlier lookup the load changes: a running mode would repaint
 	m.loadRemainingHighlightLanguages()
 	m.backgroundTasks.Wait()
 	select {

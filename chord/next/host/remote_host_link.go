@@ -10,7 +10,7 @@ import (
 	"github.com/MichaelKinsy/PiG/chord/next/link"
 )
 
-// Ports packages/chord/src/next/remote/host-link.ts. One link of a host (§3, §22): its channel, its role, the peer's
+// Ports packages/chord/src/remote/host-link.ts. One link of a host (§3, §22): its channel, its role, the peer's
 // principal, its limits per part, and both sides: a provider side per origin (holds and calls the peer sent, its own or a
 // relay's for one of its downstream links) and the consumer side (holds and calls this host sent). Message kinds are
 // directional, so each goes to its side; a revocation is honoured from the parent only. Parts are made and opened here,
@@ -35,10 +35,9 @@ type hostLinkOptions struct {
 	trusted bool
 	codec   link.Codec
 	limits  link.Limits
+	// opened is a route's `opened` (`RouteOptions.resolve`): the peer's incarnation once its `hello` arrived.
+	opened func(incarnation string)
 }
-
-// linkCalls is how many concurrent calls a host accepts on each of its links, announced in `hello`.
-const linkCalls = 256
 
 // inflatePart is a deflated part an owner admitted, with its decoded limit.
 type inflatePart struct {
@@ -59,6 +58,9 @@ type hostLink struct {
 	trusted bool
 	// limits are the limits per part of what arrives on this link (Q2).
 	limits link.Limits
+	// calls is how many concurrent calls of one origin this side accepts, announced in `hello`: 0 (none) on a link it was
+	// given as trusted, else the host's `callWindow` (decision "Call windows only for untrusted links").
+	calls int
 	// context is the parent of the work arriving on this link.
 	context  context.Context
 	consumer *consumerSide
@@ -67,6 +69,8 @@ type hostLink struct {
 	// only from relays").
 	providers orderedTable[int, *providerSide]
 	channel   *link.Channel
+	// opened is told the peer's incarnation first thing when its `hello` arrived; nil: none.
+	opened func(incarnation string)
 	// closing is cancelled when the link closes: stops its asynchronous inflates at once.
 	closing       context.Context
 	closingCancel func(cause error)
@@ -78,14 +82,17 @@ var _ link.ChannelHandler = (*hostLink)(nil)
 func newHostLink(host *chordHost, made link.Link, options hostLinkOptions, ctx context.Context) *hostLink {
 	l := &hostLink{
 		host: host, role: options.role, principal: options.principal, trusted: options.trusted, limits: options.limits,
-		context: ctx,
+		context: ctx, opened: options.opened,
+	}
+	if !options.trusted {
+		l.calls = host.callWindow
 	}
 	l.closing, l.closingCancel = chordctx.WithCancel(chordctx.Background())
 	l.consumer = newConsumerSide(l)
 	report := func(err error) { host.report(HostError{Kind: ErrProtocolError, Error: err}) }
 	channel, err := link.NewChannel(made, l, link.ChannelOptions{
-		Codec: options.codec, Incarnation: host.incarnation, Calls: linkCalls, Trusted: options.trusted, Report: report,
-		Now: host.loop().Now,
+		Codec: options.codec, Incarnation: host.incarnation, Calls: l.calls, Trusted: options.trusted, Report: report,
+		Now: host.loop().Now, Metrics: host.metrics,
 	}, ctx)
 	if err != nil {
 		// A `hello` the codec cannot write: nothing was started; the link is closed.
@@ -95,6 +102,7 @@ func newHostLink(host *chordHost, made link.Link, options hostLinkOptions, ctx c
 		return l
 	}
 	l.channel = channel
+	host.metrics.UpDownCounter("chord.links.open").Add(1, nil)
 	if taker, ok := made.(DeliveryAwaiter); ok {
 		taker.Taken(l.awaitDeliveries)
 	}
@@ -116,7 +124,11 @@ func (l *hostLink) send(message link.Message) {
 	if l.channel == nil {
 		return
 	}
-	if err := l.channel.Send(message); err != nil {
+	// A paced ending's send may block on the transport: a real wait, which pace does not wait for (Loop.sending).
+	sending := l.host.paceSend()
+	err := l.channel.Send(message)
+	l.host.paceSent(sending)
+	if err != nil {
 		l.host.report(HostError{Kind: ErrProtocolError, Error: err})
 	}
 }
@@ -127,16 +139,39 @@ func (l *hostLink) close() {
 	}
 }
 
+// fence runs then once everything the peer sent before it saw a `ping` sent now has arrived (see link.Channel.Fence). The
+// channel runs it on the link's delivery goroutine with no lock held: it enters a section of the host there, so then runs as
+// every handler of the link does. It returns what cancels the fence, to be called inside a section: a cancelled fence never
+// runs then, also when its `pong` was read already and its section is still waiting.
+func (l *hostLink) fence(then func()) (cancel func()) {
+	cancelled := false
+	cancelChannel := l.channel.Fence(func() {
+		l.host.loop().Run(func() {
+			if !cancelled {
+				then()
+			}
+		})
+	})
+	return func() {
+		cancelled = true
+		cancelChannel()
+	}
+}
+
 // tick is the heartbeat (see Channel.Tick).
-func (l *hostLink) tick(now int64, ping, close time.Duration) {
+func (l *hostLink) tick(now, paused int64, ping, close time.Duration) {
 	if l.channel != nil {
-		l.channel.Tick(now, ping.Milliseconds(), close.Milliseconds())
+		l.channel.Tick(now, paused, ping.Milliseconds(), close.Milliseconds())
 	}
 }
 
 // Opened implements link.ChannelHandler: the peer's `hello` arrived.
 func (l *hostLink) Opened() {
 	l.host.loop().Run(func() {
+		// First: whoever asked knows the peer before anything else it sent is handled, and before this host sends (host-link.ts `opened`).
+		if l.opened != nil {
+			l.opened(l.channel.Peer())
+		}
 		l.consumer.opened(l.channel.PeerCalls())
 		l.host.linkOpened(l)
 	})
@@ -200,6 +235,8 @@ func (l *hostLink) Message(message link.Message) (*link.Handling, error) {
 		}
 		handling, err = l.dispatch(message)
 	})
+	// Pi's microtask checkpoint before the next frame (Loop.pace): the reader reads on once no paced ending can run.
+	l.host.pace(l.closing)
 	return handling, err
 }
 
@@ -218,7 +255,7 @@ func (l *hostLink) dispatch(message link.Message) (*link.Handling, error) {
 			provider.closed()
 		}
 		l.providers.delete(m.Origin)
-	case *link.BoundMessage, *link.StateMessage, *link.FailedMessage, *link.LoadingMessage, *link.ResultMessage, *link.ErrorMessage, *link.GoneMessage:
+	case *link.BoundMessage, *link.StateMessage, *link.FailedMessage, *link.LoadingMessage, *link.ResultMessage, *link.ErrorMessage, *link.GoneMessage, *link.EventMessage:
 		return l.consumer.message(message.(link.ConsumerMessage))
 	case *link.RevokeMessage:
 		// Only the parent revokes; a child or a route cannot (race 6). JSON from the parent, the app's revocation type
@@ -250,6 +287,7 @@ func (l *hostLink) revokeUnbound(revoked func(principal data.Principal) bool, er
 // Closed implements link.ChannelHandler: the link closed, from either end.
 func (l *hostLink) Closed() {
 	l.host.loop().Run(func() {
+		l.host.metrics.UpDownCounter("chord.links.open").Add(-1, nil)
 		l.closingCancel(nil)
 		for _, provider := range l.providers.values() {
 			provider.closed()
@@ -268,7 +306,7 @@ func (l *hostLink) hold(message *link.HoldMessage) error {
 	}
 	provider, ok := l.providers.get(origin)
 	if !ok {
-		provider = newProviderSide(l, origin, linkCalls)
+		provider = newProviderSide(l, origin, l.calls)
 		l.providers.set(origin, provider)
 	}
 	_, err := provider.message(message)

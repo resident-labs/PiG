@@ -19,8 +19,8 @@ import (
 // Ports packages/coding-agent/test/mcp-oauth-refresh.test.ts ("MCP OAuth client ID metadata documents", #10302).
 
 var (
-	cimdSettings = mcpext.McpOAuthSettings{ClientRegistration: "cimd"}
-	dcrSettings  = mcpext.McpOAuthSettings{ClientRegistration: "dcr"}
+	cimdSettings = oauth.McpOAuthSettings{ClientRegistration: "cimd"}
+	dcrSettings  = oauth.McpOAuthSettings{ClientRegistration: "dcr"}
 )
 
 // piAppName is the APP_NAME of the pi these cases port: `auto` identifies with pi's documents only as that application.
@@ -28,7 +28,7 @@ const piAppName = "pi"
 
 type cimdHarness struct {
 	server  *oauthMcpServer
-	store   mcpext.McpOAuthServerStore
+	store   oauth.McpOAuthServerStore
 	appName string
 }
 
@@ -42,7 +42,7 @@ func startCimdServer(t *testing.T, options oauthMcpServerOptions) *cimdHarness {
 	return &cimdHarness{server: server, store: store, appName: piAppName}
 }
 
-func (h *cimdHarness) signIn(t *testing.T, settings mcpext.McpOAuthSettings, prompt mcpext.McpSignInPrompt) error {
+func (h *cimdHarness) signIn(t *testing.T, settings oauth.McpOAuthSettings, prompt mcpext.McpSignInPrompt) error {
 	t.Helper()
 	if prompt == nil {
 		prompt = followPrompt{}
@@ -78,11 +78,11 @@ func TestMCPOAuthCIMDRegistersDynamicallyWithDcrEvenWhenTheServerSupportsDocumen
 // #11426
 func TestMCPOAuthCIMDUsesPisDocumentWhenAuthorizationResponsesNameTheirIssuer(t *testing.T) {
 	h := startCimdServer(t, oauthMcpServerOptions{Cimd: true, IssParameter: true})
-	if err := h.signIn(t, mcpext.McpOAuthSettings{}, nil); err != nil {
+	if err := h.signIn(t, oauth.McpOAuthSettings{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	authorization := h.server.recordedAuthorizations()[0]
-	if got := authorization.Get("client_id"); got != "https://pi.dev/oauth/client.json" {
+	if got := authorization.Get("client_id"); got != "https://pi-in-go.dev/oauth/client.json" {
 		t.Fatalf("client_id = %q", got)
 	}
 	redirect, err := url.Parse(authorization.Get("redirect_uri"))
@@ -96,21 +96,21 @@ func TestMCPOAuthCIMDUsesPisDocumentWhenAuthorizationResponsesNameTheirIssuer(t 
 		t.Fatalf("registrations = %d", got)
 	}
 	tokens := h.server.recordedTokenRequests()
-	if tokens[0].Get("client_id") != "https://pi.dev/oauth/client.json" || tokens[0].Get("redirect_uri") != redirect.String() {
+	if tokens[0].Get("client_id") != "https://pi-in-go.dev/oauth/client.json" || tokens[0].Get("redirect_uri") != redirect.String() {
 		t.Fatalf("token request = %v", tokens[0])
 	}
 	// The document is not stored, so signing in again refreshes the tokens instead of discarding them.
 	if id, ok := h.storedClientID(t); ok {
 		t.Fatalf("stored client = %q", id)
 	}
-	if err := h.signIn(t, mcpext.McpOAuthSettings{}, nil); err != nil {
+	if err := h.signIn(t, oauth.McpOAuthSettings{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := len(h.server.recordedAuthorizations()); got != 1 {
 		t.Fatalf("authorizations = %d", got)
 	}
 	tokens = h.server.recordedTokenRequests()
-	if tokens[1].Get("grant_type") != "refresh_token" || tokens[1].Get("client_id") != "https://pi.dev/oauth/client.json" {
+	if tokens[1].Get("grant_type") != "refresh_token" || tokens[1].Get("client_id") != "https://pi-in-go.dev/oauth/client.json" {
 		t.Fatalf("second token request = %v", tokens[1])
 	}
 }
@@ -118,7 +118,7 @@ func TestMCPOAuthCIMDUsesPisDocumentWhenAuthorizationResponsesNameTheirIssuer(t 
 // #11426
 func TestMCPOAuthCIMDRegistersDynamicallyByDefaultWhenTheServerDoesNotSupportDocuments(t *testing.T) {
 	h := startCimdServer(t, oauthMcpServerOptions{IssParameter: true})
-	if err := h.signIn(t, mcpext.McpOAuthSettings{}, nil); err != nil {
+	if err := h.signIn(t, oauth.McpOAuthSettings{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := h.server.registrationCount(); got != 1 {
@@ -132,7 +132,7 @@ func TestMCPOAuthCIMDRegistersDynamicallyByDefaultWhenTheServerDoesNotSupportDoc
 // #11426
 func TestMCPOAuthCIMDRegistersDynamicallyByDefaultWithAClientName(t *testing.T) {
 	h := startCimdServer(t, oauthMcpServerOptions{Cimd: true, IssParameter: true})
-	if err := h.signIn(t, mcpext.McpOAuthSettings{ClientName: "Claude Code"}, nil); err != nil {
+	if err := h.signIn(t, oauth.McpOAuthSettings{ClientName: "Claude Code"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := h.server.registrationCount(); got != 1 {
@@ -148,7 +148,7 @@ func TestMCPOAuthCIMDRegistersDynamicallyByDefaultWithAClientName(t *testing.T) 
 func TestMCPOAuthCIMDRegistersDynamicallyByDefaultEvenWhenTheServerSupportsDocuments(t *testing.T) {
 	h := startCimdServer(t, oauthMcpServerOptions{Cimd: true, IssParameter: true})
 	h.appName = "pig"
-	if err := h.signIn(t, mcpext.McpOAuthSettings{}, nil); err != nil {
+	if err := h.signIn(t, oauth.McpOAuthSettings{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := h.server.registrationCount(); got != 1 {
@@ -162,7 +162,7 @@ func TestMCPOAuthCIMDKeepsARegisteredClientByDefault(t *testing.T) {
 	if err := h.signIn(t, dcrSettings, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.signIn(t, mcpext.McpOAuthSettings{}, nil); err != nil {
+	if err := h.signIn(t, oauth.McpOAuthSettings{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	// The registered client's tokens are refreshed instead of signing in with the document.
@@ -187,7 +187,7 @@ func TestMCPOAuthCIMDUsesADocumentAndCallbackPathSpecificToTheMCPServerWithoutTh
 	sum := sha256.Sum256([]byte(h.server.URL))
 	id := base64.RawURLEncoding.EncodeToString(sum[:9])
 	authorization := h.server.recordedAuthorizations()[0]
-	if got := authorization.Get("client_id"); got != "https://pi.dev/oauth/"+id+"/client.json" {
+	if got := authorization.Get("client_id"); got != "https://pi-in-go.dev/oauth/"+id+"/client.json" {
 		t.Fatalf("client_id = %q", got)
 	}
 	redirect, err := url.Parse(authorization.Get("redirect_uri"))
@@ -221,7 +221,7 @@ func TestMCPOAuthCIMDReplacesARegisteredClientWhenSwitchingToTheDocument(t *test
 	for _, authorization := range h.server.recordedAuthorizations() {
 		clients = append(clients, authorization.Get("client_id"))
 	}
-	if want := []string{"client-1", "https://pi.dev/oauth/client.json"}; !reflect.DeepEqual(clients, want) {
+	if want := []string{"client-1", "https://pi-in-go.dev/oauth/client.json"}; !reflect.DeepEqual(clients, want) {
 		t.Fatalf("authorization clients = %q, want %q", clients, want)
 	}
 	if id, ok := h.storedClientID(t); ok {

@@ -34,7 +34,18 @@ type sessionBoundTool struct {
 //
 // upstream: agent-session.ts:1551-1557 (declared = { ...tool, description })
 func (tool *sessionBoundTool) Schema() ai.ToolSchema {
-	schema := tool.AgentTool.Schema()
+	return tool.withDescription(tool.AgentTool.Schema())
+}
+
+// BorrowedSchema is Schema with the wrapped tool's parameters shared where it can share them; see agent.schemaBorrower.
+func (tool *sessionBoundTool) BorrowedSchema() ai.ToolSchema {
+	if borrower, ok := tool.AgentTool.(interface{ BorrowedSchema() ai.ToolSchema }); ok {
+		return tool.withDescription(borrower.BorrowedSchema())
+	}
+	return tool.Schema()
+}
+
+func (tool *sessionBoundTool) withDescription(schema ai.ToolSchema) ai.ToolSchema {
 	if tool.description != nil {
 		schema.Description = *tool.description
 	}
@@ -217,6 +228,9 @@ func createSessionToolRegistry(services *AgentSessionServices, opts SessionOptio
 		registry.allowed = maps.Clone(registry.allowed)
 		registry.excluded = maps.Clone(registry.excluded)
 		registry.filter = registry.compileFilter()
+		if opts.InitialActiveToolNames != nil {
+			return registry, registry.selectTools(opts.InitialActiveToolNames), nil
+		}
 		return registry, registry.tools(), nil
 	}
 	// upstream: sdk.ts:280-281; the tools option that changes the default selection is DefaultToolModifiers here.
@@ -301,6 +315,7 @@ func createSessionToolRegistry(services *AgentSessionServices, opts SessionOptio
 			activeNames = icodingagent.ApplyToolModifiers(services.SettingsManager().ResolvedDefaultTools(), opts.DefaultToolModifiers)
 		}
 	}
+	var customActiveNames []string
 	for _, tool := range opts.Tools {
 		definition, err := toolDefinition(tool)
 		if err != nil {
@@ -311,7 +326,7 @@ func createSessionToolRegistry(services *AgentSessionServices, opts SessionOptio
 			definition.PromptGuidelines = nil
 		}
 		registry.custom = append(registry.custom, sessionToolEntry{tool: tool, registration: extension.RegisteredTool{Definition: definition, SourceInfo: syntheticToolSource(tool.Name(), "sdk")}})
-		activeNames = append(activeNames, tool.Name())
+		customActiveNames = append(customActiveNames, tool.Name())
 	}
 	for _, definition := range opts.CustomTools {
 		registration := extension.RegisteredTool{Definition: definition, SourceInfo: syntheticToolSource(definition.Name, "sdk")}
@@ -320,11 +335,12 @@ func createSessionToolRegistry(services *AgentSessionServices, opts SessionOptio
 			return registry, nil, err
 		}
 		registry.custom = append(registry.custom, sessionToolEntry{tool: tool, registration: registration})
-		activeNames = append(activeNames, definition.Name)
+		customActiveNames = append(customActiveNames, definition.Name)
 	}
 	if err := registry.refresh(opts.Runner); err != nil {
 		return registry, nil, err
 	}
+	// upstream: agent-session.ts:3660-3666, 3702, 3733-3736: extension-registered tools precede caller custom tools.
 	if opts.Runner != nil && !registry.skipExtensions {
 		for _, tool := range opts.Runner.Tools() {
 			if ExtensionToolStartsActive(tool.Definition, registry.allowed) {
@@ -332,6 +348,7 @@ func createSessionToolRegistry(services *AgentSessionServices, opts SessionOptio
 			}
 		}
 	}
+	activeNames = append(activeNames, customActiveNames...)
 	return registry, registry.selectTools(activeNames), nil
 }
 
@@ -490,13 +507,15 @@ func (s *Session) GetToolDefinition(name string) (extension.ToolDefinition, bool
 	return s.toolDefinitionLocked(name)
 }
 
-// BindExtensions stores the mode bindings the argument defines, always applies the stored bindings to the runner, awaits the configured session_start event and admits tools registered by its handlers before returning (upstream bindExtensions, agent-session.ts:3258-3282). Attach an event consumer before binding when handlers can send messages.
+// BindExtensions stores the mode bindings the argument defines, always applies the stored bindings to the runner, awaits the configured session_start event and admits tools registered by its handlers before returning (upstream bindExtensions, agent-session.ts:3258-3282). A host that binds with empty bindings still marks the extensions bound: Reload then restarts them (Pi e03dca7a3843 _extensionsBound). Attach an event consumer before binding when handlers can send messages.
 func (s *Session) BindExtensions(ctx context.Context, bindings ExtensionBindings) error {
+	merged := s.mergeExtensionBindings(bindings)
+	s.extensionsBound.Store(true)
 	runner := s.currentRunner()
 	if runner == nil {
 		return nil
 	}
-	s.bindSessionExtensions(runner, s.mergeExtensionBindings(bindings))
+	s.bindSessionExtensions(runner, merged)
 	event := s.sessionStartEvent
 	if event.Type == "" {
 		event = extension.SessionStartEvent{Type: "session_start", Reason: "startup"}
@@ -535,6 +554,7 @@ func (s *Session) refreshTools(includeAllExtensionTools bool) error {
 	if includeAllExtensionTools {
 		// The active tools become pending under the same locks as the rebuild, as reload() marks them and calls _buildRuntime without yielding, so no loadout change or registry refresh runs in between.
 		s.addPendingTools(s.ActiveToolNames())
+		s.restoredToolNames = s.ActiveToolNames()
 	}
 	// upstream: agent-session.ts:3457-3459: only tools that were already activated on registration count as known, so a tool whose exposure changes to `direct` or `model-only` is activated like a new tool.
 	previous := make(map[string]struct{}, len(s.tools))
@@ -591,12 +611,20 @@ func WithBeforeSessionStart(fn func(context.Context) error) ReloadOption {
 	return func(o *reloadOptions) { o.beforeSessionStart = fn }
 }
 
-// Reload is AgentSession.reload (agent-session.ts:3640-3685): the old extensions receive session_shutdown with reason reload and go stale;
+// Reload is AgentSession.reload (agent-session.ts:3640-3685): a session that is running or compacting rejects it first; otherwise the old extensions receive session_shutdown with reason reload and go stale;
 // the settings and the resource loader are read again; the loader's extensions build a new runner that keeps the previous flag values; the
-// tools a settings reload newly added to defaultTools activate; and, when the mode bound its UI or command actions, the new runner gets them
+// tools a settings reload newly added to defaultTools activate; and, when the host bound the extensions (BindExtensions, also with empty bindings), the new runner gets the stored bindings
 // and session_start with reason reload, then the resources its resources_discover handlers contribute. A failure before the new runner exists
 // leaves the old one stale, as Pi does.
 func (s *Session) Reload(ctx context.Context, options ...ReloadOption) error {
+	// Pi c3b938e3e rejects a reload while the session is running or compacting, before session_shutdown or any
+	// runner invalidation, so a running extension tool keeps its context (Pi 1.5.0 reloads and the tool fails with a stale-context error).
+	if s.IsStreaming() {
+		return errors.New("Wait for the current response to finish before reloading.")
+	}
+	if s.IsCompacting() {
+		return errors.New("Wait for compaction to finish before reloading.")
+	}
 	var reload reloadOptions
 	for _, option := range options {
 		option(&reload)
@@ -612,8 +640,11 @@ func (s *Session) Reload(ctx context.Context, options ...ReloadOption) error {
 				return err
 			}
 		}
-		// upstream: agent-session.ts:3663-3664 marks the old runner stale right after session_shutdown. Its runtime stays active until the reload knows whether the rebuilt runner keeps it: a loader whose extensions registered against the same runtime hands it to the new runner, and invalidating it would make the new runner stale too.
-		previous.InvalidateKeepingRuntime("")
+		// upstream: agent-session.ts:3663-3664 marks the old runner stale right after session_shutdown. Its runtime stays active until the reload knows whether the rebuilt runner keeps it: a loader whose extensions registered against the same runtime hands it to the new runner, and invalidating it would make the new runner stale too. A runtime an earlier failed reload invalidated is made active again here, for the loader that registers against it.
+		if previous.Runtime() != nil {
+			previous.Runtime().Reactivate()
+		}
+		previous.InvalidateForReload("")
 		defer func() {
 			if !keepsRuntime && previous.Runtime() != nil {
 				previous.Runtime().Invalidate(previous.StaleMessage())
@@ -643,8 +674,8 @@ func (s *Session) Reload(ctx context.Context, options ...ReloadOption) error {
 		return nil
 	}
 	s.bindSessionExtensions(runner, *bindings)
-	// upstream: agent-session.ts:3688-3698: only a session whose mode bound a UI context, command actions, a shutdown handler or an error listener replays session_start on reload.
-	if !bindings.hasBindings() {
+	// upstream: agent-session.ts:3865-3870 (Pi e03dca7a3843): only a session whose host called bindExtensions, even with empty bindings, replays session_start on reload.
+	if !s.extensionsBound.Load() {
 		return nil
 	}
 	if reload.beforeSessionStart != nil {

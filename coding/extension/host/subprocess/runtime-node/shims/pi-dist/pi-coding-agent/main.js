@@ -11,6 +11,9 @@ import chalk from "../../chalk/source/index.js";
 import { normalizeSessionName, parseArgs, printHelp } from "./cli/args.js";
 import { checkProviderAuth, createAuthCheckModelRuntime, getProviderCredential, } from "./cli/auth-check.js";
 import { AuthCommandError, getAuthCommandName, getAuthCommandUsage, isAuthCommandHelp, parseAuthCommand, printAuthCommandHelp, validateAuthCommandArgs, } from "./cli/auth-command.js";
+import { runAuthLogin } from "./cli/auth-login.js";
+import { runAuthLogout } from "./cli/auth-logout.js";
+import { createProcessLoginTerminal } from "./cli/auth-terminal.js";
 import { resolveCredentialForPrint } from "./cli/credential-print.js";
 import { processFileArguments } from "./cli/file-processor.js";
 import { buildInitialMessage } from "./cli/initial-message.js";
@@ -25,11 +28,11 @@ import { formatNoModelsAvailableMessage } from "./core/auth-guidance.js";
 import { AuthStorage, ReadOnlyAuthStorage } from "./core/auth-storage.js";
 import { exportFromFile } from "./core/export-html/index.js";
 import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.js";
-import { resolveCliModel, resolveModelScope } from "./core/model-resolver.js";
+import { resolveCliModel, resolveModelScopeWithDiagnostics } from "./core/model-resolver.js";
 import { ModelRuntime } from "./core/model-runtime.js";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.js";
 import { resolveProjectTrusted } from "./core/project-trust.js";
-import { formatMissingSessionCwdPrompt, getMissingSessionCwdIssue, MissingSessionCwdError, } from "./core/session-cwd.js";
+import { formatMissingSessionCwdPrompt, getMissingSessionCwdIssue, getMissingSessionCwdOptions, MissingSessionCwdError, } from "./core/session-cwd.js";
 import { assertValidSessionId, SessionManager } from "./core/session-manager.js";
 import { collectSettingsDiagnostics, deduplicateDiagnostics } from "./core/settings-diagnostics.js";
 import { SettingsManager } from "./core/settings-manager.js";
@@ -38,6 +41,7 @@ import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/tru
 import { builtInExtensions } from "./extensions/index.js";
 import { loadMcpCommand } from "./extensions/mcp/cli.lazy.js";
 import { runMigrations, showDeprecationWarnings } from "./migrations.js";
+import { writeDiagnosticsToStderr } from "./modes/diagnostics-stderr.js";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.js";
 import { initTheme, setThemeJsonValidator, stopThemeWatcher } from "./modes/interactive/theme/theme.js";
 import { validateThemeJson } from "./modes/interactive/theme/theme-schema.js";
@@ -66,13 +70,6 @@ async function readPipedStdin() {
         process.stdin.resume();
     });
 }
-function reportDiagnostics(diagnostics) {
-    for (const diagnostic of diagnostics) {
-        const color = diagnostic.type === "error" ? chalk.red : diagnostic.type === "warning" ? chalk.yellow : chalk.dim;
-        const prefix = diagnostic.type === "error" ? "Error: " : diagnostic.type === "warning" ? "Warning: " : "";
-        console.error(color(`${prefix}${diagnostic.message}`));
-    }
-}
 function isTruthyEnvFlag(value) {
     if (!value)
         return false;
@@ -96,9 +93,51 @@ function toPrintOutputMode(appMode) {
 function isPlainRuntimeMetadataCommand(parsed) {
     return !parsed.print && parsed.mode === undefined && (parsed.help === true || parsed.listModels !== undefined);
 }
+async function runAuthLoginCommand(args) {
+    const cwd = process.cwd();
+    const agentDir = getAgentDir();
+    const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
+    applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy);
+    configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());
+    const modelRuntime = await ModelRuntime.create({ allowModelNetwork: false, signal: AbortSignal.timeout(15_000) });
+    const controller = new AbortController();
+    const interrupt = () => controller.abort();
+    process.on("SIGINT", interrupt);
+    try {
+        return await runAuthLogin(args, {
+            modelRuntime,
+            terminal: createProcessLoginTerminal(interrupt),
+            agentDir,
+            cwd,
+            getDeviceId: () => settingsManager.getOrCreateDeviceId(),
+            signal: controller.signal,
+        });
+    }
+    finally {
+        process.off("SIGINT", interrupt);
+    }
+}
+async function runAuthLogoutCommand(args) {
+    const signal = AbortSignal.timeout(15_000);
+    const modelRuntime = await ModelRuntime.create({ allowModelNetwork: false, signal });
+    return runAuthLogout(args, {
+        modelRuntime,
+        terminal: { write: (line) => console.log(line), error: (line) => console.error(line) },
+        signal,
+    });
+}
 async function runAuthCommand(args) {
     if (isAuthCommandHelp(args)) {
         printAuthCommandHelp();
+        return true;
+    }
+    if (args[0] === "auth" && args[1] === "login") {
+        // main() already applied --offline.
+        process.exitCode = await runAuthLoginCommand(args.slice(2).filter((arg) => arg !== "--offline"));
+        return true;
+    }
+    if (args[0] === "auth" && args[1] === "logout") {
+        process.exitCode = await runAuthLogoutCommand(args.slice(2).filter((arg) => arg !== "--offline"));
         return true;
     }
     let command;
@@ -441,12 +480,6 @@ function buildSessionOptions(parsed, scopedModels, hasExistingSession, modelRunt
 function resolveCliPaths(cwd, paths) {
     return paths?.map((value) => (isLocalPath(value) ? resolvePath(value, cwd) : value));
 }
-async function promptForMissingSessionCwd(issue, settingsManager) {
-    return showStartupSelector(settingsManager, formatMissingSessionCwdPrompt(issue), [
-        { label: "Continue", value: issue.fallbackCwd },
-        { label: "Cancel", value: undefined },
-    ]);
-}
 export async function main(args, options) {
     resetTimings();
     // Commands and startup selectors can load user-authored themes before runtime creation.
@@ -565,11 +598,19 @@ export async function main(args, options) {
     const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
     if (missingSessionCwdIssue) {
         if (appMode === "interactive") {
-            const selectedCwd = await promptForMissingSessionCwd(missingSessionCwdIssue, startupSettingsManager);
-            if (!selectedCwd) {
-                process.exit(0);
+            const sessionFile = missingSessionCwdIssue.sessionFile;
+            const choice = await showStartupSelector(startupSettingsManager, formatMissingSessionCwdPrompt(missingSessionCwdIssue), getMissingSessionCwdOptions(missingSessionCwdIssue));
+            switch (choice) {
+                case "continue":
+                    sessionManager = SessionManager.open(sessionFile, sessionDir, cwd);
+                    break;
+                // Fork like `--session <id>` from another project, so the choice sticks without rewriting history (#11060).
+                case "fork":
+                    sessionManager = forkSessionOrExit(sessionFile, cwd, sessionDir);
+                    break;
+                case undefined:
+                    process.exit(0);
             }
-            sessionManager = SessionManager.open(missingSessionCwdIssue.sessionFile, sessionDir, selectedCwd);
         }
         else {
             console.error(chalk.red(new MissingSessionCwdError(missingSessionCwdIssue).message));
@@ -596,6 +637,16 @@ export async function main(args, options) {
     const resolvedSkillPaths = resolveCliPaths(cwd, parsed.skills);
     const resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
     const resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
+    // Interactive mode installs and refreshes packages again on /reload, /new, /resume and /fork while the TUI
+    // draws on the terminal, where git and npm output would corrupt its screen (#11264). Their output is
+    // captured, and until the TUI starts each install is announced on stderr instead.
+    const packageCommandOutput = appMode === "interactive" ? "capture" : "inherit";
+    let announcePackageInstalls = packageCommandOutput === "capture";
+    const onPackageProgress = (event) => {
+        if (announcePackageInstalls && event.type === "start" && event.message) {
+            console.error(chalk.dim(event.message));
+        }
+    };
     const createRuntime = async ({ cwd, agentDir, sessionManager, sessionStartEvent, projectTrustContext, }) => {
         const isInitialRuntime = sessionStartEvent === undefined;
         const projectTrustDiagnostics = [];
@@ -636,6 +687,8 @@ export async function main(args, options) {
                 }
                 : undefined,
             resourceLoaderOptions: {
+                packageCommandOutput,
+                onPackageProgress,
                 additionalExtensionPaths: resolvedExtensionPaths,
                 additionalSkillPaths: resolvedSkillPaths,
                 additionalPromptTemplatePaths: resolvedPromptTemplatePaths,
@@ -666,9 +719,14 @@ export async function main(args, options) {
             })),
         ];
         const modelPatterns = parsed.models ?? settingsManager.getEnabledModels();
-        const scopedModels = modelPatterns && modelPatterns.length > 0
-            ? await resolveModelScope(modelPatterns, modelRuntime, { signal: AbortSignal.timeout(15_000) })
-            : [];
+        const { scopedModels, diagnostics: modelScopeDiagnostics } = modelPatterns && modelPatterns.length > 0
+            ? await resolveModelScopeWithDiagnostics(modelPatterns, modelRuntime, {
+                signal: AbortSignal.timeout(15_000),
+            })
+            : { scopedModels: [], diagnostics: [] };
+        // Returned as diagnostics instead of printed: this factory runs again on /new, /resume and /fork,
+        // while the interactive TUI draws on the terminal (#11264).
+        diagnostics.push(...modelScopeDiagnostics);
         const { options: sessionOptions, cliThinkingFromModel, diagnostics: sessionOptionDiagnostics, } = buildSessionOptions(parsed, scopedModels, sessionManager.buildSessionContext().messages.length > 0, modelRuntime, settingsManager);
         diagnostics.push(...sessionOptionDiagnostics);
         if (parsed.apiKey) {
@@ -698,6 +756,12 @@ export async function main(args, options) {
         if (created.session.model && cliThinkingOverride) {
             created.session.setThinkingLevel(created.session.thinkingLevel);
         }
+        // "Could not restore model x/y. Using a/b." is set again on /resume and /fork. As a diagnostic, every
+        // mode reports it at startup and after each replacement. Without any model, the message is login
+        // guidance instead: interactive mode shows it at startup, the other modes exit with it below.
+        if (created.modelFallbackMessage && created.session.model) {
+            diagnostics.push({ type: "warning", message: created.modelFallbackMessage });
+        }
         return {
             ...created,
             services,
@@ -716,10 +780,14 @@ export async function main(args, options) {
     setCapabilityOverrides(settingsManager.getTerminalCapabilityOverrides());
     applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy);
     configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());
-    const startupDiagnostics = deduplicateDiagnostics([...startupSettingsDiagnostics, ...runtime.diagnostics]);
+    // Taking them marks them reported, so the modes do not report them again after a session replacement.
+    const startupDiagnostics = deduplicateDiagnostics([
+        ...startupSettingsDiagnostics,
+        ...runtime.takeUnreportedDiagnostics(),
+    ]);
     const hasRuntimeErrors = runtime.diagnostics.some((diagnostic) => diagnostic.type === "error");
     if (parsed.help) {
-        reportDiagnostics(startupDiagnostics);
+        writeDiagnosticsToStderr(startupDiagnostics);
         const extensionFlags = resourceLoader
             .getExtensions()
             .extensions.flatMap((extension) => Array.from(extension.flags.values()));
@@ -727,7 +795,7 @@ export async function main(args, options) {
         process.exit(0);
     }
     if (parsed.listModels !== undefined) {
-        reportDiagnostics(startupDiagnostics);
+        writeDiagnosticsToStderr(startupDiagnostics);
         const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
         await listModels(modelRuntime, searchPattern, AbortSignal.timeout(15_000));
         process.exit(0);
@@ -751,7 +819,7 @@ export async function main(args, options) {
     }
     time("resolveModelScope");
     if (appMode !== "interactive" || hasRuntimeErrors) {
-        reportDiagnostics(startupDiagnostics);
+        writeDiagnosticsToStderr(startupDiagnostics);
     }
     if (hasRuntimeErrors) {
         if (runtime.diagnostics.some((diagnostic) => diagnostic.message.includes("Failed to load extension"))) {
@@ -783,10 +851,12 @@ export async function main(args, options) {
         await runRpcMode(runtime);
     }
     else if (appMode === "interactive") {
+        announcePackageInstalls = false;
         const interactiveMode = new InteractiveMode(runtime, {
             migratedProviders,
             startupDiagnostics,
-            modelFallbackMessage,
+            // A fallback to another model is already in startupDiagnostics.
+            modelFallbackMessage: session.model ? undefined : modelFallbackMessage,
             autoTrustOnReloadCwd,
             initialMessage,
             initialImages,
@@ -802,6 +872,7 @@ export async function main(args, options) {
             // (Kitty keyboard protocol, device attributes, cell size) before restoring the terminal.
             await new Promise((resolve) => setTimeout(resolve, 150));
             interactiveMode.stop();
+            await runtime.dispose();
             stopThemeWatcher();
             printTimings();
             if (process.stdout.writableLength > 0) {

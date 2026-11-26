@@ -325,10 +325,18 @@ var (
 		`connection.?error`,
 		`connection.?refused`,
 		`connection.?lost`,
+		// Pi 9b88b94e2 (#12064): a gateway's mid-stream drop relayed as an Anthropic-style api_error event reading "Connection closed.".
+		`connection.?closed`,
 		`other side closed`,
 		`fetch failed`,
 		`request to \S+ failed, reason:`,
 		`getaddrinfo`,
+		// Pi 4699b5b26 (#12128): bare Node socket error codes, e.g. "read ECONNRESET", "write EPIPE", or "connect ETIMEDOUT 1.2.3.4:443", not part of a longer identifier.
+		// Pi spells it (?<![a-z0-9_])(?:ECONNRESET|ECONNABORTED|ECONNREFUSED|ETIMEDOUT|EPIPE)(?![a-z0-9_]); RE2 has no lookaround, so the neighbours are matched.
+		// upstream: packages/ai/src/utils/retry.ts:RETRYABLE_PROVIDER_ERROR_PATTERN
+		`(?:^|[^a-z0-9_])(?:ECONNRESET|ECONNABORTED|ECONNREFUSED|ETIMEDOUT|EPIPE)(?:[^a-z0-9_]|$)`,
+		// upstream: packages/ai/src/utils/retry.ts:RETRYABLE_PROVIDER_ERROR_PATTERN
+		`connection reset by peer`,
 		`ENOTFOUND`,
 		`EAI_AGAIN`,
 		`upstream.?connect`,
@@ -340,6 +348,9 @@ var (
 		`terminated`,
 		`websocket.?closed`,
 		`websocket.?error`,
+		// Codex 60-minute WebSocket lifetime limit, as code `websocket_connection_limit_reached` or as text "Responses websocket connection limit reached" (#12124, Pi bb1a2b3542b5).
+		// upstream: packages/ai/src/utils/retry.ts:RETRYABLE_PROVIDER_ERROR_PATTERN
+		`websocket.?connection.?limit.?reached`,
 		`ended without`,
 		`stream ended before message_stop`,
 		`stream ended before a terminal response event`,

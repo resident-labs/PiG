@@ -24,6 +24,11 @@ func EvaluateOutcome(o *ScenarioOutcome) {
 			o.Failures = append(o.Failures, fmt.Sprintf("normalize_replace %q requires a reason", rule.Pattern))
 		}
 	}
+	for _, rule := range a.StderrNormalizeReplace {
+		if strings.TrimSpace(rule.Reason) == "" {
+			o.Failures = append(o.Failures, fmt.Sprintf("stderr_normalize_replace %q requires a reason", rule.Pattern))
+		}
+	}
 	o.Pig.MedianMs = medianRuntime(o.Pig.Runs)
 	o.Pi.MedianMs = medianRuntime(o.Pi.Runs)
 
@@ -167,9 +172,17 @@ func EvaluateOutcome(o *ScenarioOutcome) {
 			}
 		}
 	}
-	if a.JSONOutputEqual {
+	if a.jsonCompared() {
+		compare := compareJSONResults
+		if a.JSONOutputOrderedEqual {
+			compare = compareJSONResultsOrdered
+		}
 		for run := range min(len(o.Pig.Runs), len(o.Pi.Runs)) {
-			if err := compareJSONResults(o.Pig.Runs[run], o.Pi.Runs[run], a.JSONAliases); err != nil {
+			pig, err := dropPigOnlyRecords(o.Pig.Runs[run], a.JSONPigOnlyRecords, compare)
+			if err == nil {
+				err = compare(pig, o.Pi.Runs[run], a.JSONAliases)
+			}
+			if err != nil {
 				o.Failures = append(o.Failures, fmt.Sprintf("run %d JSON output: %v", run+1, err))
 			}
 		}
@@ -179,8 +192,21 @@ func EvaluateOutcome(o *ScenarioOutcome) {
 			g, p := o.Pig.Runs[run], o.Pi.Runs[run]
 			if !g.StderrCaptured || !p.StderrCaptured {
 				o.Failures = append(o.Failures, "stderr_equal requires separately captured stderr")
-			} else if g.Stderr != p.Stderr {
-				o.Failures = append(o.Failures, fmt.Sprintf("run %d stderr mismatch: pig=%q pi=%q", run+1, g.Stderr, p.Stderr))
+			} else {
+				// Individually justified replacements for the stderr comparison only (a documentation root in a warning is distribution-specific).
+				gs, ps := g.Stderr, p.Stderr
+				for _, rule := range a.StderrNormalizeReplace {
+					if strings.TrimSpace(rule.Reason) == "" {
+						continue
+					}
+					if re, err := regexp.Compile(rule.Pattern); err == nil {
+						gs = re.ReplaceAllString(gs, rule.With)
+						ps = re.ReplaceAllString(ps, rule.With)
+					}
+				}
+				if gs != ps {
+					o.Failures = append(o.Failures, fmt.Sprintf("run %d stderr mismatch: pig=%q pi=%q", run+1, g.Stderr, p.Stderr))
+				}
 			}
 		}
 	}
@@ -334,6 +360,44 @@ func EvaluateOutcome(o *ScenarioOutcome) {
 			}
 		}
 	}
+
+	// pig_no_stale_frames: every pig run's frame_watch took enough samples and none was a forbidden frame.
+	if a.PigNoStaleFrames {
+		for run, r := range o.Pig.Runs {
+			watch := r.FrameWatch
+			switch {
+			case !watch.Watched:
+				o.Failures = append(o.Failures, fmt.Sprintf("pig run %d: pig_no_stale_frames needs a tmux step with frame_watch", run+1))
+			case watch.Samples < watch.MinSamples:
+				o.Failures = append(o.Failures, fmt.Sprintf("pig run %d: frame watch took %d samples, fewer than the %d it needs to have observed the step", run+1, watch.Samples, watch.MinSamples))
+			case watch.StaleCount > 0:
+				o.Failures = append(o.Failures, fmt.Sprintf("pig run %d: %d of %d sampled panes were a forbidden frame; first: %q", run+1, watch.StaleCount, watch.Samples, trunc(strings.Join(strings.Fields(watch.Stale[0]), " "), 400)))
+			}
+		}
+	}
+
+	// no_frames_after_reply: no frame begins after the reply text in either binary's raw transcript.
+	if a.NoFramesAfterReply {
+		for _, system := range []SystemResults{o.Pig, o.Pi} {
+			for run, r := range system.Runs {
+				f := r.FinalFrame
+				switch {
+				case !f.Observed:
+					o.Failures = append(o.Failures, fmt.Sprintf("%s run %d: no_frames_after_reply needs a tmux step with final_frame", system.System, run+1))
+				case !f.Found:
+					o.Failures = append(o.Failures, fmt.Sprintf("%s run %d: the reply text %q is not in %s", system.System, run+1, f.Text, f.source()))
+				case f.Trailing > 0:
+					o.Failures = append(o.Failures, fmt.Sprintf("%s run %d: %d frame(s) began after the reply text %q; bytes after it: %s", system.System, run+1, f.Trailing, f.Text, f.Tail))
+				}
+			}
+		}
+	}
+
+	// final_frame_cursor_only_pig / _pi: each binary's exact count of cursor-only frames after the final_frame text.
+	evaluateFinalFrameCursorOnly(o, a)
+
+	// transcript_sequences_equal: the two binaries' ordered sequences in each declared window of the terminal transcript.
+	evaluateSequenceWindows(o, a)
 
 	// runtime_ratio_max: the performance gate.
 	// pig.median <= ratio * pi.median, when both have at least one run.
@@ -500,4 +564,28 @@ func expandVersionTokens(lists ...[]string) []string {
 		}
 	}
 	return out
+}
+
+// evaluateFinalFrameCursorOnly checks the cursor-only frame counts a scenario pins for a recorded divergence.
+func evaluateFinalFrameCursorOnly(o *ScenarioOutcome, a AssertSpec) {
+	check := func(system SystemResults, key string, want *int) {
+		if want == nil {
+			return
+		}
+		for run, r := range system.Runs {
+			f := r.FinalFrame
+			switch {
+			case !f.Observed:
+				o.Failures = append(o.Failures, fmt.Sprintf("%s run %d: %s needs a tmux step with final_frame", system.System, run+1, key))
+			case !f.Found:
+				o.Failures = append(o.Failures, fmt.Sprintf("%s run %d: the text %q is not in %s", system.System, run+1, f.Text, f.source()))
+			default:
+				if got := f.CursorOnly(); got != *want {
+					o.Failures = append(o.Failures, fmt.Sprintf("%s run %d: %d cursor-only frame(s) began after the text %q, want %d; bytes after it: %q", system.System, run+1, got, f.Text, *want, f.Frames))
+				}
+			}
+		}
+	}
+	check(o.Pig, "final_frame_cursor_only_pig", a.FinalFrameCursorOnlyPig)
+	check(o.Pi, "final_frame_cursor_only_pi", a.FinalFrameCursorOnlyPi)
 }

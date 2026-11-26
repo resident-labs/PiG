@@ -5,6 +5,7 @@ package mcp_test
 import (
 	"regexp"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -17,7 +18,7 @@ import (
 func TestStdioTransportKillsAServerThatIgnoresShutdownIncludingItsChildren(t *testing.T) {
 	command, args, env := fixtureStdioOptions("stubborn-server")
 	transport := mcp.NewStdioTransport(mcp.StdioTransportOptions{Command: command, Args: args, Env: env, CloseTimeoutMs: 100})
-	client := mcp.NewClient(mcp.ClientOptions{Implementation: mcp.Implementation{Name: "stdio-test", Version: "1.0.0"}})
+	client := mcp.NewClient(mcp.ClientOptions{Name: "stdio-test", Version: "1.0.0"})
 	if _, err := client.Connect(t.Context(), transport); err != nil {
 		t.Fatal(err)
 	}
@@ -55,11 +56,47 @@ func TestStdioTransportKillsAServerThatIgnoresShutdownIncludingItsChildren(t *te
 	}
 }
 
+// Ports packages/mcp/test/stdio.test.ts "kills children still holding the pipes after the server process exited" (fixtures/exiting-parent-server.mjs; #11724).
+func TestStdioTransportKillsChildrenStillHoldingThePipesAfterTheServerProcessExited(t *testing.T) {
+	command, args, env := fixtureStdioOptions("exiting-parent-server")
+	transport := mcp.NewStdioTransport(mcp.StdioTransportOptions{Command: command, Args: args, Env: env, CloseTimeoutMs: 100})
+	var closeEvents atomic.Int32
+	transport.OnClose(func() { closeEvents.Add(1) })
+	if err := transport.Start(); err != nil {
+		t.Fatal(err)
+	}
+	killGroupOnCleanup(t, transport.PID())
+	pattern := regexp.MustCompile(`helper (\d+)`)
+	helper := 0
+	for i := 0; i < 200 && helper == 0; i++ {
+		if match := pattern.FindStringSubmatch(transport.Stderr()); match != nil {
+			helper, _ = strconv.Atoi(match[1])
+		} else {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if helper == 0 {
+		t.Fatal("no helper pid in stderr")
+	}
+	t.Cleanup(func() { _ = syscall.Kill(helper, syscall.SIGKILL) })
+	if !processAlive(helper) {
+		t.Fatal("helper is not running before close")
+	}
+
+	if err := transport.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return !processAlive(helper) })
+	if got := closeEvents.Load(); got != 1 {
+		t.Fatalf("close events = %d, want 1", got)
+	}
+}
+
 func connectFixture(t *testing.T, name string, closeTimeoutMs int) (*mcp.Client, *mcp.StdioTransport) {
 	t.Helper()
 	command, args, env := fixtureStdioOptions(name)
 	transport := mcp.NewStdioTransport(mcp.StdioTransportOptions{Command: command, Args: args, Env: env, CloseTimeoutMs: closeTimeoutMs})
-	client := mcp.NewClient(mcp.ClientOptions{Implementation: mcp.Implementation{Name: "stdio-test", Version: "1.0.0"}})
+	client := mcp.NewClient(mcp.ClientOptions{Name: "stdio-test", Version: "1.0.0"})
 	if _, err := client.Connect(t.Context(), transport); err != nil {
 		t.Fatal(err)
 	}

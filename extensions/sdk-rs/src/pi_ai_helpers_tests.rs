@@ -462,6 +462,72 @@ fn zhipu_usage_limit_1308_is_not_retryable() {
     }
 }
 
+/// Pi 9b88b94e2 packages/ai/test/retry.test.ts:106 (#12064): a gateway ends the stream with an Anthropic-style api_error event reading "Connection closed.".
+#[test]
+fn connection_closed_is_retryable() {
+    for (text, want) in [
+        (
+            r#"{"type":"error","error":{"type":"api_error","message":"Connection closed."}}"#,
+            true,
+        ),
+        (
+            "Connection closed by proxy server before the response completed",
+            true,
+        ),
+        (
+            r#"{"type":"error","error":{"type":"api_error","message":"Connection closed. insufficient_quota"}}"#,
+            false,
+        ),
+        ("The connection was closed by the user", false),
+    ] {
+        let message = json!({"role": "assistant", "stopReason": "error", "errorMessage": text});
+        assert_eq!(is_retryable_assistant_error(&message), want, "{text}");
+    }
+}
+
+/// Pi 4699b5b26 packages/ai/test/retry.test.ts:65,77 (#12128): a provider error that reports only a Node socket error code is retried; a code inside a longer identifier is not.
+#[test]
+fn node_socket_error_codes_are_retryable() {
+    for (text, want) in [
+        ("read ECONNRESET", true),
+        ("connect ETIMEDOUT 140.82.113.3:443", true),
+        ("write EPIPE", true),
+        ("connect ECONNREFUSED 127.0.0.1:443", true),
+        ("ECONNABORTED", true),
+        ("Connection reset by peer", true),
+        ("Invalid value EXECONNRESET", false),
+        ("Unknown field ETIMEDOUTX", false),
+        ("Invalid key ERR_EPIPE_ID", false),
+    ] {
+        let message = json!({"role": "assistant", "stopReason": "error", "errorMessage": text});
+        assert_eq!(is_retryable_assistant_error(&message), want, "{text}");
+    }
+}
+
+/// Pi bb1a2b3542b5 packages/ai/test/retry.test.ts (#12124): the Codex WebSocket lifetime limit, as text or as the error code, is retried; a generic connection limit is not.
+#[test]
+fn codex_websocket_connection_limit_is_retryable() {
+    for (text, want) in [
+        (
+            "Codex error: Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.",
+            true,
+        ),
+        ("Codex error: websocket_connection_limit_reached", true),
+        ("WEBSOCKET CONNECTION LIMIT REACHED", true),
+        ("websocket-connection-limit-reached", true),
+        ("connection limit reached", false),
+        ("websocket connection limit", false),
+        ("connection limit reached on the websocket", false),
+        (
+            "websocket connection limit reached: insufficient_quota",
+            false,
+        ),
+    ] {
+        let message = json!({"role": "assistant", "stopReason": "error", "errorMessage": text});
+        assert_eq!(is_retryable_assistant_error(&message), want, "{text}");
+    }
+}
+
 #[test]
 fn the_default_retry_delay_cap_is_pis() {
     assert_eq!(DEFAULT_MAX_AGENT_RETRY_DELAY_MS, 60_000.0);

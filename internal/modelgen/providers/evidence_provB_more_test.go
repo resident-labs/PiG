@@ -15,11 +15,11 @@ package providers
 // pi: packages/ai/catalog/providers/xiaomi-token-plan-sgp.ts
 // pi: packages/ai/catalog/providers/zai.ts
 // pi: packages/ai/catalog/providers/zai-coding-cn.ts
+// pi: packages/ai/catalog/providers/qwen-token-plan-individual-cn.ts
 
 // Behavioral evidence, second half: see evidence_provB_test.go.
 
 import (
-	"strings"
 	"testing"
 
 	. "github.com/MichaelKinsy/PiG/internal/modelgen"
@@ -40,7 +40,7 @@ func provBOpenCodeAPIs(protocol, baseURL, aisdk string) string {
 
 func TestProvBOpencode(t *testing.T) {
 	// Pi source: providers/opencode.ts opencodeApi + opencodeModels + finalizeOpencodeModel
-	defaults := `{"supportsStore":false,"supportsDeveloperRole":false,"supportsStrictMode":true`
+	defaults := `{"supportsStore":false,"supportsStrictMode":true`
 	sources := &CatalogSources{ModelsDev: provBModelsDev(t, map[string][]provBSpec{"opencode": {
 		// Native protocols come before Chat Completions when models.dev lists several.
 		{ID: "alpha", API: `{"chat-completions":{"base_url":"` + provBZen + `"},"responses":{"base_url":"` + provBZen + `"}}`},
@@ -123,7 +123,7 @@ func TestProvBOpencode(t *testing.T) {
 
 func TestProvBOpencodeGo(t *testing.T) {
 	// Pi source: providers/opencode-go.ts (opencodeModels and finalizeOpencodeModel of providers/opencode.ts with OpenCode Go's rules)
-	defaults := `{"supportsStore":false,"supportsDeveloperRole":false,"supportsStrictMode":true`
+	defaults := `{"supportsStore":false,"supportsStrictMode":true`
 	sources := &CatalogSources{ModelsDev: provBModelsDev(t, map[string][]provBSpec{"opencode-go": {
 		{ID: "kimi-k2.6", API: provBOpenCodeAPIs("chat-completions", provBGoV1, "")},
 		// Only "opencode:deepseek-v4-flash" is rejected; the Go endpoint takes long cache retention.
@@ -205,13 +205,13 @@ func TestProvBOpenRouter(t *testing.T) {
 	provBCheck(t, models, []provBWant{
 		// Developer messages pass through to Anthropic and OpenAI models only; Anthropic ones take cache_control.
 		{"anthropic/claude-x", "compat", `{` + tail + `,"cacheControlFormat":"anthropic","sendSessionAffinityHeaders":true}`},
-		{"~anthropic/claude-latest", "compat", `{"supportsDeveloperRole":false,` + tail + `,"cacheControlFormat":"anthropic","sendSessionAffinityHeaders":true}`},
+		{"~anthropic/claude-latest", "compat", `{` + tail + `,"cacheControlFormat":"anthropic","sendSessionAffinityHeaders":true}`},
 		{"openai/gpt-x", "compat", `{` + tail + `,"sendSessionAffinityHeaders":true}`},
-		{"meta/llama-x", "compat", `{"supportsDeveloperRole":false,` + tail + `,"sendSessionAffinityHeaders":true}`},
+		{"meta/llama-x", "compat", `{` + tail + `,"sendSessionAffinityHeaders":true}`},
 		// Corrections.
 		{"moonshotai/kimi-k2.5", "cost", `{"input":0.41,"output":2.06,"cacheRead":0.07,"cacheWrite":0}`},
 		{"moonshotai/kimi-k2.5", "maxTokens", "4096"},
-		{"moonshotai/kimi-k2.6", "compat", `{"supportsDeveloperRole":false,` + tail + `,"sendSessionAffinityHeaders":true,"requiresReasoningContentOnAssistantMessages":true}`},
+		{"moonshotai/kimi-k2.6", "compat", `{` + tail + `,"sendSessionAffinityHeaders":true,"requiresReasoningContentOnAssistantMessages":true}`},
 		{"moonshotai/kimi-k3.1-pro", "maxTokens", "131072"},
 		{"~moonshotai/kimi-latest", "maxTokens", "131072"},
 		{"z-ai/glm-5", "cost", `{"input":0.6,"output":1.9,"cacheRead":0.119,"cacheWrite":0}`},
@@ -243,13 +243,13 @@ func TestProvBQwenTokenPlans(t *testing.T) {
 		{ID: "glm-5", Reasoning: `"supported":true,"toggle":true`},
 		{ID: "glm-5.1", Reasoning: `"supported":true,"toggle":true`},
 		{ID: "glm-5.2", Reasoning: `"supported":true,"toggle":true`},
-		{ID: "qwen3.8-max-preview"},
+		{ID: "qwen3.8-max-preview", Status: "deprecated"},
 		{ID: "intl-only"},
 	}
-	cn := []provBSpec{{ID: "cn-only"}, {ID: "qwen3.8-max-preview"}}
+	cn := []provBSpec{{ID: "cn-only"}, {ID: "qwen3.8-max-preview", Status: "deprecated"}}
 	sources := &CatalogSources{ModelsDev: provBModelsDev(t, map[string][]provBSpec{"alibaba-token-plan": intl, "alibaba-token-plan-cn": cn})}
-	withLevels := `{"supportsStrictMode":true,"thinkingFormat":"qwen","supportsDeveloperRole":false,"supportsStore":false,"supportsReasoningEffort":true}`
-	without := `{"supportsStrictMode":true,"thinkingFormat":"qwen","supportsDeveloperRole":false,"supportsStore":false,"supportsReasoningEffort":false}`
+	withLevels := `{"supportsStrictMode":true,"thinkingFormat":"qwen","supportsStore":false,"supportsReasoningEffort":true}`
+	without := `{"supportsStrictMode":true,"thinkingFormat":"qwen","supportsStore":false,"supportsReasoningEffort":false}`
 	fallback := `{"minimal":null,"low":null,"medium":null,"high":"high","xhigh":null,"max":"max"}`
 
 	catalog, err := provBBuild(t, "qwen-token-plan", sources, true)
@@ -258,7 +258,7 @@ func TestProvBQwenTokenPlans(t *testing.T) {
 	}
 	provBIDsEqual(t, provBIDs(catalog), "qwen3.7-plus", "qwen3.7-max", "glm-5", "glm-5.1", "glm-5.2", "intl-only")
 	provBCheck(t, provBModelsOf(catalog), []provBWant{
-		{"qwen3.7-plus", "baseUrl", `"https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"`},
+		{"qwen3.7-plus", "baseUrl", `"https://token-plan.maas.qwencloudapi.com/compatible-mode/v1"`},
 		{"qwen3.7-plus", "compat", withLevels},
 		{"qwen3.7-plus", "thinkingLevelMap", `{"off":null,"minimal":null,"low":"low","medium":null,"high":"high","xhigh":null,"max":null}`},
 		{"qwen3.7-max", "compat", without},
@@ -277,38 +277,58 @@ func TestProvBQwenTokenPlans(t *testing.T) {
 	}
 	provBIDsEqual(t, provBIDs(cnCatalog), "cn-only")
 	provBCheck(t, provBModelsOf(cnCatalog), []provBWant{
-		{"cn-only", "baseUrl", `"https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"`},
+		{"cn-only", "baseUrl", `"https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1"`},
 		{"cn-only", "compat", without},
 	})
 
-	// The individual plan keeps its allowlist of the international models, and strict generation requires exactly that list.
-	all := []string{"deepseek-v4-flash-0731", "deepseek-v4-pro", "deepseek-v4-pro-0813", "glm-5.2", "qwen3.6-flash", "qwen3.7-max", "qwen3.7-plus", "qwen3.8-flash", "qwen3.8-max"}
+	// The individual plan keeps its allowlist of the international models, and strict generation no longer requires exactly that list (Pi 1e34c3b4c).
+	all := []string{"deepseek-v4-flash-0731", "deepseek-v4-pro", "deepseek-v4-pro-0813", "deepseek-v4.1-flash", "deepseek-v4.1-flash-1017", "glm-5.2", "glm-5.3", "qwen3.6-flash", "qwen3.7-max", "qwen3.7-plus", "qwen3.8-flash", "qwen3.8-max", "qwen4-max-preview"}
 	var allowed []provBSpec
 	for _, id := range all {
 		allowed = append(allowed, provBSpec{ID: id})
 	}
-	individual := &CatalogSources{ModelsDev: provBModelsDev(t, map[string][]provBSpec{"alibaba-token-plan": append(append([]provBSpec{}, allowed...), provBSpec{ID: "qwen3.8-max-preview"}, provBSpec{ID: "intl-only"})})}
+	individual := &CatalogSources{ModelsDev: provBModelsDev(t, map[string][]provBSpec{"alibaba-token-plan": append(append([]provBSpec{}, allowed...), provBSpec{ID: "qwen3.8-max-preview", Status: "deprecated"}, provBSpec{ID: "intl-only"})})}
 	individualCatalog, err := provBBuild(t, "qwen-token-plan-individual", individual, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	provBIDsEqual(t, provBIDs(individualCatalog), all...)
 	provBCheck(t, provBModelsOf(individualCatalog), []provBWant{
-		{"qwen3.7-max", "baseUrl", `"https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"`},
+		{"qwen3.7-max", "baseUrl", `"https://token-plan.maas.qwencloudapi.com/compatible-mode/v1"`},
 		{"qwen3.7-max", "compat", without},
 	})
 	missing := &CatalogSources{ModelsDev: provBModelsDev(t, map[string][]provBSpec{"alibaba-token-plan": allowed[1:]})}
-	if _, err := provBBuild(t, "qwen-token-plan-individual", missing, true); err == nil || !strings.HasPrefix(err.Error(), "qwen-token-plan-individual model IDs do not match") {
-		t.Errorf("strict individual error = %v", err)
+	// A model models.dev lacks does not fail strict generation (Pi 1e34c3b4c): the provider lists the allowed models it has.
+	for _, strict := range []bool{true, false} {
+		missingCatalog, err := provBBuild(t, "qwen-token-plan-individual", missing, strict)
+		if err != nil {
+			t.Fatalf("individual with a model missing (strict %v): %v", strict, err)
+		}
+		provBIDsEqual(t, provBIDs(missingCatalog), all[1:]...)
 	}
-	if _, err := provBBuild(t, "qwen-token-plan-individual", missing, false); err != nil {
-		t.Errorf("non-strict individual error = %v", err)
+
+	// qwen-token-plan-individual-cn serves the same allowlist from the China catalog (Pi 3e4f8726).
+	individualCn := &CatalogSources{ModelsDev: provBModelsDev(t, map[string][]provBSpec{"alibaba-token-plan-cn": append(append([]provBSpec{}, allowed...), provBSpec{ID: "qwen3.8-max-preview", Status: "deprecated"}, provBSpec{ID: "cn-only"})})}
+	individualCnCatalog, err := provBBuild(t, "qwen-token-plan-individual-cn", individualCn, true)
+	if err != nil {
+		t.Fatal(err)
 	}
+	provBIDsEqual(t, provBIDs(individualCnCatalog), all...)
+	provBCheck(t, provBModelsOf(individualCnCatalog), []provBWant{
+		{"qwen3.7-max", "baseUrl", `"https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1"`},
+		{"qwen3.7-max", "compat", without},
+	})
+	missingCn := &CatalogSources{ModelsDev: provBModelsDev(t, map[string][]provBSpec{"alibaba-token-plan-cn": allowed[1:]})}
+	missingCnCatalog, err := provBBuild(t, "qwen-token-plan-individual-cn", missingCn, true)
+	if err != nil {
+		t.Fatalf("individual-cn with a model missing, strict: %v", err)
+	}
+	provBIDsEqual(t, provBIDs(missingCnCatalog), all[1:]...)
 }
 
 func TestProvBTogether(t *testing.T) {
 	// Pi source: providers/together.ts
-	base := `"supportsStore":false,"supportsDeveloperRole":false`
+	base := `"supportsStore":false`
 	compat := func(effort, format string) string {
 		return `{` + base + `,"supportsReasoningEffort":` + effort + `,"maxTokensField":"max_tokens","thinkingFormat":"` + format + `","supportsLongCacheRetention":false,"supportsStrictMode":false}`
 	}
@@ -465,7 +485,7 @@ func TestProvBZai(t *testing.T) {
 	// supportsReasoningEffort and zaiToolStream follow the models: only models with verified effort levels take the effort;
 	// the GLM-4.5 generation rejects tool_stream.
 	compat := func(effort, toolStream bool) string {
-		out := `{"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":`
+		out := `{"supportsStore":false,"supportsReasoningEffort":`
 		if effort {
 			out += "true"
 		} else {

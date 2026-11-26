@@ -190,6 +190,10 @@ func resolveStartupSessionSelectionIn(flags Args, launchCWD, sessionDir string) 
 		path = selection.forkPath
 	}
 	if path == "" {
+		// Pi's createSessionManager gives a new session its manager here (main.ts:744, SessionManager.create or continueRecent with nothing to continue), whose directory, the default one when none is given, is made before the project trust store, the model or any auth check.
+		if err := codingagent.MkdirSessionDir(manager.SessionDir()); err != nil {
+			return selection, err
+		}
 		err := selection.checkNewSessionCWD(flags, manager, launchCWD)
 		return selection, err
 	}
@@ -294,6 +298,32 @@ func confirmCrossProjectSession(reader io.Reader, writer io.Writer, cwd string) 
 	return answer == "y" || answer == "yes", nil
 }
 
+// applyMissingCWDChoice is main.ts's switch on the missing-cwd prompt. Continue runs the Session in the current cwd without storing the choice. Fork copies it into the current cwd as a new Session, like `--session <id>` from another project, so the choice sticks without rewriting history (Pi #11060); the copy is stored like other new Sessions for the current cwd (sessionDir is the configured directory, empty for the cwd's default one).
+func (s *startupSessionSelection) applyMissingCWDChoice(choice codingagent.MissingSessionCwdChoice, flags *Args, sessionDir string) error {
+	issue := s.missingCWD
+	switch choice {
+	case codingagent.MissingSessionCwdContinue:
+		s.runtimeCWD = issue.fallbackCWD
+		s.missingCWD = nil
+		flags.sessionCwdOverride = new(s.runtimeCWD)
+	case codingagent.MissingSessionCwdFork:
+		forked, err := newSessionManagerWithDir(issue.fallbackCWD, sessionDir).ForkFromFile(issue.sessionFile)
+		if err != nil {
+			return err
+		}
+		s.runtimeCWD = issue.fallbackCWD
+		s.forkPath = forked.Path()
+		s.sessionDir = filepath.Dir(forked.Path())
+		s.resumePath = ""
+		s.missingCWD = nil
+	}
+	return nil
+}
+
+func (issue missingSessionCWD) options() []codingagent.MissingSessionCwdOption {
+	return codingagent.GetMissingSessionCwdOptions(codingagent.SessionCwdIssue{SessionFile: issue.sessionFile, SessionCwd: issue.storedCWD, FallbackCwd: issue.fallbackCWD})
+}
+
 func (issue missingSessionCWD) prompt() string {
 	return codingagent.FormatMissingSessionCwdPrompt(codingagent.SessionCwdIssue{SessionFile: issue.sessionFile, SessionCwd: issue.storedCWD, FallbackCwd: issue.fallbackCWD})
 }
@@ -337,7 +367,8 @@ func readSessionCWD(path string) (string, error) {
 		}
 		return session.CWD(), nil
 	}
-	return "", fmt.Errorf("Session file is not a valid pi session: %s", path)
+	// pig divergence (D2): the message names pig where Pi's names pi ("Product name in messages").
+	return "", fmt.Errorf("Session file is not a valid pig session: %s", path)
 }
 
 // sessionNotFoundError is the shared unmatched ID/prefix result for --session and --fork. Unlike other startup failures, Pi prints it without an Error: prefix.

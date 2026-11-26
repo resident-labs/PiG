@@ -2,7 +2,7 @@
 
 PiG reads these variables at startup. Each one has a setting or a default that covers the normal case, so set a variable only when you need to change PiG from outside its configuration: in a container, in CI, or while debugging.
 
-Variables named `PI_*` are read for compatibility with Pi 1.5.0 ([Pi's environment variable reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/environment-variables.md)). Directory variables use the spellings selected by `PIG_USE_PI_DIRS`; other paired variables accept both spellings. Provider credential variables, such as `ANTHROPIC_API_KEY`, are listed in [Providers](/docs/latest/providers) and in `pig --help`.
+Variables named `PI_*` are read for compatibility with Pi 1.6.0 ([Pi's environment variable reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/environment-variables.md)). Directory variables use the spellings selected by `PIG_USE_PI_DIRS`; other paired variables accept both spellings. Provider credential variables, such as `ANTHROPIC_API_KEY`, are listed in [Providers](/docs/latest/providers) and in `pig --help`.
 
 ## Location
 
@@ -65,20 +65,12 @@ One mistake to avoid: a shell that already has `PIG_CODING_AGENT_DIR` set keeps 
 | `PI_CODEMODE_MAX_WORKERS` | Maximum codemode VMs alive at once across all sessions in the process; default `2`. Each VM's script may use up to 256 MB. Raise it when one process runs several sessions, such as in-process subagents. A value that is not a positive integer is ignored; the variable is read on every script. Further scripts wait for a free VM. See [Codemode](/docs/latest/codemode) |
 | `PI_SHARE_GATEWAY_URL` | Artifact upload endpoint used only when you run `/share`. Default `https://pi-in-go.dev/v1/artifacts?visibility=unlisted&title=PiG+session`. PiG does not read Pi's `PI_SHARE_VIEWER_URL`, because `/share` uploads to PiG's own host (D64) |
 | `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` | Proxy outbound HTTP requests. The `httpProxy` setting sets the first two when they are not set |
-| `PI_TELEMETRY` | Override the `enableInstallTelemetry` setting: `1`, `true` or `yes` enables it, anything else disables it. Gates the install/update ping to `https://pi-in-go.dev/api/report-install?version=<version>` (sent only after a fresh install or an update with new changelog entries) and the OpenRouter/NVIDIA/Cloudflare attribution headers. `PI_OFFLINE` also stops the ping regardless of this setting. |
+| `PIG_TELEMETRY` / `PI_TELEMETRY` | Override the `enableInstallTelemetry` setting: `1`, `true` or `yes` enables it, anything else disables it. Gates the install/update ping to `https://pi-in-go.dev/api/report-install?version=<version>` (sent only after a fresh install or an update with new changelog entries) and the OpenRouter/NVIDIA/Cloudflare attribution headers. When both are set, `PIG_TELEMETRY` decides; `pig` passes the choice on as `PI_TELEMETRY` to its extension runtime and to every process it starts. `PIG_OFFLINE` or `PI_OFFLINE` also stops the ping regardless of this setting. |
 | `PIG_INSTALL_TELEMETRY_URL` | Overrides the install/update ping's destination URL. No upstream equivalent; tests use it to point at a local server instead of the network. |
 
 Set `PIG_OFFLINE` in CI. Without it, every run checks for updates and fails slowly when the network is blocked.
 
 Offline mode, from `--offline`, `PIG_OFFLINE` or `PI_OFFLINE`, sets `PI_OFFLINE=1` and `PI_SKIP_VERSION_CHECK=1` in the environment extensions inherit, as Pi does. Pi extensions that check `PI_OFFLINE` see PiG's offline mode.
-
-## Version output
-
-| Variable | Effect |
-|---|---|
-| `PIG_VERSION_FORMAT` | Exact value `pi` makes `pig --version` and `pig -v` print the pinned Pi package version, which is what `pi --version` prints, instead of PiG's composite version (D63). Empty and all other values keep the default composite output. This variable does not change `pig version`, help, banners, diagnostics, updates, or SDK versions |
-
-Use this opt-in when a Pi-compatible launcher checks the version before it starts PiG. The output is the version of the Pi build PiG ports, not a fabricated release.
 
 ## Diagnostics
 
@@ -91,7 +83,7 @@ Use this opt-in when a Pi-compatible launcher checks the version before it start
 | `PI_TUI_DEBUG_REDRAW` | Log why the screen was fully repainted. Needs the exact value `1` |
 | `PI_TUI_WRITE_LOG` | Record the bytes PiG writes to the terminal. A file path is appended to. An existing directory gets one `tui-<date>_<time>-<pid>.log` file per process. Cursor, title, progress, start and stop sequences are not logged. Pi reads the same variable |
 | `PIG_STARTUP_TRACE` | Time each startup step |
-| `PIG_PROFILE` | Write Go runtime profiles when PiG exits. Takes a comma-separated list of `cpu`, `heap`, `allocs`, `block`, `mutex`, `goroutine`, `trace`, `metrics` and `flight`. `heap` and the live heap in `metrics` are measured after two garbage collections, so buffers that pools keep for reuse do not count as live. `metrics` writes `pig-<pid>-metrics.json`: allocation and GC counts for the whole run, live heap, peak RSS, and the goroutines, open files and child processes left at exit. `flight` keeps the last 10 seconds of the execution trace in memory and writes it as `<agent dir>/crash-output/<pid>.flight.trace` (mode 0600) when the session ends without a user request, beside the crash output file; it writes nothing at a normal exit |
+| `PIG_PROFILE` | Write Go runtime profiles when PiG exits. Takes a comma-separated list of `cpu`, `heap`, `allocs`, `block`, `mutex`, `goroutine`, `trace`, `metrics` and `flight`. `heap` and the live heap in `metrics` are measured after two garbage collections, so buffers that pools keep for reuse do not count as live. `metrics` writes `pig-<pid>-metrics.json`: allocation and GC counts for the whole run, live heap, peak RSS, and the goroutines, open files and child processes left at exit. `flight` keeps the last 10 seconds of the execution trace in memory and writes it as `<agent dir>/crash-output/<pid>.flight.trace` (mode 0600) when the session ends without a user request, beside the crash output file; it writes nothing at a normal exit. Heap-profile sampling is off unless the process asks for it (D627): a heap profile that another tool takes from a default run is empty, while `heap` and `allocs` here, or `GODEBUG=memprofilerate=N`, keep it on from the start of the process. |
 | `PIG_PROFILE_DIR` | Directory for `PIG_PROFILE` output. Default: the working directory |
 
 Set `PIG_DEBUG=1` and `PIG_DEBUG_KEYS=1` when a keybinding does not respond. The log shows whether the key reaches PiG and uses the active keybinding manager. Diagnostic logging preserves user overrides. See [terminal setup](/docs/latest/terminal-setup).
@@ -107,7 +99,7 @@ When a session ends without you asking it to, look in the agent directory (`~/.p
 | Variable | Effect |
 |---|---|
 | `GOMAXPROCS` | Number of processors the Go runtime schedules on. When it is not set, PiG uses at most 2 (fewer when the runtime default is lower), which lowers CPU use during streamed turns. Opening or resuming a session, the `/resume` listing, a batch of parallel tool calls and extension builds still run at the full default width. A value you set is used unchanged. Pi has no such setting, because Node runs JavaScript on one thread (D174) |
-| `GOGC` | Go garbage collector target. When it is not set, a print (`-p`), JSON (`--mode json`) or RPC (`--mode rpc`) run collects at 400 until more than 64 MiB of heap is live, then at the default 100 for the rest of the run (D175). Interactive runs keep the default. A value you set is used unchanged |
+| `GOGC` | Go garbage collector target. When it is not set, a print (`-p`), JSON (`--mode json`) or RPC (`--mode rpc`) run collects at 400 until more than 64 MiB of heap is live, then at the default 100 for the rest of the run (D175). An interactive run keeps a heap goal of at least 16 MiB, at 150 until more than 8 MiB of heap is live and at 100 from then on, and only when `GOMEMLIMIT` is not set either (D621). A value you set is used unchanged |
 
 ## Sessions
 
@@ -161,8 +153,9 @@ These variables describe how PiG was installed, so `pig update` can give the rig
 | `PI_PROGRAM_STATUS` | Override OSC 7501 program status detection: `1` always reports, `0` never reports; otherwise PiG reports only after the terminal confirms support. See [Terminal setup](/docs/latest/terminal-setup#program-status) |
 | `PI_IMAGE_PROTOCOL` | Override inline image detection with `kitty`, `iterm2`, `none`, or `auto` |
 | `PI_TRUE_COLOR` | Override true-color detection with `1`, `0`, or `auto`. With true color off, themes use the 256-color palette |
+| `PIG_FRAME_PACING` | PiG-only (D625). `adaptive` begins the frames of a streaming reply 10 to 16 ms apart in fullscreen mode on the terminals listed in [Terminal setup](/docs/latest/terminal-setup#display-problems), for this run; `pi` or `0` begins them 16 ms apart, as Pi does, which is also the default. Any other value, and an empty one, counts as unset. `adaptive` takes effect only with the screen writer (`PIG_TUI_SCREEN_WRITER=writer` or `terminal.screenWriter`); without it, interactive mode shows a warning at start. Read when PiG starts |
 
-Each has a setting that does the same thing. A `terminal.hyperlinks`, `terminal.images` or `terminal.trueColor` setting wins over its variable. See [settings](/docs/latest/settings).
+Each has a setting that does the same thing. A `terminal.hyperlinks`, `terminal.images` or `terminal.trueColor` setting wins over its variable; `PIG_FRAME_PACING` wins over the `terminal.framePacing` setting. See [settings](/docs/latest/settings).
 
 `VISUAL`, then `EDITOR`, name the external editor when the `externalEditor` setting is unset.
 

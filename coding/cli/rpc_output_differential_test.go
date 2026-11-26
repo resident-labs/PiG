@@ -86,7 +86,10 @@ func requireLegacyRPCLines(t testing.TB, label string, event agent.AgentEvent) {
 		wantLine, wantLineErr := legacyRPCLine(want[i])
 		gotLine, gotLineErr := rpcclient.SerializeJsonLine(got[i])
 		// The replaced route's top-level type is the test's wrapper of rpcObject.
-		if fmt.Sprint(gotLineErr) != strings.ReplaceAll(fmt.Sprint(wantLineErr), "cli.legacyRPCObject", "cli.rpcObject") {
+		legacyErr := strings.ReplaceAll(fmt.Sprint(wantLineErr), "cli.legacyRPCObject", "cli.rpcObject")
+		// encoding/json calls the MarshalJSONTo that ai.Usage and the messages define; the sdk encoder calls their MarshalJSON. Same failure.
+		legacyErr = strings.ReplaceAll(legacyErr, "error calling MarshalJSONTo for type", "error calling MarshalJSON for type")
+		if fmt.Sprint(gotLineErr) != legacyErr {
 			t.Fatalf("%s frame %d: encode error %v, legacy %v", label, i, gotLineErr, wantLineErr)
 		}
 		if !bytes.Equal(gotLine, wantLine) {
@@ -293,7 +296,7 @@ func randomEvents(random *rand.Rand) []agent.AgentEvent {
 		agent.ToolExecutionEndEvent{ToolCallID: randomText(random), ToolName: randomText(random), Result: randomToolResultValue(random), IsError: random.IntN(2) == 0, DurationMs: new(random.Int64N(1000))},
 		agent.ToolExecutionEndEvent{ToolCallID: randomText(random), ToolName: randomText(random), Result: randomToolResultValue(random)},
 		agent.CompactionStartEvent{Reason: randomText(random)},
-		agent.CompactionEndEvent{Reason: "manual", Summary: randomText(random), FirstKeptEntryID: randomText(random), TokensBefore: random.IntN(1000), EstimatedTokensAfter: random.IntN(1000), Usage: randomUsage(random), ErrorMessage: randomText(random)},
+		agent.CompactionEndEvent{Reason: "manual", HasResult: true, Summary: randomText(random), FirstKeptEntryID: randomText(random), TokensBefore: random.IntN(1000), EstimatedTokensAfter: random.IntN(1000), Usage: randomUsage(random), ErrorMessage: randomText(random)},
 		agent.CompactionEndEvent{Reason: "overflow", Aborted: true, ErrorMessage: randomText(random)},
 		agent.AutoRetryStartEvent{Attempt: 1, MaxAttempts: 3, DelayMs: 2000, ErrorMessage: randomText(random)}, agent.AutoRetryEndEvent{Attempt: 2, FinalError: randomText(random)},
 		agent.SummarizationRetryScheduledEvent{Attempt: 1, MaxAttempts: 2, DelayMs: 5, ErrorMessage: randomText(random)},
@@ -342,7 +345,7 @@ func TestRPCEventLinesMatchTheReplacedEncoderForEdgeStrings(t *testing.T) {
 			agent.MessageUpdateEvent{Message: assistant, AssistantMessageEvent: ai.ToolCallDeltaEvent{Delta: text, Partial: partial}},
 			agent.MessageUpdateEvent{Message: assistant, AssistantMessageEvent: ai.ToolCallStartEvent{Partial: partial}},
 			agent.ToolExecutionEndEvent{ToolCallID: text, ToolName: text, Result: agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: text}}, Details: map[string]any{text: text}}},
-			agent.CompactionEndEvent{Reason: text, Summary: "s", ErrorMessage: text},
+			agent.CompactionEndEvent{Reason: text, HasResult: true, Summary: "s", ErrorMessage: text},
 		} {
 			requireLegacyRPCLines(t, fmt.Sprintf("%q event %d", text, i), event)
 		}
@@ -363,7 +366,7 @@ func TestRPCEventLinesFailAsTheReplacedEncoderDid(t *testing.T) {
 					usage.CacheWrite1h = new(1)
 				}
 				for i, event := range []agent.AgentEvent{agent.MessageEndEvent{Message: assistant(usage)}, agent.TurnEndEvent{Message: assistant(usage)},
-					agent.CompactionEndEvent{Reason: "manual", Summary: "s", Usage: usage},
+					agent.CompactionEndEvent{Reason: "manual", HasResult: true, Summary: "s", Usage: usage},
 				} {
 					requireLegacyRPCLines(t, fmt.Sprintf("cost %v field %d split %v event %d", cost, field, split, i), event)
 					if _, err := rpcclient.SerializeJsonLine(mustFrames(t, event)[0]); err == nil {
@@ -457,7 +460,7 @@ func TestRPCEventLinesKeepTheMemberOrderOfUsageTheProviderBuilt(t *testing.T) {
 		for i, event := range []agent.AgentEvent{
 			agent.MessageEndEvent{Message: assistant}, agent.TurnEndEvent{Message: assistant},
 			agent.MessageUpdateEvent{Message: assistant, AssistantMessageEvent: ai.TextDeltaEvent{Delta: "d", Partial: &ai.AssistantMessage{}}},
-			agent.CompactionEndEvent{Reason: "manual", Summary: "s", Usage: &usage},
+			agent.CompactionEndEvent{Reason: "manual", HasResult: true, Summary: "s", Usage: &usage},
 			agent.ToolExecutionEndEvent{ToolCallID: "c", ToolName: "t", Result: agent.AgentToolResult{Usage: &usage}},
 		} {
 			requireLegacyRPCLines(t, fmt.Sprintf("usage %s event %d", text, i), event)

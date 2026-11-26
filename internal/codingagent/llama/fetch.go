@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +33,39 @@ type fetchError struct{ cause error }
 func (e *fetchError) Error() string { return "fetch failed" }
 func (e *fetchError) Unwrap() error { return e.cause }
 
+// unreachableError is client.ts fetchServer's `Could not reach llama.cpp server at <url>: <cause>` with the original fetch error as its cause.
+type unreachableError struct {
+	serverURL string
+	cause     error
+}
+
+func (e *unreachableError) Error() string {
+	return "Could not reach llama.cpp server at " + e.serverURL + ": " + connectionErrorDetail(e.cause)
+}
+func (e *unreachableError) Unwrap() error { return e.cause }
+
+// connectionErrorDetail is client.ts connectionErrorDetail: the message of the transport error behind a failed fetch (undici's error.cause), without the
+// request URL Go's url.Error prefixes.
+func connectionErrorDetail(err error) string {
+	var fetch *fetchError
+	if !errors.As(err, &fetch) || fetch.cause == nil {
+		return err.Error()
+	}
+	var urlErr *url.Error
+	if errors.As(fetch.cause, &urlErr) && urlErr.Err != nil {
+		return urlErr.Err.Error()
+	}
+	return fetch.cause.Error()
+}
+
+// serverFailure is client.ts fetchServer's catch: a network-level failure names the server and its cause; an abort or a timeout is rethrown unchanged.
+func serverFailure(serverURL string, err error) error {
+	if _, ok := errors.AsType[*fetchError](err); ok {
+		return &unreachableError{serverURL: serverURL, cause: err}
+	}
+	return err
+}
+
 // fetchResponse is the part of a fetch Response the clients read: the status
 // and the body parsed as JSON, or nil when the body is not JSON.
 type fetchResponse struct {
@@ -42,10 +76,19 @@ type fetchResponse struct {
 
 func (r fetchResponse) ok() bool { return r.status >= 200 && r.status <= 299 }
 
+// requestContext is the signal of one request: the caller's joined with a 15 s timeout of the request's own (client.ts:193-194 and huggingface.ts:75-76, `AbortSignal.any([signal, AbortSignal.timeout(15_000)])`). The request's own timer starts only when the caller has no deadline or one that is due later. Under a caller's deadline that is due earlier or at the same instant, the caller's signal alone ends the request. That is Pi's order: syncCatalog creates its `AbortSignal.timeout(15_000)` (index.ts:51) before any request it bounds, and Node fires the timers of one delay in creation order, so the caller's signal is aborted before a request's own timer can fire. The order is observable: a refresh is aborted, and index.ts:60 reports "Model catalog refresh timed out.", only by the caller's own signal (models.ts:575, :639 and model-runtime.ts:925 read no other), while a request's own timeout that ended the refresh first would be reported as the refresh's error. Two Go timers that are due at the same instant fire in either order.
+func requestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	own := time.Now().Add(requestTimeout)
+	if deadline, ok := ctx.Deadline(); ok && !deadline.After(own) {
+		return context.WithCancel(ctx)
+	}
+	return context.WithDeadlineCause(ctx, own, timeoutError{})
+}
+
 // fetchJSON performs one request under the upstream 15 s timeout combined with
 // ctx, then parses the body like `await response.json()` inside try/catch.
 func fetchJSON(ctx context.Context, method, url string, headers http.Header, body []byte) (fetchResponse, error) {
-	requestCtx, cancel := context.WithTimeoutCause(ctx, requestTimeout, timeoutError{})
+	requestCtx, cancel := requestContext(ctx)
 	defer cancel()
 	var reader io.Reader
 	if body != nil {

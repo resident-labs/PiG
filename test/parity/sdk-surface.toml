@@ -174,10 +174,10 @@ wire = "subprocess.SendUserMessageOptions.deliverAs"
 [[row]]
 key = "pi.sendUserMessage(options.expandPromptTemplates)"
 node = "api.sendUserMessage"
-go = "-"
-rust = "-"
-python = "-"
-lisp = "-"
+go = "Context.SendUserMessageWith|SendUserMessageOptions.ExpandPromptTemplates"
+rust = "Context::send_user_message_with"
+python = "Context.send_user_message(expand_prompt_templates)"
+lisp = "pig:ctx-send-user-message(expand-prompt-templates)|pig:ctx-send-user-message-p(expand-prompt-templates)"
 wire = "subprocess.SendUserMessageOptions.expandPromptTemplates"
 
 [[row]]
@@ -389,16 +389,12 @@ wire = "subprocess.CommandInfo.sourceInfo"
 [[row]]
 key = "pi.registerProvider"
 node_partial = "config registration reaches the host; native callback providers remain process-local"
-go_partial = "registration declaration is applied at load; use ModelRegistry.RegisterProvider for live config registration"
-rust_partial = "registration declaration is applied at load; use ModelRegistry.register_provider for live config registration"
-python_partial = "registration declaration is applied at load; use ModelRegistry.register_provider for live config registration"
+rust_partial = "Extension::register_provider queues at load (the extension is moved into run, so a later call does not compile); after load a handler calls ModelRegistry::register_provider through Context::model_registry, which applies the config at once through the host"
 
 [[row]]
 key = "pi.unregisterProvider"
 node_partial = "config removal reaches the host; native providers remain process-local"
-go_partial = "registration declarations are removed at load; live config removal is exposed by ModelRegistry.UnregisterProvider"
-rust_partial = "registration declarations are removed at load; live config removal is exposed by ModelRegistry.unregister_provider"
-python_partial = "registration declarations are removed at load; live config removal is exposed by ModelRegistry.unregister_provider"
+rust_partial = "Extension::unregister_provider drops a queued registration at load; after load a handler calls ModelRegistry::unregister_provider through Context::model_registry, which removes the provider at once through the host"
 
 [[row]]
 key = "pi.getThinkingLevel"
@@ -421,9 +417,9 @@ go = "Context.Done"
 rust = "Context::is_cancelled"
 python = "Context.is_cancelled"
 lisp = "pig:ctx-is-cancelled|pig:ctx-is-cancelled-p|pig:ctx-cancelled-p"
-wire = "none"
-partial = "the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary"
-node_partial = "event.signal is the handler request's AbortSignal, aborted when the host cancels the request"
+wire = "subprocess.RequestPayload.signal_aborted"
+partial = "the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary: the host sends a signal-only cancel (CancelPayload.signal_only) when the signal ends while the handler runs and keeps its reply; the abort aborts the handler signal and cancels no host call, as Pi's in-process calls never fail with it, and a handler dispatched after the abort starts with it aborted (signal_aborted)"
+node_partial = "event.signal is the handler request's AbortSignal, aborted by the signal-only cancel (CancelPayload.signal_only), which cancels no host call, and already aborted for a handler dispatched after the abort (signal_aborted)"
 
 [[row]]
 key = "session_before_tree event.signal"
@@ -432,9 +428,9 @@ go = "Context.Done"
 rust = "Context::is_cancelled"
 python = "Context.is_cancelled"
 lisp = "pig:ctx-is-cancelled|pig:ctx-is-cancelled-p|pig:ctx-cancelled-p"
-wire = "none"
-partial = "the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary"
-node_partial = "event.signal is the handler request's AbortSignal, aborted when the host cancels the request"
+wire = "subprocess.RequestPayload.signal_aborted"
+partial = "the handler's request cancellation stands in for the AbortSignal, which cannot cross the process boundary: the host sends a signal-only cancel (CancelPayload.signal_only) when the signal ends while the handler runs and keeps its reply; the abort aborts the handler signal and cancels no host call, as Pi's in-process calls never fail with it, and a handler dispatched after the abort starts with it aborted (signal_aborted)"
+node_partial = "event.signal is the handler request's AbortSignal, aborted by the signal-only cancel (CancelPayload.signal_only), which cancels no host call, and already aborted for a handler dispatched after the abort (signal_aborted)"
 
 [[row]]
 key = "input return.action"
@@ -450,11 +446,12 @@ wire = "extension.InputEventResultTransform.images"
 
 [[row]]
 key = "user_bash return.operations"
-node = "-"
-go = "-"
-rust = "-"
-python = "-"
-lisp = "-"
+node = "read:result.operations"
+go = "BashOperations"
+rust = "Context::bash_operations"
+python = "BashOperations"
+lisp = "pig:make-bash-operations"
+wire = "literal:operations"
 
 # ── ctx (ExtensionContext) ─────────────────────────────────────────────────
 
@@ -504,7 +501,7 @@ go = "ContextUsage.Tokens"
 rust = "ContextUsage.tokens"
 python = "Context.get_context_usage"
 lisp = "pig:ctx-get-context-usage|pig:ctx-get-context-usage-p|pig:ctx-context-usage-p|pig:ctx-context-usage"
-wire = "subprocess.extensionContextUsageDTO.tokens"
+wire = "extension.ContextUsage.tokens"
 
 [[row]]
 key = "ctx.getContextUsage → contextWindow"
@@ -513,7 +510,7 @@ go = "ContextUsage.ContextWindow"
 rust = "ContextUsage.context_window"
 python = "Context.get_context_usage"
 lisp = "pig:ctx-get-context-usage|pig:ctx-get-context-usage-p|pig:ctx-context-usage-p|pig:ctx-context-usage"
-wire = "subprocess.extensionContextUsageDTO.contextWindow"
+wire = "extension.ContextUsage.contextWindow"
 
 [[row]]
 key = "ctx.getContextUsage → percent"
@@ -522,7 +519,7 @@ go = "ContextUsage.Percent"
 rust = "ContextUsage.percent"
 python = "Context.get_context_usage"
 lisp = "pig:ctx-get-context-usage|pig:ctx-get-context-usage-p|pig:ctx-context-usage-p|pig:ctx-context-usage"
-wire = "subprocess.extensionContextUsageDTO.percent"
+wire = "extension.ContextUsage.percent"
 
 [[row]]
 key = "ctx.compact(options.customInstructions)"
@@ -556,9 +553,6 @@ wire = "literal:awaitCompletion"
 [[row]]
 key = "ctx.modelRegistry.registerProvider"
 node_partial = "config registration reaches the host; native callback providers remain process-local"
-go_partial = "config overload only; native Provider callback objects are not implemented"
-rust_partial = "config overload only; native Provider callback objects are not implemented"
-python_partial = "config overload only; native Provider callback objects are not implemented"
 
 [[row]]
 key = "ctx.modelRegistry.getAvailable"
@@ -575,11 +569,12 @@ wire = "extension.NewSessionOptions.parentSession"
 
 [[row]]
 key = "ctx.newSession(options.setup)"
-node = "-"
-go = "-"
-rust = "-"
-python = "-"
-lisp = "-"
+node = "read:entry.callback"
+go = "SetupFunc"
+rust = "Context::new_session_setup"
+python = "SetupSessionManager"
+lisp = "pig:ctx-new-session(setup)"
+wire = "subprocess.SetupArgs.handle"
 
 [[row]]
 key = "ctx.newSession(options.withSession)"
@@ -773,10 +768,10 @@ wire = "subprocess.SendUserMessageOptions.deliverAs"
 [[row]]
 key = "withSession ctx.sendUserMessage(options.expandPromptTemplates)"
 node = "read:context.sendUserMessage"
-go = "-"
-rust = "-"
-python = "-"
-lisp = "-"
+go = "Context.SendUserMessageWith|SendUserMessageOptions.ExpandPromptTemplates"
+rust = "Context::send_user_message_with"
+python = "Context.send_user_message(expand_prompt_templates)"
+lisp = "pig:ctx-send-user-message(expand-prompt-templates)|pig:ctx-send-user-message-p(expand-prompt-templates)"
 wire = "subprocess.SendUserMessageOptions.expandPromptTemplates"
 
 # ── ctx.ui (ExtensionUIContext) ────────────────────────────────────────────
@@ -1018,11 +1013,8 @@ rust = "Theme.source_path"
 
 [[row]]
 key = "ctx.ui.theme.sourceInfo"
-node = "-"
-go = "-"
-rust = "-"
-python = "-"
-lisp = "-"
+go = "UITheme.SourceInfo"
+rust = "Theme.source_info"
 
 [[row]]
 key = "ctx.ui.theme.appearance"
@@ -1093,8 +1085,8 @@ partial = "reaches the host's tool definition, but PiG's system prompt does not 
 
 [[row]]
 key = "tool.execute"
-partial = "params arrive as JSON; onUpdate is ctx.OnUpdate/on_update and the AbortSignal is the request's cancellation"
-node_partial = "the AbortSignal is the tool request's, aborted when the host cancels it"
+partial = "params arrive as JSON; onUpdate is ctx.OnUpdate/on_update and the AbortSignal is the request's cancellation: the host aborts it with a signal-only cancel (CancelPayload.signal_only), which cancels none of the tool's host calls, as in Pi; only its nested executeTool calls take the abort, and the ordinary cancel follows when D111's grace period ends"
+node_partial = "the AbortSignal is the tool request's, aborted by the signal-only cancel, which cancels none of the tool's host calls; the ordinary cancel follows when D111's grace period ends"
 
 [[row]]
 key = "tool.renderCall"
@@ -1180,11 +1172,11 @@ lisp = "pig:tool-render-context-invalidate|pig:tool-render-context-invalidate-p"
 [[row]]
 key = "tool render context.lastComponent"
 node = "read:card.state"
-go = "-"
-rust = "-"
-python = "-"
-lisp = "-"
-node_partial = "the component this card's renderer last returned, kept inside the extension process"
+
+[[row]]
+key = "tool render context.durationMs"
+node = "read:payload.context"
+wire = "subprocess.RenderToolContext.durationMs"
 
 [[row]]
 key = "tool render context.state"
@@ -1314,11 +1306,12 @@ wire = "extension.ProviderConfig.api"
 
 [[row]]
 key = "provider.streamSimple"
-node = "-"
-go = "-"
-rust = "-"
-python = "-"
-lisp = "-"
+node = "read:config.streamSimple"
+go = "ProviderStreamSimpleFunc"
+rust = "ProviderOperations.stream_simple"
+python = "Extension.register_provider"
+lisp = "pig:register-provider|pig:register-provider-p"
+wire = "subprocess.ProviderDecl.stream_simple"
 
 [[row]]
 key = "provider.headers"
@@ -1349,11 +1342,12 @@ wire = "extension.ProviderConfig.models"
 
 [[row]]
 key = "provider.refreshModels"
-node = "-"
-go = "-"
-rust = "-"
-python = "-"
-lisp = "-"
+node = "read:config.refreshModels"
+go = "ProviderRefreshModelsFunc"
+rust = "ProviderOperations.refresh_models"
+python = "Extension.register_provider"
+lisp = "pig:register-provider|pig:register-provider-p"
+wire = "subprocess.ProviderDecl.refresh_models"
 
 [[row]]
 key = "provider.images"
@@ -1402,11 +1396,12 @@ wire = "subprocess.ProviderOAuthConfig.isSubscription"
 
 [[row]]
 key = "provider.oauth.usesCallbackServer"
-node = "-"
-go = "-"
-rust = "-"
-python = "-"
-lisp = "-"
+node = "read:oauth.usesCallbackServer"
+go = "OAuthProvider.UsesCallbackServer"
+rust = "OAuthProvider.uses_callback_server"
+python = "OAuthProvider.uses_callback_server"
+lisp = "pig:oauth-provider-uses-callback-server"
+wire = "subprocess.ProviderOAuthConfig.usesCallbackServer"
 
 [[row]]
 key = "provider.oauth.login"
@@ -1437,11 +1432,12 @@ wire = "subprocess.ProviderOAuthConfig.has_get_api_key"
 
 [[row]]
 key = "provider.oauth.modifyModels"
-node = "-"
-go = "-"
-rust = "-"
-python = "-"
-lisp = "-"
+node = "read:oauth.modifyModels"
+go = "OAuthProvider.ModifyModels"
+rust = "OAuthProvider.modify_models"
+python = "OAuthProvider.modify_models"
+lisp = "pig:oauth-provider-modify-models"
+wire = "subprocess.ProviderOAuthConfig.has_modify_models"
 
 [[row]]
 key = "provider model.id"
@@ -1602,7 +1598,7 @@ wire = "extension.ProviderModelConfig.compat"
 key = "pi.registerMarkdownTransformer"
 node = "api.registerMarkdownTransformer"
 go = "Extension.MarkdownTransformer"
-rust = "Extension::markdown_transformer"
+rust = "Extension::markdown_transformer_with_options|Extension::markdown_transformer"
 python = "Extension.markdown_transformer"
 lisp = "pig:markdown-transformer|pig:markdown-transformer-p"
 
@@ -2041,6 +2037,46 @@ go = "Extension.EntryViewRenderer"
 rust = "Extension::entry_view_renderer"
 python = "Extension.entry_view_renderer"
 lisp = "pig:entry-view-renderer|pig:entry-view-renderer-p"
+
+[[row]]
+key = "kit message renderer view event"
+section = "component kit (D107)"
+decl = "the events of the mouse regions of a message renderer's view (Pi: the MouseRegion closure of the component the renderer returns)"
+node = "api.registerMessageRenderer"
+go = "Extension.MessageViewEvent"
+rust = "Extension::message_view_event"
+python = "Extension.message_view_event"
+lisp = "pig:message-view-event"
+
+[[row]]
+key = "kit entry renderer view event"
+section = "component kit (D107)"
+decl = "the events of the mouse regions of an entry renderer's view (Pi: the MouseRegion closure of the component the renderer returns)"
+node = "api.registerEntryRenderer"
+go = "Extension.EntryViewEvent"
+rust = "Extension::entry_view_event"
+python = "Extension.entry_view_event"
+lisp = "pig:entry-view-event"
+
+[[row]]
+key = "kit message renderer state"
+section = "component kit (D107)"
+decl = "the renderer state of one displayed message (Pi: the WeakMap a renderer keeps by message object)"
+node = "api.registerMessageRenderer"
+go = "MessageRenderOptions.State"
+rust = "MessageRenderOptions.state"
+python = "MessageRenderOptions.state"
+lisp = "pig:message-render-options-state"
+
+[[row]]
+key = "kit entry renderer state"
+section = "component kit (D107)"
+decl = "the renderer state of one displayed entry (Pi: the WeakMap a renderer keeps by entry object)"
+node = "api.registerEntryRenderer"
+go = "EntryRenderOptions.State"
+rust = "EntryRenderOptions.state"
+python = "MessageRenderOptions.state"
+lisp = "pig:entry-render-options-state"
 
 [[row]]
 key = "kit lines list annotation"

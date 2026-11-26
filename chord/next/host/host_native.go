@@ -8,10 +8,13 @@ import (
 	"time"
 
 	chordctx "github.com/MichaelKinsy/PiG/chord/context"
+	"github.com/MichaelKinsy/PiG/chord/internal/parking"
 	"github.com/MichaelKinsy/PiG/chord/next/data"
+	chordtelemetry "github.com/MichaelKinsy/PiG/chord/next/telemetry"
+	"github.com/MichaelKinsy/PiG/telemetry"
 )
 
-// Ports packages/chord/src/next/host/native.ts. Natives (§13): the handle `self.open` returns, a value opened during
+// Ports packages/chord/src/host/native.ts. Natives (§13): the handle `self.open` returns, a value opened during
 // activation and closed with a reason when its attempt ends; `within`, which bounds a close or a drain by a timeout; and the
 // drain's admission of running work.
 
@@ -60,6 +63,11 @@ type nativeOwner struct {
 	context  context.Context
 	report   func(HostError)
 	loop     sectionLoop
+	// typ, hostKey and telemetry are what its spans record: its object's type, its host's `chord.host`, and the host's
+	// adapter (a close is a root span on it).
+	typ       string
+	hostKey   string
+	telemetry telemetry.TelemetryContext
 }
 
 // nativeSlot is what an attempt does with each of its natives, whatever their value's type.
@@ -143,14 +151,33 @@ func (n *nativeHandle[T]) open(ctx context.Context) error {
 	}
 	n.state = nativeState[T]{kind: nativeOpening}
 	n.mu.Unlock()
+	// Its `chord.open` span under its attempt's, when something records; none otherwise.
+	var span *chordtelemetry.OpenSpan
+	if parent := chordctx.Telemetry(ctx); !chordtelemetry.Untraced(parent) {
+		owner := n.owner
+		span = chordtelemetry.NewOpenSpan(parent, "chord.open", telemetry.SpanAttributes{
+			telemetry.Attr("chord.host", owner.hostKey),
+			telemetry.Attr("type", owner.typ),
+			telemetry.Attr("native", float64(owner.position)),
+		})
+		ctx = chordctx.WithTelemetry(ctx, span.Span())
+	}
 	var value T
 	if err := nativeTry(func() (err error) {
 		value, err = n.opener(ctx)
 		return err
 	}); err != nil {
+		if span != nil {
+			// An open its attempt abandoned (a deadline, an end) was cancelled: no error.
+			chordtelemetry.Ended(span.Span(), "open_failed", err, ctx)
+			span.End()
+		}
 		return err
 	}
 	n.opened(value)
+	if span != nil {
+		span.End()
+	}
 	return nil
 }
 
@@ -192,16 +219,31 @@ func (n *nativeHandle[T]) opened(value T) {
 func (n *nativeHandle[T]) closeValue(value T, reason NativeCloseReason) *closeFailed {
 	owner := n.owner
 	at := HostError{Object: owner.object, Native: Position{Kind: PositionNative, Position: owner.position}}
-	// The object's context, aborted at the close timeout: Pi's `withAbortSignal(timeout.signal, context)`. A close that settled
-	// needs no more abort; one that timed out was aborted with its cause already.
+	// The object's context, aborted at the close timeout only: Pi's `withAbortSignal(timeout.signal, context)`. A close that
+	// settled in time leaves its context live, as Pi leaves `timeout.signal` unaborted.
 	closeCtx, abort := chordctx.WithCancel(owner.context)
-	defer abort(nil)
+	// Its `chord.close` root span on the host's adapter, when something records.
+	var span *chordtelemetry.OpenSpan
+	if !chordtelemetry.Untraced(owner.telemetry) {
+		span = chordtelemetry.NewOpenSpan(owner.telemetry, "chord.close", telemetry.SpanAttributes{
+			telemetry.Attr("chord.host", owner.hostKey),
+			telemetry.Attr("type", owner.typ),
+			telemetry.Attr("native", float64(owner.position)),
+			telemetry.Attr("reason", string(reason.Kind)),
+		})
+		defer span.End()
+		closeCtx = chordctx.WithTelemetry(closeCtx, span.Span())
+	}
 	closing := newNativeWork()
-	owner.loop.Go(func() {
+	// An owned task the loop counts (a test's join waits for a close that runs, not for one parked on something outside).
+	goTask(owner.loop, n.closer, func() {
 		closing.settle(nativeTry(func() error { return n.closer(value, reason, closeCtx) }))
 	})
 	result, err := within(owner.loop, closing, n.closeTimeout)
 	if err != nil {
+		if span != nil {
+			chordtelemetry.SpanFailed(span.Span(), "close_failed", err)
+		}
 		failure := at
 		failure.Kind, failure.Error = ErrCloseFailed, err
 		return &failure
@@ -251,6 +293,16 @@ func (w *nativeWork) settle(err error) {
 	})
 }
 
+// settled reports whether the work ended.
+func (w *nativeWork) settled() bool {
+	select {
+	case <-w.done:
+		return true
+	default:
+		return false
+	}
+}
+
 // withinResult is whether the work settled in time.
 type withinResult string
 
@@ -260,11 +312,21 @@ const (
 )
 
 // raceTimer waits for settled (which reports whether the work it waits on is done, giving up when its timedOut channel
-// closes) against a timer of ms on loop: the Promise.race of Pi's `within`.
-func raceTimer(loop eventLoop, ms time.Duration, settled func(timedOut <-chan struct{}) bool) withinResult {
+// closes) against a timer of ms on loop: the Promise.race of Pi's `within`. over reports, with no effect, whether the work is
+// done already: the wait of a task (awaitTask) is parked, so a test's join does not wait for work that is still running or
+// for the timer, and counts the task again once either is over (a timer is a later macrotask of Pi's loop).
+func raceTimer(loop eventLoop, ms time.Duration, over func() bool, settled func(timedOut <-chan struct{}) bool) withinResult {
 	timedOut := make(chan struct{})
 	timer := loop.AfterFunc(ms, func() { close(timedOut) })
 	defer timer.Stop()
+	defer parking.Idle(func() bool {
+		select {
+		case <-timedOut:
+			return true
+		default:
+			return over()
+		}
+	})()
 	if settled(timedOut) {
 		return withinSettled
 	}
@@ -273,7 +335,7 @@ func raceTimer(loop eventLoop, ms time.Duration, settled func(timedOut <-chan st
 
 // within reports whether promise settled within ms (it returns its error when it rejects first); promise itself runs on.
 func within(loop eventLoop, promise *nativeWork, ms time.Duration) (withinResult, error) {
-	result := raceTimer(loop, ms, func(timedOut <-chan struct{}) bool {
+	result := raceTimer(loop, ms, func() bool { return promise.settled() }, func(timedOut <-chan struct{}) bool {
 		select {
 		case <-promise.done:
 			return true
@@ -299,7 +361,14 @@ func drained(loop eventLoop, drain []*nativeWork, ms time.Duration) withinResult
 	if len(drain) == 0 {
 		return withinSettled
 	}
-	return raceTimer(loop, ms, func(timedOut <-chan struct{}) bool {
+	return raceTimer(loop, ms, func() bool {
+		for _, promise := range drain {
+			if !promise.settled() {
+				return false
+			}
+		}
+		return true
+	}, func(timedOut <-chan struct{}) bool {
 		for _, promise := range drain {
 			select {
 			case <-promise.done:

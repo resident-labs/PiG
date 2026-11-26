@@ -8,6 +8,7 @@ import (
 	"math"
 	"path/filepath"
 	"slices"
+	"sync/atomic"
 	"testing"
 
 	"github.com/MichaelKinsy/PiG/ai"
@@ -18,7 +19,7 @@ import (
 // turnTool is a tool `name` whose execution runs execute.
 func turnTool(name string, execute func(ctx context.Context, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error), replay ...durable.ToolReplay) *durable.ToolRegistration {
 	registration := durable.ToolRegistration{
-		ToolSchema: ai.ToolSchema{Name: name, Description: name, Parameters: map[string]any{"type": "object", "properties": map[string]any{}}},
+		Name: name, Description: name, Parameters: map[string]any{"type": "object", "properties": map[string]any{}},
 		Execute: func(ctx context.Context, _ any, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			return execute(ctx, api)
 		},
@@ -128,7 +129,7 @@ func TestTurnLimit(t *testing.T) {
 		// upstream: packages/durable/test/harness-turn-limit.test.ts:104
 		yields := 0
 		setup, harness, root := turnLimited(t, 2, func(chat *chatState) {
-			addHooks(t, chat.Registry, GenerationTask.Erased(), &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (*YieldContinue, error) {
+			addHooks(t, chat.Registry, GenerationTask.Erased(), &GenerationHooks{OnYield: func(context.Context, ai.AssistantMessage, HookApi) (YieldResult, error) {
 				yields++
 				if yields == 1 {
 					return &YieldContinue{Continue: ai.UserText("keep going")}, nil
@@ -337,7 +338,11 @@ func TestTurnLimit(t *testing.T) {
 	// #11043
 	t.Run("is resumed by a continue, with a fresh budget, on the round's results", func(t *testing.T) {
 		// upstream: packages/durable/test/harness-turn-limit.test.ts:251
-		setup, harness, root := turnLimited(t, 1)
+		var models *continueModels
+		setup, harness, root := turnLimited(t, 1, func(setup *chatState) {
+			models = &continueModels{Models: setup.Models}
+			setup.HarnessModels = models
+		})
 		continued := ""
 		setup.Faux.SetResponses([]ai.FauxResponseStep{
 			turnRound("c1"),
@@ -348,10 +353,14 @@ func TestTurnLimit(t *testing.T) {
 			}),
 		})
 		must(submit(t, root, inputDraft("go")).Wait(testContext))
+		// The continue's run answers at once; held where it resolves its model (continueModels), its run is read still open.
+		held := models.hold()
+		defer held.release.resolve()
 		resumed := submit(t, root, durable.SubmissionDraft{Type: durable.SubmissionTypeContinue})
 		if run := liveOf(t, harness, root.Id()).Run; run == nil || run.Turns != 0 {
 			t.Fatalf("run = %s, want turns 0", jsonText(t, run))
 		}
+		held.release.resolve()
 		settled := must(resumed.Wait(testContext))
 		if settled.Status != durable.SubmissionDone || settled.Type == durable.SubmissionTypeWrite {
 			t.Fatalf("Unexpected %s", settled.Status)
@@ -422,11 +431,19 @@ func TestTurnLimit(t *testing.T) {
 		})
 		started := deferred()
 		runs := 0
+		var reopened atomic.Bool
+		rerun := deferred()
+		defer rerun.resolve()
 		addTool(t, setup.Registry, turnTool("noop", func(ctx context.Context, _ durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
 			runs++
 			if runs == 2 {
 				started.resolve()
 				return durable.ToolExecutionResult{}, abortedBy(ctx)
+			}
+			if reopened.Load() {
+				if err := rerun.wait(ctx); err != nil {
+					return durable.ToolExecutionResult{}, err
+				}
 			}
 			return noopResult()
 		}, durable.ReplaySafe))
@@ -446,13 +463,16 @@ func TestTurnLimit(t *testing.T) {
 		}
 		opened.kill()
 
-		// The replay-safe call runs again after reopen; the stored count still ends the run at this round.
+		// The replay-safe call runs again after reopen; the stored count still ends the run at this round. The run resumes on its
+		// own goroutine, so the re-run waits at rerun until the run is read still open.
 		runs = 0
+		reopened.Store(true)
 		second, secondRoot := openAt(t, path, setup)
 		second.Resume()
 		if run := liveOf(t, second, secondRoot.Id()).Run; run == nil || run.Turns != 2 {
 			t.Fatalf("run after reopen = %s, want turns 2", jsonText(t, run))
 		}
+		rerun.resolve()
 		settled := must(submissionOfHarness(t, second, id).Wait(testContext))
 		expectSettled(t, settled, durable.SubmissionUnanswered, "turn_limit")
 		if detail := detailOf(t, settled); detail != "2 turns" {

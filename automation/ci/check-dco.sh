@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: MIT
 #
 # Fails unless every non-merge commit in <base-commit>..<head-commit> carries a
-# "Signed-off-by:" line matching its author or its committer.
+# "Signed-off-by:" line matching its author or its committer. With a trusted
+# upstream ref (Dyna fork mode), check all commits, including merges, except
+# the ancestors of the upstream ref. The caller must fetch that ref from upstream.
 #
 # A commit that lacks one is also accepted when a LATER commit in the same range
 # retroactively signs it off. That remediation commit must:
@@ -37,8 +39,8 @@
 
 set -euo pipefail
 
-if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <base-commit> <head-commit>" >&2
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  echo "usage: $0 <base-commit> <head-commit> [trusted-upstream-ref]" >&2
   exit 2
 fi
 
@@ -47,6 +49,14 @@ head=$2
 
 git rev-parse --verify "${base}^{commit}" >/dev/null
 git rev-parse --verify "${head}^{commit}" >/dev/null
+
+range=(--no-merges "${base}..${head}")
+kind=non-merge
+if [[ $# -eq 3 ]]; then
+  upstream=$(git rev-parse --verify "${3}^{commit}")
+  range=("${base}..${head}" "^${upstream}")
+  kind=fork
+fi
 
 min_prefix=10
 
@@ -103,7 +113,7 @@ remediations=()
 # "done < <(git ...)" would hide its exit status and report a clean pass over a range it could not read.
 records=$(mktemp)
 trap 'rm -f "$records"' EXIT
-git log --reverse --no-merges -z --format='%H%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%s%x1f%B' "${base}..${head}" >"$records"
+git log --reverse -z --format='%H%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%s%x1f%B' "${range[@]}" >"$records"
 while IFS= read -r -d '' record; do
   fields=()
   rest=$record
@@ -210,4 +220,4 @@ fi
 for (( i = 0; i < ${#notes[@]}; i++ )); do
   echo "${notes[i]}" >&2
 done
-printf 'DCO: %d non-merge commit(s) signed off\n' "${#commits[@]}"
+printf 'DCO: %d %s commit(s) signed off\n' "${#commits[@]}" "$kind"

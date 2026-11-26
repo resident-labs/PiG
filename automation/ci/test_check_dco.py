@@ -74,9 +74,12 @@ class CheckDCOTests(unittest.TestCase):
         self.git("commit", "-q", "--allow-empty", "-m", message, env=env)
         return self.git("rev-parse", "HEAD").strip()
 
-    def check(self, env=None):
+    def check(self, env=None, trusted_upstream=None):
+        args = ["bash", str(self.script), self.base, "HEAD"]
+        if trusted_upstream is not None:
+            args.append(trusted_upstream)
         return subprocess.run(
-            ["bash", str(self.script), self.base, "HEAD"],
+            args,
             cwd=self.directory.name, env=env or self.env, capture_output=True, text=True,
         )
 
@@ -94,6 +97,23 @@ class CheckDCOTests(unittest.TestCase):
             [line.split()[0] for line in done.stderr.splitlines() if line.startswith("  ")],
             [self.git("rev-parse", "--short", sha).strip() for sha in unsigned],
         )
+
+    def test_fork_mode_checks_ancestry_not_identity_and_includes_the_merge(self):
+        self.git("switch", "-c", "trusted-upstream")
+        imported = self.commit(ALICE, "unsigned upstream change")
+        self.git("switch", "main")
+        self.git("-c", "user.name=Bob Example", "-c", "user.email=bob@example.invalid", "merge", "--no-ff", "--no-commit", "trusted-upstream")
+        self.commit(BOB, "fork merge\n\n" + signoff(BOB))
+        self.assertFails(imported)  # The ordinary upstream gate is unchanged.
+        done = self.check(trusted_upstream="trusted-upstream")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "DCO: 1 fork commit(s) signed off\n")
+
+        forged = self.commit(ALICE, "unsigned fork change from the same identity")
+        done = self.check(trusted_upstream="trusted-upstream")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn(self.git("rev-parse", "--short", forged).strip(), done.stderr)
+        self.assertNotIn(self.git("rev-parse", "--short", imported).strip(), done.stderr)
 
     def test_signed_commit_passes(self):
         self.commit(ALICE, "feature\n\n" + signoff(ALICE))

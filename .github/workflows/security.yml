@@ -311,7 +311,8 @@ jobs:
   dependency-review:
     name: Dependency review
     needs: [changes]
-    if: github.event_name == 'pull_request' && github.event.repository.private == false && needs.changes.outputs.product == 'true'
+    # The Dyna fork does not have a GitHub dependency graph. The other security jobs still run.
+    if: github.repository != 'resident-labs/PiG' && github.event_name == 'pull_request' && github.event.repository.private == false && needs.changes.outputs.product == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -417,6 +418,7 @@ jobs:
     steps:
       - name: Require every security job this event runs
         env:
+          REPOSITORY: ${{ github.repository }}
           EVENT: ${{ github.event_name }}
           PRIVATE: ${{ github.event.repository.private }}
           PRODUCT: ${{ needs.changes.outputs.product }}
@@ -441,7 +443,7 @@ jobs:
           # Docs-only changes (the changes classifier) skip the product scans.
           product_skip=false; review_skip=false; codeql_skip=false
           [ "$PRODUCT" = false ] && product_skip=true
-          { [ "$EVENT" != pull_request ] || [ "$PRIVATE" = true ] || [ "$product_skip" = true ]; } && review_skip=true
+          { [ "$REPOSITORY" = resident-labs/PiG ] || [ "$EVENT" != pull_request ] || [ "$PRIVATE" = true ] || [ "$product_skip" = true ]; } && review_skip=true
           { [ "$PRIVATE" = true ] || [ "$product_skip" = true ]; } && codeql_skip=true
           expect "Changed paths" "$CHANGES" false
           expect "Source assurance" "$SOURCE" "$product_skip"

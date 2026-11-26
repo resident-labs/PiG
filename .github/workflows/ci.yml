@@ -281,17 +281,32 @@ jobs:
       - name: Test the shard verdict
         run: python3 -B -m unittest automation/ci/test_bookkeeping_shards.py
       - name: Check commit sign-offs
-        if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
+        if: github.repository != 'resident-labs/PiG' && github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: ./automation/ci/check-dco.sh "$BASE_SHA" "$HEAD_SHA"
+      - name: Fetch the canonical SDK release tag for the module-pin gate
+        if: github.repository == 'resident-labs/PiG'
+        run: git fetch --no-tags https://github.com/MichaelKinsy/PiG.git refs/tags/extensions/sdk/v0.8.0:refs/tags/extensions/sdk/v0.8.0
+      - name: Resolve canonical PiG ancestry
+        if: github.repository == 'resident-labs/PiG' && github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
+        run: |
+          git fetch --no-tags https://github.com/MichaelKinsy/PiG.git refs/heads/main
+          upstream=$(git rev-parse --verify 'FETCH_HEAD^{commit}')
+          echo "TRUSTED_UPSTREAM_SHA=$upstream" >> "$GITHUB_ENV"
       - name: Check test expectations edited with their code
         if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: go run ./test/parity/cmd/testprune lint -base "$BASE_SHA" -head "$HEAD_SHA"
+        shell: bash
+        run: |
+          args=(-base "$BASE_SHA" -head "$HEAD_SHA")
+          if [ "$GITHUB_REPOSITORY" = resident-labs/PiG ]; then
+            args+=(-exclude-ancestors-of "${TRUSTED_UPSTREAM_SHA:?trusted PiG revision was not fetched}")
+          fi
+          go run ./test/parity/cmd/testprune lint "${args[@]}"
       # port-map-drift, coverage-drift and divergence-guard read Pi's source mirror, and a commit pin's mirror takes its generated
       # provider data from the oracle build, so this prepares the oracle as the Linux shards do (the build is cached by pin).
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -359,6 +374,13 @@ jobs:
           path: ${{ runner.temp }}/autofix/
           if-no-files-found: error
           retention-days: 3
+      # Check Dyna's fork history after the ordinary shard verdict. Requiring fork sign-offs keeps CI red on failure without skipping Linux builds and tests.
+      - name: Check fork commit sign-offs
+        if: ${{ !cancelled() && github.repository == 'resident-labs/PiG' && github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./automation/ci/check-dco.sh "$BASE_SHA" "$HEAD_SHA" "${TRUSTED_UPSTREAM_SHA:?trusted PiG revision was not fetched}"
       - name: Fail the job when a gate failed
         if: steps.gates.outcome == 'failure'
         run: |

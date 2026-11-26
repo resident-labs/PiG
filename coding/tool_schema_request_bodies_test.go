@@ -1,6 +1,7 @@
 package coding
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -26,9 +27,7 @@ import (
 // The tool schemas are held once, not copied per prompt, and the request bodies a session sends must not notice. This test drives
 // a session with three extension tools (one whose schema needs normalisation for strict providers) and the default built-in
 // tools through each API that converts tools, against a recording server, and compares every request body with the file
-// testdata/tool_schema_request_bodies.golden.json, which holds the length and SHA-256 of every body and was written by the code before the cut (9cd955810e; WRITE_TOOL_SCHEMA_GOLDEN=1 rewrites it). The scenario
-// is fresh session (two prompts), one compaction, a third prompt, then the session resumed with one tool removed and one changed
-// since the transcript was written (two prompts).
+// testdata/tool_schema_request_bodies.golden.json. Its unchanged requests keep the length and SHA-256 from before the refactor (9cd955810e); the fork's P16 compaction and its Responses summary replay pin the intentional wire differences. WRITE_TOOL_SCHEMA_GOLDEN=1 regenerates the snapshot. The scenario is a fresh session with two prompts, one compaction and a third prompt, then two prompts after resume with one tool removed and one changed.
 const requestBodiesGolden = "testdata/tool_schema_request_bodies.golden.json"
 
 var (
@@ -44,9 +43,10 @@ type requestShape struct {
 }
 
 const (
-	chatReply      = "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\ndata: [DONE]\n\n"
-	responsesReply = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"id\":\"m\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
-	anthropicReply = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"m\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" +
+	chatReply            = "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\ndata: [DONE]\n\n"
+	responsesSummaryItem = "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}}\n\n"
+	responsesReply       = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"id\":\"m\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
+	anthropicReply       = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"m\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" +
 		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
 		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n" +
 		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
@@ -161,7 +161,12 @@ func recordRequestBodies(t *testing.T, shape requestShape) []string {
 		bodies = append(bodies, string(body))
 		mu.Unlock()
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte(shape.reply))
+		reply := shape.reply
+		// Responses finalizes streamed text on output_item.done, not on response.completed. Leave the historical ordinary-turn fixture unchanged.
+		if reply == responsesReply && bytes.Contains(body, []byte("Stop working on the task now. Do not call tools.")) {
+			reply = responsesSummaryItem + reply
+		}
+		_, _ = w.Write([]byte(reply))
 	}))
 	defer server.Close()
 	// A small keepRecentTokens lets a few short prompts be compacted.
@@ -179,7 +184,8 @@ func recordRequestBodies(t *testing.T, shape requestShape) []string {
 		}
 		ext.InitializeToolRegistry()
 		model := &ai.Model{ID: "model-a", DisplayName: "model-a", Provider: shape.provider(server.URL), Capabilities: ai.ModelCapabilities{ContextWindow: 8000}}
-		session, err := NewSession(services, SessionOptions{Model: model, SystemPrompt: "You are a test agent.", ResumePath: resume, Runner: inproc.NewRunner([]extension.Extension{ext}, services.CWD())})
+		// The fixture serves SSE. A Codex auto-transport probe adds a WebSocket GET without a request body, and recovery can vary whether a later request probes again.
+		session, err := NewSession(services, SessionOptions{Model: model, SystemPrompt: "You are a test agent.", ResumePath: resume, Transport: ai.TransportSSE, Runner: inproc.NewRunner([]extension.Extension{ext}, services.CWD())})
 		if err != nil {
 			t.Fatal(err)
 		}

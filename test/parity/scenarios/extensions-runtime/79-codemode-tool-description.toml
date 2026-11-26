@@ -3,9 +3,9 @@
 # identifier-hostile names, descriptions with padding, NEL, BOM and non-ASCII, guidelines with blank entries, nested input schemas, output schemas including MCP structuredContent shapes, namespaces
 # (ordered by name), deferred tools, the models flag and inline budgets from none to a few tokens (tools and namespaces that do not fit are named as not listed). Each description is compared as one
 # JSON line; the docs path is replaced because each binary names its own docs directory (D22). The Go test TestCodemodeDescriptionMatchesPi runs the same corpus against the vendored Pi module;
-# this scenario compares the two printed streams.
+# this scenario compares the two printed streams, with exactly the fork's two P19 help-text substitutions on the Pi side (PATCHES.md).
 name = "79-codemode-tool-description"
-description = "The codemode tool's model-facing description, with its tool sections and budget, is the same text as Pi's."
+description = "Codemode description text matches Pi around the fork's exact truncation and store guidance."
 covers = ["packages/coding-agent/src/extensions/codemode/tool.ts"]
 tags = ["fast", "hermetic"]
 driver = "cli-mode"

@@ -269,4 +269,4 @@ why = "Pi has no plugin UI carrier, so the nine messages of the view carrier (D6
 paths = ["coding/testdata/tool_schema_request_bodies.golden.json"]
 owner = "pig"
 invariant = "TestRequestBodiesAreUnchangedByHoldingToolSchemasOnce"
-why = "The length and SHA-256 of every request body the session sent through seven provider shapes before tool schemas were held once (written from commit 9cd955810e). The test is a before and after guard of a refactor, so only a body taken from the code before the change can state it; the provider conformance tests hold the bodies themselves against Pi."
+why = "The original digests from commit 9cd955810e pin the requests tool schema sharing did not change. The Dyna fork pins its P16 live-compaction requests in place of Pi's standalone summaries; The Responses fixtures emit a text-item event for that summary, and subsequent requests replay its text. The SSE fixture does not attempt Codex WebSocket upgrades, which have no request body. Other request digests remain the original pre-refactor bytes. Provider conformance tests hold the wire against Pi."

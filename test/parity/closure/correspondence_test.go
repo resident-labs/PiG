@@ -136,8 +136,36 @@ func TestAddCorrespondenceDenominatorGeneratesExactOpenGraph(t *testing.T) {
 	compactMapping := graph.Records["mapping:correspondence:function:compact"].(*Mapping)
 	compactReachability := graph.Records["reachability:correspondence:function:compact"].(*Reachability)
 	applyReachability := graph.Records["reachability:correspondence:function:applyOverrides"].(*Reachability)
-	if compactMapping.Status != "derived" || compactReachability.Class != "prod-reachable" || len(compactReachability.RootPinIDs) != 1 {
+	if compactMapping.Status != "derived" || compactReachability.Class != "prod-reachable" {
 		t.Fatalf("compact mapping/reachability = %#v / %#v", compactMapping, compactReachability)
+	}
+	compactFact := graph.Records["fact:correspondence:function:compact"].(*Fact)
+	var compactFunctions struct {
+		Target correspondence.Function `json:"target"`
+	}
+	if err := json.Unmarshal(compactFact.Value, &compactFunctions); err != nil {
+		t.Fatal(err)
+	}
+	// Both wrappers reach the shared body; the session's fallback reaches it
+	// through CompactStandalone. The separate CompactLive branch is not a root.
+	wantCompactCallers := []string{
+		"coding/session_summarization_auth.go#runDefaultCompaction -> compaction.CompactStandalone(ctx, prep, request.model, request.apiKey, request.headers, customInstructions, request.thinkingLevel, streamFn, request.env, retry, retryCallbacks, \"\")",
+		"internal/codingagent/compaction/compaction.go#Compact -> compact(ctx, prep, model, apiKey, headers, customInstructions, thinkingLevel, streamFn, env, retry, callbacks, sessionID, false)",
+		"internal/codingagent/compaction/compaction.go#CompactStandalone -> compact(ctx, prep, model, apiKey, headers, customInstructions, thinkingLevel, streamFn, env, retry, callbacks, sessionID, true)",
+	}
+	var compactCallers, compactPins []string
+	for i, caller := range compactFunctions.Target.Callers {
+		compactCallers = append(compactCallers, caller.Path+"#"+caller.Symbol+" -> "+caller.Expression)
+		pin := correspondenceCallerPin(snapshot, "target", "compact", i, caller)
+		if _, exists := graph.Records[pin.ID]; !exists {
+			t.Fatalf("missing compaction caller pin %s", pin.ID)
+		}
+		compactPins = append(compactPins, pin.ID)
+	}
+	slices.Sort(compactCallers)
+	slices.Sort(compactPins)
+	if !slices.Equal(compactCallers, wantCompactCallers) || !slices.Equal(compactReachability.RootPinIDs, compactPins) {
+		t.Fatalf("compact callers/pins = %v / %v, want %v / %v", compactCallers, compactReachability.RootPinIDs, wantCompactCallers, compactPins)
 	}
 	if applyReachability.Class != "unknown" || applyReachability.Uncertainty == "" {
 		t.Fatalf("applyOverrides reachability = %#v", applyReachability)

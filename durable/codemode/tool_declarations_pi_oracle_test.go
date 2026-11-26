@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os/exec"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/MichaelKinsy/PiG/durable"
@@ -45,8 +46,18 @@ func TestToolDeclarationsMatchPi(t *testing.T) {
 			if !found {
 				t.Fatalf("Pi declares no tool %q", tool.Name)
 			}
+			if tool.Name == "codemode" {
+				// P19 (PATCHES.md): only the two fork help phrases differ from Pi.
+				const resultText = "resolves to a string, or an object"
+				const storeText = "keep JSON values across codemode calls."
+				if strings.Count(want.Description, resultText) != 1 || strings.Count(want.Description, storeText) != 1 {
+					t.Fatalf("Pi changed the help text patched by P19: %q", want.Description)
+				}
+				want.Description = strings.Replace(want.Description, resultText, "resolves to a string, the text you would see with any truncation notice, or an object", 1)
+				want.Description = strings.Replace(want.Description, storeText, "keep small JSON values (up to 256 KB, such as IDs or summaries) across codemode calls; large data goes to a file.", 1)
+			}
 			if tool.Description != want.Description {
-				t.Errorf("description = %q\nPi: %q", tool.Description, want.Description)
+				t.Errorf("description = %q\nexpected: %q", tool.Description, want.Description)
 			}
 			whole, err := json.Marshal(tool.ToolSchema)
 			if err != nil {

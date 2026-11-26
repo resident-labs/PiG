@@ -288,7 +288,16 @@ jobs:
         run: ./automation/ci/check-dco.sh "$BASE_SHA" "$HEAD_SHA"
       - name: Fetch the canonical SDK release tag for the module-pin gate
         if: github.repository == 'resident-labs/PiG'
-        run: git fetch --no-tags https://github.com/MichaelKinsy/PiG.git refs/tags/extensions/sdk/v0.8.0:refs/tags/extensions/sdk/v0.8.0
+        shell: bash
+        run: |
+          version=$(go mod edit -json | jq -er '.Require[] | select(.Path == "github.com/MichaelKinsy/PiG/extensions/sdk").Version')
+          canonical=https://github.com/MichaelKinsy/PiG.git
+          ref="refs/tags/extensions/sdk/$version"
+          # A pseudo-version has no tag. The module-pin gate checks its commit instead.
+          match=$(git ls-remote --refs --tags "$canonical" "$ref")
+          if [ -n "$match" ]; then
+            git fetch --no-tags "$canonical" "$ref:$ref"
+          fi
       - name: Resolve canonical PiG ancestry
         if: github.repository == 'resident-labs/PiG' && github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
         run: |

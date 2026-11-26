@@ -3,12 +3,16 @@ package ai_test
 import (
 	"encoding/base64"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
+	"strings"
 	"testing"
 
 	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/internal/jsonopts"
 )
 
 // pi: packages/ai/src/api/openai-responses.ts
@@ -205,13 +209,41 @@ func checkResponsesPayload(t *testing.T, api string) {
 			t.Fatalf("probe %d: Pi produced no payload where PiG did: %.300s", i, got)
 		}
 		label := fmt.Sprintf("probe %d provider=%s reasoning=%v simple=%v compat=%s levels=%s options=%v", i, p.Provider, p.Reasoning, p.Simple, p.Compat, p.Levels, p.Options)
-		comparePayload(t, label, got, want[i], &failures, classes)
-		comparePayloadBytes(t, label, got, want[i], &reordered)
+		wantPayload := want[i]
+		if _, explicit := p.Options["reasoningSummary"]; !explicit && apiName == ai.APIOpenAIResponses && p.Provider == "openai" {
+			// D192: native OpenAI Responses defaults to detailed. None of these probes uses a custom Fetch.
+			wantPayload = withNativeResponsesSummary(t, wantPayload)
+		}
+		comparePayload(t, label, got, wantPayload, &failures, classes)
+		comparePayloadBytes(t, label, got, wantPayload, &reordered)
 	}
 	if failures > 0 {
 		t.Errorf("%d of %d probes differ from Pi; differing members: %v", failures, len(probes), classes)
 	}
 	if reordered > 0 {
 		t.Errorf("%d of %d probes write Pi's payload in another member order", reordered, len(probes))
+	}
+}
+
+// withNativeResponsesSummary changes only the pinned oracle's default summary value, without reserializing any JSON.
+func withNativeResponsesSummary(t *testing.T, payload string) string {
+	t.Helper()
+	decoder := jsontext.NewDecoder(strings.NewReader(payload), jsonopts.Parse)
+	for {
+		token, err := decoder.ReadToken()
+		if err == io.EOF {
+			return payload
+		}
+		if err != nil {
+			t.Fatalf("Pi Responses payload is not JSON: %v", err)
+		}
+		if token.Kind() == '"' && token.String() == "auto" && decoder.StackPointer() == "/reasoning/summary" {
+			const auto = `"auto"`
+			end := int(decoder.InputOffset())
+			if payload[end-len(auto):end] != auto {
+				t.Fatalf("Pi's default summary is not JSON.stringify's %s", auto)
+			}
+			return payload[:end-len(auto)] + `"detailed"` + payload[end:]
+		}
 	}
 }

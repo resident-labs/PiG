@@ -199,20 +199,17 @@ func (p *TestFauxProvider) Stream(ctx context.Context, transcript TranscriptCont
 			return
 		}
 
+		initialSummary := isTestFauxLiveCompaction(lastText) || strings.Contains(lastText, "Create a structured context checkpoint summary")
 		slowCompactionProbe := os.Getenv("TEST_FAUX_SLOW_COMPACTION") == "1" &&
-			(strings.Contains(lastText, "Create a concise checkpoint of the user's request and the progress shown above.") ||
-				strings.Contains(lastText, "Create a structured context checkpoint summary") ||
+			(initialSummary || strings.Contains(lastText, "Create a concise checkpoint of the user's request and the progress shown above.") ||
 				strings.Contains(lastText, "NEW conversation messages to incorporate into the existing summary"))
-		slowOverflowSummary := os.Getenv("TUI_LIVE_PROBE") == "1" &&
-			strings.Contains(lastText, "Create a structured context checkpoint summary") ||
-			strings.Contains(lastText, "Create a structured context checkpoint summary") &&
-				strings.Contains(historyText(messages), "Trigger: overflow error with queued message")
+		slowOverflowSummary := initialSummary && (os.Getenv("TUI_LIVE_PROBE") == "1" ||
+			strings.Contains(historyText(messages), "Trigger: overflow error with queued message"))
 		// TEST_FAUX_HOLD_COMPACTION holds a /compact summary until the run is
 		// cancelled, so a probe of the in-progress screen captures a steady
 		// state instead of racing a fixed delay. test/parity/testdata/
 		// test-faux-provider.ts does the same for Pi.
-		if os.Getenv("TEST_FAUX_HOLD_COMPACTION") == "1" &&
-			strings.Contains(lastText, "Create a structured context checkpoint summary") {
+		if os.Getenv("TEST_FAUX_HOLD_COMPACTION") == "1" && initialSummary {
 			builder.start()
 			testFauxWait(turn, ctx, -1)
 			builder.fail(StopReasonAborted, errors.New("This operation was aborted"))
@@ -311,6 +308,11 @@ func (p *TestFauxProvider) reserveToolCallIDs(sessionID string, messages []Messa
 	return last + 1
 }
 
+// isTestFauxLiveCompaction matches the beginning of P16's LIVE_SUMMARIZATION_PROMPT, including requests with additional focus.
+func isTestFauxLiveCompaction(text string) bool {
+	return strings.HasPrefix(text, "Stop working on the task now. Do not call tools. Your context window is full, so the conversation above is about to be replaced by a summary that you write now.")
+}
+
 func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []testFauxToolCall) {
 	if len(msgs) == 0 {
 		// The pinned Pi provider reads an empty list as an empty last message and answers it as an unhandled request (test/parity/testdata/test-faux-provider.ts classify).
@@ -328,9 +330,15 @@ func classifyTestFauxRequest(msgs []Message) (kind, text string, toolCalls []tes
 		}
 	}
 
-	// Compaction summarization: triggered by /compact or auto-compaction.
-	// The summarization prompt contains this verbatim string from
-	// compaction.go SUMMARIZATION_PROMPT / UPDATE_SUMMARIZATION_PROMPT.
+	// Live and standalone requests get the same canned summary for paired scenarios.
+	if isTestFauxLiveCompaction(lastText) {
+		// An RPC probe distinguishes a live request from a standalone fallback.
+		if strings.HasSuffix(lastText, "\n\nAdditional focus: RPC_LIVE_SUMMARY_PROBE") {
+			return "text", "RPC live compaction summary", nil
+		}
+		return "text", testFauxSummaryResponse, nil
+	}
+	// Standalone compaction.go SUMMARIZATION_PROMPT / UPDATE_SUMMARIZATION_PROMPT.
 	if strings.Contains(lastText, "Create a structured context checkpoint summary") ||
 		strings.Contains(lastText, "NEW conversation messages to incorporate into the existing summary") {
 		return "text", testFauxSummaryResponse, nil

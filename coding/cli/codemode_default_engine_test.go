@@ -10,16 +10,10 @@ import (
 	"testing"
 
 	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/coding/extension/factoryload"
-	"github.com/MichaelKinsy/PiG/internal/codingagent"
 )
-
-type noBranch struct {
-	extension.ReadonlySessionManager
-}
-
-func (noBranch) GetBranch(...string) []codingagent.SessionEntry { return nil }
 
 // pig additive (D263): nothing selects wazero's interpreter for Code Mode by default. The codemode tool of the built-in extensions the pig command builds runs a
 // script on the compiler: the compiler writes its machine code under the compilation cache directory the command gives the sandbox, and the interpreter writes none.
@@ -48,7 +42,12 @@ func TestPigCommandRunsCodeModeOnTheCompilerByDefault(t *testing.T) {
 	if !ok {
 		t.Fatal("the codemode extension registers no codemode tool")
 	}
-	base := extension.NewContext(t.TempDir(), nil, func() error { return nil }, extension.ContextActions{SessionManager: noBranch{}})
+	cwd := t.TempDir()
+	manager, err := coding.NewInMemorySessionManager(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := extension.NewContext(cwd, nil, func() error { return nil }, extension.ContextActions{SessionManager: manager})
 	ctx := extension.WithToolContext(t.Context(), extension.NewToolContext(base, "call", t.Context(), extension.ToolActions{}))
 	params, _ := json.Marshal(map[string]string{"code": "return 6 * 7"})
 	result, err := tool.Definition.Execute(ctx, "call", params, nil)

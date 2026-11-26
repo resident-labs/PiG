@@ -165,16 +165,19 @@ func TestRpcModeShouldSaveMessagesToSessionFile(t *testing.T) {
 func TestRpcModeShouldHandleManualCompaction(t *testing.T) {
 	f := newFauxFixture(t)
 	f.promptAndWait(t, "reply with exactly: hello")
-	result, err := f.client.Compact(nil)
+	// The provider returns this summary only for P16's live request with the supplied focus.
+	focus := "RPC_LIVE_SUMMARY_PROBE"
+	const summary = "RPC live compaction summary"
+	result, err := f.client.Compact(&focus)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Summary == "" || result.TokensBefore <= 0 {
-		t.Fatalf("compaction = %+v", result)
+	if result.Summary != summary || result.TokensBefore <= 0 {
+		t.Fatalf("compaction = %+v, want live summary %q and positive tokensBefore", result, summary)
 	}
 	compactions := entriesOfType(f.sessionFileEntries(t), "compaction")
-	if len(compactions) != 1 || compactions[0]["summary"] == "" {
-		t.Fatalf("compaction entries = %v", compactions)
+	if len(compactions) != 1 || compactions[0]["summary"] != summary {
+		t.Fatalf("compaction entries = %v, want one with live summary %q", compactions, summary)
 	}
 }
 

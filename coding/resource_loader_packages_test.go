@@ -11,7 +11,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -898,11 +897,7 @@ func checkDefaultLoaderEndsAnInstallWithItsContext(t *testing.T, output PackageC
 	if err != nil {
 		t.Fatal(err)
 	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := process.Signal(syscall.Signal(0)); err == nil {
+	if loaderProcessAlive(t, pid) {
 		t.Fatalf("npm (pid %d) is still running", pid)
 	}
 }
@@ -964,11 +959,7 @@ func TestDefaultLoaderEndsAGitInstallWithItsContext(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			process, err := os.FindProcess(pid)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := process.Signal(syscall.Signal(0)); err == nil {
+			if loaderProcessAlive(t, pid) {
 				t.Fatalf("the %s (pid %d) is still running", hung, pid)
 			}
 		})

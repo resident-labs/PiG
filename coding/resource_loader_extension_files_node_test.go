@@ -86,12 +86,15 @@ func TestDefaultResourceLoaderSuccessfulLoadRunsInALiveHostThatCloseStops(t *tes
 		t.Fatal(err)
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || !extensionProcessAlive(pid) {
-		t.Fatalf("extension process %q is not alive after the load: %v", data, err)
+	if err != nil {
+		t.Fatalf("invalid extension process ID %q: %v", data, err)
+	}
+	if !loaderProcessAlive(t, pid) {
+		t.Fatalf("extension process %d is not alive after the load", pid)
 	}
 	loader.Close()
 	deadline := time.Now().Add(10 * time.Second)
-	for extensionProcessAlive(pid) {
+	for loaderProcessAlive(t, pid) {
 		if time.Now().After(deadline) {
 			t.Fatalf("extension process %d still alive 10s after Close", pid)
 		}
